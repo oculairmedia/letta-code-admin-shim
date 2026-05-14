@@ -1,0 +1,691 @@
+/**
+ * Behavioral tests for Run-record lifecycle.
+ *
+ * The admin-shim overlays a vanilla-Letta-compatible Run abstraction on
+ * top of letta-code's LocalBackend (which has none). One Run is created
+ * per turn; mobile polls/cancels them via /v1/runs/*. These tests pin
+ * down the wire contract before the .mjs→.ts migration.
+ *
+ * Behaviour under test (see lib/runs.mjs + lib/agent-pool.mjs):
+ *   - Run created on turn start, finalized on turn end
+ *   - Listing + filtering + pagination
+ *   - Per-run usage / metrics / steps projections
+ *   - Cancel (POST /v1/agents/{id}/messages/cancel)
+ *   - Delete (DELETE /v1/runs/{id})
+ *   - On-disk persistence under ${stateDir}/runs/<id>/run.json
+ *
+ * Numbers in assertions come from the captured stream-trace fixtures in
+ * test/fixtures/stream-traces/. If those fixtures are re-captured, the
+ * expected token / step counts here must be updated to match.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import {
+  startShim,
+  seedAgent,
+  seedConversation,
+  externalConvId,
+  streamMessages,
+  framesOfType,
+} from "./helpers/index.mjs";
+
+// ── helpers ───────────────────────────────────────────────────────
+
+/** Send a user message and return { runId, frames, doneSeen }. */
+async function sendTurn(shim, agentId, content, { convId, timeoutMs = 10_000 } = {}) {
+  const conv = convId ?? externalConvId(agentId);
+  const { frames, doneSeen, status } = await streamMessages(
+    `${shim.url}/v1/conversations/${conv}/messages`,
+    { messages: [{ role: "user", content }], streaming: true },
+    { timeoutMs },
+  );
+  assert.equal(status, 200, "POST should be 200");
+  // Pull run_id off the first frame that has it — every turn frame carries
+  // the same id once chat.mjs has stamped it.
+  const runId = frames.map((f) => f.run_id).find((id) => typeof id === "string");
+  return { runId, frames, doneSeen };
+}
+
+async function getJson(url) {
+  const res = await fetch(url);
+  let body = null;
+  try { body = await res.json(); } catch {}
+  return { status: res.status, body };
+}
+
+function readRunRecord(stateDir, runId) {
+  const p = join(stateDir, "runs", runId, "run.json");
+  if (!existsSync(p)) return null;
+  return JSON.parse(readFileSync(p, "utf8"));
+}
+
+// ── tests ─────────────────────────────────────────────────────────
+
+test("runs: turn creates a Run record reachable via GET /v1/runs/{id}", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-001" });
+  seedConversation(shim.stateDir, agentId);
+
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+  assert.ok(runId, "stream frames should carry a run_id");
+  assert.match(runId, /^run-/, "run_id should use the shim's run- prefix, not local-run-");
+
+  const { status, body } = await getJson(`${shim.url}/v1/runs/${runId}`);
+  assert.equal(status, 200);
+  assert.equal(body.id, runId);
+  assert.equal(body.agent_id, agentId);
+  assert.equal(body.conversation_id, "default");
+  assert.equal(body.status, "completed");
+  // plain trace ends with stop_reason="end_turn" (single step)
+  assert.equal(body.stop_reason, "end_turn");
+  assert.ok(typeof body.created_at === "string" && body.created_at.length > 0);
+  assert.ok(typeof body.completed_at === "string" && body.completed_at.length > 0);
+  assert.ok(body.total_duration_ns > 0, "wall-clock duration should be > 0");
+  assert.ok(body.ttft_ns > 0, "ttft should be > 0");
+});
+
+test("runs: fresh shim returns [] from GET /v1/runs/", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const { status, body } = await getJson(`${shim.url}/v1/runs/`);
+  assert.equal(status, 200);
+  assert.deepEqual(body, []);
+});
+
+test("runs: one turn → listRuns returns one record with correct ids", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-002" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+
+  const { body } = await getJson(`${shim.url}/v1/runs/`);
+  assert.ok(Array.isArray(body));
+  assert.equal(body.length, 1);
+  assert.equal(body[0].id, runId);
+  assert.equal(body[0].agent_id, agentId);
+  assert.equal(body[0].conversation_id, "default");
+});
+
+test("runs: multiple turns → listRuns ordered desc by created_at", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-003" });
+  seedConversation(shim.stateDir, agentId);
+
+  const a = await sendTurn(shim, agentId, "reply with pong");
+  const b = await sendTurn(shim, agentId, "reply with pong");
+  const c = await sendTurn(shim, agentId, "reply with pong");
+
+  const { body } = await getJson(`${shim.url}/v1/runs/`);
+  assert.equal(body.length, 3);
+  // desc — most recent first
+  assert.equal(body[0].id, c.runId);
+  assert.equal(body[1].id, b.runId);
+  assert.equal(body[2].id, a.runId);
+});
+
+test("runs: listRuns filters by agent_id, conversation_id, statuses", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const a1 = seedAgent(shim.stateDir, { id: "agent-run-fa" });
+  seedConversation(shim.stateDir, a1);
+  const a2 = seedAgent(shim.stateDir, { id: "agent-run-fb" });
+  seedConversation(shim.stateDir, a2);
+
+  await sendTurn(shim, a1, "reply with pong");
+  await sendTurn(shim, a2, "reply with pong");
+
+  // agent_id filter
+  const byA1 = await getJson(`${shim.url}/v1/runs/?agent_id=${a1}`);
+  assert.equal(byA1.body.length, 1);
+  assert.equal(byA1.body[0].agent_id, a1);
+
+  // conversation_id filter
+  const byConv = await getJson(`${shim.url}/v1/runs/?conversation_id=default`);
+  assert.equal(byConv.body.length, 2);
+
+  // statuses=completed → both completed runs
+  const byCompleted = await getJson(`${shim.url}/v1/runs/?statuses=completed`);
+  assert.equal(byCompleted.body.length, 2);
+
+  // statuses=running → no runs are still running after both turns finished
+  const byRunning = await getJson(`${shim.url}/v1/runs/?statuses=running`);
+  assert.equal(byRunning.body.length, 0);
+});
+
+test("runs: listRuns?active=true returns 1 mid-turn, 0 once finished", async (t) => {
+  const shim = await startShim({ env: { LETTA_MOCK_DELAY_MS: "200" } });
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-active" });
+  seedConversation(shim.stateDir, agentId);
+  const convId = externalConvId(agentId);
+
+  // Kick the turn off in the background; while frames trickle in we sample
+  // active=true via the listRuns endpoint.
+  const turnPromise = streamMessages(
+    `${shim.url}/v1/conversations/${convId}/messages`,
+    { messages: [{ role: "user", content: "reply with pong" }], streaming: true },
+    { timeoutMs: 15_000 },
+  );
+
+  // Poll for an active run for up to ~3s — startup + first frame in the mock
+  // need to land before the Run record is on disk.
+  let sawActive = false;
+  for (let i = 0; i < 30; i += 1) {
+    const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
+    if (body.length >= 1) {
+      assert.equal(body[0].status, "running");
+      sawActive = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(sawActive, "should see an active run mid-turn with LETTA_MOCK_DELAY_MS=200");
+
+  // Wait for the turn to finish, then re-check.
+  await turnPromise;
+  const after = await getJson(`${shim.url}/v1/runs/?active=true`);
+  assert.equal(after.body.length, 0, "no active runs after turn finishes");
+});
+
+test("runs: listRuns?active=false returns the completed runs", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-inactive" });
+  seedConversation(shim.stateDir, agentId);
+  await sendTurn(shim, agentId, "reply with pong");
+
+  const { body } = await getJson(`${shim.url}/v1/runs/?active=false`);
+  assert.equal(body.length, 1);
+  assert.equal(body[0].status, "completed");
+});
+
+test("runs: listRuns pagination — ?limit=2&before=<id>", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-page" });
+  seedConversation(shim.stateDir, agentId);
+
+  const a = await sendTurn(shim, agentId, "reply with pong");
+  const b = await sendTurn(shim, agentId, "reply with pong");
+  const c = await sendTurn(shim, agentId, "reply with pong");
+
+  // Default order=desc: [c, b, a]. listRuns's `before` / `after` are
+  // position-based on the sorted list:
+  //   ?after=c  → entries appearing AFTER c in the list, i.e. older runs.
+  // (cf. lib/runs.mjs listRuns — vanilla matches this semantic.)
+  const { body } = await getJson(`${shim.url}/v1/runs/?limit=2&after=${c.runId}`);
+  assert.equal(body.length, 2);
+  assert.equal(body[0].id, b.runId);
+  assert.equal(body[1].id, a.runId);
+
+  // And ?before=a → entries appearing BEFORE a (newer) → [c, b]; limit=2.
+  const fwd = await getJson(`${shim.url}/v1/runs/?limit=2&before=${a.runId}`);
+  assert.equal(fwd.body.length, 2);
+  assert.equal(fwd.body[0].id, c.runId);
+  assert.equal(fwd.body[1].id, b.runId);
+});
+
+test("runs: GET /v1/runs/{id} response includes all vanilla + shim fields", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-shape" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+
+  const { body } = await getJson(`${shim.url}/v1/runs/${runId}`);
+  // Vanilla Run fields
+  for (const key of [
+    "id",
+    "agent_id",
+    "conversation_id",
+    "status",
+    "created_at",
+    "completed_at",
+    "stop_reason",
+    "total_duration_ns",
+    "ttft_ns",
+  ]) {
+    assert.ok(key in body, `vanilla field "${key}" missing`);
+  }
+  // Shim extensions
+  for (const key of ["message_ids", "tools_used", "num_steps", "usage"]) {
+    assert.ok(key in body, `shim extension "${key}" missing`);
+  }
+});
+
+test("runs: GET /v1/runs/{unknown} → 404 with { detail }", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const { status, body } = await getJson(`${shim.url}/v1/runs/run-does-not-exist`);
+  assert.equal(status, 404);
+  assert.equal(typeof body.detail, "string");
+  assert.match(body.detail, /run/i);
+});
+
+test("runs: GET /v1/runs/count is an integer matching list length", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const empty = await getJson(`${shim.url}/v1/runs/count`);
+  assert.equal(empty.status, 200);
+  assert.equal(empty.body, 0);
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-count" });
+  seedConversation(shim.stateDir, agentId);
+  await sendTurn(shim, agentId, "reply with pong");
+  await sendTurn(shim, agentId, "reply with pong");
+
+  const after = await getJson(`${shim.url}/v1/runs/count`);
+  assert.equal(after.body, 2);
+});
+
+test("runs: GET /v1/runs/{id}/usage — plain trace = 12 total_tokens (p=6,c=6)", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-usage" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+
+  const { body } = await getJson(`${shim.url}/v1/runs/${runId}/usage`);
+  // Numbers come from fixtures/stream-traces/plain.jsonl — if that fixture
+  // is re-captured the expected values here must move with it.
+  assert.equal(body.prompt_tokens, 6);
+  assert.equal(body.completion_tokens, 6);
+  assert.equal(body.total_tokens, 12);
+  assert.equal(body.step_count, 1);
+  assert.equal(body.cached_input_tokens, 0);
+  assert.equal(body.cache_write_tokens, 0);
+  assert.equal(body.reasoning_tokens, 0);
+});
+
+test("runs: GET /v1/runs/{id}/metrics — shape + values from a real run", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-metrics" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+
+  const { status, body } = await getJson(`${shim.url}/v1/runs/${runId}/metrics`);
+  assert.equal(status, 200);
+  assert.equal(body.id, runId);
+  assert.equal(body.agent_id, agentId);
+  assert.equal(body.organization_id, null);
+  assert.equal(body.project_id, null);
+  assert.ok(typeof body.run_start_ns === "number" && body.run_start_ns > 0);
+  assert.ok(typeof body.run_ns === "number" && body.run_ns > 0);
+  assert.equal(body.num_steps, 1); // plain trace → 1 step
+  assert.deepEqual(body.tools_used, []); // plain trace has no tool calls
+});
+
+test("runs: GET /v1/runs/{id}/steps — plain=1 step, bash-tool=2 steps with usage+stop_reason", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  // plain: single step, no tools
+  const aPlain = seedAgent(shim.stateDir, { id: "agent-steps-plain" });
+  seedConversation(shim.stateDir, aPlain);
+  const r1 = await sendTurn(shim, aPlain, "reply with pong");
+  const p1 = await getJson(`${shim.url}/v1/runs/${r1.runId}/steps`);
+  assert.equal(p1.status, 200);
+  assert.equal(p1.body.length, 1);
+  assert.ok(p1.body[0].usage, "step record should carry per-step usage");
+  assert.ok(p1.body[0].stop_reason, "step record should carry stop_reason");
+
+  // bash-tool: 2 steps (tool-call step + final assistant step)
+  const aBash = seedAgent(shim.stateDir, { id: "agent-steps-bash" });
+  seedConversation(shim.stateDir, aBash);
+  const r2 = await sendTurn(shim, aBash, "run bash echo hello");
+  const p2 = await getJson(`${shim.url}/v1/runs/${r2.runId}/steps`);
+  assert.equal(p2.body.length, 2);
+  for (const step of p2.body) {
+    assert.ok(step.usage, "every step should have usage");
+    assert.ok(step.stop_reason, "every step should have stop_reason");
+    assert.equal(step.run_id, r2.runId);
+  }
+});
+
+test("runs: GET /v1/runs/{id}/messages — mock-only turn returns []", async (t) => {
+  // The captured mock doesn't append to messages.jsonl, so the Run record's
+  // message_ids stays empty and the /messages projection has nothing to
+  // emit. This is intentional behaviour for the mock; a real letta worker
+  // writes to disk and this list is non-empty. Recapturing the fixtures or
+  // adding a disk-write mock would change this; for now we pin the empty
+  // shape so future migrations don't accidentally regress to non-empty.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-msgs" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+
+  const { status, body } = await getJson(`${shim.url}/v1/runs/${runId}/messages`);
+  assert.equal(status, 200);
+  assert.deepEqual(body, []);
+
+  // Sanity: the run record's message_ids matches the projection.
+  const run = readRunRecord(shim.stateDir, runId);
+  assert.deepEqual(run.message_ids, []);
+});
+
+test("runs: tools_used is recorded + deduped per turn", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const a1 = seedAgent(shim.stateDir, { id: "agent-tools-bash" });
+  seedConversation(shim.stateDir, a1);
+  const a2 = seedAgent(shim.stateDir, { id: "agent-tools-multi" });
+  seedConversation(shim.stateDir, a2);
+  const a3 = seedAgent(shim.stateDir, { id: "agent-tools-inter" });
+  seedConversation(shim.stateDir, a3);
+
+  // bash-tool → ["Bash"]
+  const r1 = await sendTurn(shim, a1, "run bash echo hello");
+  const b1 = await getJson(`${shim.url}/v1/runs/${r1.runId}`);
+  assert.deepEqual(b1.body.tools_used, ["Bash"]);
+
+  // multi-tool-bash-read → ["Bash", "Read"] (insertion order preserved)
+  const r2 = await sendTurn(shim, a2, "multi tool call please");
+  const b2 = await getJson(`${shim.url}/v1/runs/${r2.runId}`);
+  assert.deepEqual(b2.body.tools_used.sort(), ["Bash", "Read"]);
+
+  // interleaved-tools → only Bash (deduped across the multiple tool steps)
+  const r3 = await sendTurn(shim, a3, "interleaved one at a time");
+  const b3 = await getJson(`${shim.url}/v1/runs/${r3.runId}`);
+  assert.deepEqual(b3.body.tools_used, ["Bash"]);
+});
+
+test("runs: num_steps mirrors model-step count from stop_reason frames", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const aPlain = seedAgent(shim.stateDir, { id: "agent-nsteps-plain" });
+  seedConversation(shim.stateDir, aPlain);
+  const aBash = seedAgent(shim.stateDir, { id: "agent-nsteps-bash" });
+  seedConversation(shim.stateDir, aBash);
+  const aInter = seedAgent(shim.stateDir, { id: "agent-nsteps-inter" });
+  seedConversation(shim.stateDir, aInter);
+
+  const r1 = await sendTurn(shim, aPlain, "reply with pong");
+  const r2 = await sendTurn(shim, aBash, "run bash echo hello");
+  const r3 = await sendTurn(shim, aInter, "interleaved one at a time");
+
+  const b1 = await getJson(`${shim.url}/v1/runs/${r1.runId}`);
+  const b2 = await getJson(`${shim.url}/v1/runs/${r2.runId}`);
+  const b3 = await getJson(`${shim.url}/v1/runs/${r3.runId}`);
+
+  // step counts derived from stop_reason frame count in each fixture:
+  //   plain.jsonl              → 1
+  //   bash-tool.jsonl          → 2
+  //   interleaved-tools.jsonl  → 4  (one stop_reason per step; 3 tool steps
+  //                                  + 1 final assistant step)
+  assert.equal(b1.body.num_steps, 1);
+  assert.equal(b2.body.num_steps, 2);
+  assert.equal(b3.body.num_steps, 4);
+});
+
+test("runs: cancel via POST /v1/agents/{id}/messages/cancel with run_ids", async (t) => {
+  const shim = await startShim({ env: { LETTA_MOCK_DELAY_MS: "1500" } });
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-cancel-run" });
+  seedConversation(shim.stateDir, agentId);
+  const convId = externalConvId(agentId);
+
+  // Kick off a slow turn in the background.
+  const turnPromise = streamMessages(
+    `${shim.url}/v1/conversations/${convId}/messages`,
+    { messages: [{ role: "user", content: "reply with pong" }], streaming: true },
+    { timeoutMs: 20_000 },
+  );
+
+  // Find the active run.
+  let runId = null;
+  for (let i = 0; i < 30; i += 1) {
+    const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
+    if (body.length >= 1) { runId = body[0].id; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(runId, "should observe an active run before cancel");
+
+  // Issue the cancel.
+  const cancelRes = await fetch(`${shim.url}/v1/agents/${agentId}/messages/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_ids: [runId] }),
+  });
+  assert.equal(cancelRes.status, 200);
+  const cancelBody = await cancelRes.json();
+  assert.equal(cancelBody[runId], "cancelled");
+
+  // Wait for the in-flight stream to drain (worker SIGTERM'd).
+  await turnPromise;
+
+  // Run record should reflect the cancellation.
+  const { body } = await getJson(`${shim.url}/v1/runs/${runId}`);
+  assert.equal(body.status, "cancelled");
+  assert.equal(body.stop_reason, "user_cancelled");
+});
+
+test("runs: cancel with empty run_ids cancels ALL active runs for the agent", async (t) => {
+  const shim = await startShim({ env: { LETTA_MOCK_DELAY_MS: "1500" } });
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-cancel-all" });
+  seedConversation(shim.stateDir, agentId);
+  const convId = externalConvId(agentId);
+
+  const turnPromise = streamMessages(
+    `${shim.url}/v1/conversations/${convId}/messages`,
+    { messages: [{ role: "user", content: "reply with pong" }], streaming: true },
+    { timeoutMs: 20_000 },
+  );
+
+  let runId = null;
+  for (let i = 0; i < 30; i += 1) {
+    const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
+    if (body.length >= 1) { runId = body[0].id; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(runId);
+
+  // No run_ids → cancel all active for agent.
+  const cancelRes = await fetch(`${shim.url}/v1/agents/${agentId}/messages/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assert.equal(cancelRes.status, 200);
+  const cancelBody = await cancelRes.json();
+  assert.equal(cancelBody[runId], "cancelled");
+
+  await turnPromise;
+});
+
+test("runs: cancel unknown run returns not_found; cancel wrong agent returns agent_mismatch", async (t) => {
+  const shim = await startShim({ env: { LETTA_MOCK_DELAY_MS: "1500" } });
+  t.after(() => shim.stop());
+
+  const agentA = seedAgent(shim.stateDir, { id: "agent-cancel-mismatch-a" });
+  seedConversation(shim.stateDir, agentA);
+  const agentB = seedAgent(shim.stateDir, { id: "agent-cancel-mismatch-b" });
+  seedConversation(shim.stateDir, agentB);
+  const convA = externalConvId(agentA);
+
+  // not_found path — no active turn at all.
+  const r1 = await fetch(`${shim.url}/v1/agents/${agentA}/messages/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_ids: ["run-does-not-exist"] }),
+  });
+  const b1 = await r1.json();
+  assert.equal(b1["run-does-not-exist"], "not_found");
+
+  // agent_mismatch: start a turn on agent A, attempt cancel via agent B.
+  const turnPromise = streamMessages(
+    `${shim.url}/v1/conversations/${convA}/messages`,
+    { messages: [{ role: "user", content: "reply with pong" }], streaming: true },
+    { timeoutMs: 20_000 },
+  );
+
+  let runId = null;
+  for (let i = 0; i < 30; i += 1) {
+    const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
+    if (body.length >= 1) { runId = body[0].id; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(runId);
+
+  const r2 = await fetch(`${shim.url}/v1/agents/${agentB}/messages/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_ids: [runId] }),
+  });
+  const b2 = await r2.json();
+  assert.equal(b2[runId], "agent_mismatch");
+
+  // Clean up: cancel via correct agent so the stream drains promptly.
+  await fetch(`${shim.url}/v1/agents/${agentA}/messages/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_ids: [runId] }),
+  });
+  await turnPromise;
+});
+
+test("runs: DELETE /v1/runs/{id} removes the record + dir", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-delete" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+
+  // Pre-condition: record exists.
+  assert.ok(readRunRecord(shim.stateDir, runId));
+
+  const del = await fetch(`${shim.url}/v1/runs/${runId}`, { method: "DELETE" });
+  assert.equal(del.status, 200);
+  const delBody = await del.json();
+  assert.equal(delBody.deleted, true);
+  assert.equal(delBody.id, runId);
+
+  // GET → 404 now.
+  const after = await getJson(`${shim.url}/v1/runs/${runId}`);
+  assert.equal(after.status, 404);
+
+  // Directory removed.
+  assert.equal(existsSync(join(shim.stateDir, "runs", runId)), false);
+});
+
+test("runs: run record persisted on disk at ${stateDir}/runs/<id>/run.json", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-disk" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "reply with pong");
+
+  const path = join(shim.stateDir, "runs", runId, "run.json");
+  assert.ok(existsSync(path), `run.json should exist at ${path}`);
+  const rec = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(rec.id, runId);
+  assert.equal(rec.agent_id, agentId);
+  assert.equal(rec.status, "completed");
+  assert.ok(rec.usage, "completed run should have usage on disk");
+});
+
+test("runs: cancelled run still produces a persisted record", async (t) => {
+  const shim = await startShim({ env: { LETTA_MOCK_DELAY_MS: "1500" } });
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-cancel-persist" });
+  seedConversation(shim.stateDir, agentId);
+  const convId = externalConvId(agentId);
+
+  const turnPromise = streamMessages(
+    `${shim.url}/v1/conversations/${convId}/messages`,
+    { messages: [{ role: "user", content: "reply with pong" }], streaming: true },
+    { timeoutMs: 20_000 },
+  );
+
+  let runId = null;
+  for (let i = 0; i < 30; i += 1) {
+    const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
+    if (body.length >= 1) { runId = body[0].id; break; }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(runId);
+
+  await fetch(`${shim.url}/v1/agents/${agentId}/messages/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ run_ids: [runId] }),
+  });
+  await turnPromise;
+
+  const rec = readRunRecord(shim.stateDir, runId);
+  assert.ok(rec, "cancelled run record should still be on disk");
+  assert.equal(rec.status, "cancelled");
+  assert.equal(rec.stop_reason, "user_cancelled");
+  assert.ok(rec.completed_at, "cancel should stamp completed_at");
+  assert.ok(rec.total_duration_ns > 0);
+});
+
+test("runs: frames emitted during a turn carry the matching run_id", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-run-frameid" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId, frames } = await sendTurn(shim, agentId, "reply with pong");
+  assert.ok(runId);
+
+  // Every assistant/reasoning/tool frame should carry the shim's run_id, NOT
+  // the captured `local-run-1`. (stop_reason/usage_statistics intentionally
+  // omit the id per the wire contract; see chat.mjs reshapeFrame. The
+  // opening `ping` frame is also exempt — it is written before the worker
+  // resolves and the run_id is known.)
+  const stamped = frames.filter((f) =>
+    ["assistant_message", "reasoning_message", "tool_call_message"].includes(f.message_type),
+  );
+  assert.ok(stamped.length > 0, "should have at least one stampable frame");
+  for (const f of stamped) {
+    assert.equal(f.run_id, runId, `frame ${f.message_type} should be stamped with ${runId}`);
+  }
+});
+
+test("runs: bash-tool turn has stop_reason from FIRST step (requires_approval)", async (t) => {
+  // The agent-pool's finalizeRun records the FIRST usage_statistics + the
+  // FIRST stop_reason frame in the turn (see lib/agent-pool.mjs ~L323).
+  // For a 2-step turn that means the run-level stop_reason captures the
+  // tool-call step's stop, not the final end_turn.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-stopreason" });
+  seedConversation(shim.stateDir, agentId);
+  const { runId } = await sendTurn(shim, agentId, "run bash echo hello");
+
+  const { body } = await getJson(`${shim.url}/v1/runs/${runId}`);
+  assert.equal(body.status, "completed");
+  assert.equal(body.stop_reason, "requires_approval");
+});

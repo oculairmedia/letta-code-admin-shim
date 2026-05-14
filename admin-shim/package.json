@@ -6,7 +6,9 @@
   "type": "module",
   "main": "server.mjs",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test --test-concurrency=1 --test-reporter=spec test/*.test.mjs",
+    "test:watch": "node --test --test-concurrency=1 --watch test/*.test.mjs"
   },
   "dependencies": {
     "ws": "8.18.0"
