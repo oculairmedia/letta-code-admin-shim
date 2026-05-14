@@ -1,0 +1,17 @@
+{
+  "name": "letta-code-admin-shim",
+  "version": "0.3.0",
+  "private": true,
+  "description": "HTTP shim exposing a Letta-server-compatible REST surface on top of letta-code's LocalBackend. Also hosts the mobile channel WS endpoint.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

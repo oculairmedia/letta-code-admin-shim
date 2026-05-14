@@ -1,0 +1,22 @@
+{
+  "accounts": [
+    {
+      "channel": "mobile",
+      "accountId": "default",
+      "displayName": "Letta Mobile",
+      "enabled": true,
+      "dmPolicy": "open",
+      "allowedUsers": [],
+      "config": {
+        "_comment": "Generate a token with `openssl rand -hex 32` and export as MOBILE_CHANNEL_TOKEN, or set tokenFallback to a strong secret. The fallback below is REJECTED unless you change it.",
+        "tokenEnv": "MOBILE_CHANNEL_TOKEN",
+        "tokenFallback": "PLEASE_SET_MOBILE_CHANNEL_TOKEN_OR_USE_ENV",
+        "pingIntervalMs": 25000,
+        "idleTimeoutMs": 120000,
+        "bufferHighWaterBytes": 1000000
+      },
+      "createdAt": "1970-01-01T00:00:00.000Z",
+      "updatedAt": "1970-01-01T00:00:00.000Z"
+    }
+  ]
+}

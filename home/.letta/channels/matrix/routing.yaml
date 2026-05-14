@@ -1,0 +1,13 @@
+{
+  "routes": [
+    {
+      "accountId": "lettabot",
+      "chatId": "!Pe4ArriZEzEOQwAzxI:matrix.oculair.ca",
+      "agentId": "agent-local-ffa3a92b-f5d6-45e1-8866-f3c965a92133",
+      "conversationId": "local-conv-1",
+      "enabled": true,
+      "createdAt": "2026-05-14T03:31:35.384Z",
+      "threadId": null
+    }
+  ]
+}

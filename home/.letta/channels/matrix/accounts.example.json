@@ -1,0 +1,22 @@
+{
+  "accounts": [
+    {
+      "channel": "matrix",
+      "accountId": "default",
+      "displayName": "your-bot@your-homeserver",
+      "enabled": false,
+      "dmPolicy": "open",
+      "allowedUsers": [],
+      "config": {
+        "homeserverUrl": "http://your-matrix-homeserver:8008",
+        "accessToken": "REPLACE_WITH_MATRIX_ACCESS_TOKEN",
+        "userId": "@your-bot:your-homeserver",
+        "autoJoinInvites": false,
+        "syncTimeoutMs": 30000,
+        "allowedRooms": []
+      },
+      "createdAt": "1970-01-01T00:00:00.000Z",
+      "updatedAt": "1970-01-01T00:00:00.000Z"
+    }
+  ]
+}
