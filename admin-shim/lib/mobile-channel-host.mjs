@@ -20,7 +20,11 @@ import { pathToFileURL } from "node:url";
 
 import { reshapeFrame } from "./chat.mjs";
 import { cancelRun, getAgentPool } from "./agent-pool.mjs";
-import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.mjs";
+import {
+  findUnmappedTailUserMessageId,
+  resolveConversationId,
+  writeOtidForLocalId,
+} from "./store.mjs";
 
 function channelDir() {
   const root = process.env.LETTA_HOME || join(homedir(), ".letta");
@@ -48,8 +52,29 @@ async function bridgeSendMessage(
   onFrame,
   { onRunCreated } = {},
 ) {
+  // Accept both the INTERNAL conv id (real "conv-<uuid>") and the EXTERNAL
+  // form mobile uses on the HTTP path ("conv-default-<agentId>"). Mirrors
+  // what the SSE handler does via resolveConversationId so a mobile client
+  // can use the same conv id over both transports. When the id resolves,
+  // the resolved (agentId, conversationId) pair wins over the client's
+  // agent_id — the conv on disk is the source of truth for which agent
+  // owns it. When it doesn't resolve (fresh agent before its disk record
+  // exists, or a custom conv letta hasn't persisted yet), fall back to
+  // the client's pair.
+  //
+  // The literal "default" is intentionally NOT resolved — every agent has
+  // its own default conv, so the id alone is ambiguous. Trust the client's
+  // agent_id in that case. (resolveConversationId would otherwise disk-scan
+  // and return the FIRST agent's default it finds, which is the wrong
+  // agent for a multi-agent backend.)
+  const resolved = conversation_id && conversation_id !== "default"
+    ? resolveConversationId(conversation_id)
+    : null;
+  const effectiveAgentId = resolved?.agentId ?? agent_id;
+  const effectiveConvId = resolved?.conversationId ?? conversation_id;
+
   const pool = getAgentPool();
-  const worker = await pool.get(conversation_id, agent_id);
+  const worker = await pool.get(effectiveConvId, effectiveAgentId);
 
   // Buffer assistant_message chunks for server-side coalescing so the
   // mobile channel matches vanilla's "one assistant_message per turn"
@@ -119,8 +144,8 @@ async function bridgeSendMessage(
   // the optimistic Local user bubble next to the Confirmed disk twin.
   if (otid) {
     try {
-      const localId = findUnmappedTailUserMessageId(conversation_id, agent_id);
-      if (localId) writeOtidForLocalId(conversation_id, agent_id, localId, otid);
+      const localId = findUnmappedTailUserMessageId(effectiveConvId, effectiveAgentId);
+      if (localId) writeOtidForLocalId(effectiveConvId, effectiveAgentId, localId, otid);
     } catch (err) {
       console.error(`[mobile-channel] otid bind failed: ${err.message}`);
     }

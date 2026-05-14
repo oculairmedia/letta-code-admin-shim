@@ -22,7 +22,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -197,11 +197,11 @@ test("ws: turn_done follows stop_reason (post-stamp sentinel)", async (t) => {
 // ─── 8. otid propagation ────────────────────────────────────────────
 
 test("ws: otid in send_message propagates to disk sidecar via the otid bind", async (t) => {
-  // Note: mobile WS clients pass the INTERNAL conversation id ("default" or
-  // "conv-<uuid>") in send_message — the bridge calls the worker pool +
-  // findUnmappedTailUserMessageId with that id directly. (Compare with the
-  // SSE handler which resolves an external "conv-default-<agentId>" form via
-  // resolveConversationId first.) See ws-smoke.mjs for the canonical client.
+  // WS accepts BOTH the internal conv id ("default", "conv-<uuid>") and the
+  // external form mobile uses on the HTTP path ("conv-default-<agentId>").
+  // The bridge resolves whichever it gets via resolveConversationId before
+  // touching disk, so the sidecar always lands at the internal key
+  // (`default:<agentId>`) regardless of which form the client sent.
   const shim = await startShim();
   t.after(() => shim.stop());
   const agentId = seedAgent(shim.stateDir, { id: "agent-ws-otid" });
@@ -219,7 +219,7 @@ test("ws: otid in send_message propagates to disk sidecar via the otid bind", as
   conn.send({
     type: "send_message",
     agent_id: agentId,
-    conversation_id: "default", // internal form — what mobile actually sends
+    conversation_id: "default", // internal form — what ws-smoke.mjs sends today
     text: "reply with pong",
     otid: myOtid,
   });
@@ -233,6 +233,91 @@ test("ws: otid in send_message propagates to disk sidecar via the otid bind", as
     sidecar[seededId],
     myOtid,
     `WS-supplied otid must bind to the tail user message: ${JSON.stringify(sidecar)}`,
+  );
+});
+
+test("ws: literal `default` conv id with multiple agents routes to the CLIENT-supplied agent, not the first-on-disk", async (t) => {
+  // Hazard: resolveConversationId disk-scans when given the literal "default"
+  // and returns whichever agent's default it finds first. The WS bridge must
+  // NOT disk-resolve "default" — trust the client's agent_id. Otherwise a
+  // multi-agent backend mis-routes the turn to the wrong agent's worker and
+  // the otid sidecar lands at the wrong key.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+  const agentA = seedAgent(shim.stateDir, { id: "agent-multi-a" });
+  const agentB = seedAgent(shim.stateDir, { id: "agent-multi-b" });
+  seedConversation(shim.stateDir, agentA);
+  seedConversation(shim.stateDir, agentB);
+  const seededA = seedMessage(shim.stateDir, agentA, "default", { role: "user", content: "A's prior message" });
+  seedMessage(shim.stateDir, agentB, "default", { role: "user", content: "B's prior message" });
+
+  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+  const myOtid = "cm-multi-agent-default";
+  conn.send({
+    type: "send_message",
+    agent_id: agentA,
+    conversation_id: "default",
+    text: "reply with pong",
+    otid: myOtid,
+  });
+  await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS });
+
+  // Sidecar must land at agent-A's default-key dir (the client's agent), not B's.
+  const keyA = Buffer.from(`default:${agentA}`).toString("base64url");
+  const keyB = Buffer.from(`default:${agentB}`).toString("base64url");
+  const sidecarA = join(shim.stateDir, "conversations", keyA, "_otid-map.json");
+  const sidecarB = join(shim.stateDir, "conversations", keyB, "_otid-map.json");
+  assert.ok(existsSync(sidecarA), `sidecar must exist at agent-A's key`);
+  assert.equal(existsSync(sidecarB), false, `sidecar must NOT leak to agent-B's key`);
+  const parsed = JSON.parse(readFileSync(sidecarA, "utf8"));
+  assert.equal(parsed[seededA], myOtid, `otid must bind to A's seeded message: ${JSON.stringify(parsed)}`);
+});
+
+test("ws: external conv id (conv-default-<agentId>) resolves like SSE — otid sidecar lands at the internal key", async (t) => {
+  // Regression: mobile clients that already use the external `conv-default-X`
+  // form on /v1/conversations/{id}/messages can use the same id over WS.
+  // The bridge calls resolveConversationId() so the worker pool and the
+  // otid sidecar both see the canonical internal pair.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+  const agentId = seedAgent(shim.stateDir, { id: "agent-ws-extid" });
+  seedConversation(shim.stateDir, agentId);
+  const seededId = seedMessage(shim.stateDir, agentId, "default", {
+    role: "user",
+    content: "prior user message",
+  });
+  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+
+  const myOtid = "cm-ws-extid-bind";
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: externalConvId(agentId), // EXTERNAL form: `conv-default-<agentId>`
+    text: "reply with pong",
+    otid: myOtid,
+  });
+  await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS });
+
+  // Sidecar must land at the INTERNAL key, NOT at any external-keyed dir.
+  const internalKey = Buffer.from(`default:${agentId}`).toString("base64url");
+  const internalSidecar = join(shim.stateDir, "conversations", internalKey, "_otid-map.json");
+  assert.ok(
+    existsSync(internalSidecar),
+    `sidecar must land at the internal-key dir; got list: ${readdirSync(join(shim.stateDir, "conversations")).join(",")}`,
+  );
+  const sidecar = JSON.parse(readFileSync(internalSidecar, "utf8"));
+  assert.equal(sidecar[seededId], myOtid, `otid must bind via the internal pair: ${JSON.stringify(sidecar)}`);
+
+  // And there should NOT be a stray external-key dir, which would prove
+  // the resolver ran (older code created `conversation:conv-default-X` instead).
+  const externalKey = Buffer.from(`conversation:${externalConvId(agentId)}`).toString("base64url");
+  const externalDir = join(shim.stateDir, "conversations", externalKey);
+  assert.equal(
+    existsSync(externalDir),
+    false,
+    `external-key dir should NOT exist; pool keyed by raw external id is the bug`,
   );
 });
 
