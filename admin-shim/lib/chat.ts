@@ -226,13 +226,19 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
     };
   }
   if (mt === "usage_statistics") {
+    // run_ids carries the run this usage observation belongs to. The streaming
+    // path's handleRawFrameWithRun stamps the active run id onto every raw
+    // frame, so by the time reshape sees this frame `f.run_id` is the active
+    // run id (or absent if the frame wasn't routed through that path). lcp-0c5.
+    const rid = f["run_id"];
+    const runIds = typeof rid === "string" && rid.length > 0 ? [rid] : null;
     const usage: UsageStatisticsMessage = {
       message_type: "usage_statistics",
       completion_tokens: (f["completion_tokens"] ?? 0) as number,
       prompt_tokens: (f["prompt_tokens"] ?? 0) as number,
       total_tokens: (f["total_tokens"] ?? 0) as number,
       step_count: 1,
-      run_ids: null,
+      run_ids: runIds,
       cached_input_tokens: (f["cached_input_tokens"] ?? 0) as number,
       cache_write_tokens: (f["cache_write_tokens"] ?? 0) as number,
       reasoning_tokens: (f["reasoning_tokens"] ?? 0) as number,
