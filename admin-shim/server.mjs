@@ -43,7 +43,7 @@ import {
   conversationToLetta,
   localMessageToConversationMessages,
   localMessageToLettaMessage,
-} from "./lib/translate.mjs";
+} from "./lib/translate.js";
 import { handleSendMessage } from "./lib/chat.mjs";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.mjs";
 import {
