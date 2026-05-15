@@ -587,7 +587,11 @@ test("ws: send_message with missing agent_id → error{protocol_violation}, no c
 
 // ─── 21. stop_reason frame shape on WS ──────────────────────────────
 
-test("ws: stop_reason frame carries reason field (`end_turn` on clean turn)", async (t) => {
+test("ws: stop_reason frame carries stop_reason field (`end_turn` on clean turn)", async (t) => {
+  // The WS envelope uses the same `stop_reason:` field name as the REST/SSE
+  // surface and Kotlin's StopReason model. Kotlin clients can deserialize
+  // this frame directly with the canonical StopReason.serializer().
+  // (Was `reason:` until lcp-fgd; renamed before the mobile WS client shipped.)
   const { conn, agentId, convId } = await setupAuthed(t);
   conn.send({
     type: "send_message",
@@ -598,8 +602,8 @@ test("ws: stop_reason frame carries reason field (`end_turn` on clean turn)", as
   });
   const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
   const stop = turn.find((f) => f.type === "stop_reason") as unknown as
-    { reason: string; turn_id?: unknown } | undefined;
+    { stop_reason: string; turn_id?: unknown } | undefined;
   assert.ok(stop, "stop_reason must be present");
-  assert.equal(stop.reason, "end_turn");
+  assert.equal(stop.stop_reason, "end_turn");
   assert.ok(stop.turn_id, "stop_reason must carry turn_id");
 });

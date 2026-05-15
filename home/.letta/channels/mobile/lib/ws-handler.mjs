@@ -235,7 +235,7 @@ export function handleConnection(ws, request, host) {
                 safeSend(ws, makeFrame("stop_reason", {
                   turn_id: turnId,
                   run_id: runId ?? null,
-                  reason: outFrame.stop_reason ?? "end_turn",
+                  stop_reason: outFrame.stop_reason ?? "end_turn",
                 }), log);
               } else if (mt === "usage_statistics") {
                 safeSend(ws, makeFrame("usage_statistics", {

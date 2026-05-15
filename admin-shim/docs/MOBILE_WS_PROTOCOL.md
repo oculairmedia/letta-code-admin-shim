@@ -443,17 +443,18 @@ Test: `ws: assistant_message carries non-empty content on a normal reply`.
 ```json
 { "v": 1, "type": "stop_reason", "id": "…", "ts": "…",
   "turn_id": "turn-…", "run_id": "run-…",
-  "reason": "end_turn" }
+  "stop_reason": "end_turn" }
 ```
 
 - `reason` is one of `"end_turn"`, `"requires_approval"`, `"error"`,
   `"max_steps"`, etc.
-- This is the **WS-envelope shape** for stop_reason — note `reason` is
-  the field name here, NOT `stop_reason` (the inner-shape field name
-  used by the REST/SSE path). Differs from `StopReasonMessage` in
-  `wire.ts` because the WS handler wraps it. See §4.7.
+- This is the **WS-envelope shape** for stop_reason. The inner field is
+  the same `stop_reason:` name used by the REST/SSE path and Kotlin's
+  `StopReasonMessage` — the WS handler just adds the `turn_id` / `run_id`
+  routing fields. Kotlin clients can deserialize the `stop_reason:` field
+  directly with `StopReason.serializer()`. See §4.7.
 
-Test: `ws: stop_reason frame carries reason field (\`end_turn\` on clean turn)`.
+Test: `ws: stop_reason frame carries stop_reason field (\`end_turn\` on clean turn)`.
 
 #### `usage_statistics`
 
@@ -676,30 +677,30 @@ way to abort a turn from the same socket.
 
 The shim's REST/SSE path emits these two frame types in a **bare**
 shape (no `LettaMessageBase` envelope; no `id`, no `date`,
-no `otid`). The WS handler **re-wraps** them in a WS envelope with
-`turn_id` / `run_id`, BUT keeps the inner field naming. Specifically
-the WS frame for `stop_reason` uses the field `reason`, not
-`stop_reason`:
+no `otid`). The WS handler wraps them with `turn_id` / `run_id` for
+routing but keeps the inner field names byte-identical to the REST/SSE
+surface. Specifically the WS frame for `stop_reason` uses `stop_reason:`
+(matching Kotlin's `StopReasonMessage` and the REST/SSE emit):
 
 ```json
 { "v": 1, "type": "stop_reason", "turn_id": "...", "run_id": "...",
-  "reason": "end_turn" }
+  "stop_reason": "end_turn" }
 ```
 
-This differs from the SSE-emitted bare shape:
+The SSE-emitted bare shape:
 
 ```json
 { "message_type": "stop_reason", "stop_reason": "end_turn" }
 ```
 
-- **The contract:** on the WS surface, read `reason`. On the REST/SSE
-  surface, read `stop_reason`. Mobile's `Message.kt StopReason`
-  deserializes from `stop_reason`; the WS-specific frame should be a
-  separate envelope type (don't try to deserialize WS
-  `stop_reason` as `StopReason` directly — the field name differs).
-- **Defended by:** `ws: stop_reason frame carries reason field`.
-- **Client implementer:** keep the WS envelope distinct from the
-  inner LettaMessage union.
+- **The contract:** the WS envelope carries `type: "stop_reason"` for
+  routing plus an inner `stop_reason:` payload field. Kotlin clients
+  can reuse `StopReason.serializer()` directly on the WS payload
+  (only the outer envelope is WS-specific).
+- **Defended by:** `ws: stop_reason frame carries stop_reason field`.
+- **Client implementer:** keep the WS envelope (`type`, `turn_id`,
+  `run_id`) distinct from the inner LettaMessage union, but the inner
+  fields match.
 
 ### 4.8 `otid` round-trip
 
@@ -754,7 +755,7 @@ Client                                    Shim
   │ ◄─ { tool_return_message, run_id }      │
   │ ◄─ { assistant_message, content,        │
   │       id:"cm-stream-...", otid }        │
-  │ ◄─ { stop_reason, reason:"end_turn" }   │
+  │ ◄─ { stop_reason:"end_turn" }           │
   │ ◄─ { usage_statistics, prompt_tokens... }│
   │ ◄─ { turn_done, status:"completed" }    │ <- disk stamped
   │                                         │
@@ -775,7 +776,7 @@ Client                                    Shim
   │                                         │
   │ ─► { cancel, run_id }                   │
   │                                         │
-  │ ◄─ { stop_reason, reason:"cancelled" }  │ (may race; could be "end_turn")
+  │ ◄─ { stop_reason:"cancelled" }          │ (may race; could be "end_turn")
   │ ◄─ { usage_statistics }                 │
   │ ◄─ { turn_done, status:"cancelled" }    │ (or "completed", race)
   │                                         │
