@@ -24,7 +24,7 @@
 
 import { spawn } from "node:child_process";
 
-import { listMessages, stampNewMessages } from "./store.mjs";
+import { listMessages, stampNewMessages } from "./store.js";
 import {
   createRun,
   finalizeRun,

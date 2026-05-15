@@ -15,7 +15,7 @@
  */
 
 import { getAgentPool } from "./agent-pool.mjs";
-import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.mjs";
+import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.js";
 
 const POOL_ENABLED = process.env.SHIM_POOL_DISABLE !== "1";
 

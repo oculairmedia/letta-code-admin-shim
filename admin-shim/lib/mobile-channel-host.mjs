@@ -24,7 +24,7 @@ import {
   findUnmappedTailUserMessageId,
   resolveConversationId,
   writeOtidForLocalId,
-} from "./store.mjs";
+} from "./store.js";
 
 function channelDir() {
   const root = process.env.LETTA_HOME || join(homedir(), ".letta");

@@ -37,7 +37,7 @@ import {
   readSystemPrompt,
   resolveConversationId,
   _internals as storeInternals,
-} from "./lib/store.mjs";
+} from "./lib/store.js";
 import {
   agentToLettaState,
   conversationToLetta,
