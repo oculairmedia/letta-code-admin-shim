@@ -494,10 +494,31 @@ export async function readMessageTimestamps(conversationId: string, agentId: str
 // `id` → mobile-supplied otid. The projection joins this on read so the
 // user_message wire frame echoes the original otid, letting mobile collapse
 // the Local-vs-Confirmed pair via its existing reconcileAfterSend flow.
-export async function readOtidMap(conversationId: string, agentId: string): Promise<OtidSidecar> {
+
+// lcp-6ai: in-memory cache of otid sidecars, keyed by `${convId}|${agentId}`.
+// Avoids re-reading the file every turn: writeOtidForLocalId mutates the
+// cached map in place and persists, readOtidMap returns the cached map if
+// present and only loads from disk on cold access. On write failure the
+// cache entry is evicted so the next read re-fetches authoritative state.
+const otidMapCache = new Map<string, OtidSidecar>();
+
+function otidCacheKey(conversationId: string, agentId: string): string {
+  return `${conversationId}|${agentId}`;
+}
+
+async function loadOtidMap(conversationId: string, agentId: string): Promise<OtidSidecar> {
+  const key = otidCacheKey(conversationId, agentId);
+  const cached = otidMapCache.get(key);
+  if (cached) return cached;
   const path = otidSidecarPath(conversationId, agentId);
   const raw = await readJsonOrNullAsync(path);
-  return isStringRecord(raw) ? raw : {};
+  const map: OtidSidecar = isStringRecord(raw) ? raw : {};
+  otidMapCache.set(key, map);
+  return map;
+}
+
+export async function readOtidMap(conversationId: string, agentId: string): Promise<OtidSidecar> {
+  return loadOtidMap(conversationId, agentId);
 }
 
 export async function writeOtidForLocalId(
@@ -508,8 +529,8 @@ export async function writeOtidForLocalId(
 ): Promise<void> {
   if (!localId || !otid) return;
   const path = otidSidecarPath(conversationId, agentId);
-  const raw = await readJsonOrNullAsync(path);
-  const current: OtidSidecar = isStringRecord(raw) ? raw : {};
+  const key = otidCacheKey(conversationId, agentId);
+  const current = await loadOtidMap(conversationId, agentId);
   if (current[localId] === otid) return;
   current[localId] = otid;
   try {
@@ -517,6 +538,9 @@ export async function writeOtidForLocalId(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[store] otid sidecar write failed for ${conversationId}: ${msg}`);
+    // Evict so the next reader doesn't trust an in-memory state that didn't
+    // make it to disk; subsequent loadOtidMap will reread the file.
+    otidMapCache.delete(key);
   }
 }
 
