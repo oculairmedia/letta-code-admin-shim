@@ -53,7 +53,7 @@ import {
   listRunSteps,
   listRuns,
 } from "./lib/runs.js";
-import { getMobileChannelAdapter } from "./lib/mobile-channel-host.mjs";
+import { getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.SHIM_PORT || 8291);
