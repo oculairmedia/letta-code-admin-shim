@@ -34,7 +34,7 @@ import {
   streamMessages,
   framesOfType,
   indexOfType,
-} from "./helpers/index.mjs";
+} from "./helpers/index.js";
 
 const STREAM_TIMEOUT_MS = 5_000;
 

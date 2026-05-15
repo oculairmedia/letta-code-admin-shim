@@ -32,7 +32,7 @@ import {
   seedMessage,
   externalConvId,
   openMobileWs,
-} from "./helpers/index.mjs";
+} from "./helpers/index.js";
 
 const WS_TIMEOUT_MS = 8_000;
 

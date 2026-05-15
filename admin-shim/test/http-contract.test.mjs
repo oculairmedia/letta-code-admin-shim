@@ -19,7 +19,7 @@ import {
   seedConversation,
   seedMessage,
   externalConvId,
-} from "./helpers/index.mjs";
+} from "./helpers/index.js";
 
 // ── helpers ─────────────────────────────────────────────────────────
 

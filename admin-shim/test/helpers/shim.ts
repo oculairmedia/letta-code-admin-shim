@@ -7,7 +7,7 @@
  *
  * Typical use:
  *
- *   import { startShim } from "./helpers/shim.mjs";
+ *   import { startShim } from "./helpers/shim.js";
  *
  *   test("agents list returns the seeded agent", async (t) => {
  *     const shim = await startShim({ fixture: "single-agent" });
@@ -20,7 +20,8 @@
  * copy into the shim's LETTA_LOCAL_BACKEND_DIR before launch.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
 import { cpSync, mkdtempSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -37,6 +38,34 @@ const MOCK_LETTA = join(__dirname, "letta-mock.mjs");
 // collisions we hit when many tests across multiple test files were picking
 // from a small random range — under load some shims would lose the race and
 // fail to start with EADDRINUSE.
+
+export interface ShimOpts {
+  /** Name of a directory under test/fixtures/state/ to copy into the shim's backend dir. */
+  fixture?: string;
+  /** Extra env vars to inject (overrides defaults). */
+  env?: Record<string, string | undefined>;
+  /** Sets MOBILE_CHANNEL_TOKEN (default "test-token-do-not-use-in-prod"). */
+  mobileToken?: string;
+  /** If false, return as soon as we have a port (default true). */
+  waitForReady?: boolean;
+}
+
+export interface WaitForLogLineOpts {
+  timeoutMs?: number;
+}
+
+export interface ShimHandle {
+  url: string | null;
+  port: number | null;
+  stateDir: string;
+  homeDir: string;
+  mobileToken: string;
+  pid: number | undefined;
+  child: ChildProcessByStdio<null, Readable, Readable>;
+  readLog(): string;
+  waitForLogLine(regex: RegExp, opts?: WaitForLogLineOpts): Promise<true>;
+  stop(): Promise<void>;
+}
 
 /**
  * Start the shim. Returns a handle with:
@@ -55,7 +84,7 @@ const MOCK_LETTA = join(__dirname, "letta-mock.mjs");
  *   mobileToken   — sets MOBILE_CHANNEL_TOKEN (default "test-token")
  *   waitForReady  — if false, return as soon as we have a port (default true)
  */
-export async function startShim(opts = {}) {
+export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
   const tmp = mkdtempSync(join(tmpdir(), "shim-test-"));
   const stateDir = join(tmp, "state");
   const homeDir = join(tmp, "home");
@@ -103,7 +132,7 @@ export async function startShim(opts = {}) {
   const { writeFileSync } = await import("node:fs");
   writeFileSync(mobileAccountsPath, JSON.stringify(mobileAccounts, null, 2));
 
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: homeDir,
     LETTA_LOCAL_BACKEND_DIR: stateDir,
@@ -127,16 +156,16 @@ export async function startShim(opts = {}) {
   const child = spawn("node", ["--import", "tsx/esm", serverPath], {
     env,
     stdio: ["ignore", "pipe", "pipe"],
-  });
+  }) as ChildProcessByStdio<null, Readable, Readable>;
 
   let log = "";
-  child.stdout.on("data", (b) => { log += b.toString("utf8"); });
-  child.stderr.on("data", (b) => { log += b.toString("utf8"); });
+  child.stdout.on("data", (b: Buffer) => { log += b.toString("utf8"); });
+  child.stderr.on("data", (b: Buffer) => { log += b.toString("utf8"); });
 
   // Port is OS-assigned at bind time; we parse it from the "listening on"
   // log line once the shim is ready (see below). Url/port are populated
   // before startShim() resolves.
-  const handle = {
+  const handle: ShimHandle = {
     url: null,
     port: null,
     stateDir,
@@ -146,12 +175,12 @@ export async function startShim(opts = {}) {
     child,
     readLog: () => log,
     waitForLogLine(regex, { timeoutMs = 5000 } = {}) {
-      return new Promise((resolve, reject) => {
+      return new Promise<true>((resolve, reject) => {
         if (regex.test(log)) return resolve(true);
         const timer = setTimeout(() => {
           reject(new Error(`timeout waiting for log line ${regex}`));
         }, timeoutMs);
-        const checker = (b) => {
+        const checker = (_b: Buffer) => {
           if (regex.test(log)) {
             clearTimeout(timer);
             child.stdout.off("data", checker);
@@ -166,7 +195,7 @@ export async function startShim(opts = {}) {
     async stop() {
       if (!child.killed) {
         child.kill("SIGTERM");
-        await new Promise((r) => {
+        await new Promise<void>((r) => {
           const onExit = () => r();
           child.once("exit", onExit);
           setTimeout(() => {

@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// Kept as .mjs (not converted to .ts in Phase 6a): spawned as a standalone
+// `node <path>` subprocess by agent-pool via LETTA_BIN, so it must be
+// directly runnable by node without a tsx loader.
 /**
  * Mock `letta` binary — replays captured stream-json traces so the shim
  * can be tested without a real model.

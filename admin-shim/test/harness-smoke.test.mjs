@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { startShim, seedAgent, seedConversation } from "./helpers/index.mjs";
+import { startShim, seedAgent, seedConversation } from "./helpers/index.js";
 
 test("harness: shim starts, serves /v1/health, stops cleanly", async (t) => {
   const shim = await startShim();

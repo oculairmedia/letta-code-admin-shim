@@ -17,13 +17,38 @@
  *   - every turn frame carries the same `run_id`
  */
 
-export async function streamMessages(url, body, {
-  headers = {},
-  timeoutMs = 15_000,
-} = {}) {
+import type { LettaMessage } from "../../lib/types/wire.js";
+
+/**
+ * Frames parsed from the SSE stream. The shim writes JSON conforming to the
+ * `LettaMessage` union (or close variants thereof); tests narrow per-case via
+ * `message_type`. We keep a loose surface here so tests don't have to widen.
+ */
+export type SseFrame = LettaMessage & Record<string, unknown>;
+
+export interface StreamMessagesOptions {
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+}
+
+export interface StreamMessagesResult {
+  frames: SseFrame[];
+  doneSeen: boolean;
+  status: number;
+  raw: string;
+}
+
+export async function streamMessages(
+  url: string,
+  body: unknown,
+  {
+    headers = {},
+    timeoutMs = 15_000,
+  }: StreamMessagesOptions = {},
+): Promise<StreamMessagesResult> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
-  let res;
+  let res: Response;
   try {
     res = await fetch(url, {
       method: "POST",
@@ -41,7 +66,7 @@ export async function streamMessages(url, body, {
   }
   const decoder = new TextDecoder("utf-8");
   let raw = "";
-  const frames = [];
+  const frames: SseFrame[] = [];
   let doneSeen = false;
   let buf = "";
   try {
@@ -51,7 +76,7 @@ export async function streamMessages(url, body, {
       const chunk = decoder.decode(value, { stream: true });
       raw += chunk;
       buf += chunk;
-      let idx;
+      let idx: number;
       while ((idx = buf.indexOf("\n\n")) >= 0) {
         const event = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
@@ -63,7 +88,7 @@ export async function streamMessages(url, body, {
             continue;
           }
           try {
-            frames.push(JSON.parse(payload));
+            frames.push(JSON.parse(payload) as SseFrame);
           } catch {
             // ignore malformed frames; the test will fail elsewhere
           }
@@ -77,11 +102,11 @@ export async function streamMessages(url, body, {
 }
 
 /** Filter helper: framesOfType(frames, "assistant_message") */
-export function framesOfType(frames, type) {
+export function framesOfType(frames: SseFrame[], type: string): SseFrame[] {
   return frames.filter((f) => f.message_type === type);
 }
 
 /** Index helper: indexOfType(frames, "stop_reason") returns -1 if missing. */
-export function indexOfType(frames, type) {
+export function indexOfType(frames: SseFrame[], type: string): number {
   return frames.findIndex((f) => f.message_type === type);
 }

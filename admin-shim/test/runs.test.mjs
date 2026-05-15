@@ -31,7 +31,7 @@ import {
   externalConvId,
   streamMessages,
   framesOfType,
-} from "./helpers/index.mjs";
+} from "./helpers/index.js";
 
 // ── helpers ───────────────────────────────────────────────────────
 

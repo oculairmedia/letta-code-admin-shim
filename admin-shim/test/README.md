@@ -36,7 +36,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   startShim, seedAgent, seedConversation, streamMessages, externalConvId,
-} from "./helpers/index.mjs";
+} from "./helpers/index.js";
 
 test("describe what's tested", async (t) => {
   const shim = await startShim();

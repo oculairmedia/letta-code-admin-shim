@@ -14,7 +14,7 @@ import {
   streamMessages,
   framesOfType,
   externalConvId,
-} from "./helpers/index.mjs";
+} from "./helpers/index.js";
 
 test("integration: POST /v1/conversations/{id}/messages streams plain trace", async (t) => {
   const shim = await startShim();

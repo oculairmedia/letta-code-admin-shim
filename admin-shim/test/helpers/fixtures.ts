@@ -20,19 +20,31 @@
 import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 
-function b64url(value) {
+import type { LocalMessagePart } from "../../lib/types/letta-stream.js";
+
+function b64url(value: string): string {
   return Buffer.from(value).toString("base64url");
 }
 
-function ensureDir(p) {
+function ensureDir(p: string): void {
   mkdirSync(p, { recursive: true });
+}
+
+export interface SeedAgentOptions {
+  id?: string;
+  name?: string;
+  description?: string | null;
+  systemPrompt?: string;
+  blocks?: Record<string, string>;
+  tools?: string[];
+  model?: string;
 }
 
 /**
  * Write an agent record to <root>/agents/<base64>.json.
  * Returns the agentId used.
  */
-export function seedAgent(stateDir, {
+export function seedAgent(stateDir: string, {
   id,
   name = "Test Agent",
   description = null,
@@ -40,7 +52,7 @@ export function seedAgent(stateDir, {
   blocks = { persona: "I am a test persona.", human: "The user is a tester." },
   tools = ["Bash", "Read", "Write"],
   model = "lmstudio/opus-4-7",
-} = {}) {
+}: SeedAgentOptions = {}): string {
   const agentId = id ?? `agent-test-${cryptoRandom()}`;
   ensureDir(join(stateDir, "agents"));
   const record = {
@@ -80,6 +92,17 @@ export function seedAgent(stateDir, {
   return agentId;
 }
 
+export interface SeedConversationOptions {
+  id?: string;
+  title?: string;
+}
+
+export interface SeedConversationResult {
+  conversationId: string;
+  key: string;
+  dir: string;
+}
+
 /**
  * Write a conversation + system-prompt for the given agent. Returns
  * { conversationId, internalKey } where internalKey is what the on-disk
@@ -87,10 +110,10 @@ export function seedAgent(stateDir, {
  *
  * If `id` is omitted, creates the agent's "default" conversation.
  */
-export function seedConversation(stateDir, agentId, {
+export function seedConversation(stateDir: string, agentId: string, {
   id,
   title = "Test Conversation",
-} = {}) {
+}: SeedConversationOptions = {}): SeedConversationResult {
   const conversationId = id ?? "default";
   const key = conversationId === "default"
     ? `default:${agentId}`
@@ -116,12 +139,27 @@ export function seedConversation(stateDir, agentId, {
   return { conversationId, key, dir };
 }
 
+export interface SeedMessageInput {
+  id?: string;
+  role?: string;
+  parts?: LocalMessagePart[];
+  content?: string;
+  sourceMessageIndex?: number;
+  created_at?: string;
+  metadata?: Record<string, unknown>;
+}
+
 /**
  * Append a LocalMessage to the conversation's messages.jsonl. `parts`
  * defaults to a single text part; pass a custom array for tool calls,
  * reasoning, etc.
  */
-export function seedMessage(stateDir, agentId, conversationId, msg) {
+export function seedMessage(
+  stateDir: string,
+  agentId: string,
+  conversationId: string,
+  msg: SeedMessageInput,
+): string {
   const key = conversationId === "default"
     ? `default:${agentId}`
     : `conversation:${conversationId}`;
@@ -141,12 +179,12 @@ export function seedMessage(stateDir, agentId, conversationId, msg) {
   return id;
 }
 
-function cryptoRandom() {
+function cryptoRandom(): string {
   return globalThis.crypto?.randomUUID?.().slice(0, 8) ?? `${Date.now().toString(36)}`;
 }
 
 /** External conv id used by the shim (mobile-style). */
-export function externalConvId(agentId, conversationId = "default") {
+export function externalConvId(agentId: string, conversationId: string = "default"): string {
   return conversationId === "default"
     ? `conv-default-${agentId}`
     : conversationId;
