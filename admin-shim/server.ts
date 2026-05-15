@@ -50,6 +50,7 @@ import { handleSendMessage } from "./lib/chat.js";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.js";
 import {
   aggregateUsage,
+  buildMessageRunMap,
   deleteRun,
   getRun,
   listRunSteps,
@@ -212,10 +213,12 @@ async function handleAgentMessages(
   const before = url.searchParams.get("before") ?? undefined;
   const conversationId = url.searchParams.get("conversation_id") ?? "default";
   const items = await listMessages(conversationId, agentId, { limit, before });
+  // lcp-nwd: attach run_id from run.message_ids attribution.
+  const runIdsByMessageId = buildMessageRunMap({ agentId, conversationId });
   json(
     res,
     200,
-    items.map((m) => localMessageToLettaMessage(m, { agentId, conversationId })),
+    items.map((m) => localMessageToLettaMessage(m, { agentId, conversationId, runIdsByMessageId })),
   );
 }
 
@@ -239,6 +242,11 @@ async function handleAgentContext(
       ? (sp as { content: string }).content
       : undefined;
   const systemPrompt = spContent ?? (typeof a.system === "string" ? a.system : "") ?? "";
+  // lcp-nwd: same run_id attribution as the messages-list path.
+  const runIdsByMessageId = buildMessageRunMap({
+    agentId: resolved.agentId,
+    conversationId: resolved.conversationId,
+  });
   json(res, 200, {
     context_window_size_current:
       Math.ceil(systemPrompt.length / 4) + messages.length * 50,
@@ -262,7 +270,7 @@ async function handleAgentContext(
     memory_filesystem: null,
     tool_usage_rules: null,
     directories: [],
-    messages: messages.map((m) => localMessageToLettaMessage(m, { agentId, conversationId: requestedConv })),
+    messages: messages.map((m) => localMessageToLettaMessage(m, { agentId, conversationId: requestedConv, runIdsByMessageId })),
     functions_definitions: [],
   });
 }
@@ -563,15 +571,22 @@ async function handleConversationMessagesList(
   if (order === "desc") items = [...items].reverse();
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
+  // lcp-nwd: build messageId -> runId index once per request so each
+  // projected message carries the run that attributed it. Mobile groups
+  // chat bubbles by run_id for the collapsible run-block affordance;
+  // null run_id meant every message rendered ungrouped.
+  const runIdsByMessageId = buildMessageRunMap({
+    agentId: resolved.agentId,
+    conversationId: resolved.conversationId,
+  });
   const out = [];
   for (const m of items) {
-    // .mjs passed agentId/conversationId here too; the function ignores them
-    // (only realTimes/otidMap are read). Preserved structurally via the cast.
     const scope = {
       agentId: resolved.agentId,
       conversationId: externalConvId,
       realTimes,
       otidMap,
+      runIdsByMessageId,
     };
     const projected = localMessageToConversationMessages(m, scope);
     for (const p of projected) out.push(p);
@@ -681,16 +696,22 @@ async function handleRunMessages(_req: IncomingMessage, res: ServerResponse, url
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
   const runMessageIds = new Set(run.message_ids ?? []);
+  // lcp-nwd: this endpoint already knows the run id, so build a trivial
+  // single-run map rather than walking all runs. Every message we emit
+  // here belongs to `run` by construction.
+  const runIdsByMessageId: Record<string, string> = {};
+  for (const mid of run.message_ids ?? []) {
+    if (typeof mid === "string") runIdsByMessageId[mid] = run.id;
+  }
   let out: Array<{ id?: string }> = [];
   for (const m of items) {
     if (!runMessageIds.has(m?.id)) continue;
-    // .mjs passed agentId/conversationId here too; the function ignores them
-    // (only realTimes/otidMap are read). Preserved structurally via the cast.
     const scope = {
       agentId: resolved.agentId,
       conversationId: run.conversation_id,
       realTimes,
       otidMap,
+      runIdsByMessageId,
     };
     const projected = localMessageToConversationMessages(m, scope);
     for (const p of projected) out.push(p as { id?: string });

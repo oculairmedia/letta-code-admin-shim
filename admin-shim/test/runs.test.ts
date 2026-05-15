@@ -21,13 +21,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
   startShim,
   seedAgent,
   seedConversation,
+  seedMessage,
   externalConvId,
   streamMessages,
 } from "./helpers/index.js";
@@ -778,4 +779,190 @@ test("runs: bash-tool turn has stop_reason from FIRST step (requires_approval)",
   const b = body as RunRecord;
   assert.equal(b.status, "completed");
   assert.equal(b.stop_reason, "requires_approval");
+});
+
+// ─── lcp-nwd: message-list projections must carry run_id ──────────────
+//
+// Regression guard: mobile groups chat bubbles by run_id for its
+// collapsible run-block affordance. Previously every projected message
+// had run_id: null because the wire projection hardcoded it. Fix:
+// runs.buildMessageRunMap() walks run.message_ids[] to build the
+// inverse index; server handlers pass it into LocalMessageScope, and
+// translate.ts substitutes scope.runIdsByMessageId?.[id] ?? null.
+//
+// These tests seed messages + a run record directly so they don't
+// depend on the mock worker persisting messages (it doesn't in the
+// happy-path traces — recordRunMessage only fires when listMessages
+// post-turn shows a diff, which our trace-replay mock can't simulate
+// because it doesn't write messages.jsonl).
+
+/** Write a synthetic run record claiming the given message ids. */
+function seedRun(
+  stateDir: string,
+  {
+    runId,
+    agentId,
+    conversationId,
+    messageIds,
+    status = "completed",
+    stopReason = "end_turn",
+  }: {
+    runId: string;
+    agentId: string;
+    conversationId: string;
+    messageIds: string[];
+    status?: string;
+    stopReason?: string;
+  },
+): void {
+  const dir = join(stateDir, "runs", runId);
+  mkdirSync(dir, { recursive: true });
+  const now = "2026-01-01T00:00:10.000Z";
+  const record = {
+    id: runId,
+    agent_id: agentId,
+    conversation_id: conversationId,
+    status,
+    stop_reason: stopReason,
+    message_ids: messageIds,
+    tools_used: [],
+    num_steps: 1,
+    background: false,
+    created_at: now,
+    completed_at: now,
+    started_at: now,
+    total_duration_ns: 1_000_000_000,
+    ttft_ns: 100_000_000,
+    base_template_id: null,
+    callback_error: null,
+    callback_sent_at: null,
+    callback_status_code: null,
+    callback_url: null,
+    metadata: {},
+    request_config: null,
+    usage: null,
+    template_id: null,
+  };
+  writeFileSync(join(dir, "run.json"), JSON.stringify(record, null, 2));
+}
+
+test("lcp-nwd: GET /v1/conversations/{ext}/messages projects run_id on claimed messages", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-runid-conv" });
+  seedConversation(shim.stateDir, agentId);
+  const convId = externalConvId(agentId);
+
+  const uMsgId = seedMessage(shim.stateDir, agentId, "default", {
+    id: "ui-msg-nwd-u",
+    role: "user",
+    content: "hello",
+    sourceMessageIndex: 0,
+  });
+  const aMsgId = seedMessage(shim.stateDir, agentId, "default", {
+    id: "ui-msg-nwd-a",
+    role: "assistant",
+    content: "hi back",
+    sourceMessageIndex: 1,
+  });
+  // Unclaimed message — must remain run_id=null.
+  const orphanId = seedMessage(shim.stateDir, agentId, "default", {
+    id: "ui-msg-nwd-o",
+    role: "user",
+    content: "later",
+    sourceMessageIndex: 2,
+  });
+
+  const runId = "run-nwd-conv-001";
+  seedRun(shim.stateDir, {
+    runId,
+    agentId,
+    conversationId: "default",
+    messageIds: [uMsgId, aMsgId],
+  });
+
+  const { status, body } = await getJson(`${shim.url}/v1/conversations/${convId}/messages?limit=50`);
+  assert.equal(status, 200);
+  const arr = body as Array<{ id: string; run_id: string | null }>;
+  const byId = new Map(arr.map((m) => [m.id, m]));
+  assert.equal(byId.get(uMsgId)?.run_id, runId, "claimed user message must carry run_id");
+  assert.equal(byId.get(aMsgId)?.run_id, runId, "claimed assistant message must carry run_id");
+  assert.equal(byId.get(orphanId)?.run_id, null, "unclaimed message must stay null");
+});
+
+test("lcp-nwd: GET /v1/agents/{id}/messages legacy shape also carries run_id", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-runid-legacy" });
+  seedConversation(shim.stateDir, agentId);
+
+  const m1 = seedMessage(shim.stateDir, agentId, "default", {
+    id: "ui-msg-legacy-u",
+    role: "user",
+    content: "hello",
+    sourceMessageIndex: 0,
+  });
+
+  const runId = "run-nwd-legacy-001";
+  seedRun(shim.stateDir, {
+    runId,
+    agentId,
+    conversationId: "default",
+    messageIds: [m1],
+  });
+
+  const { status, body } = await getJson(`${shim.url}/v1/agents/${agentId}/messages?limit=50&conversation_id=default`);
+  assert.equal(status, 200);
+  const arr = body as Array<{ id: string; run_id?: string | null }>;
+  const hit = arr.find((m) => m.id === m1);
+  assert.ok(hit, "seeded message must appear in agent-messages listing");
+  assert.equal(hit.run_id, runId, "legacy projection must carry run_id");
+});
+
+test("lcp-nwd: GET /v1/runs/{id}/messages keeps run_id stable across the run's messages", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-runid-runmsgs" });
+  seedConversation(shim.stateDir, agentId);
+
+  const m1 = seedMessage(shim.stateDir, agentId, "default", {
+    id: "ui-msg-runmsgs-1",
+    role: "user",
+    content: "hello",
+    sourceMessageIndex: 0,
+  });
+  const m2 = seedMessage(shim.stateDir, agentId, "default", {
+    id: "ui-msg-runmsgs-2",
+    role: "assistant",
+    content: "hi back",
+    sourceMessageIndex: 1,
+  });
+  // Unclaimed — must NOT appear in the run-messages projection.
+  seedMessage(shim.stateDir, agentId, "default", {
+    id: "ui-msg-runmsgs-orphan",
+    role: "user",
+    content: "later",
+    sourceMessageIndex: 2,
+  });
+
+  const runId = "run-nwd-runmsgs-001";
+  seedRun(shim.stateDir, {
+    runId,
+    agentId,
+    conversationId: "default",
+    messageIds: [m1, m2],
+  });
+
+  const { status, body } = await getJson(`${shim.url}/v1/runs/${runId}/messages?limit=50`);
+  assert.equal(status, 200);
+  const arr = body as Array<{ id: string; run_id: string | null }>;
+  assert.ok(arr.length > 0, "expected the run's claimed messages to be returned");
+  for (const m of arr) {
+    assert.equal(m.run_id, runId, `every message under /v1/runs/${runId}/messages must carry run_id=${runId}`);
+  }
+  // Orphan must not be in the output.
+  assert.ok(!arr.some((m) => m.id === "ui-msg-runmsgs-orphan"), "unclaimed messages must not appear");
 });

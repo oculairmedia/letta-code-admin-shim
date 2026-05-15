@@ -302,6 +302,13 @@ function withTypeOffset(createdIso: string, messageType: OffsetMessageType): str
 export interface LocalMessageScope {
   realTimes?: Record<string, string> | null;
   otidMap?: Record<string, string> | null;
+  /**
+   * lcp-nwd: messageId -> runId lookup. When provided, projections
+   * substitute the run_id field with this value instead of the
+   * previous hardcoded null. Built by runs.buildMessageRunMap()
+   * over runs whose message_ids[] claimed each persisted message.
+   */
+  runIdsByMessageId?: Record<string, string> | null;
 }
 
 /**
@@ -367,6 +374,14 @@ export function localMessageToConversationMessages(
   // sees their prompt twice.
   const mobileOtid = otidMap && localMsg?.id ? otidMap[localMsg.id] : null;
   const projectedOtid = mobileOtid ?? localMsg.id;
+  // lcp-nwd: attribute each emitted message to the run that claimed it
+  // via run.message_ids during turn finalize. Lookup is by the *source*
+  // LocalMessage id (we project 1:N — the fan-out children share the
+  // parent id's run attribution).
+  const projectedRunId: string | null =
+    scope.runIdsByMessageId && localMsg?.id
+      ? (scope.runIdsByMessageId[localMsg.id] ?? null)
+      : null;
 
   // User / system messages: collapse all text parts into one wire message.
   // Strip system-reminder envelopes from user-role messages so mobile's
@@ -388,7 +403,7 @@ export function localMessageToConversationMessages(
         step_id: null,
         is_err: null,
         seq_id: null,
-        run_id: null,
+        run_id: projectedRunId,
         content: text,
       },
     ];
@@ -412,7 +427,7 @@ export function localMessageToConversationMessages(
       step_id: null,
       is_err: null,
       seq_id: null,
-      run_id: null,
+      run_id: projectedRunId,
       content: pendingText,
     });
     pendingText = "";
@@ -445,7 +460,7 @@ export function localMessageToConversationMessages(
         step_id: null,
         is_err: null,
         seq_id: null,
-        run_id: null,
+        run_id: projectedRunId,
         source: "reasoner_model",
         reasoning: part.text,
         signature,
@@ -480,7 +495,7 @@ export function localMessageToConversationMessages(
         step_id: null,
         is_err: null,
         seq_id: null,
-        run_id: null,
+        run_id: projectedRunId,
         tool_call: tc,
         tool_calls: [tc],
       };
@@ -512,7 +527,7 @@ export function localMessageToConversationMessages(
         step_id: null,
         is_err: null,
         seq_id: null,
-        run_id: null,
+        run_id: projectedRunId,
         tool_call: tc,
         tool_calls: [tc],
       };
@@ -548,7 +563,7 @@ export function localMessageToConversationMessages(
           step_id: null,
           is_err: isError ? true : null,
           seq_id: null,
-          run_id: null,
+          run_id: projectedRunId,
           tool_call_id: part.toolCallId,
           status,
           tool_return: returnText,
@@ -594,7 +609,7 @@ export function localMessageToConversationMessages(
         step_id: null,
         is_err: part.status === "error" ? true : null,
         seq_id: null,
-        run_id: null,
+        run_id: projectedRunId,
         tool_call_id: callId,
         status,
         tool_return: returnText,
@@ -686,16 +701,22 @@ export interface LegacyLocalMessageWire {
   otid: string;
   group_id: string | null;
   seq_id: number | null;
+  /** lcp-nwd: run that attributed this message; null when unowned. */
+  run_id: string | null;
 }
 
 export interface LocalMessageToLettaMessageScope {
   agentId: string;
   conversationId: string;
+  /** lcp-nwd: messageId -> runId lookup, same shape as
+   *  LocalMessageScope.runIdsByMessageId. Built by
+   *  runs.buildMessageRunMap(). */
+  runIdsByMessageId?: Record<string, string> | null;
 }
 
 export function localMessageToLettaMessage(
   localMsg: LocalMessage,
-  { agentId, conversationId }: LocalMessageToLettaMessageScope,
+  { agentId, conversationId, runIdsByMessageId }: LocalMessageToLettaMessageScope,
 ): LegacyLocalMessageWire {
   const created = localMsg.metadata?.created_at ?? new Date().toISOString();
   const role: LocalMessageRole = localMsg.role ?? ("system" as LocalMessageRole);
@@ -736,5 +757,6 @@ export function localMessageToLettaMessage(
     otid: localMsg.id,
     group_id: null,
     seq_id: null,
+    run_id: (runIdsByMessageId && localMsg?.id ? (runIdsByMessageId[localMsg.id] ?? null) : null),
   };
 }

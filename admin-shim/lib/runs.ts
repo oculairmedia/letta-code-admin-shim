@@ -568,6 +568,40 @@ export function listActiveRunIds(): string[] {
   return [..._activeRuns.keys()];
 }
 
+/**
+ * lcp-nwd: build an inverse messageId -> runId index for a given scope.
+ * Used by the message wire projection so each returned LettaMessage
+ * carries the run_id that attributed it, enabling mobile's chat-UI
+ * run-grouping affordance.
+ *
+ * Filters mirror listRuns: if both agentId and conversationId are
+ * supplied, only runs matching BOTH are walked. Either may be
+ * undefined to widen.
+ *
+ * When the same messageId appears in multiple runs' message_ids
+ * (rare — would imply two runs both claimed the same persisted
+ * message), the LAST writer wins to match the "first run that
+ * attributed it" semantics most callers want. listRuns returns
+ * desc-by-created-at; we iterate accordingly so older wins overall.
+ */
+export function buildMessageRunMap(
+  { agentId, conversationId }: { agentId?: string | undefined; conversationId?: string | undefined } = {},
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const runs = listRuns({
+    ...(agentId !== undefined ? { agentId } : {}),
+    ...(conversationId !== undefined ? { conversationId } : {}),
+    limit: 10_000,
+    order: "asc",
+  });
+  for (const r of runs) {
+    for (const mid of r.message_ids ?? []) {
+      if (typeof mid === "string" && !out[mid]) out[mid] = r.id;
+    }
+  }
+  return out;
+}
+
 // ── Usage aggregation ────────────────────────────────────────────────
 //
 // Sums token counts across runs matching filters. Per-step granularity
