@@ -1,12 +1,23 @@
 # admin-shim tests
 
-Behavioral test harness for the shim. Uses `node:test` (no extra deps).
+Behavioral test harness for the shim. Uses `node:test` and runs TypeScript
+sources directly via the `tsx/esm` loader — no precompile step.
 
 ```bash
 cd admin-shim
 npm test               # one shot
 npm run test:watch     # re-runs on file changes
 ```
+
+Both scripts expand to roughly:
+
+```bash
+node --import tsx/esm --test --test-concurrency=1 test/*.test.ts
+```
+
+Test files are `*.test.ts` and import `.ts` helpers from `./helpers/`. The
+loader resolves TypeScript on the fly; you do not need to run `npm run build`
+before testing.
 
 ## How it works
 
@@ -17,21 +28,25 @@ stream-json traces so no real model is needed.
 ```
 test/
 ├── helpers/
-│   ├── shim.mjs          # spawn + teardown
-│   ├── fixtures.mjs      # seed agents/conversations/messages
-│   ├── sse.mjs           # parse SSE responses
-│   ├── ws.mjs            # WebSocket client with frame collector
-│   ├── letta-mock.mjs    # fake `letta` binary
-│   └── index.mjs         # aggregate re-exports
+│   ├── shim.ts           # spawn + teardown
+│   ├── fixtures.ts       # seed agents/conversations/messages
+│   ├── sse.ts            # parse SSE responses
+│   ├── ws.ts             # WebSocket client with frame collector
+│   ├── letta-mock.ts     # fake `letta` binary
+│   └── index.ts          # aggregate re-exports
 ├── fixtures/
 │   ├── state/            # full LocalStore trees to copy at startShim()
 │   └── stream-traces/    # captured letta-code stream-json traces
-└── *.test.mjs
+└── *.test.ts
 ```
 
 ## Writing a test
 
-```js
+Tests are TypeScript. Import helpers from `./helpers/index.ts` (the `.ts`
+extension is omitted in import specifiers — NodeNext resolution + tsx handles
+it).
+
+```ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -111,7 +126,7 @@ select the new trace by prompt text.
 ## Running a single file
 
 ```bash
-node --test test/streaming.test.mjs
+node --import tsx/esm --test test/streaming.test.ts
 ```
 
 ## CI

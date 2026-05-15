@@ -46,12 +46,21 @@ $EDITOR env.sh              # set LMSTUDIO_BASE_URL, MOBILE_CHANNEL_TOKEN
 cp home/.letta/channels/mobile/accounts.example.json \
    home/.letta/channels/mobile/accounts.json
 
-# 2. Install + run the shim
-cd admin-shim && npm install && cd ..
+# 2. Install, build, and run the shim
+cd admin-shim && npm install && npm run build && cd ..
 
 source ./env.sh
-node admin-shim/server.mjs
+cd admin-shim && npm start              # node dist/server.js
+# or, for iterative dev:
+# cd admin-shim && npm run dev          # tsx watch server.ts
 ```
+
+The shim source is TypeScript (`admin-shim/server.ts`, `admin-shim/lib/**/*.ts`).
+`npm run build` compiles to `admin-shim/dist/` via `tsconfig.build.json`;
+`npm start` runs the compiled output. Channel plugins under
+`home/.letta/channels/*` remain `.mjs` by design — see
+`admin-shim/docs/CHANNEL_PLUGINS.md` for the plugin contract and how to opt
+into type hints.
 
 The shim listens on `http://0.0.0.0:8291` by default. Health check:
 
@@ -81,16 +90,20 @@ A plain turn finishes in a few seconds with `[smoke] PASS`. Add
 
 ```
 .
-├── admin-shim/                 # The HTTP server (Node, no framework)
-│   ├── server.mjs              # Route table
+├── admin-shim/                 # The HTTP server (TypeScript, no framework)
+│   ├── server.ts               # Route table (compiled to dist/server.js)
+│   ├── tsconfig.json           # strict + checkJs; see file for flags
+│   ├── tsconfig.build.json     # emit config for `npm run build`
 │   ├── lib/
-│   │   ├── store.mjs           # Read letta-code's LocalBackend on disk
-│   │   ├── translate.mjs       # LocalMessage ↔ vanilla Letta wire shape
-│   │   ├── chat.mjs            # POST /messages, SSE streaming, otid bind
-│   │   ├── agent-pool.mjs      # Long-running `letta` workers per conv
-│   │   ├── runs.mjs            # Run records + usage aggregation
-│   │   └── mobile-channel-host.mjs  # Bridge to the mobile channel plugin
-│   └── docs/DIVERGENCE.md      # Intentional differences from vanilla
+│   │   ├── store.ts            # Read letta-code's LocalBackend on disk
+│   │   ├── translate.ts        # LocalMessage ↔ vanilla Letta wire shape
+│   │   ├── chat.ts             # POST /messages, SSE streaming, otid bind
+│   │   ├── agent-pool.ts       # Long-running `letta` workers per conv
+│   │   ├── runs.ts             # Run records + usage aggregation
+│   │   └── mobile-channel-host.ts   # Bridge to the mobile channel plugin
+│   └── docs/
+│       ├── DIVERGENCE.md       # Intentional differences from vanilla
+│       └── CHANNEL_PLUGINS.md  # Plugin contract + type-hint opt-in
 ├── home/.letta/channels/
 │   ├── mobile/                 # Mobile WS channel plugin (Phase 1)
 │   │   ├── plugin.mjs
@@ -177,14 +190,23 @@ agent id; pass `--preserve-id` to keep the original UUID.
 ## Development
 
 ```bash
-cd admin-shim && npm install
-node ../home/.letta/channels/mobile/test/ws-smoke.mjs --text "ack"
+cd admin-shim
+npm install
+npm run dev          # tsx watch server.ts — reloads on .ts edits
+npm test             # node --import tsx/esm --test test/*.test.ts
+npm run typecheck    # tsc --noEmit
+npm run build        # tsc -p tsconfig.build.json → dist/
 ```
 
-There's no test framework — channels and the shim ship smoke tests that
-exercise the wire surface end-to-end. The codebase deliberately favors
-zero-dependency, filesystem-state, manifest-driven plugins — see `AGENTS.md`
-for the principles.
+The shim is written in TypeScript with `strict: true`; tests run via the
+`tsx/esm` loader so no precompile step is needed. Channel plugins remain
+`.mjs` and can opt into type hints via the generated
+`admin-shim/dist/lib/types/channel-plugin.d.ts` — see
+`admin-shim/docs/CHANNEL_PLUGINS.md`.
+
+The codebase deliberately favors zero-dependency, filesystem-state,
+manifest-driven plugins — see `admin-shim/AGENTS.md` for the TS conventions
+and `AGENTS.md` for repo-wide rules.
 
 ## License
 
