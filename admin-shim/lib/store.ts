@@ -304,18 +304,41 @@ export function listAllConversations(): OnDiskConversation[] {
  * form (the conversation list endpoint synthesizes this), or supply the
  * agent context out-of-band (e.g. `/v1/agents/{id}/...` routes).
  */
+// lcp-efg cache: external conv id -> ResolvedConversation. Invalidated when
+// the conversations-root directory's mtime changes (add / remove of a
+// conversation subdir bumps it). Content changes inside an existing
+// conversation.json do NOT invalidate, but the only field we read here is
+// `agent_id`, which is structural and set at conv creation — it doesn't
+// change during the conversation's lifetime. Safe to cache.
+let _convIdMapCache: Map<string, ResolvedConversation> | null = null;
+let _convIdMapCacheMtimeMs = -1;
+
+function convIdMap(): Map<string, ResolvedConversation> {
+  const root = join(storageDir(), "conversations");
+  let mtimeMs = -1;
+  try { mtimeMs = statSync(root).mtimeMs; } catch {}
+  if (_convIdMapCache !== null && mtimeMs === _convIdMapCacheMtimeMs) {
+    return _convIdMapCache;
+  }
+  const map = new Map<string, ResolvedConversation>();
+  if (existsSync(root)) {
+    for (const dirName of readdirSync(root)) {
+      const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
+      if (!isConversationOnDisk(conv)) continue;
+      map.set(conv.id, { conversationId: conv.id, agentId: conv.agent_id });
+    }
+  }
+  _convIdMapCache = map;
+  _convIdMapCacheMtimeMs = mtimeMs;
+  return map;
+}
+
 export function resolveConversationId(externalId: string | null | undefined): ResolvedConversation | null {
   if (!externalId) return null;
   if (externalId === "default") return null;
   const defaultMatch = externalId.match(/^conv-default-(agent-.+)$/);
   if (defaultMatch) return { conversationId: "default", agentId: defaultMatch[1]! };
-  // Otherwise scan disk for a matching conv-* id.
-  for (const conv of listAllConversations()) {
-    if (conv.id === externalId) {
-      return { conversationId: conv.id, agentId: conv.agent_id };
-    }
-  }
-  return null;
+  return convIdMap().get(externalId) ?? null;
 }
 
 export function getConversation(externalId: string, agentIdHint?: string | null): OnDiskConversation | null {
