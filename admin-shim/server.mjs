@@ -44,7 +44,7 @@ import {
   localMessageToConversationMessages,
   localMessageToLettaMessage,
 } from "./lib/translate.js";
-import { handleSendMessage } from "./lib/chat.mjs";
+import { handleSendMessage } from "./lib/chat.js";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.js";
 import {
   aggregateUsage,

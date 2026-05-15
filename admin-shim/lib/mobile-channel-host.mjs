@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { reshapeFrame } from "./chat.mjs";
+import { reshapeFrame } from "./chat.js";
 import { cancelRun, getAgentPool } from "./agent-pool.js";
 import {
   findUnmappedTailUserMessageId,
