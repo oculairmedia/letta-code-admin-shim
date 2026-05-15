@@ -16,11 +16,38 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   statSync,
+  unlinkSync,
   writeFileSync as _writeFileSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+
+/**
+ * Atomic JSON write: write to a tmp sibling, fsync (via writeFile O_SYNC
+ * default semantics on Linux), then rename over the target. POSIX rename is
+ * atomic on the same filesystem, so readers either see the old bytes or the
+ * new bytes — never a torn JSON file. Cleans up the tmp on partial failure.
+ *
+ * Fixes lcp-ayo. Previously these sidecars used a bare writeFileSync which
+ * leaves a truncated file on crash; readJsonOrNull silently treats that as
+ * empty, losing every otid / timestamp mapping for the conversation.
+ */
+function atomicWriteJson(path: string, value: unknown): void {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true });
+  const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  const payload = JSON.stringify(value, null, 2) + "\n";
+  try {
+    _writeFileSync(tmp, payload);
+    renameSync(tmp, path);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch {}
+    throw err;
+  }
+}
 
 import type { Block } from "./types/wire.js";
 import type { LocalMessage } from "./types/letta-stream.js";
@@ -390,8 +417,7 @@ export function writeOtidForLocalId(
   if (current[localId] === otid) return;
   current[localId] = otid;
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    _writeFileSync(path, JSON.stringify(current, null, 2) + "\n");
+    atomicWriteJson(path, current);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[store] otid sidecar write failed for ${conversationId}: ${msg}`);
@@ -451,8 +477,7 @@ export function stampNewMessages(
   if (dirty) {
     const path = timestampSidecarPath(conversationId, agentId);
     try {
-      mkdirSync(dirname(path), { recursive: true });
-      _writeFileSync(path, JSON.stringify(current, null, 2) + "\n");
+      atomicWriteJson(path, current);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[store] stamp sidecar write failed for ${conversationId}: ${msg}`);
