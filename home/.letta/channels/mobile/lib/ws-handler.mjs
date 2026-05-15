@@ -117,10 +117,18 @@ export function handleConnection(ws, request, host) {
         return;
       }
       const expected = host.getToken();
-      if (!timingSafeEqualHexish(frame.token ?? "", expected ?? "")) {
-        log(`auth failed for device=${frame.device_id ?? "?"}`);
-        sendError(ERROR_CODES.INVALID_TOKEN, "invalid token");
-        return;
+      // Mirror REST permissiveness on this dev box: when no token is
+      // configured (env unset and tokenFallback is empty), any token in
+      // the hello frame is accepted. Set MOBILE_CHANNEL_TOKEN or restore
+      // tokenFallback in accounts.json to re-enable strict matching.
+      if (typeof expected === "string" && expected.length > 0) {
+        if (!timingSafeEqualHexish(frame.token ?? "", expected)) {
+          log(`auth failed for device=${frame.device_id ?? "?"}`);
+          sendError(ERROR_CODES.INVALID_TOKEN, "invalid token");
+          return;
+        }
+      } else {
+        log(`auth skipped (no token configured) for device=${frame.device_id ?? "?"}`);
       }
       const deviceId = frame.device_id || `anon-${randomUUID()}`;
       device = recordDeviceConnect({

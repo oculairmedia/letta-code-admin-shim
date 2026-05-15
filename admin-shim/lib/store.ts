@@ -586,10 +586,13 @@ export async function stampNewMessages(
   const current = await readMessageTimestamps(conversationId, agentId);
   let dirty = false;
   let offset = 0;
+  let maxStampedIso = "";
   const baseMs = startTime.getTime();
   for (const m of messages) {
     if (m?.id && !current[m.id]) {
-      current[m.id] = new Date(baseMs + offset).toISOString();
+      const iso = new Date(baseMs + offset).toISOString();
+      current[m.id] = iso;
+      maxStampedIso = iso;
       offset += 1;
       dirty = true;
     }
@@ -602,6 +605,35 @@ export async function stampNewMessages(
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[store] stamp sidecar write failed for ${conversationId}: ${msg}`);
     }
+    // lcp-pwz: bump conversation.json's last_message_at / updated_at so the
+    // mobile conversations list (sorted by last_message_at) reflects real
+    // recent activity. Without this, both fields stay frozen at conv-create
+    // time and the list order is wrong forever.
+    await bumpConversationLastMessageAt(conversationId, agentId, maxStampedIso);
+  }
+}
+
+async function bumpConversationLastMessageAt(
+  conversationId: string,
+  agentId: string,
+  iso: string,
+): Promise<void> {
+  if (!iso) return;
+  const key = conversationKey(conversationId, agentId);
+  const path = join(storageDir(), "conversations", b64url(key), "conversation.json");
+  const raw = await readJsonOrNullAsync(path);
+  if (!raw || typeof raw !== "object") return;
+  const conv = raw as Record<string, unknown>;
+  const currentLast = typeof conv["last_message_at"] === "string" ? (conv["last_message_at"] as string) : "";
+  // Never go backwards: only bump if the new timestamp is strictly later.
+  if (currentLast && currentLast >= iso) return;
+  conv["last_message_at"] = iso;
+  conv["updated_at"] = iso;
+  try {
+    await atomicWriteJson(path, conv);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[store] conversation.json bump failed for ${conversationId}: ${msg}`);
   }
 }
 
