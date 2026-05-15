@@ -21,6 +21,7 @@ import type { IncomingMessage } from "node:http";
 
 import { reshapeFrame } from "./chat.js";
 import { cancelRun, getAgentPool } from "./agent-pool.js";
+import { createRun } from "./runs.js";
 import {
   findUnmappedTailUserMessageId,
   resolveConversationId,
@@ -132,6 +133,26 @@ async function bridgeSendMessage(
   const effectiveAgentId = resolved?.agentId ?? agent_id;
   const effectiveConvId = resolved?.conversationId ?? conversation_id;
 
+  // lcp-99a: create the Run record BEFORE awaiting pool.get() so the ws
+  // handler can emit turn_started carrying a non-null run_id. Mobile
+  // cancel-during-startup then always has a valid target. The cancel
+  // hook is a no-op shim here — runTurn() will late-bind the real
+  // SIGTERM dispatcher onto the existing run id once the worker exists
+  // (see agent-pool.ts setRunCancelHandler call).
+  const runHandle = createRun({
+    agentId: effectiveAgentId,
+    conversationId: effectiveConvId,
+    onCancel: () => {
+      // Replaced by runTurn(). If a cancel lands before runTurn() patches
+      // this in, it's a no-op — the worker doesn't exist yet so there's
+      // nothing to kill; the turn will short-circuit when the cancel
+      // state is observed at run start.
+    },
+  });
+  if (typeof onRunCreated === "function") {
+    try { onRunCreated(runHandle.id); } catch {}
+  }
+
   const pool = getAgentPool();
   const worker = await pool.get(effectiveConvId, effectiveAgentId);
 
@@ -151,11 +172,11 @@ async function bridgeSendMessage(
   let pendingUsage: BridgeFrame | null = null;
 
   const turn = await worker.runTurn(text, {
-    onRunCreated: (runId: string) => {
-      if (typeof onRunCreated === "function") {
-        try { onRunCreated(runId); } catch {}
-      }
-    },
+    // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
+    // patches the SIGTERM hook onto it via setRunCancelHandler. The
+    // worker will NOT call onRunCreated when a handle is provided —
+    // the caller already knows the id (we fired onRunCreated above).
+    runHandle,
     onFrame: (raw, meta) => {
       const reshaped = reshapeFrame(raw);
       if (!reshaped) return;

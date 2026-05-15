@@ -610,7 +610,131 @@ test("ws: send_message with missing agent_id → error{protocol_violation}, no c
   assert.equal(conn.closed, false, "validation error must NOT close the socket");
 });
 
-// ─── 21. stop_reason frame shape on WS ──────────────────────────────
+// ─── 21a. lcp-99a: turn_started always carries non-null run_id ─────
+
+test("ws: lcp-99a — turn_started always carries non-null run_id", async (t) => {
+  // The shim pre-creates the Run before emitting turn_started so mobile's
+  // ChannelTransport.cancel() always has a valid target, even immediately
+  // after send_message. Before lcp-99a, run_id was null until the first
+  // run_id-bearing post-turn_started frame arrived.
+  const { conn, agentId, convId } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "reply with pong",
+    otid: "cm-ws-ts-runid",
+  });
+  const ts = await conn.waitFor("turn_started", { timeoutMs: WS_TIMEOUT_MS }) as unknown as
+    { turn_id: string; run_id?: string | null };
+  assert.ok(ts.run_id, "turn_started.run_id must be a non-empty string (lcp-99a)");
+  assert.match(ts.run_id, /^run-/, "run_id must use the run- prefix");
+  // And every subsequent typed frame must carry the same run_id.
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  for (const f of turn) {
+    if (["turn_started", "ping", "welcome"].includes(f.type)) continue;
+    const runIdOnFrame = (f as { run_id?: unknown }).run_id;
+    if (runIdOnFrame !== undefined && runIdOnFrame !== null) {
+      assert.equal(runIdOnFrame, ts.run_id, `frame ${f.type} run_id must match turn_started.run_id`);
+    }
+  }
+});
+
+// ─── 21b. lcp-srk: turn_done carries lossy + drop_count fields ─────
+
+test("ws: lcp-srk — turn_done carries lossy=false + drop_count=0 on a clean turn", async (t) => {
+  const { conn, agentId, convId } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "reply with pong",
+    otid: "cm-ws-lossy",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const done = turn.find((f) => f.type === "turn_done") as unknown as
+    { status: string; lossy?: boolean; drop_count?: number } | undefined;
+  assert.ok(done, "turn_done required");
+  assert.equal(done.status, "completed", "clean turn must complete");
+  assert.equal(done.lossy, false, "no drops on a clean turn → lossy:false");
+  assert.equal(done.drop_count, 0, "drop_count must be 0 on a clean turn");
+});
+
+// ─── 21c. lcp-sep: tool_call frames may stream progressive args ────
+
+test("ws: lcp-sep — tool_call_message frames pass through without shim-side dedup (multiple per call ok)", async (t) => {
+  // letta-code may emit multiple tool_call_message frames sharing the
+  // same tool_call_id as the LLM's arg JSON accumulates. The shim must
+  // forward each one verbatim (preserving the `toolcall-<id>` envelope
+  // id) so mobile's `newScore >= oldScore` merge policy can pick the
+  // most-complete version. Test verifies the shim adds NO dedup at the
+  // mobile-WS layer: frame count >= 1, and any duplicate ids point at
+  // the same tool_call_id.
+  const { conn, agentId, convId } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "run bash echo hello",
+    otid: "cm-ws-sep",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const tcs = turn.filter((f) => f.type === "tool_call_message") as unknown as Array<{
+    id?: string;
+    tool_call?: { tool_call_id?: string; name?: string };
+  }>;
+  assert.ok(tcs.length >= 1, "at least one tool_call_message must arrive");
+  // Each frame's envelope id is `toolcall-<tool_call_id>` and groups
+  // representing the same logical call share that id and tool_call_id.
+  for (const tc of tcs) {
+    assert.ok(tc.id?.startsWith("toolcall-"), `envelope id must start with toolcall-, got: ${tc.id}`);
+    const stripped = tc.id?.replace(/^toolcall-/, "");
+    assert.equal(stripped, tc.tool_call?.tool_call_id, "envelope id suffix must equal tool_call_id");
+  }
+  // No dedup at shim layer: an unbounded number of frames per call is
+  // acceptable. (Current fixtures emit 1, but the contract permits N.)
+});
+
+// ─── 21d. lcp-kfr: client disconnect mid-turn does not abort the run ──
+
+test("ws: lcp-kfr — client WS disconnect does not prevent run from finalizing", async (t) => {
+  // Phase-1 contract: disconnect mid-turn loses the wire frames but the
+  // shim keeps running the turn locally. The Run record must transition
+  // to a terminal status so mobile's reconcile-from-disk path on
+  // reconnect finds an authoritative outcome.
+  const { conn, agentId, convId, shim } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "reply with pong",
+    otid: "cm-ws-kfr",
+  });
+  // Wait for turn_started so we have run_id.
+  const ts = await conn.waitFor("turn_started", { timeoutMs: WS_TIMEOUT_MS }) as unknown as
+    { run_id: string };
+  assert.ok(ts.run_id, "expected run_id on turn_started");
+  // Yank the connection immediately. The run is still in flight on the
+  // shim side.
+  conn.close();
+  // Give the worker time to finish processing the turn locally and
+  // finalize the run record. Worker turns in the test harness are fast
+  // (synthetic fixtures) but generous timeout in case of slow IO.
+  await new Promise((r) => setTimeout(r, 3_000));
+  // The Run record on disk should now have a terminal status. Hit the
+  // REST surface to confirm — same data the mobile reconcile path uses.
+  const res = await fetch(`${shim.url}/v1/runs/${ts.run_id}`, {
+    headers: { Authorization: "Bearer fake-token" },
+  });
+  assert.equal(res.status, 200, "run must be readable from disk after disconnect");
+  const run = await res.json() as { status?: string };
+  assert.ok(
+    ["completed", "failed", "cancelled"].includes(run.status ?? ""),
+    `run must reach a terminal status post-disconnect, got: ${run.status}`,
+  );
+});
+
+// ─── 22. stop_reason frame shape on WS ──────────────────────────────
 
 test("ws: stop_reason frame carries stop_reason field (`end_turn` on clean turn)", async (t) => {
   // The WS envelope uses the same `stop_reason:` field name as the REST/SSE

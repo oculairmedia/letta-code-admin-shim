@@ -175,21 +175,35 @@ export function handleConnection(ws, request, host) {
         }
         inFlight = true;
         const turnId = `turn-${randomUUID()}`;
-        // turn_started is emitted BEFORE the run is created. run_id gets
-        // patched onto subsequent frames once the bridge surfaces it via
-        // onRunCreated. Mobile correlates via turn_id until run_id appears.
+        // lcp-99a: turn_started now waits until host.sendMessage has fired
+        // onRunCreated (which mobile-channel-host does synchronously before
+        // any await). That guarantees run_id is non-null on turn_started,
+        // closing the cancel-during-startup gap. The cost is a few-ms
+        // delay before the "agent typing" indicator can flip — createRun
+        // is a single atomic write.
         let activeRunId = null;
-        safeSend(
-          ws,
-          makeFrame("turn_started", {
-            agent_id,
-            conversation_id,
-            turn_id: turnId,
-          }),
-          log,
-        );
+        let turnStartedEmitted = false;
+        // lcp-srk: count backpressure drops within this turn so turn_done
+        // can carry an authoritative lossy flag. Mobile reconciles iff
+        // lossy === true; clean turns can skip the round-trip.
+        let droppedFrameCount = 0;
+        const emitTurnStarted = () => {
+          if (turnStartedEmitted || closed) return;
+          turnStartedEmitted = true;
+          safeSend(
+            ws,
+            makeFrame("turn_started", {
+              agent_id,
+              conversation_id,
+              turn_id: turnId,
+              run_id: activeRunId ?? null,
+            }),
+            log,
+          );
+        };
+        let turnResult = null;
         try {
-          await host.sendMessage(
+          turnResult = await host.sendMessage(
             { agent_id, conversation_id, text, otid, turn_id: turnId, session_id: sessionId },
             (outFrame) => {
               if (closed) return;
@@ -209,7 +223,8 @@ export function handleConnection(ws, request, host) {
               // a slow consumer that lets this grow unbounded eats RAM.
               const HIGH_WATER = host.config?.bufferHighWaterBytes ?? 1_000_000;
               if (ws.bufferedAmount > HIGH_WATER) {
-                log(`backpressure: bufferedAmount=${ws.bufferedAmount} > ${HIGH_WATER}, dropping ${mt}`);
+                droppedFrameCount += 1;
+                log(`backpressure: bufferedAmount=${ws.bufferedAmount} > ${HIGH_WATER}, dropping ${mt} (turn=${turnId} dropped=${droppedFrameCount})`);
                 return;
               }
               // lcp-cv3: pass the upstream id through to the envelope so
@@ -277,31 +292,72 @@ export function handleConnection(ws, request, host) {
             {
               onRunCreated: (id) => {
                 activeRunId = id;
+                // lcp-99a: emit turn_started NOW (with the just-created
+                // run_id). Subsequent frames in the onFrame closure rely
+                // on turn_started having been sent first, so we sequence
+                // it here on the synchronous tick where the run id lands.
+                emitTurnStarted();
               },
             },
           );
+          // Defensive: if onRunCreated never fired (e.g. host bug), still
+          // emit turn_started so mobile doesn't stall. run_id will be null
+          // in that pathological case, but the turn lifecycle stays intact.
+          emitTurnStarted();
           // turn_done sentinel — emitted AFTER bridgeSendMessage settles,
           // which means stampNewMessages + writeOtidForLocalId have run.
           // Mobile can now safely GET /messages without racing the disk.
+          //
+          // Status derivation (lcp-axv + lcp-kfr): the turnResult carries
+          // lifecycle flags from agent-pool. `cancelled` wins (cancel
+          // intent is authoritative even if upstream produced a clean
+          // result frame in the race). `exit` / `timeout` / `dead` mean
+          // the worker died mid-turn → "failed". Otherwise "completed".
+          //
+          // lossy (lcp-srk): true iff any onFrame call dropped a frame
+          // due to backpressure. Mobile reconciles iff lossy === true.
           if (!closed) {
+            const status = turnResult?.cancelled
+              ? "cancelled"
+              : (turnResult?.exit || turnResult?.timeout || turnResult?.dead)
+                ? "failed"
+                : "completed";
             safeSend(ws, makeFrame("turn_done", {
               turn_id: turnId,
               run_id: activeRunId ?? null,
-              status: "completed",
+              status,
+              lossy: droppedFrameCount > 0,
+              drop_count: droppedFrameCount,
             }), log);
           }
         } catch (err) {
           if (err instanceof ProtocolError) {
             sendError(err.code, err.message, { close: false });
+            // Protocol-level error does NOT abort the in-flight turn (we
+            // haven't started one yet on this branch in practice — the
+            // validation above runs before host.sendMessage), so no
+            // turn_done to emit.
           } else {
             log(`send_message failed: ${err.stack ?? err.message}`);
-            // Surface the turn_id so mobile can attribute the failure.
-            safeSend(ws, makeFrame("error", {
-              code: ERROR_CODES.INTERNAL,
-              message: err.message ?? "send failed",
-              turn_id: turnId,
-              run_id: activeRunId ?? null,
-            }), log);
+            // lcp-axv: locked sequence on failure — emit error FIRST so
+            // mobile can capture the message, then turn_done(status:
+            // "failed") to close the turn lifecycle. Without the
+            // turn_done mobile's "agent typing" UI would never clear.
+            if (!closed) {
+              safeSend(ws, makeFrame("error", {
+                code: ERROR_CODES.INTERNAL,
+                message: err.message ?? "send failed",
+                turn_id: turnId,
+                run_id: activeRunId ?? null,
+              }), log);
+              safeSend(ws, makeFrame("turn_done", {
+                turn_id: turnId,
+                run_id: activeRunId ?? null,
+                status: "failed",
+                lossy: droppedFrameCount > 0,
+                drop_count: droppedFrameCount,
+              }), log);
+            }
           }
         } finally {
           inFlight = false;

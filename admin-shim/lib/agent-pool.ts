@@ -32,6 +32,7 @@ import {
   recordRunMessage,
   recordRunStep,
   recordRunTool,
+  setRunCancelHandler,
   type RunHandle,
   type UsageInput,
 } from "./runs.js";
@@ -76,6 +77,17 @@ export interface RunTurnOptions {
    */
   turnStartedAt?: Date | number;
   onRunCreated?: (runId: string) => void;
+  /**
+   * lcp-99a: pre-created Run handle, supplied by callers that need to
+   * know the run id BEFORE the turn starts streaming (mobile WS channel
+   * uses this to put run_id on the very first turn_started frame so
+   * cancel-during-startup is always possible). When supplied, runTurn
+   * does NOT createRun() of its own and does NOT invoke onRunCreated
+   * (the caller already knows the id). Cancel hook attachment still
+   * happens via the handle's own onCancel, so the supplier must wire
+   * that when calling createRun().
+   */
+  runHandle?: RunHandle;
 }
 
 /**
@@ -297,7 +309,7 @@ class Worker {
    * Turns are queued on the per-worker chain so two simultaneous callers
    * can't interleave.
    */
-  runTurn(userText: string, { onFrame, turnStartedAt: passedStart, onRunCreated }: RunTurnOptions = {}): Promise<RunTurnResult> {
+  runTurn(userText: string, { onFrame, turnStartedAt: passedStart, onRunCreated, runHandle: providedRunHandle }: RunTurnOptions = {}): Promise<RunTurnResult> {
     const previous = this.chain;
     let resolveTurn!: (value: RunTurnResult) => void;
     const turnPromise = new Promise<RunTurnResult>((r) => (resolveTurn = r));
@@ -322,17 +334,35 @@ class Worker {
       // turn-scoped state record; finalize at end-of-turn (or on cancel).
       // We register an onCancel hook that signals the child so an in-flight
       // turn can be aborted from the cancel API.
+      //
+      // lcp-99a: callers that need run_id BEFORE the turn streams (mobile
+      // WS) can pre-create the handle and pass it in. In that case we
+      // reuse their handle and skip the onRunCreated callback (they
+      // already know the id). The cancel hook still needs to wire into
+      // *this* turn's state — we patch it onto the supplied handle so
+      // the cancel signal kills the right child.
       let cancelled = false;
-      const runHandle: RunHandle = createRun({
-        agentId: this.agentId,
-        conversationId: this.conversationId,
-        onCancel: () => {
-          cancelled = true;
-          try { this.child?.kill?.("SIGTERM"); } catch {}
-        },
-      });
-      if (typeof onRunCreated === "function") {
-        try { onRunCreated(runHandle.id); } catch {}
+      const cancelChild = (): void => {
+        cancelled = true;
+        try { this.child?.kill?.("SIGTERM"); } catch {}
+      };
+      let runHandle: RunHandle;
+      if (providedRunHandle) {
+        runHandle = providedRunHandle;
+        // Late-bind the cancel hook to this turn's worker. The provided
+        // handle was created before the worker existed; now that we own
+        // the child process, patch the SIGTERM dispatcher into the
+        // cancel-handler map keyed by the existing run id.
+        setRunCancelHandler(runHandle.id, cancelChild);
+      } else {
+        runHandle = createRun({
+          agentId: this.agentId,
+          conversationId: this.conversationId,
+          onCancel: cancelChild,
+        });
+        if (typeof onRunCreated === "function") {
+          try { onRunCreated(runHandle.id); } catch {}
+        }
       }
 
       const frames: LettaStreamFrame[] = [];

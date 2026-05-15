@@ -324,6 +324,20 @@ export function createRun({ agentId, conversationId, onCancel }: CreateRunOption
   return handle;
 }
 
+/**
+ * lcp-99a: late-bind the cancel handler for an existing Run. Used when
+ * a caller creates the Run BEFORE the worker exists (e.g. mobile WS
+ * channel emits turn_started with run_id before pool.get() resolves)
+ * and then runTurn() patches the actual SIGTERM hook onto it once the
+ * worker is in scope. Idempotent — overwrites whatever was there.
+ */
+export function setRunCancelHandler(
+  runId: string,
+  onCancel: (reason: string) => void,
+): void {
+  _cancelHandlers.set(runId, onCancel);
+}
+
 /** Set ttft on the first frame that carries assistant content. Idempotent. */
 export function markRunFirstToken(handle: RunHandle | null | undefined): void {
   if (!handle || handle.firstTokenSet) return;

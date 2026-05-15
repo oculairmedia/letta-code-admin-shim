@@ -119,7 +119,7 @@ accumulates — early frames may have a name and id but blank or
 partial arguments; later frames fill in the rest. Each frame is
 NOT a delta; it carries the full argument state KNOWN AT EMIT TIME.
 
-Consumer requirement (locked — see lcp-sep): merge by `tool_call_id`
+Consumer requirement (locked — lcp-sep closed): merge by `tool_call_id`
 with last-wins-when-more-complete semantics. Concrete rule mobile
 uses: `mergedCalls = if (newScore >= oldScore) newCalls else oldCalls`
 where score = count of calls with non-blank arguments. This avoids a
@@ -168,12 +168,10 @@ When mobile sends `{type: "cancel", run_id: "<id>"}` mid-turn:
 - `stop_reason` may or may not appear before `turn_done` — do not
   assume it does on a cancel path.
 
-`cancel.run_id` is REQUIRED (no implicit fallback — lcp-bll). Tracked
-gap (lcp-99a): mobile cannot cancel between `turn_started` and the
-first `run_id`-bearing frame because no run_id exists yet. Resolution
-pending: either always emit `run_id` on `turn_started` (shim-side fix)
-or specify a client-buffer rule. Until then, mobile MAY ignore cancel
-requests during that window and rely on the user retrying.
+`cancel.run_id` is REQUIRED (no implicit fallback — lcp-bll).
+**lcp-99a closed:** `turn_started` now always carries a non-null
+`run_id`, so the cancel-during-startup window is gone. Mobile can
+cancel at any point starting from the first frame mobile receives.
 
 Mobile MUST treat `turn_done.status != "completed"` as authoritative
 for run state.
@@ -186,18 +184,28 @@ is in flight:
 - The shim's worker pool keeps running the turn locally.
 - `onFrame` writes into a dead socket — frames are lost on the wire.
 - The Run record finalizes to disk (status `completed` / `failed` /
-  `cancelled`) regardless of WS state — tracked by lcp-kfr.
+  `cancelled`) regardless of WS state.
 
-**Mobile MUST reconcile from the run record on reconnect** to recover
-the turn's outcome. The disk projection carries the complete text,
-tool calls, and tool returns once finalize lands.
+**lcp-kfr closed.** Mobile MUST reconcile from the run record (GET
+`/v1/runs/<run_id>`) on reconnect to recover the turn's outcome. The
+disk projection carries the complete text, tool calls, and tool
+returns once finalize lands.
 
 ## Failure paths
 
-Tracked by lcp-axv. Locked convention (pending): every turn that
-terminates abnormally emits an `error` frame BEFORE the
-`turn_done.status="failed"` frame. The error frame carries `code`,
-`message`, and the in-flight `turn_id` / `run_id`.
+**lcp-axv closed.** Locked convention: every turn that terminates
+abnormally emits an `error` frame FIRST, immediately followed by
+`turn_done.status="failed"`. The `error` frame carries `code`,
+`message`, `turn_id`, `run_id`. The `turn_done` frame closes the
+lifecycle so mobile's "agent typing" UI can clear.
+
+`turn_done.status` derivation (from `RunTurnResult` flags):
+
+| Result                          | turn_done.status |
+|---------------------------------|------------------|
+| `cancelled` (auth wins)         | `"cancelled"`    |
+| `exit` / `timeout` / `dead`     | `"failed"`       |
+| otherwise (`done` clean result) | `"completed"`    |
 
 Mobile error-banner UX should buffer the error string from the
 `error` frame and flip state on the subsequent `turn_done`.
@@ -213,12 +221,11 @@ than the socket being closed. This is OK for the streaming path because
 each chunk is a delta of bounded size — losing one means the assembled
 content has a gap, but the connection survives.
 
-Recovery contract (tracked by lcp-srk, pending implementation):
-`turn_done.lossy: bool` will indicate whether any drop fired during
-the turn. Mobile MUST reconcile from the disk projection iff
-`turn_done.lossy === true`. Until that flag ships, mobile MAY
-reconcile defensively on every clean `turn_done.status === "completed"`,
-but is not required to.
+**lcp-srk closed.** `turn_done` carries `lossy: bool` and
+`drop_count: number`. Mobile MUST reconcile from the disk projection
+iff `turn_done.lossy === true`; clean turns can skip the reconcile.
+`drop_count` is informational (telemetry only — mobile shouldn't
+branch on its value).
 
 ---
 
@@ -324,12 +331,10 @@ shim — wait for `turn_done` or reconcile from disk.
   default 120s) closes the socket. WS-layer ping/pong satisfies this
   timer.
 
-### `turn_started.run_id` transition window
+### `turn_started.run_id`
 
-Currently NULL until the first run_id-bearing frame arrives (lcp-99a
-target: always non-null). Mobile capture path should treat the field
-as optional until lcp-99a closes. After lcp-99a: mobile MAY assert
-non-null and crash-loud on null (regression).
+**Always non-null** (lcp-99a closed). Mobile MAY assert non-null and
+crash-loud on null — a null value would be a regression in the shim.
 
 ### Empty content / zero-frame turns
 
