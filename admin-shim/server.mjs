@@ -364,6 +364,14 @@ function handleTools(_req, res) {
   json(res, 200, BUILTIN_TOOL_DEFINITIONS.map(vanillaTool));
 }
 
+function handleToolDetail(_req, res, toolId) {
+  const match = BUILTIN_TOOL_DEFINITIONS
+    .map(vanillaTool)
+    .find((t) => t.id === toolId);
+  if (!match) return notFound(res, `tool ${toolId}`);
+  json(res, 200, match);
+}
+
 function vanillaProvider({ name, providerType, baseUrl }) {
   const idHash = Buffer.from(`provider:${name}`).toString("base64url").slice(0, 24).toLowerCase();
   return {
@@ -847,6 +855,8 @@ const server = createServer((req, res) => {
   if (pathname === "/v1/tools" && req.method === "GET") return handleTools(req, res);
   if (pathname === "/v1/tools/count" && req.method === "GET")
     return json(res, 200, BUILTIN_TOOL_DEFINITIONS.length);
+  const toolDetail = pathname.match(/^\/v1\/tools\/(tool-[^/]+)\/?$/);
+  if (toolDetail && req.method === "GET") return handleToolDetail(req, res, toolDetail[1]);
   if (pathname === "/v1/providers" && req.method === "GET") return handleProviders(req, res);
   if (pathname === "/v1/models/embedding" && req.method === "GET") {
     return json(res, 200, [

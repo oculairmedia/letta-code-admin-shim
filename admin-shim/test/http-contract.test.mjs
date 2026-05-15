@@ -704,6 +704,28 @@ test("GET /v1/tools returns the builtin tool definitions", async (t) => {
   }
 });
 
+test("GET /v1/tools/{tool_id} returns the matching builtin", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const list = await getJson(`${shim.url}/v1/tools`);
+  const bash = list.body.find((it) => it.name === "Bash");
+  assert.ok(bash, "Bash must be in the list");
+
+  const { res, body } = await getJson(`${shim.url}/v1/tools/${bash.id}`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(body, bash);
+});
+
+test("GET /v1/tools/{tool_id} returns 404 for an unknown id", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const { res, body } = await getJson(`${shim.url}/v1/tools/tool-doesnotexist`);
+  assert.equal(res.status, 404);
+  assert.match(body.detail, /tool tool-doesnotexist/);
+});
+
 // ── messages search ────────────────────────────────────────────────
 
 test("POST /v1/messages/search returns { messages: [] }", async (t) => {
