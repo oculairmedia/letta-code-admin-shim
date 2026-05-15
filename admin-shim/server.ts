@@ -95,7 +95,7 @@ function parsePagination(searchParams: URLSearchParams): Pagination {
   return { limit: Number.isFinite(limit) ? limit : 50, offset: Number.isFinite(offset) ? offset : 0 };
 }
 
-function defaultConversationForAgent(agentId: string): OnDiskConversation | null {
+function defaultConversationForAgent(agentId: string): Promise<OnDiskConversation | null> {
   return getConversation("default", agentId);
 }
 
@@ -141,11 +141,11 @@ function handlePoolStats(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, getAgentPool().stats());
 }
 
-function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
+async function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const { limit, offset } = parsePagination(url.searchParams);
   const tagFilter = url.searchParams.getAll("tags");
   const nameFilter = url.searchParams.get("name");
-  let agents = listAgents();
+  let agents = await listAgents();
   if (tagFilter.length > 0) {
     agents = agents.filter((a) => (a.tags ?? []).some((t) => tagFilter.includes(t)));
   }
@@ -155,17 +155,17 @@ function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url: URL):
     );
   }
   const sliced = agents.slice(offset, offset + limit);
-  const projected = sliced.map((a) => {
-    defaultConversationForAgent(a.id);
-    const messages = listMessages("default", a.id);
+  const projected = await Promise.all(sliced.map(async (a) => {
+    await defaultConversationForAgent(a.id);
+    const messages = await listMessages("default", a.id);
     const blocks = readBlocksForAgent(a.id);
     return agentToLettaState(a, { messages, blocks });
-  });
+  }));
   json(res, 200, projected);
 }
 
-function handleAgentsCount(_req: IncomingMessage, res: ServerResponse): void {
-  json(res, 200, listAgents().length);
+async function handleAgentsCount(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  json(res, 200, (await listAgents()).length);
 }
 
 // Stale-id alias table — mobile may have cached an agent_id from an earlier
@@ -192,26 +192,26 @@ function resolveAgentRecord(agentId: string): OnDiskAgentRecord | null {
   return null;
 }
 
-function handleAgentDetail(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
+async function handleAgentDetail(_req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
   const a = resolveAgentRecord(agentId);
   if (!a) return notFound(res, `agent ${agentId}`);
-  const messages = listMessages("default", a.id);
+  const messages = await listMessages("default", a.id);
   const blocks = readBlocksForAgent(a.id);
   json(res, 200, agentToLettaState(a, { messages, blocks }));
 }
 
-function handleAgentMessages(
+async function handleAgentMessages(
   _req: IncomingMessage,
   res: ServerResponse,
   url: URL,
   agentId: string,
-): void {
+): Promise<void> {
   const a = resolveAgentRecord(agentId);
   if (!a) return notFound(res, `agent ${agentId}`);
   const { limit } = parsePagination(url.searchParams);
   const before = url.searchParams.get("before") ?? undefined;
   const conversationId = url.searchParams.get("conversation_id") ?? "default";
-  const items = listMessages(conversationId, agentId, { limit, before });
+  const items = await listMessages(conversationId, agentId, { limit, before });
   json(
     res,
     200,
@@ -219,21 +219,21 @@ function handleAgentMessages(
   );
 }
 
-function handleAgentContext(
+async function handleAgentContext(
   _req: IncomingMessage,
   res: ServerResponse,
   url: URL,
   agentId: string,
-): void {
+): Promise<void> {
   const a = resolveAgentRecord(agentId);
   if (!a) return notFound(res, `agent ${agentId}`);
   // mobile passes the synthesized external conv id; resolve to internal.
   const requestedConv = url.searchParams.get("conversation_id") ?? "default";
   const resolved = requestedConv === "default"
     ? { conversationId: "default", agentId }
-    : resolveConversationId(requestedConv) ?? { conversationId: requestedConv, agentId };
+    : (await resolveConversationId(requestedConv)) ?? { conversationId: requestedConv, agentId };
   const sp = readSystemPrompt(resolved.conversationId, resolved.agentId);
-  const messages = listMessages(resolved.conversationId, resolved.agentId);
+  const messages = await listMessages(resolved.conversationId, resolved.agentId);
   const spContent =
     sp && typeof sp === "object" && "content" in sp && typeof (sp as { content: unknown }).content === "string"
       ? (sp as { content: string }).content
@@ -272,18 +272,18 @@ function handleAgentBlocks(_req: IncomingMessage, res: ServerResponse, agentId: 
   json(res, 200, readBlocksForAgent(agentId));
 }
 
-function handleBlocksList(_req: IncomingMessage, res: ServerResponse): void {
+async function handleBlocksList(_req: IncomingMessage, res: ServerResponse): Promise<void> {
   // Union of all per-agent blocks. Real Letta has globally addressable blocks
   // but LocalBackend doesn't, so we synthesize.
   const all = [];
-  for (const a of listAgents()) {
+  for (const a of await listAgents()) {
     all.push(...readBlocksForAgent(a.id));
   }
   json(res, 200, all);
 }
 
-function handleBlockDetail(_req: IncomingMessage, res: ServerResponse, blockId: string): void {
-  for (const a of listAgents()) {
+async function handleBlockDetail(_req: IncomingMessage, res: ServerResponse, blockId: string): Promise<void> {
+  for (const a of await listAgents()) {
     const blocks = readBlocksForAgent(a.id);
     const hit = blocks.find((b) => b.id === blockId);
     if (hit) return json(res, 200, hit);
@@ -465,16 +465,16 @@ async function sendMessage(
 
 // ── /v1/conversations namespace ────────────────────────────────────
 
-function handleConversationsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
+async function handleConversationsList(_req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const { limit, offset } = parsePagination(url.searchParams);
   const agentId = url.searchParams.get("agent_id") ?? undefined;
-  const items = agentId ? listConversationsForAgent(agentId) : listAllConversations();
+  const items = agentId ? listConversationsForAgent(agentId) : await listAllConversations();
   items.sort((a, b) => (b.last_message_at ?? "").localeCompare(a.last_message_at ?? ""));
   json(res, 200, items.slice(offset, offset + limit).map(conversationToLetta));
 }
 
-function handleConversationDetail(_req: IncomingMessage, res: ServerResponse, conversationId: string): void {
-  const conv = getConversation(conversationId);
+async function handleConversationDetail(_req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
+  const conv = await getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   json(res, 200, conversationToLetta(conv));
 }
@@ -515,7 +515,7 @@ async function handleConversationCreate(req: IncomingMessage, res: ServerRespons
 }
 
 async function handleConversationUpdate(req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
-  const conv = getConversation(conversationId);
+  const conv = await getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   const body = await readJsonBody(req);
   const next: OnDiskConversation = {
@@ -531,8 +531,8 @@ async function handleConversationUpdate(req: IncomingMessage, res: ServerRespons
   json(res, 200, conversationToLetta(next));
 }
 
-function handleConversationDelete(_req: IncomingMessage, res: ServerResponse, conversationId: string): void {
-  const conv = getConversation(conversationId);
+async function handleConversationDelete(_req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
+  const conv = await getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   if (conv.id === "default") {
     return json(res, 400, { detail: "cannot delete the default conversation" });
@@ -543,13 +543,13 @@ function handleConversationDelete(_req: IncomingMessage, res: ServerResponse, co
   json(res, 200, { id: conv.id, deleted: true });
 }
 
-function handleConversationMessagesList(
+async function handleConversationMessagesList(
   _req: IncomingMessage,
   res: ServerResponse,
   url: URL,
   externalConvId: string,
-): void {
-  const resolved = resolveConversationId(externalConvId);
+): Promise<void> {
+  const resolved = await resolveConversationId(externalConvId);
   if (!resolved) {
     // Unknown conv (e.g. cached client-side from a prior Python-Letta-server
     // session, or stale UI state). Return an empty list rather than 404 so
@@ -559,10 +559,10 @@ function handleConversationMessagesList(
   const { limit } = parsePagination(url.searchParams);
   const before = url.searchParams.get("before") ?? undefined;
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
-  let items = listMessages(resolved.conversationId, resolved.agentId, { limit, before });
+  let items = await listMessages(resolved.conversationId, resolved.agentId, { limit, before });
   if (order === "desc") items = [...items].reverse();
-  const realTimes = readMessageTimestamps(resolved.conversationId, resolved.agentId);
-  const otidMap = readOtidMap(resolved.conversationId, resolved.agentId);
+  const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
+  const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
   const out = [];
   for (const m of items) {
     // .mjs passed agentId/conversationId here too; the function ignores them
@@ -580,7 +580,7 @@ function handleConversationMessagesList(
 }
 
 async function handleConversationSendMessage(req: IncomingMessage, res: ServerResponse, externalConvId: string): Promise<void> {
-  const resolved = resolveConversationId(externalConvId);
+  const resolved = await resolveConversationId(externalConvId);
   if (!resolved) return notFound(res, `conversation ${externalConvId}`);
   // letta-code's --conversation expects the INTERNAL id (e.g. "default" or
   // a real conv-*), not our synthesized external one.
@@ -609,16 +609,16 @@ function handleConversationStream(req: IncomingMessage, res: ServerResponse, ext
   req.on("close", () => clearInterval(ping));
 }
 
-function handleConversationCancel(_req: IncomingMessage, res: ServerResponse, conversationId: string): void {
+async function handleConversationCancel(_req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
   // Phase 1: there's no shared subprocess registry yet. Acknowledge so the
   // client UI clears any pending state.
-  const conv = getConversation(conversationId);
+  const conv = await getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   json(res, 200, { id: conv.id, status: "accepted" });
 }
 
-function handleConversationStub(_req: IncomingMessage, res: ServerResponse, conversationId: string, op: string): void {
-  if (!getConversation(conversationId)) return notFound(res, `conversation ${conversationId}`);
+async function handleConversationStub(_req: IncomingMessage, res: ServerResponse, conversationId: string, op: string): Promise<void> {
+  if (!(await getConversation(conversationId))) return notFound(res, `conversation ${conversationId}`);
   json(res, 501, { detail: `conversation op ${op} not yet implemented in Phase 1` });
 }
 
@@ -663,7 +663,7 @@ function handleRunDetail(_req: IncomingMessage, res: ServerResponse, runId: stri
   json(res, 200, run);
 }
 
-function handleRunMessages(_req: IncomingMessage, res: ServerResponse, url: URL, runId: string): void {
+async function handleRunMessages(_req: IncomingMessage, res: ServerResponse, url: URL, runId: string): Promise<void> {
   const run = getRun(runId);
   if (!run) return notFound(res, `run ${runId}`);
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
@@ -674,12 +674,12 @@ function handleRunMessages(_req: IncomingMessage, res: ServerResponse, url: URL,
   // Resolve the conversation that owned this run and fetch its messages,
   // filtered to the ids the run claimed. Project to vanilla shape so the
   // response matches what mobile gets from /v1/conversations/{id}/messages.
-  const conv = run.conversation_id ? getConversation(run.conversation_id, run.agent_id) : null;
+  const conv = run.conversation_id ? await getConversation(run.conversation_id, run.agent_id) : null;
   const resolved = conv ? { conversationId: conv.id, agentId: conv.agent_id } : null;
   if (!resolved) return json(res, 200, []);
-  const items = listMessages(resolved.conversationId, resolved.agentId, {});
-  const realTimes = readMessageTimestamps(resolved.conversationId, resolved.agentId);
-  const otidMap = readOtidMap(resolved.conversationId, resolved.agentId);
+  const items = await listMessages(resolved.conversationId, resolved.agentId, {});
+  const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
+  const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
   const runMessageIds = new Set(run.message_ids ?? []);
   let out: Array<{ id?: string }> = [];
   for (const m of items) {

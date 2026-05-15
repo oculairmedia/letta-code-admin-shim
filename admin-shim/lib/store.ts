@@ -13,14 +13,19 @@
 
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   statSync,
-  unlinkSync,
-  writeFileSync as _writeFileSync,
 } from "node:fs";
+import {
+  mkdir as fsMkdir,
+  readFile as fsReadFile,
+  readdir as fsReaddir,
+  rename as fsRename,
+  stat as fsStat,
+  unlink as fsUnlink,
+  writeFile as fsWriteFile,
+} from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -35,16 +40,16 @@ import { dirname, join } from "node:path";
  * leaves a truncated file on crash; readJsonOrNull silently treats that as
  * empty, losing every otid / timestamp mapping for the conversation.
  */
-function atomicWriteJson(path: string, value: unknown): void {
+async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   const dir = dirname(path);
-  mkdirSync(dir, { recursive: true });
+  await fsMkdir(dir, { recursive: true });
   const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
   const payload = JSON.stringify(value, null, 2) + "\n";
   try {
-    _writeFileSync(tmp, payload);
-    renameSync(tmp, path);
+    await fsWriteFile(tmp, payload);
+    await fsRename(tmp, path);
   } catch (err) {
-    try { unlinkSync(tmp); } catch {}
+    try { await fsUnlink(tmp); } catch {}
     throw err;
   }
 }
@@ -167,9 +172,17 @@ function readJsonOrNull(path: string): unknown {
   }
 }
 
-function readJsonlOrEmpty(path: string): unknown[] {
+async function readJsonOrNullAsync(path: string): Promise<unknown> {
   try {
-    const raw = readFileSync(path, "utf8");
+    return JSON.parse(await fsReadFile(path, "utf8")) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonlOrEmptyAsync(path: string): Promise<unknown[]> {
+  try {
+    const raw = await fsReadFile(path, "utf8");
     return raw
       .split("\n")
       .map((line) => line.trim())
@@ -225,15 +238,15 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 // callers that hit this hot path.
 const _listAgentsCached = makeDirMtimeCache(
   () => join(storageDir(), "agents"),
-  () => {
+  async () => {
     const root = join(storageDir(), "agents");
     const out: OnDiskAgentRecord[] = [];
     if (!existsSync(root)) return out;
-    for (const fname of readdirSync(root)) {
+    for (const fname of await fsReaddir(root)) {
       if (!fname.endsWith(".json")) continue;
-      const record = readJsonOrNull(join(root, fname));
+      const record = await readJsonOrNullAsync(join(root, fname));
       if (!isAgentRecordCandidate(record)) continue;
-      const stat = statSync(join(root, fname));
+      const stat = await fsStat(join(root, fname));
       out.push({ ...record, _mtimeMs: stat.mtimeMs, _ctimeMs: stat.ctimeMs } as OnDiskAgentRecord);
     }
     out.sort((a, b) => (b._mtimeMs ?? 0) - (a._mtimeMs ?? 0));
@@ -241,7 +254,7 @@ const _listAgentsCached = makeDirMtimeCache(
   },
 );
 
-export function listAgents(): OnDiskAgentRecord[] {
+export function listAgents(): Promise<OnDiskAgentRecord[]> {
   return _listAgentsCached();
 }
 
@@ -300,12 +313,12 @@ export function listConversationsForAgent(agentId: string): OnDiskConversation[]
 // is preserved.
 const _listAllConversationsCached = makeDirMtimeCache(
   () => join(storageDir(), "conversations"),
-  () => {
+  async () => {
     const root = join(storageDir(), "conversations");
     const out: OnDiskConversation[] = [];
     if (!existsSync(root)) return out;
-    for (const dirName of readdirSync(root)) {
-      const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
+    for (const dirName of await fsReaddir(root)) {
+      const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
       if (!isConversationOnDisk(conv)) continue;
       out.push(conv);
     }
@@ -313,7 +326,7 @@ const _listAllConversationsCached = makeDirMtimeCache(
   },
 );
 
-export function listAllConversations(): OnDiskConversation[] {
+export function listAllConversations(): Promise<OnDiskConversation[]> {
   return _listAllConversationsCached();
 }
 
@@ -345,18 +358,29 @@ export function listAllConversations(): OnDiskConversation[] {
  */
 function makeDirMtimeCache<T>(
   rootFn: () => string,
-  loader: () => T,
-): () => T {
+  loader: () => Promise<T>,
+): () => Promise<T> {
   let cached: T | null = null;
   let cachedMtimeMs = -1;
-  return () => {
+  let inflight: Promise<T> | null = null;
+  return async () => {
     const root = rootFn();
     let mtimeMs = -1;
-    try { mtimeMs = statSync(root).mtimeMs; } catch {}
+    try { mtimeMs = (await fsStat(root)).mtimeMs; } catch {}
     if (cached !== null && mtimeMs === cachedMtimeMs) return cached;
-    cached = loader();
-    cachedMtimeMs = mtimeMs;
-    return cached;
+    if (inflight) return inflight;
+    const expectedMtimeMs = mtimeMs;
+    inflight = (async () => {
+      try {
+        const value = await loader();
+        cached = value;
+        cachedMtimeMs = expectedMtimeMs;
+        return value;
+      } finally {
+        inflight = null;
+      }
+    })();
+    return inflight;
   };
 }
 
@@ -368,12 +392,12 @@ function makeDirMtimeCache<T>(
 // change during the conversation's lifetime. Safe to cache.
 const convIdMap = makeDirMtimeCache(
   () => join(storageDir(), "conversations"),
-  () => {
+  async () => {
     const map = new Map<string, ResolvedConversation>();
     const root = join(storageDir(), "conversations");
     if (existsSync(root)) {
-      for (const dirName of readdirSync(root)) {
-        const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
+      for (const dirName of await fsReaddir(root)) {
+        const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
         if (!isConversationOnDisk(conv)) continue;
         map.set(conv.id, { conversationId: conv.id, agentId: conv.agent_id });
       }
@@ -382,43 +406,43 @@ const convIdMap = makeDirMtimeCache(
   },
 );
 
-export function resolveConversationId(externalId: string | null | undefined): ResolvedConversation | null {
+export async function resolveConversationId(externalId: string | null | undefined): Promise<ResolvedConversation | null> {
   if (!externalId) return null;
   if (externalId === "default") return null;
   const defaultMatch = externalId.match(/^conv-default-(agent-.+)$/);
   if (defaultMatch) return { conversationId: "default", agentId: defaultMatch[1]! };
-  return convIdMap().get(externalId) ?? null;
+  return (await convIdMap()).get(externalId) ?? null;
 }
 
-export function getConversation(externalId: string, agentIdHint?: string | null): OnDiskConversation | null {
+export async function getConversation(externalId: string, agentIdHint?: string | null): Promise<OnDiskConversation | null> {
   // Fast path: caller passed agentIdHint AND a real internal id.
   if (agentIdHint) {
     const key = conversationKey(externalId, agentIdHint);
     const dir = join(storageDir(), "conversations", b64url(key));
-    const conv = readJsonOrNull(join(dir, "conversation.json"));
+    const conv = await readJsonOrNullAsync(join(dir, "conversation.json"));
     if (isConversationOnDisk(conv)) return conv;
   }
   // Mobile's external id may be `conv-default-{agentId}` → translate.
-  const resolved = resolveConversationId(externalId);
+  const resolved = await resolveConversationId(externalId);
   if (!resolved) return null;
   const key = conversationKey(resolved.conversationId, resolved.agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
-  const conv = readJsonOrNull(join(dir, "conversation.json"));
+  const conv = await readJsonOrNullAsync(join(dir, "conversation.json"));
   return isConversationOnDisk(conv) ? conv : null;
 }
 
-export function getAgentIdForConversation(externalId: string): string | null {
-  return resolveConversationId(externalId)?.agentId ?? null;
+export async function getAgentIdForConversation(externalId: string): Promise<string | null> {
+  return (await resolveConversationId(externalId))?.agentId ?? null;
 }
 
-export function listMessages(
+export async function listMessages(
   conversationId: string,
   agentId: string,
   { limit, before }: ListMessagesOptions = {},
-): LocalMessage[] {
+): Promise<LocalMessage[]> {
   const key = conversationKey(conversationId, agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
-  const items = readJsonlOrEmpty(join(dir, "messages.jsonl"));
+  const items = await readJsonlOrEmptyAsync(join(dir, "messages.jsonl"));
   let scoped: LocalMessage[] = items.filter(isLocalMessage);
   if (before) {
     const idx = scoped.findIndex((m) => m.id === before);
@@ -457,9 +481,9 @@ function otidSidecarPath(conversationId: string, agentId: string): string {
   return join(storageDir(), "conversations", b64url(key), "_otid-map.json");
 }
 
-export function readMessageTimestamps(conversationId: string, agentId: string): TimestampSidecar {
+export async function readMessageTimestamps(conversationId: string, agentId: string): Promise<TimestampSidecar> {
   const path = timestampSidecarPath(conversationId, agentId);
-  const raw = readJsonOrNull(path);
+  const raw = await readJsonOrNullAsync(path);
   return isStringRecord(raw) ? raw : {};
 }
 
@@ -470,26 +494,26 @@ export function readMessageTimestamps(conversationId: string, agentId: string): 
 // `id` → mobile-supplied otid. The projection joins this on read so the
 // user_message wire frame echoes the original otid, letting mobile collapse
 // the Local-vs-Confirmed pair via its existing reconcileAfterSend flow.
-export function readOtidMap(conversationId: string, agentId: string): OtidSidecar {
+export async function readOtidMap(conversationId: string, agentId: string): Promise<OtidSidecar> {
   const path = otidSidecarPath(conversationId, agentId);
-  const raw = readJsonOrNull(path);
+  const raw = await readJsonOrNullAsync(path);
   return isStringRecord(raw) ? raw : {};
 }
 
-export function writeOtidForLocalId(
+export async function writeOtidForLocalId(
   conversationId: string,
   agentId: string,
   localId: string | null | undefined,
   otid: string | null | undefined,
-): void {
+): Promise<void> {
   if (!localId || !otid) return;
   const path = otidSidecarPath(conversationId, agentId);
-  const raw = readJsonOrNull(path);
+  const raw = await readJsonOrNullAsync(path);
   const current: OtidSidecar = isStringRecord(raw) ? raw : {};
   if (current[localId] === otid) return;
   current[localId] = otid;
   try {
-    atomicWriteJson(path, current);
+    await atomicWriteJson(path, current);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[store] otid sidecar write failed for ${conversationId}: ${msg}`);
@@ -503,9 +527,9 @@ export function writeOtidForLocalId(
  *
  * Returns the localId or null if none found.
  */
-export function findUnmappedTailUserMessageId(conversationId: string, agentId: string): string | null {
-  const messages = listMessages(conversationId, agentId);
-  const map = readOtidMap(conversationId, agentId);
+export async function findUnmappedTailUserMessageId(conversationId: string, agentId: string): Promise<string | null> {
+  const messages = await listMessages(conversationId, agentId);
+  const map = await readOtidMap(conversationId, agentId);
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m?.role === "user" && m?.id && !map[m.id]) return m.id;
@@ -528,14 +552,14 @@ export function findUnmappedTailUserMessageId(conversationId: string, agentId: s
  * Idempotent — already-stamped messages keep their original real timestamp.
  * Safe to call after every turn.
  */
-export function stampNewMessages(
+export async function stampNewMessages(
   conversationId: string,
   agentId: string,
   startTime: Date = new Date(),
-): void {
-  const messages = listMessages(conversationId, agentId);
+): Promise<void> {
+  const messages = await listMessages(conversationId, agentId);
   if (messages.length === 0) return;
-  const current = readMessageTimestamps(conversationId, agentId);
+  const current = await readMessageTimestamps(conversationId, agentId);
   let dirty = false;
   let offset = 0;
   const baseMs = startTime.getTime();
@@ -549,7 +573,7 @@ export function stampNewMessages(
   if (dirty) {
     const path = timestampSidecarPath(conversationId, agentId);
     try {
-      atomicWriteJson(path, current);
+      await atomicWriteJson(path, current);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[store] stamp sidecar write failed for ${conversationId}: ${msg}`);

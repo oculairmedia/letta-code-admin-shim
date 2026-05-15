@@ -128,7 +128,7 @@ async function bridgeSendMessage(
   // exists, a custom conv letta hasn't persisted yet, or the ambiguous
   // bare literal "default" which the resolver refuses), fall back to
   // the client's pair so the worker pool can still target a fresh conv.
-  const resolved = resolveConversationId(conversation_id);
+  const resolved = await resolveConversationId(conversation_id);
   const effectiveAgentId = resolved?.agentId ?? agent_id;
   const effectiveConvId = resolved?.conversationId ?? conversation_id;
 
@@ -212,8 +212,8 @@ async function bridgeSendMessage(
       // run-message attribution). Fall back to a scan only if it didn't
       // surface one — defensive for older worker code paths.
       const localId = (turn as { newUserMessageId?: string | null }).newUserMessageId
-        ?? findUnmappedTailUserMessageId(effectiveConvId, effectiveAgentId);
-      if (localId) writeOtidForLocalId(effectiveConvId, effectiveAgentId, localId, otid);
+        ?? await findUnmappedTailUserMessageId(effectiveConvId, effectiveAgentId);
+      if (localId) await writeOtidForLocalId(effectiveConvId, effectiveAgentId, localId, otid);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[mobile-channel] otid bind failed: ${errMsg}`);

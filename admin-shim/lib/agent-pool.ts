@@ -454,7 +454,7 @@ class Worker {
       // messages to this run after the turn settles. listMessages reads
       // messages.jsonl which letta-code appends to during the turn.
       const messageIdsBefore = new Set<string>(
-        listMessages(this.conversationId, this.agentId)
+        (await listMessages(this.conversationId, this.agentId))
           .map((m) => m?.id)
           .filter((id): id is string => Boolean(id)),
       );
@@ -494,7 +494,7 @@ class Worker {
       // user's prompt timestamps land before letta-code's stream frame
       // times (which fire later in the turn). Failure is non-fatal.
       try {
-        stampNewMessages(this.conversationId, this.agentId, turnStartedAt);
+        await stampNewMessages(this.conversationId, this.agentId, turnStartedAt);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logLine(`stampNewMessages failed conv=${this.conversationId}: ${msg}`);
@@ -508,7 +508,7 @@ class Worker {
       // bind the mobile-supplied otid without re-scanning. (lcp-y88)
       let newUserMessageId: string | null = null;
       try {
-        const after = listMessages(this.conversationId, this.agentId);
+        const after = await listMessages(this.conversationId, this.agentId);
         for (const m of after) {
           if (m?.id && !messageIdsBefore.has(m.id)) {
             recordRunMessage(runHandle, m.id);

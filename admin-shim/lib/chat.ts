@@ -710,12 +710,12 @@ export async function handleSendMessage(
       // ALSO appears — user sees two prompt bubbles.
       if (userOtid) {
         try {
-          const localId = findUnmappedTailUserMessageId(
+          const localId = await findUnmappedTailUserMessageId(
             conversationId ?? "default",
             agentId,
           );
           if (localId) {
-            writeOtidForLocalId(conversationId ?? "default", agentId, localId, userOtid);
+            await writeOtidForLocalId(conversationId ?? "default", agentId, localId, userOtid);
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
