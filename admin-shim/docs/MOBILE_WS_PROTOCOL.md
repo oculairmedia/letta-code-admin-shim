@@ -223,13 +223,13 @@ data class SendMessageFrame(
 
 #### `cancel`
 
-Cancel an in-flight turn. The client MUST supply `run_id`; the server
-also accepts the implicit "current run" if exactly one is in-flight on
-this session (`ws-handler.mjs:291`), but the public contract requires
-`run_id` and tests defend that:
+Cancel an in-flight turn. `run_id` is REQUIRED — the server does NOT
+fall back to an implicit "current run" (lcp-bll removed that path).
+Track the active run from `turn_started` + post-turn_started frames
+and pass it explicitly.
 
-- `ws: cancel with run_id flips the Run to cancelled` — the happy path
-- `ws: cancel with no run_id and no active turn → error{protocol_violation}` — missing-id error
+- `ws: cancel with run_id flips the Run to cancelled` — happy path
+- `ws: cancel without run_id → error{protocol_violation} (no implicit fallback)` — missing-id error
 
 ```json
 { "v": 1, "type": "cancel", "id": "…", "ts": "…",
@@ -242,8 +242,8 @@ Outcomes:
   arrives with `status: "completed"` or `"cancelled"` depending on the
   race (the run record will land at `cancelled` or `completed`).
 - run is unknown → `error{code: "run_not_found"}`, socket stays open.
-- no run_id and no active turn → `error{protocol_violation}`, socket
-  stays open.
+- no `run_id` field → `error{protocol_violation}`, socket stays open
+  (whether or not a turn is in flight).
 
 Kotlin:
 
@@ -890,7 +890,7 @@ originated mid-turn.
 | Code | Meaning | Socket closes? | When emitted | Suggested client action |
 |------|---------|----------------|--------------|-------------------------|
 | `invalid_token` | `hello.token` mismatch. | **Yes** (code 4000) | Authentication. | Stop reconnecting — token is wrong. Surface to UI. |
-| `protocol_violation` | Frame malformed; missing required field; wrong order; single-flight collision; unparseable JSON; pre-hello frame. | **Depends** — auth-time violations close (e.g. non-hello first), runtime violations do NOT (single-flight, missing send_message fields, missing cancel run_id). See `ws-handler.mjs:93-98` (`close = true` default) and the call sites overriding `close: false`. | Anywhere. | Fix the bug; do not retry blindly. |
+| `protocol_violation` | Frame malformed; missing required field (incl. `cancel.run_id`); wrong order; single-flight collision; unparseable JSON; pre-hello frame. | **Depends** — auth-time violations close (e.g. non-hello first), runtime violations do NOT (single-flight, missing send_message fields, missing cancel run_id). See `ws-handler.mjs:93-98` (`close = true` default) and the call sites overriding `close: false`. | Anywhere. | Fix the bug; do not retry blindly. |
 | `agent_not_found` | (declared in `ERROR_CODES`, not currently emitted) | No (if/when added) | Bridge bound to non-existent agent. | Refetch agent list. |
 | `conversation_not_found` | (declared, not currently emitted) | No (if/when added) | Bridge bound to non-existent conv. | Refetch conversations. |
 | `run_not_found` | `cancel` referenced a `run_id` the host doesn't recognize as active. | **No** | On cancel. | Drop the cancel; the run already ended. |
@@ -902,7 +902,7 @@ for validation errors during normal operation. The defaulting
 `sendError(code, msg)` (close=true) is only used during the
 hello/auth phase. Test
 `ws: send_message with missing agent_id → error{protocol_violation}, no close`
-and `ws: cancel with no run_id and no active turn → error{protocol_violation}` both confirm the soft-error behavior.
+and `ws: cancel without run_id → error{protocol_violation} (no implicit fallback)` both confirm the soft-error behavior.
 
 The close code on auth failure is `4000` (application-defined; not the
 WS standard `1008`) with the error code as the reason string. The

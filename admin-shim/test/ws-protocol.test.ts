@@ -421,7 +421,10 @@ test("ws: cancel with run_id flips the Run to cancelled", async (t) => {
 
 // ─── 11. cancel without run_id → protocol_violation ────────────────
 
-test("ws: cancel with no run_id and no active turn → error{protocol_violation}", async (t) => {
+test("ws: cancel without run_id → error{protocol_violation} (no implicit fallback)", async (t) => {
+  // run_id is required on every cancel — lcp-bll removed the previous
+  // implicit fallback to `currentRunId`. The error fires whether or not
+  // there's an active in-flight turn.
   const { conn } = await setupAuthed(t);
   conn.send({ type: "cancel" });
   const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as

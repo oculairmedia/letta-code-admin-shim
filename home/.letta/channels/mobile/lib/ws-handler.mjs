@@ -62,9 +62,11 @@ export function handleConnection(ws, request, host) {
   // first is still streaming is rejected with PROTOCOL_VIOLATION. Cancel
   // is the only way to abort an in-flight turn over the same socket.
   let inFlight = false;
-  // Track the current turn/run so cancel can target without an explicit id.
-  let currentTurnId = null;
-  let currentRunId = null;
+  // NOTE: an implicit "currentRunId" was previously tracked here so cancel
+  // could fall back to the in-flight run without an explicit id (lcp-bll).
+  // The contract now requires clients to send run_id explicitly, so the
+  // tracking is gone. activeRunId (below, scoped per-turn) carries the
+  // run-tracking state that other code still needs.
 
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -178,7 +180,6 @@ export function handleConnection(ws, request, host) {
           }),
           log,
         );
-        currentTurnId = turnId;
         try {
           await host.sendMessage(
             { agent_id, conversation_id, text, otid, turn_id: turnId, session_id: sessionId },
@@ -188,7 +189,6 @@ export function handleConnection(ws, request, host) {
               const runId = outFrame.run_id ?? activeRunId;
               if (runId && !activeRunId) {
                 activeRunId = runId;
-                currentRunId = runId;
               }
               const base = {
                 agent_id,
@@ -253,7 +253,6 @@ export function handleConnection(ws, request, host) {
             {
               onRunCreated: (id) => {
                 activeRunId = id;
-                currentRunId = id;
               },
             },
           );
@@ -282,13 +281,16 @@ export function handleConnection(ws, request, host) {
           }
         } finally {
           inFlight = false;
-          currentTurnId = null;
-          currentRunId = null;
         }
         break;
       }
       case "cancel": {
-        const targetRunId = frame.run_id ?? currentRunId;
+        // run_id is REQUIRED on cancel — the implicit fallback to the
+        // current in-flight run is gone (lcp-bll). Clients should track
+        // the active run_id from turn_started + post-turn_started frames
+        // and pass it explicitly. Doc: admin-shim/docs/MOBILE_WS_PROTOCOL.md
+        // §2.1 + §4.5.
+        const targetRunId = frame.run_id;
         if (!targetRunId) {
           sendError(ERROR_CODES.PROTOCOL_VIOLATION, "cancel needs run_id", { close: false });
           return;
