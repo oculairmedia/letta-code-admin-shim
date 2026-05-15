@@ -598,11 +598,16 @@ export async function handleSendMessage(
     if (res.writableEnded) return;
 
     if (reshaped.message_type === "stop_reason") {
-      pendingStop = reshaped;
+      // lcp-c4d: first-wins. Multi-step turns can emit several stop_reason
+      // frames upstream; the run-level contract (runs.ts finalizeRun) keeps
+      // the FIRST observed value. Align the SSE-stream contract by ignoring
+      // subsequent stop_reason frames once one is buffered.
+      if (pendingStop === null) pendingStop = reshaped;
       return;
     }
     if (reshaped.message_type === "usage_statistics") {
-      pendingUsage = reshaped;
+      // lcp-c4d: first-wins, matching the run-level contract above.
+      if (pendingUsage === null) pendingUsage = reshaped;
       return;
     }
     if (reshaped.message_type === "assistant_message") {
