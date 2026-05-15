@@ -1,25 +1,62 @@
 # Handoff — TypeScript migration of admin-shim
 
-State as of the last session. Open this in a fresh session to continue.
+**Status: COMPLETE.** Migration shipped 2026-05-15. Retained as historical
+reference + locked-contracts cheatsheet + live-shim restart command.
 
 ## Where we are
 
 - Repo: `/opt/stacks/letta-code-parallel`
 - Remote: https://github.com/oculairmedia/letta-code-admin-shim
 - Branch: `master`
-- Live shim (dogfood instance): tmux session `lettashim`, http://localhost:8291
-- Test suite: **141 tests / 140 pass + 1 todo / ~80s serial wall-time**, 100% deterministic after the OS-port-assignment fix
-- All source is still `.mjs` — the TS migration has NOT started yet
+- Live shim (dogfood instance): tmux session `lettashim`, http://localhost:8291 (running compiled `dist/server.js`)
+- Test suite: **144 tests / 143 pass + 1 todo / ~130s serial wall-time** on the TS source
+- All source files are now `.ts` except channel plugins (Hard Rule #3) and `test/helpers/letta-mock.mjs` (spawned subprocess) and `scripts/diff-vanilla.mjs` (utility script with JSDoc types)
 
-## What just shipped
+## What shipped (TS migration epic — lcp-dxa)
 
-Four commits on master:
-- `46b9b3d` — Initial commit (admin-shim + channels + migrator + docs + LICENSE + README + CI workflow)
-- `b9567dc` — Test harness: 138 behavioral tests + 9 captured letta-code stream traces + mock letta + GitHub Actions
-- `6191e10` — Fix WS / SSE conv-id asymmetry in mobile-channel-host (resolveConversationId is now called on WS path; literal `"default"` is refused to prevent multi-agent mis-routing; 2 new regression tests)
-- `178096f` — Stabilize test harness (OS-assigned ports via SHIM_PORT=0) + refuse ambiguous `default` in resolveConversationId + multi-agent regression test + this handoff doc
+17 phases, all committed to master:
 
-Working tree is clean. Ready to start the migration.
+- `c55ef62` lcp-ecg — Phase 1: TS tooling (tsconfig + tsx + CI typecheck)
+- `ab096f5` lcp-iym — Phase 2a: wire-shape types
+- `45ab746` lcp-9fd — Phase 2b: letta-code stream-json types + fixture-typecheck test
+- `563baab` lcp-bma — Phase 3a: runs.mjs → runs.ts + node --import tsx/esm loader
+- `e789f4a` lcp-gza — Phase 3b: store.mjs → store.ts
+- `686f799` lcp-u3q — Phase 3c: translate.mjs → translate.ts
+- `cd7ba96` lcp-09h — Phase 4a: agent-pool.mjs → agent-pool.ts
+- `476a51a` lcp-ry1 — Phase 4b: chat.mjs → chat.ts
+- `e09af0f` lcp-7sf — Phase 4c: mobile-channel-host.mjs → mobile-channel-host.ts
+- `2fd51f5` lcp-iei — Phase 5: server.mjs → server.ts
+- `4fd8e3f` lcp-grr — Phase 6a: test/helpers/*.mjs → .ts
+- `d4f9eed` lcp-cve — Phase 6b: test/*.test.mjs → .test.ts
+- `aa2f43f` lcp-62s — Phase 6c: flip build to emit dist/ (split tsconfig)
+- `a7fa625` lcp-afr — Phase 7a: strict-mode tightening (7 flags incl. checkJs)
+- `57d5c6d` lcp-dab — Phase 7c: publish channel-plugin .d.ts
+- `5e9d186` lcp-1ek — Phase 7b: docs (README/AGENTS/plugin READMEs)
+
+Side quests + follow-ups shipped during the migration:
+
+- `1cc4ca5` lcp-tqn — Add GET /v1/tools/{tool_id} (mobile tool-detail screen)
+- `cbe3ed6` Mobile WS protocol reference doc (admin-shim/docs/MOBILE_WS_PROTOCOL.md)
+- `3905398` lcp-fgd — WS stop_reason envelope uses `stop_reason:` (was `reason:`)
+- `2cc9bf7` lcp-bll — WS cancel.run_id is strictly required (no implicit fallback)
+
+Open follow-up beads filed during the work (not in scope for the epic;
+descriptive only):
+
+- `lcp-d9o` — chat.ts step_count:1 hardcoded on usage_statistics SSE frames
+- `lcp-0c5` — chat.ts run_ids:null hardcoded on usage_statistics SSE frames
+- `lcp-b3j` — translate.ts localMessageToLettaMessage emits a hybrid record
+- `lcp-4tv` — runs.ts background:false hardcode
+- `lcp-2zn` — translate.ts tool-return scalar stdout/stderr vs mobile List<String>
+- `lcp-c4d` — chat.ts SSE pendingStop/pendingUsage are last-wins (run-level is first-wins)
+- `lcp-pcg` — Meta: TS migration tightened disk-shape input validation (documented policy)
+
+Mobile-side companion bead:
+
+- `letta-mobile-9vgk` — Implement ChannelTransport (Android WS client against
+  the protocol described in admin-shim/docs/MOBILE_WS_PROTOCOL.md)
+
+Working tree is clean.
 
 ## Activating the sandbox
 
