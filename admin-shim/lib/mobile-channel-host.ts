@@ -302,17 +302,32 @@ interface MobileChannelPluginModule {
   default?: unknown;
 }
 
-let cachedAdapter: MobileChannelAdapter | null = null;
+// lcp-m06: cache the in-flight Promise rather than the resolved value.
+// Concurrent first-callers all await the same promise — start() runs
+// exactly once, only one adapter instance lives. On rejection we clear
+// the slot so a retry is possible.
+let cachedAdapterPromise: Promise<MobileChannelAdapter | null> | null = null;
 
 /**
  * Load the mobile channel plugin and create the adapter. Memoized.
  * Returns null if the channel isn't configured (no accounts.json or
  * no enabled account).
  */
-export async function getMobileChannelAdapter(
+export function getMobileChannelAdapter(
+  options: GetMobileChannelAdapterOptions,
+): Promise<MobileChannelAdapter | null> {
+  if (cachedAdapterPromise) return cachedAdapterPromise;
+  const promise = createMobileChannelAdapter(options);
+  cachedAdapterPromise = promise;
+  // Clear the cache on rejection so a fresh upgrade attempt can retry
+  // (e.g. accounts.json was just written, plugin file appears).
+  promise.catch(() => { cachedAdapterPromise = null; });
+  return promise;
+}
+
+async function createMobileChannelAdapter(
   { getServerId, log = console }: GetMobileChannelAdapterOptions,
 ): Promise<MobileChannelAdapter | null> {
-  if (cachedAdapter) return cachedAdapter;
   const account = loadAccount();
   if (!account) {
     log.log?.("[mobile-channel] no enabled account; channel disabled");
@@ -344,7 +359,6 @@ export async function getMobileChannelAdapter(
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();
-  cachedAdapter = adapter;
   log.log?.(`[mobile-channel] adapter ready (account=${account.accountId})`);
   return adapter;
 }
