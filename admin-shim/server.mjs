@@ -959,7 +959,11 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`letta-code admin shim listening on http://${HOST}:${PORT}`);
+  // Report the actual bound port — SHIM_PORT=0 lets the OS assign one,
+  // which the test harness uses to avoid port collisions across parallel
+  // suite invocations.
+  const actualPort = server.address()?.port ?? PORT;
+  console.log(`letta-code admin shim listening on http://${HOST}:${actualPort}`);
   console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env.LETTA_LOCAL_BACKEND_DIR ?? "(default)"}`);
 });
 

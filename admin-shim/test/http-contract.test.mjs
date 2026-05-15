@@ -564,7 +564,7 @@ test("GET /v1/conversations/{ext}/messages projects assistant text into assistan
   assert.equal(m.otid, "ui-msg-asst");
 });
 
-test("conversation external-id translation: both conv-default-{A} and direct internal id resolve", async (t) => {
+test("conversation external-id translation: conv-default-{A} resolves; bare literal `default` does NOT", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
 
@@ -577,12 +577,42 @@ test("conversation external-id translation: both conv-default-{A} and direct int
   assert.equal(viaExt.res.status, 200);
   assert.equal(viaExt.body.length, 1);
 
-  // Direct "default" form: doesn't match the regex; resolveConversationId scans
-  // disk for conv.id === "default" and finds it. This locks in BOTH code paths
-  // of resolveConversationId.
+  // Bare literal "default" is ambiguous on /v1/conversations/* (every agent
+  // has one) — the resolver refuses to disk-scan it to avoid mis-routing
+  // on a multi-agent backend. handleConversationMessagesList returns a
+  // mobile-friendly 200-empty rather than 404 for unresolved ids.
   const viaDefault = await getJson(`${shim.url}/v1/conversations/default/messages`);
   assert.equal(viaDefault.res.status, 200);
-  assert.equal(viaDefault.body.length, 1);
+  assert.equal(viaDefault.body.length, 0, "literal `default` must NOT resolve via disk-scan");
+});
+
+test("multi-agent default disambiguation: bare literal `default` doesn't disk-scan to the wrong agent", async (t) => {
+  // The disk-scan hazard: with two agents seeded, the old resolver returned
+  // whichever default it encountered first — silently routing reads to the
+  // wrong agent. Now it returns null, and the messages endpoint returns
+  // 200-empty rather than leaking another agent's messages.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const aA = seedAgent(shim.stateDir, { id: "agent-multi-resolve-a" });
+  const aB = seedAgent(shim.stateDir, { id: "agent-multi-resolve-b" });
+  seedConversation(shim.stateDir, aA);
+  seedConversation(shim.stateDir, aB);
+  seedMessage(shim.stateDir, aA, "default", { id: "a-msg-1", role: "user", content: "A's prior" });
+  seedMessage(shim.stateDir, aB, "default", { id: "b-msg-1", role: "user", content: "B's prior" });
+
+  // Each external id resolves to its agent's messages exactly.
+  const viaA = await getJson(`${shim.url}/v1/conversations/conv-default-${aA}/messages`);
+  const viaB = await getJson(`${shim.url}/v1/conversations/conv-default-${aB}/messages`);
+  assert.equal(viaA.body.length, 1);
+  assert.equal(viaB.body.length, 1);
+  assert.equal(viaA.body[0].content, "A's prior");
+  assert.equal(viaB.body[0].content, "B's prior");
+
+  // Bare literal "default" → 200 empty, never leaks either agent's messages.
+  const viaDefault = await getJson(`${shim.url}/v1/conversations/default/messages`);
+  assert.equal(viaDefault.res.status, 200);
+  assert.equal(viaDefault.body.length, 0, "literal `default` must not leak any agent's messages");
 });
 
 // ── conversation create (POST) ─────────────────────────────────────

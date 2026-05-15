@@ -59,17 +59,10 @@ async function bridgeSendMessage(
   // the resolved (agentId, conversationId) pair wins over the client's
   // agent_id — the conv on disk is the source of truth for which agent
   // owns it. When it doesn't resolve (fresh agent before its disk record
-  // exists, or a custom conv letta hasn't persisted yet), fall back to
-  // the client's pair.
-  //
-  // The literal "default" is intentionally NOT resolved — every agent has
-  // its own default conv, so the id alone is ambiguous. Trust the client's
-  // agent_id in that case. (resolveConversationId would otherwise disk-scan
-  // and return the FIRST agent's default it finds, which is the wrong
-  // agent for a multi-agent backend.)
-  const resolved = conversation_id && conversation_id !== "default"
-    ? resolveConversationId(conversation_id)
-    : null;
+  // exists, a custom conv letta hasn't persisted yet, or the ambiguous
+  // bare literal "default" which the resolver refuses), fall back to
+  // the client's pair so the worker pool can still target a fresh conv.
+  const resolved = resolveConversationId(conversation_id);
   const effectiveAgentId = resolved?.agentId ?? agent_id;
   const effectiveConvId = resolved?.conversationId ?? conversation_id;
 

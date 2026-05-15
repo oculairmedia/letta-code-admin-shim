@@ -32,11 +32,11 @@ const REPO_ROOT = join(ADMIN_SHIM_ROOT, "..");
 const FIXTURES_STATE = join(__dirname, "..", "fixtures", "state");
 const MOCK_LETTA = join(__dirname, "letta-mock.mjs");
 
-let _portCursor = 18290 + Math.floor(Math.random() * 1000);
-function nextPort() {
-  _portCursor += 1;
-  return _portCursor;
-}
+// Use OS-assigned ports (SHIM_PORT=0). The shim logs the actual port after
+// bind; the helper parses it from the log line. This avoids the port-cursor
+// collisions we hit when many tests across multiple test files were picking
+// from a small random range — under load some shims would lose the race and
+// fail to start with EADDRINUSE.
 
 /**
  * Start the shim. Returns a handle with:
@@ -56,7 +56,6 @@ function nextPort() {
  *   waitForReady  — if false, return as soon as we have a port (default true)
  */
 export async function startShim(opts = {}) {
-  const port = nextPort();
   const tmp = mkdtempSync(join(tmpdir(), "shim-test-"));
   const stateDir = join(tmp, "state");
   const homeDir = join(tmp, "home");
@@ -112,7 +111,7 @@ export async function startShim(opts = {}) {
     LETTA_BASE_URL: "http://127.0.0.1:0",
     LMSTUDIO_BASE_URL: "http://127.0.0.1:0",
     LETTA_BIN: MOCK_LETTA,
-    SHIM_PORT: String(port),
+    SHIM_PORT: "0",
     SHIM_HOST: "127.0.0.1",
     MOBILE_CHANNEL_TOKEN: mobileToken,
     NODE_PATH: join(ADMIN_SHIM_ROOT, "node_modules"),
@@ -134,9 +133,12 @@ export async function startShim(opts = {}) {
   child.stdout.on("data", (b) => { log += b.toString("utf8"); });
   child.stderr.on("data", (b) => { log += b.toString("utf8"); });
 
+  // Port is OS-assigned at bind time; we parse it from the "listening on"
+  // log line once the shim is ready (see below). Url/port are populated
+  // before startShim() resolves.
   const handle = {
-    url: `http://127.0.0.1:${port}`,
-    port,
+    url: null,
+    port: null,
     stateDir,
     homeDir,
     mobileToken,
@@ -179,10 +181,21 @@ export async function startShim(opts = {}) {
 
   if (opts.waitForReady === false) return handle;
 
-  // Wait for the listen line, then a successful health check.
-  await handle.waitForLogLine(/listening on/, { timeoutMs: 5000 });
+  // Wait for the listen line and parse the actual OS-assigned port from it.
+  // Generous timeout because the suite spawns many shims back-to-back; an
+  // event-loop hiccup while a prior shim is still tearing down can delay
+  // startup well past a tight 5s budget.
+  const READY_TIMEOUT_MS = Number(process.env.SHIM_TEST_READY_TIMEOUT_MS ?? 15000);
+  await handle.waitForLogLine(/listening on/, { timeoutMs: READY_TIMEOUT_MS });
+  const portMatch = log.match(/listening on http:\/\/[^:]+:(\d+)/);
+  if (!portMatch) {
+    await handle.stop();
+    throw new Error(`could not parse port from log: ${log.slice(0, 500)}`);
+  }
+  handle.port = Number(portMatch[1]);
+  handle.url = `http://127.0.0.1:${handle.port}`;
   const start = Date.now();
-  while (Date.now() - start < 5000) {
+  while (Date.now() - start < READY_TIMEOUT_MS) {
     try {
       const res = await fetch(`${handle.url}/v1/health/`);
       if (res.ok) return handle;

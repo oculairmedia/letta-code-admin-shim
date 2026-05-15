@@ -113,13 +113,21 @@ export function listAllConversations() {
 /**
  * Resolve a shim-external conv id like `conv-default-agent-foo` (or a real
  * `conv-...` id) into the LocalStore-internal pair (conversationId, agentId).
+ *
+ * Refuses to resolve the bare literal `"default"`. Every agent has its own
+ * default conv, so the id alone is ambiguous — disk-scanning for "default"
+ * silently routes to the first agent we find, which mis-targets the wrong
+ * agent on any multi-agent backend. Callers that need to address an
+ * agent's default conv MUST use the external `conv-default-<agentId>`
+ * form (the conversation list endpoint synthesizes this), or supply the
+ * agent context out-of-band (e.g. `/v1/agents/{id}/...` routes).
  */
 export function resolveConversationId(externalId) {
   if (!externalId) return null;
+  if (externalId === "default") return null;
   const defaultMatch = externalId.match(/^conv-default-(agent-.+)$/);
   if (defaultMatch) return { conversationId: "default", agentId: defaultMatch[1] };
-  // Otherwise scan disk for a matching conv-* id (or the literal "default"
-  // if someone passed that directly — unlikely from mobile).
+  // Otherwise scan disk for a matching conv-* id.
   for (const conv of listAllConversations()) {
     if (conv.id === externalId) {
       return { conversationId: conv.id, agentId: conv.agent_id };
