@@ -16,7 +16,7 @@ import { readFile, writeFile, readdir, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-const storageDir = process.env.LETTA_LOCAL_BACKEND_DIR;
+const storageDir = process.env["LETTA_LOCAL_BACKEND_DIR"];
 if (!storageDir) {
   console.error("LETTA_LOCAL_BACKEND_DIR is required");
   process.exit(2);
@@ -28,6 +28,7 @@ if (!existsSync(convRoot)) {
   process.exit(2);
 }
 
+/** @param {string} path */
 async function readJsonOrNull(path) {
   try {
     const txt = await readFile(path, "utf8");
@@ -37,6 +38,8 @@ async function readJsonOrNull(path) {
   }
 }
 
+/** @param {string} path
+ *  @param {unknown} value */
 async function atomicWriteJson(path, value) {
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
   await writeFile(tmp, JSON.stringify(value, null, 2) + "\n");

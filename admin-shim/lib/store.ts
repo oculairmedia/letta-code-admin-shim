@@ -26,7 +26,7 @@ import {
   unlink as fsUnlink,
   writeFile as fsWriteFile,
 } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -649,7 +649,15 @@ export function readBlocksForAgent(agentId: string): Block[] {
     const label = fname.replace(/\.md$/, "");
     const value = readFileSync(join(memSysDir, fname), "utf8");
     out.push({
-      id: `block-${b64url(`${agentId}:${label}`).slice(0, 24)}`,
+      // lcp-pwz follow-up: previously this used
+      //   `block-${b64url(`${agentId}:${label}`).slice(0, 24)}`
+      // The slice cut off everything past the agent-id prefix because
+      // base64-encoded agent UUIDs already exceed 24 chars before reaching
+      // the `:` separator. Every block on the same agent ended up sharing
+      // an id, which crashed mobile's blocks screen on duplicate
+      // LazyColumn keys. Switch to a sha256 hash so the id is unique by
+      // construction and still fixed-width (vanilla Letta shape).
+      id: `block-${createHash("sha256").update(`${agentId}:${label}`).digest("hex").slice(0, 24)}`,
       label,
       value,
       description: null,
