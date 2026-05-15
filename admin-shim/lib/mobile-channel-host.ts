@@ -138,14 +138,22 @@ async function bridgeSendMessage(
   // Buffer assistant_message chunks for server-side coalescing so the
   // mobile channel matches vanilla's "one assistant_message per turn"
   // contract — identical to how the REST stream path coalesces.
+  // chunkBuffer is an array of content strings joined once at flush
+  // time (lcp-86o); the previous `prev.content + new.content` per
+  // chunk was O(n^2) in total chunk count for long streams.
   let pendingAssistant: BridgeFrame | null = null;
+  let chunkBuffer: string[] | null = null;
   let pendingStop: BridgeFrame | null = null;
   let pendingUsage: BridgeFrame | null = null;
 
   const flushPendingAssistant = (): void => {
     if (pendingAssistant) {
+      if (chunkBuffer && pendingAssistant.message_type === "assistant_message") {
+        pendingAssistant.content = chunkBuffer.join("");
+      }
       onFrame(pendingAssistant);
       pendingAssistant = null;
+      chunkBuffer = null;
     }
   };
 
@@ -180,8 +188,9 @@ async function bridgeSendMessage(
           pendingAssistant.otid &&
           pendingAssistant.otid === reshaped.otid
         ) {
-          pendingAssistant.content =
-            (pendingAssistant.content ?? "") + (reshaped.content ?? "");
+          // Push into the chunk buffer instead of `content + content`.
+          if (!chunkBuffer) chunkBuffer = [pendingAssistant.content ?? ""];
+          chunkBuffer.push(reshaped.content ?? "");
           pendingAssistant.id = reshaped.id;
           pendingAssistant.date = reshaped.date;
           pendingAssistant.seq_id = reshaped.seq_id;
@@ -189,6 +198,7 @@ async function bridgeSendMessage(
         }
         flushPendingAssistant();
         pendingAssistant = { ...reshaped };
+        chunkBuffer = null;
         return;
       }
       flushPendingAssistant();
