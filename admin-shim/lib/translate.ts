@@ -171,6 +171,27 @@ export function agentToLettaState(
 // Parts → text helpers
 // ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Wrap a possibly-scalar tool stdout/stderr value into a `string[] | null`
+ * to match the wire contract (Kotlin Message.kt declares List<String>?).
+ * letta-code's on-disk LocalMessage part can carry either a scalar string
+ * (one stdout line) or an array (multi-line capture). Pass arrays through
+ * verbatim; lift scalars into a single-element array; null/undefined → null.
+ * Filters non-string array entries defensively. See lcp-2zn.
+ */
+export function toStringArrayOrNull(value: unknown): string[] | null {
+  if (value == null) return null;
+  if (Array.isArray(value)) {
+    const out: string[] = [];
+    for (const v of value) {
+      if (typeof v === "string") out.push(v);
+    }
+    return out;
+  }
+  if (typeof value === "string") return [value];
+  return null;
+}
+
 function partsToText(parts: unknown): string {
   if (!Array.isArray(parts)) return "";
   return parts
@@ -548,8 +569,13 @@ export function localMessageToConversationMessages(
         typeof part.tool_return === "string"
           ? part.tool_return
           : JSON.stringify(part.tool_return ?? "");
-      const stdout = part.stdout ?? null;
-      const stderr = part.stderr ?? null;
+      // Mobile's Kotlin Message.kt declares stdout/stderr as List<String>?
+      // (Message.kt:237-238). letta-code's LocalMessage part can carry either
+      // a scalar string OR an array — wrap scalars into a single-element
+      // array so the wire shape always satisfies the Kotlin contract.
+      // lcp-2zn closes the previously-flagged mismatch.
+      const stdout = toStringArrayOrNull(part.stdout);
+      const stderr = toStringArrayOrNull(part.stderr);
       const tr: ToolReturn = {
         tool_call_id: callId,
         status,

@@ -172,14 +172,11 @@ export interface ToolReturn {
   tool_call_id: string;
   status: string;
   func_response: string | null;
-  /** Kotlin Message.kt declares `List<String>?`; the shim's disk-projection
-   * path (translate.mjs `tool-return` branch) passes through whatever the
-   * upstream LocalMessage carried, which historically can be a bare scalar
-   * `string` for some tool integrations. Widening to `string | string[] | null`
-   * preserves runtime behavior; lcp-2zn tracks normalizing this to
-   * `string[] | null`. */
-  stdout: string | string[] | null;
-  stderr: string | string[] | null;
+  /** Kotlin Message.kt declares `List<String>?`. The shim's disk-projection
+   * path (translate.ts `tool-return` branch) now normalizes scalars into
+   * a single-element array via toStringArrayOrNull (lcp-2zn). */
+  stdout: string[] | null;
+  stderr: string[] | null;
   type?: string;
 }
 
@@ -197,10 +194,10 @@ export interface ToolReturnMessage extends LettaMessageBase {
   tool_return: string | null;
   status: string;
   tool_call_id: string | null;
-  /** See {@link ToolReturn.stdout} — same scalar-passthrough caveat. */
-  stdout: string | string[] | null;
-  /** See {@link ToolReturn.stderr} — same scalar-passthrough caveat. */
-  stderr: string | string[] | null;
+  /** See {@link ToolReturn.stdout} — normalized to string[] via lcp-2zn. */
+  stdout: string[] | null;
+  /** See {@link ToolReturn.stderr} — normalized to string[] via lcp-2zn. */
+  stderr: string[] | null;
   tool_returns: ToolReturn[] | null;
 }
 

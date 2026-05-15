@@ -18,6 +18,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { getAgentPool } from "./agent-pool.js";
 import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.js";
+import { toStringArrayOrNull } from "./translate.js";
 import type {
   LettaMessage,
   AssistantMessage,
@@ -344,8 +345,8 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
       tool_return: (f["tool_return"] ?? null) as string | null,
       status: (f["status"] ?? "success") as string,
       tool_call_id: (callId ?? null) as string | null,
-      stdout: (f["stdout"] ?? null) as string | string[] | null,
-      stderr: (f["stderr"] ?? null) as string | string[] | null,
+      stdout: toStringArrayOrNull(f["stdout"]),
+      stderr: toStringArrayOrNull(f["stderr"]),
       tool_returns: trs,
     };
   }
