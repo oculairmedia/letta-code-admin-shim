@@ -14,7 +14,7 @@
  * frame as data. We pass them through largely unchanged.
  */
 
-import { getAgentPool } from "./agent-pool.mjs";
+import { getAgentPool } from "./agent-pool.js";
 import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.js";
 
 const POOL_ENABLED = process.env.SHIM_POOL_DISABLE !== "1";

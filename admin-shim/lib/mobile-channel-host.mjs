@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { reshapeFrame } from "./chat.mjs";
-import { cancelRun, getAgentPool } from "./agent-pool.mjs";
+import { cancelRun, getAgentPool } from "./agent-pool.js";
 import {
   findUnmappedTailUserMessageId,
   resolveConversationId,

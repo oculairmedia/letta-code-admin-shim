@@ -463,7 +463,11 @@ export interface Step {
   created_at: string;
   model?: string | null;
   stop_reason?: string | null;
-  usage?: Partial<RunUsage>;
+  /** `null` is a legitimate value, not just absence: when a stop_reason
+   * fires with no preceding usage_statistics frame, agent-pool writes
+   * `"usage":null` to steps.jsonl explicitly (so the field's presence
+   * itself signals "step boundary observed"). */
+  usage?: Partial<RunUsage> | null;
   [k: string]: unknown;
 }
 

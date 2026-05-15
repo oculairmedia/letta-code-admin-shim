@@ -22,7 +22,7 @@
  *   SHIM_POOL_SPAWN_TIMEOUT default 15000 ms to wait for the init frame
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { listMessages, stampNewMessages } from "./store.js";
 import {
@@ -32,7 +32,14 @@ import {
   recordRunMessage,
   recordRunStep,
   recordRunTool,
+  type RunHandle,
+  type UsageInput,
 } from "./runs.js";
+import type {
+  LettaStreamFrame,
+  LettaInnerEvent,
+  UsageStatisticsEvent,
+} from "./types/letta-stream.js";
 
 const LETTA_BIN = process.env.LETTA_BIN || "letta";
 const MAX_WORKERS = Number(process.env.SHIM_POOL_MAX ?? 10);
@@ -40,16 +47,126 @@ const IDLE_EVICT_MS = Number(process.env.SHIM_POOL_IDLE_SEC ?? 300) * 1000;
 const SPAWN_TIMEOUT_MS = Number(process.env.SHIM_POOL_SPAWN_TIMEOUT ?? 15000);
 const HOUSEKEEP_INTERVAL_MS = 30_000;
 
-function logLine(msg) {
+/**
+ * Synthetic frame the Worker injects into the active turn's frame handler
+ * when the child process exits mid-turn. Not part of the upstream
+ * LettaStreamFrame discriminated union — see the WorkerFrame alias below.
+ */
+interface ExitFrame {
+  type: "__exit__";
+  exit_code: number | null;
+  stderr: string;
+}
+
+/**
+ * What the per-turn frame handler ("collector") receives: either an
+ * upstream letta-code frame or the synthetic __exit__ injected on child
+ * death. The collector branches on `type === "__exit__"` and never
+ * forwards that branch to the caller-supplied onFrame.
+ */
+type WorkerFrame = LettaStreamFrame | ExitFrame;
+
+/** Options accepted by `Worker#runTurn`. */
+export interface RunTurnOptions {
+  onFrame?: (frame: LettaStreamFrame, meta: { runId: string }) => void;
+  /**
+   * Caller-supplied turn-start anchor. `chat.mjs` captures this BEFORE
+   * calling `pool.get()` so disk-stamped and stream-emitted timestamps
+   * share a base. Accepts Date or epoch-ms number; falls back to `now`.
+   */
+  turnStartedAt?: Date | number;
+  onRunCreated?: (runId: string) => void;
+}
+
+/**
+ * Resolution value of `runTurn`. Carries the collected frames, the
+ * worker's recent stderr tail, the Run id, and whichever of the
+ * lifecycle flags applies (only one of `done`/`exit`/`timeout`/`dead`
+ * is set in practice).
+ */
+export interface RunTurnResult {
+  frames: LettaStreamFrame[];
+  stderr: string;
+  run_id?: string;
+  cancelled?: boolean;
+  /** True when a `result` frame closed the turn cleanly. */
+  done?: boolean;
+  /** True when the child exited mid-turn. */
+  exit?: boolean;
+  /** Exit code captured from the synthetic __exit__ frame. */
+  code?: number | null;
+  /** True when TURN_TIMEOUT_MS elapsed before completion. */
+  timeout?: boolean;
+  /** True when the worker was already dead or stdin write failed. */
+  dead?: boolean;
+  /** Set when an error short-circuited the turn (e.g. stdin write). */
+  error?: string;
+}
+
+/** Constructor args for the Worker class. */
+interface WorkerOptions {
+  conversationId: string;
+  agentId: string;
+}
+
+/** One snapshot row in `AgentPool#stats`. */
+export interface WorkerStat {
+  key: string;
+  conversation_id: string;
+  agent_id: string;
+  ready: boolean;
+  dead: boolean;
+  idle_sec: number;
+  spawned_sec: number;
+}
+
+/** Return shape of `AgentPool#stats`. */
+export interface PoolStats {
+  size: number;
+  max: number;
+  idle_evict_sec: number;
+  workers: WorkerStat[];
+}
+
+function logLine(msg: string): void {
   console.log(`[pool] ${msg}`);
 }
 
-function nextTurnId() {
-  return `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+/**
+ * Best-effort discriminator for an upstream letta-code stream frame.
+ * Subprocess stdout lines are JSON.parse'd into `unknown`; we narrow to
+ * `LettaStreamFrame` only after this guard fires. Init/system frames
+ * are still detected by the readiness path (which looks at the raw
+ * parsed object) — this guard intentionally accepts the full top-level
+ * union so the per-turn collector can branch on it.
+ */
+function isLettaStreamFrame(value: unknown): value is LettaStreamFrame {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.type === "string";
+}
+
+/** Pull the inner event when present, else fall back to the frame itself. */
+function frameEvent(frame: LettaStreamFrame): LettaInnerEvent | LettaStreamFrame {
+  if (frame.type === "stream_event") return frame.event;
+  return frame;
 }
 
 class Worker {
-  constructor({ conversationId, agentId }) {
+  conversationId: string;
+  agentId: string;
+  child: ChildProcessWithoutNullStreams | null;
+  stdoutBuf: string;
+  stderrBuf: string;
+  ready: boolean;
+  dead: boolean;
+  lastUsedAt: number;
+  spawnedAt: number;
+  chain: Promise<unknown>;
+  frameHandler: ((frame: WorkerFrame) => void) | null;
+  private _onReady: (() => void) | null = null;
+
+  constructor({ conversationId, agentId }: WorkerOptions) {
     this.conversationId = conversationId;
     this.agentId = agentId;
     this.child = null;
@@ -63,7 +180,7 @@ class Worker {
     this.frameHandler = null; // (frame) => void during a turn
   }
 
-  async spawn() {
+  async spawn(): Promise<void> {
     // letta-code's CLI: --conversation "default" REQUIRES --agent. Other
     // conversation ids REJECT --agent.
     const scope =
@@ -91,14 +208,14 @@ class Worker {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    this.child.stdout.on("data", (chunk) => this._ingestStdout(chunk));
-    this.child.stderr.on("data", (chunk) => {
+    this.child.stdout.on("data", (chunk: Buffer | string) => this._ingestStdout(chunk));
+    this.child.stderr.on("data", (chunk: Buffer | string) => {
       this.stderrBuf += chunk.toString("utf8");
       if (this.stderrBuf.length > 8192) {
         this.stderrBuf = this.stderrBuf.slice(-8192);
       }
     });
-    this.child.on("exit", (code) => {
+    this.child.on("exit", (code: number | null) => {
       this.dead = true;
       this.ready = false;
       if (this.frameHandler) {
@@ -108,18 +225,18 @@ class Worker {
       }
       logLine(`worker conv=${this.conversationId} exited code=${code}`);
     });
-    this.child.on("error", (err) => {
+    this.child.on("error", (err: Error) => {
       this.dead = true;
       this.ready = false;
       logLine(`worker conv=${this.conversationId} error: ${err.message}`);
     });
 
     // Wait for the init frame
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+    await new Promise<void>((resolve, reject) => {
+      const timer: NodeJS.Timeout = setTimeout(() => {
         reject(new Error(`pool spawn timeout for conv=${this.conversationId}`));
       }, SPAWN_TIMEOUT_MS);
-      const onReady = () => {
+      const onReady = (): void => {
         clearTimeout(timer);
         resolve();
       };
@@ -127,7 +244,7 @@ class Worker {
     });
   }
 
-  _ingestStdout(chunk) {
+  _ingestStdout(chunk: Buffer | string): void {
     this.stdoutBuf += chunk.toString("utf8");
     for (;;) {
       const idx = this.stdoutBuf.indexOf("\n");
@@ -135,12 +252,15 @@ class Worker {
       const line = this.stdoutBuf.slice(0, idx).trim();
       this.stdoutBuf = this.stdoutBuf.slice(idx + 1);
       if (!line) continue;
-      let frame;
+      let parsed: unknown;
       try {
-        frame = JSON.parse(line);
+        parsed = JSON.parse(line);
       } catch {
         continue;
       }
+
+      if (!isLettaStreamFrame(parsed)) continue;
+      const frame: LettaStreamFrame = parsed;
 
       // Init frame readies the worker.
       if (
@@ -170,10 +290,10 @@ class Worker {
    * Turns are queued on the per-worker chain so two simultaneous callers
    * can't interleave.
    */
-  runTurn(userText, { onFrame, turnStartedAt: passedStart, onRunCreated } = {}) {
+  runTurn(userText: string, { onFrame, turnStartedAt: passedStart, onRunCreated }: RunTurnOptions = {}): Promise<RunTurnResult> {
     const previous = this.chain;
-    let resolveTurn;
-    const turnPromise = new Promise((r) => (resolveTurn = r));
+    let resolveTurn!: (value: RunTurnResult) => void;
+    const turnPromise = new Promise<RunTurnResult>((r) => (resolveTurn = r));
     this.chain = previous.then(async () => {
       if (this.dead) {
         resolveTurn({ frames: [], dead: true, stderr: this.stderrBuf });
@@ -196,7 +316,7 @@ class Worker {
       // We register an onCancel hook that signals the child so an in-flight
       // turn can be aborted from the cancel API.
       let cancelled = false;
-      const runHandle = createRun({
+      const runHandle: RunHandle = createRun({
         agentId: this.agentId,
         conversationId: this.conversationId,
         onCancel: () => {
@@ -208,15 +328,29 @@ class Worker {
         try { onRunCreated(runHandle.id); } catch {}
       }
 
-      const frames = [];
-      let finished = null;
+      const frames: LettaStreamFrame[] = [];
+      // `finished` is the lifecycle latch the turn-wait loop polls. Each
+      // shape captures one of: clean end-of-turn (`done`), child exit
+      // (`exit` + `code` + `stderr`), or the safety-timeout
+      // (`timeout`). At most one is set during a turn. `done`/`exit`/
+      // `timeout` are optional flags because the .mjs spreads `finished`
+      // into the result and downstream callsites (chat.mjs:565) check
+      // `turn?.dead || turn?.exit` — preserve those property names.
+      type FinishedState = {
+        done?: true;
+        exit?: true;
+        timeout?: true;
+        code?: number | null;
+        stderr?: string;
+      };
+      let finished: FinishedState | null = null;
       // Buffer the most-recent usage_statistics frame seen in the current
       // step. letta-code emits one usage_statistics + one stop_reason per
       // model step; when stop_reason fires we attribute the buffered usage
       // to the step record. This is what makes per-step token tracking
       // possible (without it we'd only have the run-level aggregate).
-      let pendingStepUsage = null;
-      const collector = (frame) => {
+      let pendingStepUsage: UsageInput | null = null;
+      const collector = (frame: WorkerFrame): void => {
         if (frame.type === "__exit__") {
           finished = { exit: true, code: frame.exit_code, stderr: frame.stderr };
           return;
@@ -225,36 +359,84 @@ class Worker {
         // Run-tracking side effects. Best-effort — failures shouldn't
         // hose the turn.
         try {
-          const ev = frame?.event ?? frame;
-          const mt = ev?.message_type ?? frame.message_type;
+          const ev = frameEvent(frame);
+          // `message_type` only lives on inner stream events + the
+          // `stream_event` variant lifts it via `frameEvent`. Top-level
+          // frames (queue_*, auto_approval, result, system) have no
+          // `message_type` and fall through every branch below.
+          const mt: string | undefined =
+            "message_type" in ev && typeof ev.message_type === "string"
+              ? ev.message_type
+              : undefined;
           if (mt === "assistant_message" || mt === "tool_call_message" || mt === "approval_request_message") {
             markRunFirstToken(runHandle);
           }
-          const toolName = ev?.tool_call?.name ?? frame?.tool_call?.name;
+          // Tool call name lives on the inner event's `tool_call` only
+          // (approval_request_message / tool_call_message). Top-level
+          // `auto_approval` ALSO carries `tool_call` but is not a
+          // discriminator path the mjs read — preserve that by reading
+          // the inner-event path first, then falling back to a raw
+          // `tool_call` on the frame itself (covers `auto_approval`).
+          const evToolCall =
+            "tool_call" in ev && ev.tool_call && typeof ev.tool_call === "object"
+              ? (ev.tool_call as { name?: unknown })
+              : undefined;
+          const frameToolCall =
+            frame.type === "auto_approval" ? frame.tool_call : undefined;
+          const toolName =
+            (typeof evToolCall?.name === "string" ? evToolCall.name : undefined)
+            ?? (typeof frameToolCall?.name === "string" ? frameToolCall.name : undefined);
           if (toolName) recordRunTool(runHandle, toolName);
           if (mt === "usage_statistics") {
+            const u = ev as UsageStatisticsEvent;
             pendingStepUsage = {
-              prompt_tokens: ev.prompt_tokens ?? 0,
-              completion_tokens: ev.completion_tokens ?? 0,
-              total_tokens: ev.total_tokens ?? 0,
-              cached_input_tokens: ev.cached_input_tokens ?? 0,
-              cache_write_tokens: ev.cache_write_tokens ?? 0,
-              reasoning_tokens: ev.reasoning_tokens ?? 0,
+              prompt_tokens: u.prompt_tokens ?? 0,
+              completion_tokens: u.completion_tokens ?? 0,
+              total_tokens: u.total_tokens ?? 0,
+              cached_input_tokens: u.cached_input_tokens ?? 0,
+              cache_write_tokens: u.cache_write_tokens ?? 0,
+              reasoning_tokens: u.reasoning_tokens ?? 0,
             };
           }
           if (mt === "stop_reason") {
             // letta-code sends one stop_reason per model step. Use it as a
             // step boundary marker so num_steps reflects actual model turns.
+            // `stop_reason`/`model` are read off `ev` and `frame` exactly
+            // as the .mjs did — keep the `ev.stop_reason ?? null`,
+            // `ev.model ?? frame?.model ?? null` precedence.
+            //
+            // `usage: pendingStepUsage` (NOT `?? undefined`) is intentional:
+            // when no usage_statistics fired between this stop_reason and
+            // the previous one, the .mjs wrote "usage":null to steps.jsonl
+            // explicitly. Coercing null→undefined would let JSON.stringify
+            // omit the field — a disk-bytes change.
+            const stopReasonRaw =
+              "stop_reason" in ev && typeof ev.stop_reason === "string"
+                ? ev.stop_reason
+                : undefined;
+            const evAsRec = ev as unknown as Record<string, unknown>;
+            const frameAsRec = frame as unknown as Record<string, unknown>;
+            const evModel =
+              "model" in ev && typeof evAsRec.model === "string"
+                ? (evAsRec.model)
+                : undefined;
+            const frameModel =
+              "model" in frame && typeof frameAsRec.model === "string"
+                ? (frameAsRec.model)
+                : undefined;
             recordRunStep(runHandle, {
-              stop_reason: ev.stop_reason,
+              stop_reason: stopReasonRaw,
               usage: pendingStepUsage,
-              model: ev.model ?? frame?.model ?? null,
+              model: evModel ?? frameModel ?? null,
             });
             pendingStepUsage = null;
           }
         } catch {}
         if (onFrame) {
-          try { onFrame(frame, { runId: runHandle.id }); } catch (err) { logLine(`onFrame error: ${err.message}`); }
+          try { onFrame(frame, { runId: runHandle.id }); } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logLine(`onFrame error: ${msg}`);
+          }
         }
         if (frame.type === "result") {
           finished = { done: true };
@@ -264,24 +446,27 @@ class Worker {
       // Snapshot existing message ids so we can attribute newly-persisted
       // messages to this run after the turn settles. listMessages reads
       // messages.jsonl which letta-code appends to during the turn.
-      const messageIdsBefore = new Set(
-        listMessages(this.conversationId, this.agentId).map((m) => m?.id).filter(Boolean),
+      const messageIdsBefore = new Set<string>(
+        listMessages(this.conversationId, this.agentId)
+          .map((m) => m?.id)
+          .filter((id): id is string => Boolean(id)),
       );
       try {
-        this.child.stdin.write(
+        this.child!.stdin.write(
           JSON.stringify({ type: "user", message: { content: userText } }) + "\n",
         );
       } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
         this.frameHandler = null;
         this.dead = true;
-        finalizeRun(runHandle, { status: "failed", stopReason: `stdin_write_error: ${err.message}` });
-        resolveTurn({ frames: [], dead: true, error: err.message, run_id: runHandle.id });
+        finalizeRun(runHandle, { status: "failed", stopReason: `stdin_write_error: ${errMsg}` });
+        resolveTurn({ frames: [], dead: true, error: errMsg, run_id: runHandle.id, stderr: this.stderrBuf });
         return;
       }
       // Wait for the result frame OR child exit. Add a generous safety
       // timeout so a stuck worker doesn't block the chain forever.
       const TURN_TIMEOUT_MS = Number(process.env.SHIM_POOL_TURN_TIMEOUT ?? 180_000);
-      await new Promise((r) => {
+      await new Promise<void>((r) => {
         const start = Date.now();
         const poll = setInterval(() => {
           if (finished) {
@@ -304,7 +489,8 @@ class Worker {
       try {
         stampNewMessages(this.conversationId, this.agentId, turnStartedAt);
       } catch (err) {
-        logLine(`stampNewMessages failed conv=${this.conversationId}: ${err.message}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`stampNewMessages failed conv=${this.conversationId}: ${msg}`);
       }
       // Attribute newly-persisted messages to this run, then finalize.
       // `cancelled` short-circuits because cancelRun already wrote the
@@ -318,22 +504,62 @@ class Worker {
           }
         }
       } catch (err) {
-        logLine(`run message attribution failed for ${runHandle.id}: ${err.message}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`run message attribution failed for ${runHandle.id}: ${msg}`);
       }
-      const stopFrame = frames.find((f) => (f?.event?.message_type ?? f?.message_type) === "stop_reason");
-      const usageFrame = frames.find((f) => (f?.event?.message_type ?? f?.message_type) === "usage_statistics");
-      const stopReason = (stopFrame?.event ?? stopFrame)?.stop_reason ?? null;
-      const usage = usageFrame?.event ?? usageFrame ?? null;
+      // Find the first stop_reason / usage_statistics frame across the
+      // turn. LOCKED CONTRACTS #4 + #5 — these are the FIRST occurrences,
+      // not aggregates. Do NOT switch to .findLast or to summing.
+      const stopFrame = frames.find((f) => {
+        const ev = frameEvent(f);
+        const mt = "message_type" in ev ? ev.message_type : undefined;
+        return mt === "stop_reason";
+      });
+      const usageFrame = frames.find((f) => {
+        const ev = frameEvent(f);
+        const mt = "message_type" in ev ? ev.message_type : undefined;
+        return mt === "usage_statistics";
+      });
+      const stopReason: string | null = (() => {
+        if (!stopFrame) return null;
+        const ev = frameEvent(stopFrame);
+        if ("stop_reason" in ev && typeof ev.stop_reason === "string") return ev.stop_reason;
+        return null;
+      })();
+      // Match the .mjs precedence exactly: `usageFrame?.event ?? usageFrame ?? null`.
+      // For top-level frames there's no `.event`; for stream_event we want
+      // the inner event. Either way it's passed straight to finalizeRun.
+      const usage: UsageStatisticsEvent | LettaStreamFrame | null = usageFrame
+        ? (usageFrame.type === "stream_event"
+            ? (usageFrame.event as UsageStatisticsEvent)
+            : usageFrame)
+        : null;
       if (!cancelled) {
+        // Cast through unknown: the closure-write narrowing TS does for
+        // captured `let` collapses `finished` to `never` here even with
+        // an explicit FinishedState | null annotation — the writes live
+        // in callbacks (`collector`, child-exit handler) TS can't see.
+        // Behavior is byte-identical to the .mjs reads at this point.
+        const finishedRead = finished as unknown as FinishedState | null;
+        const finishedExit = finishedRead?.exit === true;
+        const finishedTimeout = finishedRead?.timeout === true;
         finalizeRun(runHandle, {
-          status: finished?.exit ? "failed" : (finished?.timeout ? "failed" : "completed"),
-          stopReason: finished?.timeout ? "timeout" : (finished?.exit ? "child_exit" : stopReason),
-          usage,
+          status: finishedExit ? "failed" : (finishedTimeout ? "failed" : "completed"),
+          stopReason: finishedTimeout ? "timeout" : (finishedExit ? "child_exit" : stopReason),
+          // finalizeRun reads UsageInput-shaped fields; UsageStatisticsEvent
+          // is a structural superset (carries the same `*_tokens` numerics).
+          usage: usage as UsageStatisticsEvent | null,
         });
       }
+      // Spread `finished` into the result the same way the .mjs did
+      // (`...(finished ?? {})`). Each branch contributes a different set
+      // of flags; merging them keeps the public result shape stable.
+      // Same closure-narrowing escape hatch as above — see comment.
+      const finishedSpread: Partial<RunTurnResult> =
+        (finished as unknown as FinishedState | null) ?? {};
       resolveTurn({
         frames,
-        ...(finished ?? {}),
+        ...finishedSpread,
         stderr: this.stderrBuf,
         run_id: runHandle.id,
         cancelled,
@@ -342,7 +568,7 @@ class Worker {
     return turnPromise;
   }
 
-  async stop() {
+  async stop(): Promise<void> {
     this.dead = true;
     this.ready = false;
     try {
@@ -361,6 +587,10 @@ class Worker {
 }
 
 class AgentPool {
+  workers: Map<string, Worker>;
+  spawning: Map<string, Promise<Worker>>;
+  housekeepTimer: NodeJS.Timeout;
+
   constructor() {
     this.workers = new Map(); // key: conversationId → Worker
     this.spawning = new Map(); // key: conversationId → Promise<Worker>
@@ -368,7 +598,7 @@ class AgentPool {
     this.housekeepTimer.unref?.();
   }
 
-  size() {
+  size(): number {
     return this.workers.size;
   }
 
@@ -379,7 +609,7 @@ class AgentPool {
    * messages cross-talk. For non-default conv ids the agent is derivable
    * from the conv id alone, but we still include it for symmetry.
    */
-  _key(conversationId, agentId) {
+  _key(conversationId: string | null | undefined, agentId: string | null | undefined): string {
     return `${agentId ?? "?"}::${conversationId ?? "?"}`;
   }
 
@@ -388,7 +618,7 @@ class AgentPool {
    * spawns + waits for init if cold. Concurrent callers for the same
    * (agent, conv) coalesce on a single spawn.
    */
-  async get(conversationId, agentId) {
+  async get(conversationId: string, agentId: string): Promise<Worker> {
     const key = this._key(conversationId, agentId);
     let worker = this.workers.get(key);
     if (worker && !worker.dead) return worker;
@@ -397,12 +627,15 @@ class AgentPool {
     const inFlight = this.spawning.get(key);
     if (inFlight) return inFlight;
 
-    const p = (async () => {
+    const p = (async (): Promise<Worker> => {
       // Evict if over cap (LRU).
       while (this.workers.size >= MAX_WORKERS) {
-        const [oldestKey] = [...this.workers.entries()].sort(
+        const entries = [...this.workers.entries()].sort(
           (a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
-        )[0];
+        );
+        const first = entries[0];
+        if (!first) break;
+        const oldestKey = first[0];
         if (!oldestKey) break;
         const victim = this.workers.get(oldestKey);
         logLine(`evicting (cap) conv=${oldestKey}`);
@@ -414,7 +647,8 @@ class AgentPool {
       try {
         await w.spawn();
       } catch (err) {
-        logLine(`spawn failed key=${key}: ${err.message}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`spawn failed key=${key}: ${msg}`);
         w.dead = true;
         throw err;
       }
@@ -432,7 +666,7 @@ class AgentPool {
     }
   }
 
-  housekeep() {
+  housekeep(): void {
     const now = Date.now();
     for (const [key, w] of this.workers) {
       if (w.dead) {
@@ -447,14 +681,14 @@ class AgentPool {
     }
   }
 
-  async stopAll() {
+  async stopAll(): Promise<void> {
     if (this.housekeepTimer) clearInterval(this.housekeepTimer);
     const all = [...this.workers.values()];
     this.workers.clear();
     await Promise.allSettled(all.map((w) => w.stop()));
   }
 
-  stats() {
+  stats(): PoolStats {
     return {
       size: this.workers.size,
       max: MAX_WORKERS,
@@ -472,8 +706,8 @@ class AgentPool {
   }
 }
 
-let _pool = null;
-export function getAgentPool() {
+let _pool: AgentPool | null = null;
+export function getAgentPool(): AgentPool {
   if (!_pool) _pool = new AgentPool();
   return _pool;
 }
