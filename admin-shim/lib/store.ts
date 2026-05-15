@@ -218,19 +218,31 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 // Public surface
 // ──────────────────────────────────────────────────────────────────────
 
+// lcp-5e5: dir-mtime cache of the agent list. Bump on add/remove of an
+// agent json file (the typical case mobile cares about). Content-only
+// updates to an existing agents/X.json file (e.g. settings tweak) won't
+// invalidate, but those fields aren't load-bearing for the polling
+// callers that hit this hot path.
+const _listAgentsCached = makeDirMtimeCache(
+  () => join(storageDir(), "agents"),
+  () => {
+    const root = join(storageDir(), "agents");
+    const out: OnDiskAgentRecord[] = [];
+    if (!existsSync(root)) return out;
+    for (const fname of readdirSync(root)) {
+      if (!fname.endsWith(".json")) continue;
+      const record = readJsonOrNull(join(root, fname));
+      if (!isAgentRecordCandidate(record)) continue;
+      const stat = statSync(join(root, fname));
+      out.push({ ...record, _mtimeMs: stat.mtimeMs, _ctimeMs: stat.ctimeMs } as OnDiskAgentRecord);
+    }
+    out.sort((a, b) => (b._mtimeMs ?? 0) - (a._mtimeMs ?? 0));
+    return out;
+  },
+);
+
 export function listAgents(): OnDiskAgentRecord[] {
-  const root = join(storageDir(), "agents");
-  if (!existsSync(root)) return [];
-  const out: OnDiskAgentRecord[] = [];
-  for (const fname of readdirSync(root)) {
-    if (!fname.endsWith(".json")) continue;
-    const record = readJsonOrNull(join(root, fname));
-    if (!isAgentRecordCandidate(record)) continue;
-    const stat = statSync(join(root, fname));
-    out.push({ ...record, _mtimeMs: stat.mtimeMs, _ctimeMs: stat.ctimeMs } as OnDiskAgentRecord);
-  }
-  out.sort((a, b) => (b._mtimeMs ?? 0) - (a._mtimeMs ?? 0));
-  return out;
+  return _listAgentsCached();
 }
 
 export function getAgentRecord(agentId: string): OnDiskAgentRecord | null {
@@ -280,16 +292,29 @@ export function listConversationsForAgent(agentId: string): OnDiskConversation[]
   return out;
 }
 
+// lcp-5e5: dir-mtime cache of the conversation list. Same staleness
+// caveat as listAgents — content-only updates to an existing
+// conversation.json (e.g. last_message_at bumps) don't invalidate.
+// Per-conv detail fetches (getConversation, listConversationsForAgent)
+// bypass this cache and read the file directly, so detail freshness
+// is preserved.
+const _listAllConversationsCached = makeDirMtimeCache(
+  () => join(storageDir(), "conversations"),
+  () => {
+    const root = join(storageDir(), "conversations");
+    const out: OnDiskConversation[] = [];
+    if (!existsSync(root)) return out;
+    for (const dirName of readdirSync(root)) {
+      const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
+      if (!isConversationOnDisk(conv)) continue;
+      out.push(conv);
+    }
+    return out;
+  },
+);
+
 export function listAllConversations(): OnDiskConversation[] {
-  const root = join(storageDir(), "conversations");
-  if (!existsSync(root)) return [];
-  const out: OnDiskConversation[] = [];
-  for (const dirName of readdirSync(root)) {
-    const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
-    if (!isConversationOnDisk(conv)) continue;
-    out.push(conv);
-  }
-  return out;
+  return _listAllConversationsCached();
 }
 
 /**
@@ -304,34 +329,58 @@ export function listAllConversations(): OnDiskConversation[] {
  * form (the conversation list endpoint synthesizes this), or supply the
  * agent context out-of-band (e.g. `/v1/agents/{id}/...` routes).
  */
+/**
+ * Generic mtime-keyed cache helper. Returns a memoized loader that
+ * recomputes when the named directory's mtime changes.
+ *
+ * Caveat: dir-mtime bumps only on entry add/remove at that level. Updates
+ * to FILES inside child directories do NOT invalidate. Use this when the
+ * cached value is structural (set at create time, immutable through the
+ * resource's lifetime). For content that mutates in place, prefer a TTL
+ * cache or aggregate-mtime hash.
+ *
+ * Used by lcp-efg (convIdMap — agent_id is set at conv creation) and
+ * lcp-5e5 (listAgents / listAllConversations — staleness window is
+ * acceptable for mobile's poll cadence; see those callers).
+ */
+function makeDirMtimeCache<T>(
+  rootFn: () => string,
+  loader: () => T,
+): () => T {
+  let cached: T | null = null;
+  let cachedMtimeMs = -1;
+  return () => {
+    const root = rootFn();
+    let mtimeMs = -1;
+    try { mtimeMs = statSync(root).mtimeMs; } catch {}
+    if (cached !== null && mtimeMs === cachedMtimeMs) return cached;
+    cached = loader();
+    cachedMtimeMs = mtimeMs;
+    return cached;
+  };
+}
+
 // lcp-efg cache: external conv id -> ResolvedConversation. Invalidated when
 // the conversations-root directory's mtime changes (add / remove of a
 // conversation subdir bumps it). Content changes inside an existing
 // conversation.json do NOT invalidate, but the only field we read here is
 // `agent_id`, which is structural and set at conv creation — it doesn't
 // change during the conversation's lifetime. Safe to cache.
-let _convIdMapCache: Map<string, ResolvedConversation> | null = null;
-let _convIdMapCacheMtimeMs = -1;
-
-function convIdMap(): Map<string, ResolvedConversation> {
-  const root = join(storageDir(), "conversations");
-  let mtimeMs = -1;
-  try { mtimeMs = statSync(root).mtimeMs; } catch {}
-  if (_convIdMapCache !== null && mtimeMs === _convIdMapCacheMtimeMs) {
-    return _convIdMapCache;
-  }
-  const map = new Map<string, ResolvedConversation>();
-  if (existsSync(root)) {
-    for (const dirName of readdirSync(root)) {
-      const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
-      if (!isConversationOnDisk(conv)) continue;
-      map.set(conv.id, { conversationId: conv.id, agentId: conv.agent_id });
+const convIdMap = makeDirMtimeCache(
+  () => join(storageDir(), "conversations"),
+  () => {
+    const map = new Map<string, ResolvedConversation>();
+    const root = join(storageDir(), "conversations");
+    if (existsSync(root)) {
+      for (const dirName of readdirSync(root)) {
+        const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
+        if (!isConversationOnDisk(conv)) continue;
+        map.set(conv.id, { conversationId: conv.id, agentId: conv.agent_id });
+      }
     }
-  }
-  _convIdMapCache = map;
-  _convIdMapCacheMtimeMs = mtimeMs;
-  return map;
-}
+    return map;
+  },
+);
 
 export function resolveConversationId(externalId: string | null | undefined): ResolvedConversation | null {
   if (!externalId) return null;
