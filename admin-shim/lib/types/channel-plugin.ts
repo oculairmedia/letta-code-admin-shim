@@ -1,0 +1,266 @@
+/**
+ * Channel-plugin public contract.
+ *
+ * This file is the type boundary between the admin-shim host and the
+ * user-authored channel plugins that live at
+ * `~/.letta/channels/<channelId>/plugin.mjs`. The shim discovers plugins
+ * at runtime and imports them as `unknown`, so these interfaces are
+ * NOT enforced by the host — they exist purely as opt-in type hints for
+ * plugin authors.
+ *
+ * To opt in, a plugin .mjs may add a reference directive at the top:
+ *
+ *   /// <reference path="../../../admin-shim/dist/lib/types/channel-plugin.d.ts" />
+ *
+ * and then annotate exports via JSDoc. See `docs/CHANNEL_PLUGINS.md` for the
+ * full guide and an example.
+ *
+ * Two reference plugins exemplify the contract:
+ *   - home/.letta/channels/mobile/plugin.mjs   (inbound WS-driven)
+ *   - home/.letta/channels/matrix/plugin.mjs   (outbound long-poll driven)
+ *
+ * Anything specific to one channel (e.g. the mobile WS frame shape) lives
+ * in the `MobileChannelExtras` sub-interface and is OPTIONAL on
+ * `ChannelAdapter`. The generic surface is what the host actually drives.
+ */
+
+import type { LettaMessage } from "./wire.js";
+
+// ─── Frame surfaced from the worker pool to the plugin via onFrame ─────
+
+/**
+ * A vanilla-shaped frame emitted by the worker pool for one streamed turn.
+ * The host stamps `run_id` onto every frame before calling `onFrame` so the
+ * plugin can correlate to `/v1/runs/{id}` without inspecting the worker.
+ *
+ * Identical to {@link LettaMessage} — re-exported under a friendlier name
+ * for plugin authors who don't want to learn the wire-types tree.
+ */
+export type BridgeFrame = LettaMessage;
+
+// ─── Inputs to the host's send-message bridge ──────────────────────────
+
+/**
+ * Args passed to {@link ChannelHost.bridgeSendMessage}. `agent_id` and
+ * `conversation_id` may be either the internal `conv-<uuid>` form or an
+ * external alias (e.g. `conv-default-<agentId>`) — the host resolves
+ * aliases before dispatching to the worker pool.
+ *
+ * `otid` is an optional client-side opaque token; when present, the host
+ * binds it to the user message it persists so the disk projection echoes
+ * it back. Mobile uses this for `reconcileAfterSend` dedup.
+ */
+export interface BridgeSendMessageArgs {
+  agent_id: string;
+  conversation_id: string;
+  text: string;
+  otid?: string | null;
+}
+
+/**
+ * Optional hooks the plugin can register on a `bridgeSendMessage` call.
+ * `onRunCreated` fires once per turn the moment the worker pool surfaces
+ * the `runId`. Useful for sending an early `turn_started` envelope before
+ * any model frames arrive.
+ */
+export interface BridgeSendMessageHooks {
+  onRunCreated?: (runId: string) => void;
+}
+
+// ─── Host logger ───────────────────────────────────────────────────────
+
+/**
+ * Logger shape the host hands to the plugin. Matches the subset of the
+ * Node `console` plugins are allowed to rely on.
+ *
+ * Plugins SHOULD route human-readable progress through `host.log` so the
+ * shim can route it uniformly. `console.error` calls bypass this object.
+ */
+export interface HostLogger {
+  log?: (...args: unknown[]) => void;
+}
+
+// ─── Channel account record ────────────────────────────────────────────
+
+/**
+ * The account record the host reads out of
+ * `~/.letta/channels/<channelId>/accounts.json` and hands to
+ * {@link ChannelPlugin.createAdapter}. The file is user-edited and
+ * field-permissive; the host only narrows the keys it uses and passes the
+ * full object through. Plugins are encouraged to read their own
+ * channel-specific config out of `config`.
+ */
+export interface ChannelAccount {
+  accountId?: string;
+  channel?: string;
+  enabled?: boolean;
+  displayName?: string;
+  config?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+// ─── Host surface the plugin receives in createAdapter ────────────────
+
+/**
+ * The `host` object the shim hands a channel plugin's `createAdapter`.
+ * This is the only host API a plugin is allowed to depend on.
+ *
+ *  - `log(msg)`             — line logger (routes through {@link HostLogger}).
+ *  - `getServerId()`        — server identity for plugin welcome/handshake frames.
+ *  - `bridgeSendMessage()`  — turn driver: dispatches a user message into the
+ *                              worker pool and streams reshaped frames via
+ *                              `onFrame`. Resolves when the turn settles.
+ *  - `cancelRun(runId)`     — best-effort cancel hook. Returns `true` if a
+ *                              running turn matched; `false` otherwise.
+ */
+export interface ChannelHost {
+  log: (msg: string) => void;
+  getServerId: () => string;
+  bridgeSendMessage: (
+    args: BridgeSendMessageArgs,
+    onFrame: (frame: BridgeFrame) => void,
+    hooks?: BridgeSendMessageHooks,
+  ) => Promise<unknown>;
+  cancelRun: (runId: string) => boolean;
+}
+
+// ─── Mobile-channel-specific extras ────────────────────────────────────
+
+/**
+ * Adapter surface specific to the inbound mobile WS channel. NOT part of
+ * the generic contract — only plugins that host their own WS upgrade
+ * route implement this. The shim's mobile WS upgrade handler hands the
+ * accepted socket to `acceptConnection(ws, request)`.
+ *
+ * `ws` is intentionally typed as `unknown` here so the generic types
+ * don't take a hard dependency on the `ws` package. Plugins narrow to
+ * their own WebSocket type internally.
+ */
+export interface MobileChannelExtras {
+  acceptConnection?: (ws: unknown, request: unknown) => void;
+}
+
+// ─── Channel adapter the plugin returns from createAdapter ─────────────
+
+/**
+ * The adapter object a channel plugin returns from
+ * {@link ChannelPlugin.createAdapter}. The host invokes `start()` once
+ * after construction and `stop()` on shutdown; everything else is
+ * channel-specific.
+ *
+ * Outbound channels (Matrix, future Slack/Discord) implement
+ * `sendMessage` + `sendDirectReply` and expose `onMessage` as a hook the
+ * host fills in. Inbound channels (mobile) leave those as no-ops and use
+ * {@link MobileChannelExtras.acceptConnection} instead.
+ *
+ * The index signature (`[k: string]: unknown`) is intentional: this is a
+ * loose, duck-typed surface. Channels may attach private helpers
+ * (`_editMessage`, etc.) without widening the contract.
+ */
+export interface ChannelAdapter extends MobileChannelExtras {
+  /** Stable adapter identity, conventionally `${channelId}:${accountId}`. */
+  id?: string;
+  /** Channel-family id (e.g. `"mobile"`, `"matrix"`). */
+  channelId?: string;
+  /** Account id within the channel. */
+  accountId?: string;
+  /** Human-readable display name (surfaced in UI). */
+  name?: string;
+
+  /** Begin processing — host calls this once after createAdapter resolves. */
+  start?: () => Promise<void> | void;
+  /** Tear down — host calls this on shutdown. */
+  stop?: () => Promise<void> | void;
+  /** Liveness probe used by the channel registry. */
+  isRunning?: () => boolean;
+
+  /**
+   * Send an outbound message. Outbound channels implement this; inbound
+   * channels may return a no-op result. Shape of the result is
+   * channel-defined (typically `{ messageId: string }`).
+   */
+  sendMessage?: (msg: Record<string, unknown>) => Promise<unknown>;
+
+  /** Direct-reply helper, used by some agent code paths. */
+  sendDirectReply?: (
+    chatId: string,
+    text: string,
+    options?: Record<string, unknown>,
+  ) => Promise<unknown> | unknown;
+
+  /**
+   * Inbound-message hook the host fills in. The plugin calls this with
+   * its own parsed `inbound` payload when a remote event arrives. Left
+   * `undefined` when the host hasn't wired it yet.
+   */
+  onMessage?: ((inbound: unknown) => Promise<void> | void) | undefined;
+
+  /**
+   * Optional lifecycle hook for turn boundaries (e.g. used by the Matrix
+   * plugin to stop typing indicators).
+   */
+  handleTurnLifecycleEvent?: (event: Record<string, unknown>) => Promise<void> | void;
+
+  /** Forward-compat: plugins may attach private helpers. */
+  [k: string]: unknown;
+}
+
+// ─── messageActions: optional sub-surface for agent tool dispatch ──────
+
+/**
+ * Optional sub-surface for plugins that participate in the `send_message`
+ * tool dispatch path. `describeMessageTool()` returns the per-channel
+ * action vocabulary the LLM sees in the tool description.
+ * `handleAction(ctx)` is called by the host when the LLM emits an action
+ * for this channel.
+ */
+export interface ChannelMessageActions {
+  describeMessageTool?: () => Record<string, unknown>;
+  handleAction?: (ctx: Record<string, unknown>) => Promise<unknown> | unknown;
+}
+
+// ─── The plugin export itself ──────────────────────────────────────────
+
+/**
+ * Channel-plugin metadata. The host reads this to populate the channel
+ * registry. `runtimePackages` lists the npm specifiers the plugin imports
+ * at runtime — the host may use this to bootstrap dependencies.
+ */
+export interface ChannelPluginMetadata {
+  id: string;
+  displayName?: string;
+  runtimePackages?: string[];
+  runtimeModules?: string[];
+  [k: string]: unknown;
+}
+
+/**
+ * The runtime-imported plugin module's `channelPlugin` export (or
+ * `default` — the host accepts both). User-authored .mjs files declare
+ * this; the host loads it as `unknown` and duck-type-narrows on
+ * `createAdapter`.
+ *
+ * Reference implementations:
+ *   - home/.letta/channels/mobile/plugin.mjs
+ *   - home/.letta/channels/matrix/plugin.mjs
+ */
+export interface ChannelPlugin {
+  /** Static channel metadata (id, display name, runtime deps). */
+  metadata?: ChannelPluginMetadata;
+
+  /**
+   * Constructs an adapter for one account. The host invokes this once
+   * per enabled account at startup. `host` exposes the bridge into the
+   * worker pool — see {@link ChannelHost}.
+   *
+   * Plugins may treat `host` as optional (`= {}`) for back-compat; the
+   * shim always passes a fully populated host object today.
+   */
+  createAdapter: (
+    account: ChannelAccount,
+    host: ChannelHost,
+  ) => Promise<ChannelAdapter> | ChannelAdapter;
+
+  /** Optional message-tool dispatch surface. */
+  messageActions?: ChannelMessageActions;
+}
