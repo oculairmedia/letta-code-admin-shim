@@ -207,7 +207,12 @@ async function bridgeSendMessage(
   // the optimistic Local user bubble next to the Confirmed disk twin.
   if (otid) {
     try {
-      const localId = findUnmappedTailUserMessageId(effectiveConvId, effectiveAgentId);
+      // Fast path (lcp-y88): the worker already captured the new user_message
+      // id during its post-turn listMessages diff (which it does anyway for
+      // run-message attribution). Fall back to a scan only if it didn't
+      // surface one — defensive for older worker code paths.
+      const localId = (turn as { newUserMessageId?: string | null }).newUserMessageId
+        ?? findUnmappedTailUserMessageId(effectiveConvId, effectiveAgentId);
       if (localId) writeOtidForLocalId(effectiveConvId, effectiveAgentId, localId, otid);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);

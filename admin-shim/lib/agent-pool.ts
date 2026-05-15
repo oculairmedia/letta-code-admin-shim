@@ -101,6 +101,13 @@ export interface RunTurnResult {
   dead?: boolean;
   /** Set when an error short-circuited the turn (e.g. stdin write). */
   error?: string;
+  /**
+   * The id of the newest user_message persisted by letta-code during this
+   * turn (computed once via the post-turn listMessages diff). Used by
+   * mobile-channel-host to bind the mobile-supplied otid without
+   * re-scanning messages.jsonl. See lcp-y88.
+   */
+  newUserMessageId?: string | null;
 }
 
 /** Constructor args for the Worker class. */
@@ -496,11 +503,16 @@ class Worker {
       // `cancelled` short-circuits because cancelRun already wrote the
       // record; calling finalizeRun would no-op (handle removed from
       // active map) but we still attribute messages first.
+      // Track the newest user_message id while we already have messages.jsonl
+      // open for the run-attribution loop. mobile-channel-host uses this to
+      // bind the mobile-supplied otid without re-scanning. (lcp-y88)
+      let newUserMessageId: string | null = null;
       try {
         const after = listMessages(this.conversationId, this.agentId);
         for (const m of after) {
           if (m?.id && !messageIdsBefore.has(m.id)) {
             recordRunMessage(runHandle, m.id);
+            if (m.role === "user") newUserMessageId = m.id;
           }
         }
       } catch (err) {
@@ -563,6 +575,7 @@ class Worker {
         stderr: this.stderrBuf,
         run_id: runHandle.id,
         cancelled,
+        newUserMessageId,
       });
     });
     return turnPromise;
