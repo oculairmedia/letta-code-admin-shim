@@ -13,12 +13,13 @@ State as of the last session. Open this in a fresh session to continue.
 
 ## What just shipped
 
-Three commits on master:
+Four commits on master:
 - `46b9b3d` — Initial commit (admin-shim + channels + migrator + docs + LICENSE + README + CI workflow)
 - `b9567dc` — Test harness: 138 behavioral tests + 9 captured letta-code stream traces + mock letta + GitHub Actions
 - `6191e10` — Fix WS / SSE conv-id asymmetry in mobile-channel-host (resolveConversationId is now called on WS path; literal `"default"` is refused to prevent multi-agent mis-routing; 2 new regression tests)
+- `178096f` — Stabilize test harness (OS-assigned ports via SHIM_PORT=0) + refuse ambiguous `default` in resolveConversationId + multi-agent regression test + this handoff doc
 
-Pending uncommitted: shim.mjs OS-port-assignment fix + a couple of test additions. Commit these before starting the migration.
+Working tree is clean. Ready to start the migration.
 
 ## Activating the sandbox
 

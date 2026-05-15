@@ -28,6 +28,27 @@ jobs:
         working-directory: admin-shim
         run: npm test
 
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: admin-shim/package-lock.json
+
+      - name: Install shim deps
+        working-directory: admin-shim
+        run: npm ci
+
+      - name: Run typecheck
+        working-directory: admin-shim
+        run: npm run typecheck
+
   # Channel plugin smokes run against a real `letta` binary, so they live
   # behind a manual trigger for now. CI runs the mocked shim tests above
   # which exercise the same protocol surface via captured stream traces.

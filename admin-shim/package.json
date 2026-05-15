@@ -7,11 +7,20 @@
   "main": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
+    "dev": "tsx watch server.mjs",
     "test": "node --test --test-concurrency=1 --test-reporter=spec test/*.test.mjs",
-    "test:watch": "node --test --test-concurrency=1 --watch test/*.test.mjs"
+    "test:watch": "node --test --test-concurrency=1 --watch test/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "build": "echo 'not yet — phase 6' && exit 0"
   },
   "dependencies": {
     "ws": "8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.8.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.22.0",
+    "typescript": "^6.0.3"
   },
   "engines": {
     "node": ">=20"

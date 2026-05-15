@@ -9,6 +9,7 @@ home/.letta/credentials.json
 home/.letta/settings.json
 home/.letta/cache/
 home/.letta/logs/
+home/.npm/
 home/.letta/projects/
 home/.letta/transcripts/
 home/.letta/remote-settings.json
@@ -37,6 +38,10 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# TypeScript build output
+admin-shim/dist/
+admin-shim/*.tsbuildinfo
 
 # Logs
 *.log
