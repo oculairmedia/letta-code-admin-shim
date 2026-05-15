@@ -309,7 +309,7 @@ class Worker {
    * Turns are queued on the per-worker chain so two simultaneous callers
    * can't interleave.
    */
-  runTurn(userText: string, { onFrame, turnStartedAt: passedStart, onRunCreated, runHandle: providedRunHandle }: RunTurnOptions = {}): Promise<RunTurnResult> {
+  runTurn(userInput: string | unknown[], { onFrame, turnStartedAt: passedStart, onRunCreated, runHandle: providedRunHandle }: RunTurnOptions = {}): Promise<RunTurnResult> {
     const previous = this.chain;
     let resolveTurn!: (value: RunTurnResult) => void;
     const turnPromise = new Promise<RunTurnResult>((r) => (resolveTurn = r));
@@ -489,8 +489,13 @@ class Worker {
           .filter((id): id is string => Boolean(id)),
       );
       try {
+        // lcp-dlj: `userInput` is either a plain string (text-only turn —
+        // legacy shape and current SSE path) OR an Anthropic-style content
+        // parts array carrying inline text + image blocks. letta-code's
+        // headless mode (headless.ts ~L1770) accepts both shapes directly
+        // — MessageCreate.content is a union of string | ContentBlock[].
         this.child!.stdin.write(
-          JSON.stringify({ type: "user", message: { content: userText } }) + "\n",
+          JSON.stringify({ type: "user", message: { content: userInput } }) + "\n",
         );
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);

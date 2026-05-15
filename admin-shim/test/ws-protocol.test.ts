@@ -734,6 +734,72 @@ test("ws: lcp-kfr — client WS disconnect does not prevent run from finalizing"
   );
 });
 
+// ─── 21e. lcp-dlj: content_parts size cap + shape validation ──────
+
+test("ws: lcp-dlj — send_message with non-array content_parts → protocol_violation", async (t) => {
+  const { conn, agentId, convId } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "hi",
+    content_parts: "not an array",
+  });
+  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { code: string; message: string };
+  assert.equal(err.code, "protocol_violation");
+  assert.match(err.message, /content_parts.*array/i);
+  assert.equal(conn.closed, false, "validation error must not close the socket");
+});
+
+test("ws: lcp-dlj — send_message with oversized content_parts (>10MB) → protocol_violation", async (t) => {
+  const { conn, agentId, convId } = await setupAuthed(t);
+  // 11MB worth of fake base64 image data to trip the size guard.
+  const oversized = "A".repeat(11 * 1024 * 1024);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "look at this",
+    content_parts: [
+      { type: "text", text: "look at this" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: oversized } },
+    ],
+  });
+  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { code: string; message: string };
+  assert.equal(err.code, "protocol_violation");
+  assert.match(err.message, /content_parts.*exceeds/i);
+  assert.equal(conn.closed, false);
+});
+
+test("ws: lcp-dlj — send_message with text-only content_parts passes through and completes", async (t) => {
+  // Text-only content_parts proves the shim parses + threads the field
+  // to the worker without exercising the fixture worker's (non-existent)
+  // image-handling path. The fixture replies with the standard pong
+  // trace, and the assistant message must contain "pong" — proving the
+  // content_parts text reached letta-code's headless stdin verbatim
+  // and the user prompt was honored.
+  const { conn, agentId, convId } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "reply with pong",  // present but should be ignored
+    otid: "cm-ws-dlj",
+    content_parts: [
+      { "type": "text", "text": "reply with pong" },
+    ],
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const types = turn.map((f) => f.type);
+  assert.ok(types.includes("turn_started"), `expected turn_started, got ${types.join(",")}`);
+  assert.ok(types.includes("turn_done"), `expected turn_done, got ${types.join(",")}`);
+  const done = turn.find((f) => f.type === "turn_done") as unknown as { status: string };
+  assert.equal(done.status, "completed", "text-only content_parts turn must complete cleanly");
+  const assistants = turn.filter((f) => f.type === "assistant_message") as unknown as Array<{ content?: string }>;
+  const joined = assistants.map((a) => a.content ?? "").join("");
+  assert.match(joined.toLowerCase(), /pong/, `content_parts text must reach the worker; got: ${joined}`);
+});
+
 // ─── 22. stop_reason frame shape on WS ──────────────────────────────
 
 test("ws: stop_reason frame carries stop_reason field (`end_turn` on clean turn)", async (t) => {

@@ -99,6 +99,14 @@ interface BridgeSendMessageArgs {
   agent_id: string;
   conversation_id: string;
   text: string;
+  /**
+   * lcp-dlj: optional Anthropic-style content parts (text + image blocks).
+   * When non-empty, this wins over `text` and is forwarded verbatim to
+   * letta-code's headless stdin (MessageCreate.content accepts the same
+   * union shape). The shim does NOT validate the array — letta-code is
+   * the canonical schema enforcer.
+   */
+  content_parts?: unknown[] | null;
   otid?: string | null;
 }
 
@@ -115,7 +123,7 @@ interface BridgeSendMessageHooks {
  * out of the worker. The WS handler wraps these into protocol envelopes.
  */
 async function bridgeSendMessage(
-  { agent_id, conversation_id, text, otid }: BridgeSendMessageArgs,
+  { agent_id, conversation_id, text, content_parts, otid }: BridgeSendMessageArgs,
   onFrame: (frame: BridgeFrame) => void,
   { onRunCreated }: BridgeSendMessageHooks = {},
 ): Promise<unknown> {
@@ -171,7 +179,11 @@ async function bridgeSendMessage(
   let pendingStop: BridgeFrame | null = null;
   let pendingUsage: BridgeFrame | null = null;
 
-  const turn = await worker.runTurn(text, {
+  // lcp-dlj: content_parts wins over text when present and non-empty.
+  // letta-code's headless stdin accepts either shape on MessageCreate.content.
+  const userInput: string | unknown[] =
+    Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
+  const turn = await worker.runTurn(userInput, {
     // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
     // patches the SIGTERM hook onto it via setRunCancelHandler. The
     // worker will NOT call onRunCreated when a handle is provided —

@@ -153,7 +153,7 @@ export function handleConnection(ws, request, host) {
 
     switch (frame.type) {
       case "send_message": {
-        const { agent_id, conversation_id, text, otid } = frame;
+        const { agent_id, conversation_id, text, otid, content_parts } = frame;
         if (!agent_id || !conversation_id || typeof text !== "string") {
           sendError(
             ERROR_CODES.PROTOCOL_VIOLATION,
@@ -161,6 +161,44 @@ export function handleConnection(ws, request, host) {
             { close: false },
           );
           return;
+        }
+        // lcp-dlj: validate optional content_parts. If supplied, it must
+        // be an array; size-cap the JSON-encoded frame at 10MB to bound
+        // memory pressure from oversized base64 images. Mobile is
+        // expected to downsample first (≤1568px longest side, ≤2MB raw
+        // per image, ≤4 images per send). The shim enforces the
+        // size ceiling defensively.
+        const SEND_MESSAGE_MAX_BYTES = 10 * 1024 * 1024;
+        if (content_parts !== undefined && content_parts !== null) {
+          if (!Array.isArray(content_parts)) {
+            sendError(
+              ERROR_CODES.PROTOCOL_VIOLATION,
+              "content_parts must be an array when present",
+              { close: false },
+            );
+            return;
+          }
+          // The raw inbound buffer is the cheapest size oracle: parseFrame
+          // already produced `frame` from a string we captured at the top
+          // of the message handler. Re-serialize content_parts to estimate
+          // its on-wire size (worst-case parity with what mobile sent).
+          let cpSize = 0;
+          try { cpSize = Buffer.byteLength(JSON.stringify(content_parts), "utf8"); } catch {
+            sendError(
+              ERROR_CODES.PROTOCOL_VIOLATION,
+              "content_parts is not JSON-serializable",
+              { close: false },
+            );
+            return;
+          }
+          if (cpSize > SEND_MESSAGE_MAX_BYTES) {
+            sendError(
+              ERROR_CODES.PROTOCOL_VIOLATION,
+              `content_parts exceeds ${SEND_MESSAGE_MAX_BYTES} bytes (${cpSize}); downsample images before send`,
+              { close: false },
+            );
+            return;
+          }
         }
         // Serialize sends per session — running two turns concurrently on
         // the same socket races state (pendingAssistant, run binding) and
@@ -204,7 +242,7 @@ export function handleConnection(ws, request, host) {
         let turnResult = null;
         try {
           turnResult = await host.sendMessage(
-            { agent_id, conversation_id, text, otid, turn_id: turnId, session_id: sessionId },
+            { agent_id, conversation_id, text, content_parts, otid, turn_id: turnId, session_id: sessionId },
             (outFrame) => {
               if (closed) return;
               const mt = outFrame.message_type;

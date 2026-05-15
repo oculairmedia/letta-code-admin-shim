@@ -54,6 +54,15 @@ export interface BridgeSendMessageArgs {
   agent_id: string;
   conversation_id: string;
   text: string;
+  /**
+   * lcp-dlj: optional Anthropic-style content parts (text + image blocks).
+   * When non-empty, wins over `text`. Schema mirrors REST
+   * `MessageCreate.content` so letta-code's headless stdin can ingest the
+   * value verbatim. Channel plugins MAY forward this from their own wire
+   * protocol when they support multimodal input; text-only callers leave
+   * it undefined and `text` carries the whole user prompt.
+   */
+  content_parts?: unknown[] | null;
   otid?: string | null;
 }
 

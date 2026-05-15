@@ -288,6 +288,67 @@ To verify the implementation against this contract:
 
 ---
 
+## `send_message` content parts (lcp-dlj)
+
+For text-only sends, `send_message.text` carries the user prompt and
+`content_parts` is omitted. For multimodal sends (text + images), the
+client SHOULD set `content_parts` to an Anthropic-style array; the
+shim forwards it verbatim to letta-code's headless stdin. When
+`content_parts` is non-empty it WINS over `text`.
+
+### Wire shape
+
+```jsonc
+{
+  "type": "send_message",
+  "v": 1,
+  "id": "...",
+  "ts": "...",
+  "agent_id": "agent-...",
+  "conversation_id": "conv-...",
+  "text": "Look at this photo",      // fallback when content_parts is absent
+  "otid": "cm-android-<uuid>",
+  "content_parts": [
+    { "type": "text", "text": "Look at this photo" },
+    {
+      "type": "image",
+      "source": {
+        "type": "base64",
+        "media_type": "image/jpeg",
+        "data": "<base64 with NO data: prefix>"
+      }
+    }
+  ]
+}
+```
+
+### Locked behavior
+
+| Topic                          | Rule                                                                                                                |
+|--------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| When `content_parts` wins      | Non-null, array-typed, length ≥ 1. Otherwise `text` is the user input.                                              |
+| Ordering inside `content_parts`| Preserved verbatim. Canonical builder emits `[text-part-if-any, ...image-parts]`. Mobile MAY override if needed.   |
+| Max parts                      | Soft contract: ≤ 4 image parts + ≤ 1 text part per send. The shim does not currently enforce a per-part count cap. |
+| Per-image size                 | Mobile SHOULD downsample to ≤ 1568px longest side and ≤ 2 MB raw bytes per image (Anthropic guidance).             |
+| Total `content_parts` size     | Hard cap: **10 MB** JSON-encoded bytes. Frames over the cap get `error{code:"protocol_violation"}` (socket stays). |
+| Wire shape                     | Anthropic-style only: `{type:"image", source:{type:"base64", media_type, data}}`. The Letta `{source:"letta", …}` shape is INBOUND-projection only. |
+| `data` field                   | Bare base64 — NO `data:` URL prefix. The pydantic schema downstream rejects the prefixed form.                     |
+| `otid` scope                   | One per `send_message`, covers all parts. The assistant reply still streams as `cm-stream-<upstream-otid>` (server-generated, per-logical-message). |
+| Validation errors              | Non-array `content_parts` → `protocol_violation`. Non-JSON-serializable → `protocol_violation`. Oversize → `protocol_violation`. Socket stays open in every case. |
+
+### Failure responses
+
+```jsonc
+{ "type": "error", "code": "protocol_violation",
+  "message": "content_parts must be an array when present" }
+{ "type": "error", "code": "protocol_violation",
+  "message": "content_parts exceeds 10485760 bytes (12345678); downsample images before send" }
+```
+
+After a `protocol_violation` for `content_parts`, the `inFlight`
+latch is NOT set — mobile can retry the send immediately on the
+same socket with a corrected payload.
+
 ## Frame field clarifications
 
 ### `stop_reason.stop_reason` values

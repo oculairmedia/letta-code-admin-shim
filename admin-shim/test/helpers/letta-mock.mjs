@@ -140,14 +140,37 @@ function emitTurn(content) {
   tick();
 }
 
+/**
+ * lcp-dlj: letta-code's headless mode accepts content as either a string
+ * (legacy) or an Anthropic-style content-parts array (multimodal). The
+ * mock matches traces against text content via regex, so flatten arrays
+ * to the concatenation of their `text` parts. Image parts are ignored
+ * for trace selection — the mock isn't a real model.
+ *
+ * @param {unknown} content
+ * @returns {string}
+ */
+function flattenContentToText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const part of content) {
+      if (part && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
+        parts.push(part.text);
+      }
+    }
+    return parts.join(" ");
+  }
+  return "";
+}
+
 const rl = createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   if (!line.trim()) return;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
   if (msg?.type !== "user") return;
-  const content = msg?.message?.content ?? "";
-  emitTurn(content);
+  emitTurn(flattenContentToText(msg?.message?.content));
 });
 rl.on("close", () => {
   process.exit(0);
