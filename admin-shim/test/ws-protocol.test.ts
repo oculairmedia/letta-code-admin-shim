@@ -444,7 +444,7 @@ test("ws: server emits periodic ping frames", async (t) => {
   const accounts = JSON.parse(readFileSync(accountsPath, "utf8")) as {
     accounts: Array<{ config: { pingIntervalMs: number } }>;
   };
-  accounts.accounts[0].config.pingIntervalMs = 200;
+  accounts.accounts[0]!.config.pingIntervalMs = 200;
   const { writeFileSync } = await import("node:fs");
   writeFileSync(accountsPath, JSON.stringify(accounts, null, 2));
 

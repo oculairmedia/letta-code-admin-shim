@@ -47,6 +47,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = join(__dirname, "..", "fixtures", "stream-traces");
 
 const args = process.argv.slice(2);
+/** @param {string} name */
 function argOf(name) {
   const i = args.indexOf(`--${name}`);
   return i >= 0 ? args[i + 1] : null;
@@ -55,6 +56,10 @@ const agentId = argOf("agent") ?? "agent-mock";
 const conversationId = argOf("conversation") ?? "default";
 const sessionId = agentId;
 
+/**
+ * @param {string} name
+ * @returns {any[]}
+ */
 function loadTrace(name) {
   const path = join(FIXTURES_DIR, `${name}.jsonl`);
   return readFileSync(path, "utf8")
@@ -64,8 +69,9 @@ function loadTrace(name) {
     .map((l) => JSON.parse(l));
 }
 
+/** @param {string} content */
 function pickTrace(content) {
-  const forced = process.env.LETTA_MOCK_FORCE_TRACE;
+  const forced = process.env["LETTA_MOCK_FORCE_TRACE"];
   if (forced) return forced;
   const t = (content ?? "").toLowerCase();
   // Order matters — most specific first.
@@ -82,6 +88,7 @@ function pickTrace(content) {
   return "plain";
 }
 
+/** @param {any} frame */
 function rewrite(frame) {
   // Stamp the active agent/conv/session onto every frame so consumers
   // see consistent ids. The captured fixtures use the real Meridian id;
@@ -97,6 +104,7 @@ function rewrite(frame) {
   return f;
 }
 
+/** @param {any} frame */
 function emit(frame) {
   process.stdout.write(JSON.stringify(frame) + "\n");
 }
@@ -105,21 +113,22 @@ function emit(frame) {
 // tools list etc. across all traces). Honor LETTA_MOCK_TOOLS to override.
 const initTrace = loadTrace("plain");
 const initFrame = rewrite(initTrace[0]);
-if (process.env.LETTA_MOCK_TOOLS) {
-  initFrame.tools = process.env.LETTA_MOCK_TOOLS.split(",").map((s) => s.trim());
+if (process.env["LETTA_MOCK_TOOLS"]) {
+  initFrame.tools = process.env["LETTA_MOCK_TOOLS"].split(",").map((/** @type {string} */ s) => s.trim());
 }
-if (process.env.LETTA_MOCK_MODEL) {
-  initFrame.model = process.env.LETTA_MOCK_MODEL;
+if (process.env["LETTA_MOCK_MODEL"]) {
+  initFrame.model = process.env["LETTA_MOCK_MODEL"];
 }
 emit(initFrame);
 
+/** @param {string} content */
 function emitTurn(content) {
   const traceName = pickTrace(content);
   const frames = loadTrace(traceName);
   // Skip the init frame from the trace (we already emitted one). All other
   // frames replay in order. Add a tiny delay between frames so SSE streaming
   // tests can observe the time ordering.
-  const delay = Number(process.env.LETTA_MOCK_DELAY_MS ?? 0);
+  const delay = Number(process.env["LETTA_MOCK_DELAY_MS"] ?? 0);
   let i = 1;
   const tick = () => {
     if (i >= frames.length) return;

@@ -59,8 +59,8 @@ import {
 import { getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
 import { WebSocketServer } from "ws";
 
-const PORT = Number(process.env.SHIM_PORT || 8291);
-const HOST = process.env.SHIM_HOST || "0.0.0.0";
+const PORT = Number(process.env["SHIM_PORT"] || 8291);
+const HOST = process.env["SHIM_HOST"] || "0.0.0.0";
 
 function json(
   res: ServerResponse,
@@ -310,7 +310,7 @@ function vanillaModel({ handle, name, contextWindow = 200000, maxTokens = 16384 
     model_type: "llm",
     model: name,
     model_endpoint_type: "openai",
-    model_endpoint: process.env.LMSTUDIO_BASE_URL || "http://localhost:8082/v1",
+    model_endpoint: process.env["LMSTUDIO_BASE_URL"] || "http://localhost:8082/v1",
     provider_category: "base",
     model_wrapper: null,
     context_window: contextWindow,
@@ -406,7 +406,7 @@ function handleTools(_req: IncomingMessage, res: ServerResponse): void {
 function handleToolDetail(_req: IncomingMessage, res: ServerResponse, toolId: string): void {
   const match = BUILTIN_TOOL_DEFINITIONS
     .map(vanillaTool)
-    .find((t) => t.id === toolId);
+    .find((t) => t["id"] === toolId);
   if (!match) return notFound(res, `tool ${toolId}`);
   json(res, 200, match);
 }
@@ -442,7 +442,7 @@ function handleProviders(_req: IncomingMessage, res: ServerResponse): void {
     vanillaProvider({
       name: "lmstudio-local",
       providerType: "openai",
-      baseUrl: process.env.LMSTUDIO_BASE_URL || "http://localhost:8082/v1",
+      baseUrl: process.env["LMSTUDIO_BASE_URL"] || "http://localhost:8082/v1",
     }),
   ]);
 }
@@ -484,8 +484,8 @@ async function handleConversationCreate(req: IncomingMessage, res: ServerRespons
   // mobile sends agent_id BOTH in query string AND in body — accept either.
   const agentId =
     url.searchParams.get("agent_id") ??
-    (body.agent_id as string | null | undefined) ??
-    (body.agentId as string | null | undefined);
+    (body["agent_id"] as string | null | undefined) ??
+    (body["agentId"] as string | null | undefined);
   if (!agentId || !resolveAgentRecord(agentId)) {
     return json(res, 400, { detail: "agent_id required (and must exist)" });
   }
@@ -493,7 +493,7 @@ async function handleConversationCreate(req: IncomingMessage, res: ServerRespons
   // Vanilla Letta server behaviour: every POST creates a brand-new
   // conversation. Mobile's chat lifecycle depends on this (each fresh-route
   // chat screen creates a fresh conv); idempotency here breaks mobile UX.
-  const conversationId = (body.id as string | null | undefined) ?? `conv-${cryptoRandomUUID()}`;
+  const conversationId = (body["id"] as string | null | undefined) ?? `conv-${cryptoRandomUUID()}`;
   const now = new Date().toISOString();
   const conv: OnDiskConversation = {
     id: conversationId,
@@ -503,7 +503,7 @@ async function handleConversationCreate(req: IncomingMessage, res: ServerRespons
     created_at: now,
     updated_at: now,
     last_message_at: now,
-    summary: (body.summary as string | null | undefined) ?? null,
+    summary: (body["summary"] as string | null | undefined) ?? null,
     in_context_message_ids: [],
   };
   const key = `conversation:${conversationId}`;
@@ -520,9 +520,9 @@ async function handleConversationUpdate(req: IncomingMessage, res: ServerRespons
   const body = await readJsonBody(req);
   const next: OnDiskConversation = {
     ...conv,
-    summary: (body.summary as string | null | undefined) ?? conv.summary,
-    archived: (body.archived as unknown) ?? (conv as Record<string, unknown>).archived,
-    archived_at: body.archived === true ? new Date().toISOString() : (conv as Record<string, unknown>).archived_at as string | null | undefined,
+    summary: (body["summary"] as string | null | undefined) ?? conv.summary,
+    archived: (body["archived"] as unknown) ?? (conv as Record<string, unknown>)["archived"],
+    archived_at: body["archived"] === true ? new Date().toISOString() : (conv as Record<string, unknown>)["archived_at"] as string | null | undefined,
     updated_at: new Date().toISOString(),
   };
   const key = conv.id === "default" ? `default:${conv.agent_id}` : `conversation:${conv.id}`;
@@ -713,13 +713,13 @@ function handleRunUsage(_req: IncomingMessage, res: ServerResponse, runId: strin
   if (!run) return notFound(res, `run ${runId}`);
   const u = (run.usage ?? {}) as Record<string, unknown>;
   json(res, 200, {
-    completion_tokens: (u.completion_tokens as number | undefined) ?? 0,
-    prompt_tokens: (u.prompt_tokens as number | undefined) ?? 0,
-    total_tokens: (u.total_tokens as number | undefined) ?? 0,
-    step_count: (u.step_count as number | undefined) ?? run.num_steps ?? 0,
-    cached_input_tokens: (u.cached_input_tokens as number | undefined) ?? 0,
-    cache_write_tokens: (u.cache_write_tokens as number | undefined) ?? 0,
-    reasoning_tokens: (u.reasoning_tokens as number | undefined) ?? 0,
+    completion_tokens: (u["completion_tokens"] as number | undefined) ?? 0,
+    prompt_tokens: (u["prompt_tokens"] as number | undefined) ?? 0,
+    total_tokens: (u["total_tokens"] as number | undefined) ?? 0,
+    step_count: (u["step_count"] as number | undefined) ?? run.num_steps ?? 0,
+    cached_input_tokens: (u["cached_input_tokens"] as number | undefined) ?? 0,
+    cache_write_tokens: (u["cache_write_tokens"] as number | undefined) ?? 0,
+    reasoning_tokens: (u["reasoning_tokens"] as number | undefined) ?? 0,
   });
 }
 
@@ -1045,7 +1045,7 @@ server.listen(PORT, HOST, () => {
   const addr = server.address();
   const actualPort = typeof addr === "object" && addr ? addr.port : PORT;
   console.log(`letta-code admin shim listening on http://${HOST}:${actualPort}`);
-  console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env.LETTA_LOCAL_BACKEND_DIR ?? "(default)"}`);
+  console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env["LETTA_LOCAL_BACKEND_DIR"] ?? "(default)"}`);
 });
 
 // ── Mobile channel WS upgrade route ───────────────────────────────

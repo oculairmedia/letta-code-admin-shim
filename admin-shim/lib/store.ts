@@ -80,11 +80,11 @@ export interface OnDiskAgentRecord {
 export interface OnDiskConversation {
   id: string;
   agent_id: string;
-  created_at?: string | null;
-  updated_at?: string | null;
-  last_message_at?: string | null;
-  summary?: string | null;
-  in_context_message_ids?: string[];
+  created_at?: string | null | undefined;
+  updated_at?: string | null | undefined;
+  last_message_at?: string | null | undefined;
+  summary?: string | null | undefined;
+  in_context_message_ids?: string[] | undefined;
   [k: string]: unknown;
 }
 
@@ -108,8 +108,8 @@ export interface ResolvedConversation {
 
 /** Options for `listMessages`. */
 export interface ListMessagesOptions {
-  limit?: number;
-  before?: string;
+  limit?: number | undefined;
+  before?: string | undefined;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -127,8 +127,8 @@ function b64urlDecode(value: string): string {
 
 function storageDir(): string {
   return (
-    process.env.LETTA_LOCAL_BACKEND_DIR ||
-    join(process.env.LETTA_HOME || join(homedir(), ".letta"), "lc-local-backend")
+    process.env["LETTA_LOCAL_BACKEND_DIR"] ||
+    join(process.env["LETTA_HOME"] || join(homedir(), ".letta"), "lc-local-backend")
   );
 }
 
@@ -160,22 +160,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isAgentRecordCandidate(value: unknown): value is Record<string, unknown> & { id: string } {
-  return isRecord(value) && typeof value.id === "string" && value.id.length > 0;
+  return isRecord(value) && typeof value["id"] === "string" && (value["id"] as string).length > 0;
 }
 
 function isConversationOnDisk(value: unknown): value is OnDiskConversation {
   return (
     isRecord(value) &&
-    typeof value.id === "string" &&
-    typeof value.agent_id === "string"
+    typeof value["id"] === "string" &&
+    typeof value["agent_id"] === "string"
   );
 }
 
 function isLocalMessage(value: unknown): value is LocalMessage {
   if (!isRecord(value)) return false;
-  if (typeof value.id !== "string") return false;
-  if (typeof value.role !== "string") return false;
-  if (!Array.isArray(value.parts)) return false;
+  if (typeof value["id"] !== "string") return false;
+  if (typeof value["role"] !== "string") return false;
+  if (!Array.isArray(value["parts"])) return false;
   return true;
 }
 

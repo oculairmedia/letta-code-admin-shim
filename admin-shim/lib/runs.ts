@@ -117,26 +117,26 @@ export type RecordStepInput = Partial<Step> & Record<string, unknown>;
 
 /** Argument bag for listRuns — mirrors the parsed query-param fields. */
 export interface ListRunsParams {
-  agentId?: string;
-  agentIds?: string[];
-  conversationId?: string;
-  active?: boolean;
-  background?: boolean;
-  statuses?: string[];
-  stopReason?: string;
-  before?: string;
-  after?: string;
-  limit?: number;
-  order?: "asc" | "desc";
-  ascending?: boolean;
+  agentId?: string | undefined;
+  agentIds?: string[] | undefined;
+  conversationId?: string | undefined;
+  active?: boolean | undefined;
+  background?: boolean | undefined;
+  statuses?: string[] | undefined;
+  stopReason?: string | undefined;
+  before?: string | undefined;
+  after?: string | undefined;
+  limit?: number | undefined;
+  order?: "asc" | "desc" | undefined;
+  ascending?: boolean | undefined;
 }
 
 /** Argument bag for listRunSteps. */
 export interface ListRunStepsParams {
-  before?: string;
-  after?: string;
-  limit?: number;
-  order?: "asc" | "desc";
+  before?: string | undefined;
+  after?: string | undefined;
+  limit?: number | undefined;
+  order?: "asc" | "desc" | undefined;
 }
 
 /** Argument bag for cancelRun. */
@@ -165,13 +165,13 @@ export interface AggregateUsageResult {
 }
 
 export interface AggregateUsageParams {
-  agentId?: string;
-  agentIds?: string[];
-  conversationId?: string;
-  start?: string;
-  end?: string;
-  statuses?: string[];
-  groupBy?: "agent" | "conversation" | "model" | "day" | null;
+  agentId?: string | undefined;
+  agentIds?: string[] | undefined;
+  conversationId?: string | undefined;
+  start?: string | undefined;
+  end?: string | undefined;
+  statuses?: string[] | undefined;
+  groupBy?: "agent" | "conversation" | "model" | "day" | null | undefined;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -180,8 +180,8 @@ export interface AggregateUsageParams {
 
 function storageDir(): string {
   return (
-    process.env.LETTA_LOCAL_BACKEND_DIR ||
-    join(process.env.LETTA_HOME || join(homedir(), ".letta"), "lc-local-backend")
+    process.env["LETTA_LOCAL_BACKEND_DIR"] ||
+    join(process.env["LETTA_HOME"] || join(homedir(), ".letta"), "lc-local-backend")
   );
 }
 
@@ -224,7 +224,7 @@ function readJsonOrNull(path: string): unknown {
 function isRunRecord(value: unknown): value is RunRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.id === "string";
+  return typeof v["id"] === "string";
 }
 
 function readRunFromDisk(runId: string): RunRecord | null {
@@ -240,7 +240,7 @@ function readRunAt(path: string): RunRecord | null {
 function isStep(value: unknown): value is Step {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.id === "string";
+  return typeof v["id"] === "string";
 }
 
 function writeJsonAtomic(path: string, value: unknown): void {
@@ -622,7 +622,9 @@ export function aggregateUsage({
 }: AggregateUsageParams = {}): AggregateUsageResult {
   const root = runsRoot();
   if (!existsSync(root)) {
-    return { total: emptyTotals(), breakdown: groupBy ? [] : undefined };
+    return groupBy
+      ? { total: emptyTotals(), breakdown: [] }
+      : { total: emptyTotals() };
   }
 
   const total = emptyTotals();

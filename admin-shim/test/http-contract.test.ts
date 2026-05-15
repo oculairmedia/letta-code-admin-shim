@@ -114,7 +114,7 @@ test("GET /v1/agents lists seeded agents with vanilla AgentState shape", async (
     llm_config: { model: string; model_endpoint_type: string };
   }>;
   assert.equal(arr.length, 1);
-  const a = arr[0];
+  const a = arr[0]!;
   assert.equal(a.id, id);
   assert.equal(a.name, "Listy");
   assert.equal(a.system, "Be brief.");
@@ -244,19 +244,19 @@ test("GET /v1/agents/{id}/messages returns vanilla-shaped messages", async (t) =
   }>;
   assert.equal(res.status, 200);
   assert.equal(arr.length, 2);
-  const u = arr[0];
+  const u = arr[0]!;
   assert.equal(u.id, "ui-msg-u1");
   assert.equal(u.role, "user");
   assert.equal(u.message_type, "user_message");
   assert.equal(u.agent_id, id);
   assert.equal(u.conversation_id, "default");
   assert.ok(Array.isArray(u.content));
-  assert.equal(u.content[0].type, "text");
-  assert.equal(u.content[0].text, "hello world");
+  assert.equal(u.content[0]!.type, "text");
+  assert.equal(u.content[0]!.text, "hello world");
   // otid defaults to localMsg.id in localMessageToLettaMessage
   assert.equal(u.otid, "ui-msg-u1");
 
-  const a = arr[1];
+  const a = arr[1]!;
   assert.equal(a.message_type, "assistant_message");
   assert.equal(a.role, "assistant");
 });
@@ -361,8 +361,8 @@ test("GET /v1/agents/{id}/core-memory/blocks returns memfs-derived blocks", asyn
   }>;
   assert.equal(arr.length, 2);
   const byLabel = Object.fromEntries(arr.map((b) => [b.label, b]));
-  assert.equal(byLabel.persona.value, "I am persona-text");
-  assert.equal(byLabel.human.value, "user-text");
+  assert.equal(byLabel["persona"]!.value, "I am persona-text");
+  assert.equal(byLabel["human"]!.value, "user-text");
   // Required vanilla Block fields
   for (const b of arr) {
     assert.ok(b.id, "block.id present");
@@ -418,7 +418,7 @@ test("GET /v1/blocks/{id} returns a single block", async (t) => {
   // First fetch the list to learn the synthesized id
   const list = await getJson(`${shim.url}/v1/agents/${id}/core-memory/blocks`);
   const listArr = list.body as Array<{ id: string }>;
-  const blockId = listArr[0].id;
+  const blockId = listArr[0]!.id;
 
   const { res, body } = await getJson(`${shim.url}/v1/blocks/${blockId}`);
   const b = body as { id: string; value: string };
@@ -538,7 +538,7 @@ test("GET /v1/conversations/{ext}/messages projects user message with otid=local
   }>;
   assert.equal(res.status, 200);
   assert.equal(arr.length, 1);
-  const m = arr[0];
+  const m = arr[0]!;
   assert.equal(m.id, "ui-msg-projU");
   assert.equal(m.message_type, "user_message");
   // The crucial contract: no otid map, so otid echoes localMsg.id.
@@ -566,7 +566,7 @@ test("GET /v1/conversations/{ext}/messages strips <system-reminder> envelopes fr
   const { body } = await getJson(`${shim.url}/v1/conversations/${ext}/messages`);
   const arr = body as Array<{ content: string }>;
   assert.equal(arr.length, 1);
-  assert.equal(arr[0].content, "hello there");
+  assert.equal(arr[0]!.content, "hello there");
 });
 
 test("GET /v1/conversations/{ext}/messages honors order=asc / order=desc", async (t) => {
@@ -632,7 +632,7 @@ test("GET /v1/conversations/{ext}/messages projects assistant text into assistan
   const { body } = await getJson(`${shim.url}/v1/conversations/${ext}/messages`);
   const arr = body as Array<{ message_type: string; content: string; otid: string }>;
   assert.equal(arr.length, 1);
-  const m = arr[0];
+  const m = arr[0]!;
   assert.equal(m.message_type, "assistant_message");
   assert.equal(m.content, "result is 42");
   assert.equal(m.otid, "ui-msg-asst");
@@ -684,8 +684,8 @@ test("multi-agent default disambiguation: bare literal `default` doesn't disk-sc
   const viaBArr = viaB.body as Array<{ content: string }>;
   assert.equal(viaAArr.length, 1);
   assert.equal(viaBArr.length, 1);
-  assert.equal(viaAArr[0].content, "A's prior");
-  assert.equal(viaBArr[0].content, "B's prior");
+  assert.equal(viaAArr[0]!.content, "A's prior");
+  assert.equal(viaBArr[0]!.content, "B's prior");
 
   // Bare literal "default" → 200 empty, never leaks either agent's messages.
   const viaDefault = await getJson(`${shim.url}/v1/conversations/default/messages`);
@@ -765,9 +765,9 @@ test("GET /v1/providers returns at least one provider with required fields", asy
   assert.ok(Array.isArray(body));
   const arr = body as Array<{ id: string; name: string; provider_type: string }>;
   assert.ok(arr.length >= 1);
-  assert.equal(typeof arr[0].id, "string");
-  assert.equal(typeof arr[0].name, "string");
-  assert.equal(typeof arr[0].provider_type, "string");
+  assert.equal(typeof arr[0]!.id, "string");
+  assert.equal(typeof arr[0]!.name, "string");
+  assert.equal(typeof arr[0]!.provider_type, "string");
 });
 
 test("GET /v1/tools returns the builtin tool definitions", async (t) => {
@@ -910,9 +910,9 @@ test("agent record exposes system from agent record and blocks from memfs", asyn
   assert.equal(b.system, "You are a strict reviewer.");
   // memory.blocks contains all three labels with correct values
   const byLabel = Object.fromEntries(b.memory.blocks.map((bl) => [bl.label, bl]));
-  assert.equal(byLabel.persona.value, "I am a strict reviewer.");
-  assert.equal(byLabel.human.value, "User is a developer.");
-  assert.equal(byLabel.project.value, "Project: admin-shim.");
+  assert.equal(byLabel["persona"]!.value, "I am a strict reviewer.");
+  assert.equal(byLabel["human"]!.value, "User is a developer.");
+  assert.equal(byLabel["project"]!.value, "Project: admin-shim.");
 });
 
 // ── method-not-allowed / unknown paths ──────────────────────────────

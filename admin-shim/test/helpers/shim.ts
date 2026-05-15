@@ -41,13 +41,13 @@ const MOCK_LETTA = join(__dirname, "letta-mock.mjs");
 
 export interface ShimOpts {
   /** Name of a directory under test/fixtures/state/ to copy into the shim's backend dir. */
-  fixture?: string;
+  fixture?: string | undefined;
   /** Extra env vars to inject (overrides defaults). */
-  env?: Record<string, string | undefined>;
+  env?: Record<string, string | undefined> | undefined;
   /** Sets MOBILE_CHANNEL_TOKEN (default "test-token-do-not-use-in-prod"). */
-  mobileToken?: string;
+  mobileToken?: string | undefined;
   /** If false, return as soon as we have a port (default true). */
-  waitForReady?: boolean;
+  waitForReady?: boolean | undefined;
 }
 
 export interface WaitForLogLineOpts {
@@ -146,8 +146,8 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
     NODE_PATH: join(ADMIN_SHIM_ROOT, "node_modules"),
     ...opts.env,
   };
-  delete env.LETTA_API_KEY;
-  delete env.LETTA_API_URL;
+  delete env["LETTA_API_KEY"];
+  delete env["LETTA_API_URL"];
 
   const serverPath = join(ADMIN_SHIM_ROOT, "server.ts");
   // Run via `node <mock> args...` since LETTA_BIN points at a .mjs file.
@@ -214,7 +214,7 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
   // Generous timeout because the suite spawns many shims back-to-back; an
   // event-loop hiccup while a prior shim is still tearing down can delay
   // startup well past a tight 5s budget.
-  const READY_TIMEOUT_MS = Number(process.env.SHIM_TEST_READY_TIMEOUT_MS ?? 15000);
+  const READY_TIMEOUT_MS = Number(process.env["SHIM_TEST_READY_TIMEOUT_MS"] ?? 15000);
   await handle.waitForLogLine(/listening on/, { timeoutMs: READY_TIMEOUT_MS });
   const portMatch = log.match(/listening on http:\/\/[^:]+:(\d+)/);
   if (!portMatch) {

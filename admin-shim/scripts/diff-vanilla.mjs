@@ -10,30 +10,44 @@ const VANILLA = "http://192.168.50.90:8289";
 const VANILLA_KEY = "lettaSecurePass123";
 const SHIM = "http://localhost:8291";
 
-async function fetchJson(base, path, { method = "GET", body, key } = {}) {
+/**
+ * @param {string} base
+ * @param {string} path
+ * @param {{ method?: string, body?: unknown, key?: string }} [opts]
+ * @returns {Promise<{ status: number, json?: any, text?: string, error?: string }>}
+ */
+async function fetchJson(base, path, opts = {}) {
+  const { method = "GET", body, key } = opts;
+  /** @type {Record<string, string>} */
   const headers = { "Content-Type": "application/json" };
-  if (key) headers.Authorization = `Bearer ${key}`;
+  if (key) headers["Authorization"] = `Bearer ${key}`;
   try {
-    const res = await fetch(`${base}${path}`, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    /** @type {RequestInit} */
+    const init = { method, headers };
+    if (body !== undefined) init.body = JSON.stringify(body);
+    const res = await fetch(`${base}${path}`, init);
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch {}
     return { status: res.status, json, text: text.slice(0, 500) };
   } catch (err) {
-    return { status: 0, error: err.message };
+    const msg = err instanceof Error ? err.message : String(err);
+    return { status: 0, error: msg };
   }
 }
 
+/** @param {unknown} value */
 function categorize(value) {
   if (value === null) return "null";
   if (Array.isArray(value)) return value.length === 0 ? "array[0]" : `array[${value.length}]`;
   return typeof value;
 }
 
+/**
+ * @param {unknown} obj
+ * @param {number} [depth]
+ * @returns {unknown}
+ */
 function summarizeShape(obj, depth = 0) {
   if (obj === null) return "null";
   if (typeof obj !== "object") return typeof obj;
@@ -41,14 +55,21 @@ function summarizeShape(obj, depth = 0) {
     return `array[${obj.length}]${obj.length ? " of " + summarizeShape(obj[0], depth + 1) : ""}`;
   }
   if (depth > 2) return "{...}";
-  const keys = Object.keys(obj).slice(0, 30);
+  const rec = /** @type {Record<string, unknown>} */ (obj);
+  const keys = Object.keys(rec).slice(0, 30);
+  /** @type {Record<string, unknown>} */
   const summary = {};
-  for (const k of keys) summary[k] = categorize(obj[k]);
+  for (const k of keys) summary[k] = categorize(rec[k]);
   return summary;
 }
 
+/**
+ * @param {unknown} a
+ * @param {unknown} b
+ */
 function compareKeys(a, b) {
   if (!a || !b || typeof a !== "object" || typeof b !== "object") return null;
+  /** @param {unknown} x */
   const sample = (x) => (Array.isArray(x) ? (x[0] ?? {}) : x);
   const sa = sample(a), sb = sample(b);
   if (typeof sa !== "object" || typeof sb !== "object" || sa === null || sb === null) return null;

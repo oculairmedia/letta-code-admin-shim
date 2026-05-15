@@ -28,7 +28,7 @@ import type {
   UsageStatisticsMessage,
 } from "./types/wire.js";
 
-const POOL_ENABLED = process.env.SHIM_POOL_DISABLE !== "1";
+const POOL_ENABLED = process.env["SHIM_POOL_DISABLE"] !== "1";
 
 /**
  * Shape of the JSON body POSTed to `/v1/agents/{id}/messages`. Mobile,
@@ -50,18 +50,18 @@ function extractUserOtid(body: MessageRequestBody | null | undefined): string | 
   // Falls back to `body.otid` for legacy callers and `null` for clients
   // that don't supply one (curl, our smoke test).
   if (!body) return null;
-  const messages = body.messages ?? body.message;
+  const messages = body["messages"] ?? body["message"];
   if (Array.isArray(messages)) {
     for (const m of messages) {
       if (m && typeof m === "object") {
         const rec = m as RequestMessageLike;
-        if ((rec.role === "user" || !rec.role) && typeof rec.otid === "string" && rec.otid) {
-          return rec.otid;
+        if ((rec["role"] === "user" || !rec["role"]) && typeof rec["otid"] === "string" && rec["otid"]) {
+          return rec["otid"];
         }
       }
     }
   }
-  if (typeof body.otid === "string" && body.otid) return body.otid;
+  if (typeof body["otid"] === "string" && body["otid"]) return body["otid"];
   return null;
 }
 
@@ -75,22 +75,22 @@ function extractText(body: unknown): string {
   if (typeof body === "string") return body;
   if (typeof body !== "object") return "";
   const rec = body as Record<string, unknown>;
-  if (typeof rec.input === "string") return rec.input;
-  if (typeof rec.text === "string") return rec.text;
-  const messages = rec.messages ?? rec.message;
+  if (typeof rec["input"] === "string") return rec["input"];
+  if (typeof rec["text"] === "string") return rec["text"];
+  const messages = rec["messages"] ?? rec["message"];
   if (Array.isArray(messages)) {
     return messages
       .map((m: unknown) => {
         if (typeof m === "string") return m;
         if (m && typeof m === "object") {
           const r = m as Record<string, unknown>;
-          if (typeof r.content === "string") return r.content;
-          if (Array.isArray(r.content)) {
-            return r.content
+          if (typeof r["content"] === "string") return r["content"];
+          if (Array.isArray(r["content"])) {
+            return r["content"]
               .map((c: unknown) => {
                 if (c && typeof c === "object") {
                   const cr = c as Record<string, unknown>;
-                  return typeof cr.text === "string" ? cr.text : "";
+                  return typeof cr["text"] === "string" ? cr["text"] : "";
                 }
                 return "";
               })
@@ -196,14 +196,14 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
   const rawRec = raw as Record<string, unknown>;
   let f: Record<string, unknown> = rawRec;
 
-  if (rawRec.type === "stream_event" && rawRec.event && typeof rawRec.event === "object") {
+  if (rawRec["type"] === "stream_event" && rawRec["event"] && typeof rawRec["event"] === "object") {
     // The wall-clock `timestamp` lives on the OUTER stream_event frame;
     // the inner event only carries the sentinel `date`. Forward the outer
     // timestamp onto the inner so downstream code picks it up.
-    const evt = rawRec.event as Record<string, unknown>;
-    f = { ...evt, timestamp: evt.timestamp ?? rawRec.timestamp };
-  } else if (rawRec.type === "system") return null;
-  else if (rawRec.type === "result") return null;
+    const evt = rawRec["event"] as Record<string, unknown>;
+    f = { ...evt, timestamp: evt["timestamp"] ?? rawRec["timestamp"] };
+  } else if (rawRec["type"] === "system") return null;
+  else if (rawRec["type"] === "result") return null;
 
   // Original: `const mt = f.message_type; if (!mt) return null;`. TS needs
   // `mt` typed as `string` for the literal comparisons below, but the .mjs
@@ -212,7 +212,7 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
   // keep the `!mt` check and cast to string for the comparisons — they're
   // all `===` against string literals, which evaluate false for non-strings
   // and still funnel non-string truthies to the passthrough block.
-  const mtRaw = f.message_type;
+  const mtRaw = f["message_type"];
   if (!mtRaw) return null;
   const mt = mtRaw as string;
 
@@ -221,28 +221,28 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
   if (mt === "stop_reason") {
     return {
       message_type: "stop_reason",
-      stop_reason: (f.stop_reason ?? "end_turn") as string,
+      stop_reason: (f["stop_reason"] ?? "end_turn") as string,
     };
   }
   if (mt === "usage_statistics") {
     const usage: UsageStatisticsMessage = {
       message_type: "usage_statistics",
-      completion_tokens: (f.completion_tokens ?? 0) as number,
-      prompt_tokens: (f.prompt_tokens ?? 0) as number,
-      total_tokens: (f.total_tokens ?? 0) as number,
+      completion_tokens: (f["completion_tokens"] ?? 0) as number,
+      prompt_tokens: (f["prompt_tokens"] ?? 0) as number,
+      total_tokens: (f["total_tokens"] ?? 0) as number,
       step_count: 1,
       run_ids: null,
-      cached_input_tokens: (f.cached_input_tokens ?? 0) as number,
-      cache_write_tokens: (f.cache_write_tokens ?? 0) as number,
-      reasoning_tokens: (f.reasoning_tokens ?? 0) as number,
-      context_tokens: (f.context_tokens ?? f.total_tokens ?? 0) as number,
+      cached_input_tokens: (f["cached_input_tokens"] ?? 0) as number,
+      cache_write_tokens: (f["cache_write_tokens"] ?? 0) as number,
+      reasoning_tokens: (f["reasoning_tokens"] ?? 0) as number,
+      context_tokens: (f["context_tokens"] ?? f["total_tokens"] ?? 0) as number,
     };
     return usage;
   }
   if (mt === "ping") {
     const ping: PingMessage = {
-      id: (f.id ?? `ping-${Date.now()}`) as string,
-      date: (f.date ?? f.timestamp ?? isoNow()) as string,
+      id: (f["id"] ?? `ping-${Date.now()}`) as string,
+      date: (f["date"] ?? f["timestamp"] ?? isoNow()) as string,
       name: null,
       message_type: "ping",
       otid: null,
@@ -250,46 +250,46 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
       step_id: null,
       is_err: null,
       seq_id: null,
-      run_id: (f.run_id ?? null) as string | null,
+      run_id: (f["run_id"] ?? null) as string | null,
     };
     return ping;
   }
 
   // Content normalization: letta-code emits content as [{type:"text",text}]
   // for assistant/user; vanilla emits it as a string in conv-listed streams.
-  let content: unknown = f.content;
+  let content: unknown = f["content"];
   if (Array.isArray(content)) content = partsToText(content);
 
   const base = {
-    id: (f.id ?? f.uuid ?? `letta-msg-${Date.now()}`) as string,
+    id: (f["id"] ?? f["uuid"] ?? `letta-msg-${Date.now()}`) as string,
     // letta-code emits BOTH `timestamp` (real wall-clock) and `date`
     // (sentinel: Date.UTC(2026,0,1,0,0,seqIndex+1)). The sentinel encodes
     // message order, not time. Mobile and other clients sort by `date` —
     // if we pass the sentinel, every message lands on Jan 1, 2026 and
     // recently-arrived stream messages appear duplicated against
     // disk-fetched history. Prefer the real timestamp.
-    date: (f.timestamp ?? f.date ?? isoNow()) as string,
-    name: (f.name ?? null) as string | null,
-    otid: (f.otid ?? null) as string | null,
-    sender_id: (f.sender_id ?? null) as string | null,
-    step_id: (f.step_id ?? null) as string | null,
-    is_err: (f.is_err ?? null) as boolean | null,
-    seq_id: (f.seq_id ?? null) as number | null,
-    run_id: (f.run_id ?? null) as string | null,
+    date: (f["timestamp"] ?? f["date"] ?? isoNow()) as string,
+    name: (f["name"] ?? null) as string | null,
+    otid: (f["otid"] ?? null) as string | null,
+    sender_id: (f["sender_id"] ?? null) as string | null,
+    step_id: (f["step_id"] ?? null) as string | null,
+    is_err: (f["is_err"] ?? null) as boolean | null,
+    seq_id: (f["seq_id"] ?? null) as number | null,
+    run_id: (f["run_id"] ?? null) as string | null,
   };
 
   if (mt === "reasoning_message") {
     return {
       ...base,
       message_type: "reasoning_message",
-      source: (f.source ?? "reasoner_model") as string | null,
+      source: (f["source"] ?? "reasoner_model") as string | null,
       reasoning:
-        typeof f.reasoning === "string"
-          ? f.reasoning
+        typeof f["reasoning"] === "string"
+          ? f["reasoning"]
           : typeof content === "string"
             ? content
             : "",
-      signature: (f.signature ?? null) as string | null,
+      signature: (f["signature"] ?? null) as string | null,
     };
   }
   if (mt === "assistant_message" || mt === "user_message" || mt === "system_message") {
@@ -313,8 +313,8 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
     // to tool_call_message so both paths agree on the message_type. With
     // permission_mode=unrestricted (mobile's default for this shim) the
     // tool runs without an actual approval round-trip.
-    const tc = (f.tool_call ?? null) as ToolCall | null;
-    const tcs = (f.tool_calls ?? null) as ToolCall[] | null;
+    const tc = (f["tool_call"] ?? null) as ToolCall | null;
+    const tcs = (f["tool_calls"] ?? null) as ToolCall[] | null;
     const tcFirst = Array.isArray(tcs) ? tcs[0] : undefined;
     const callId = tc?.tool_call_id ?? tcFirst?.tool_call_id;
     return {
@@ -327,12 +327,12 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
   }
   if (mt === "tool_return_message") {
     // Same id-matching trick for tool returns.
-    const trs = (f.tool_returns ?? null) as ToolReturn[] | null;
+    const trs = (f["tool_returns"] ?? null) as ToolReturn[] | null;
     const trFirst = Array.isArray(trs) ? trs[0] : undefined;
     // Original: `f.tool_call_id ?? f.tool_returns?.[0]?.tool_call_id` — keep
     // the raw nullish chain (don't narrow on type) so non-string truthies
     // flow through identically to the .mjs.
-    const callId = (f.tool_call_id ?? trFirst?.tool_call_id) as
+    const callId = (f["tool_call_id"] ?? trFirst?.tool_call_id) as
       | string
       | number
       | null
@@ -341,11 +341,11 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
       ...base,
       id: callId ? `toolreturn-${callId}` : base.id,
       message_type: "tool_return_message",
-      tool_return: (f.tool_return ?? null) as string | null,
-      status: (f.status ?? "success") as string,
+      tool_return: (f["tool_return"] ?? null) as string | null,
+      status: (f["status"] ?? "success") as string,
       tool_call_id: (callId ?? null) as string | null,
-      stdout: (f.stdout ?? null) as string | string[] | null,
-      stderr: (f.stderr ?? null) as string | string[] | null,
+      stdout: (f["stdout"] ?? null) as string | string[] | null,
+      stderr: (f["stderr"] ?? null) as string | string[] | null,
       tool_returns: trs,
     };
   }
@@ -441,7 +441,7 @@ function buildLettaArgs(
 
 /** Optional handler args supplied by the route. */
 export interface HandleSendMessageOptions {
-  conversationId?: string;
+  conversationId?: string | undefined;
 }
 
 export async function handleSendMessage(
@@ -481,16 +481,16 @@ export async function handleSendMessage(
   // legacy callers might pass other shapes; widen to `unknown` to preserve
   // behavior, then narrow at use-sites).
   const conversationId: string | undefined = (
-    explicitConv ?? body.conversation_id ?? body.conversationId ?? undefined
+    explicitConv ?? body["conversation_id"] ?? body["conversationId"] ?? undefined
   ) as string | undefined;
   // Mobile uses `streaming` (and `stream_tokens`); legacy uses `stream`.
   // Default to streaming when caller didn't specify.
   const wantStream =
-    body.streaming === true ||
-    body.stream_tokens === true ||
-    (body.streaming === undefined &&
-      body.stream_tokens === undefined &&
-      body.stream !== false);
+    body["streaming"] === true ||
+    body["stream_tokens"] === true ||
+    (body["streaming"] === undefined &&
+      body["stream_tokens"] === undefined &&
+      body["stream"] !== false);
 
   const frames: LettaMessage[] = []; // collected for non-streaming + final result
   let stderrBuf = "";
@@ -670,10 +670,10 @@ export async function handleSendMessage(
         if (activeRunId) {
           if (raw && typeof raw === "object") {
             const rRec = raw as Record<string, unknown>;
-            if (rRec.event && typeof rRec.event === "object") {
-              (rRec.event as Record<string, unknown>).run_id = activeRunId;
+            if (rRec["event"] && typeof rRec["event"] === "object") {
+              (rRec["event"] as Record<string, unknown>)["run_id"] = activeRunId;
             } else {
-              rRec.run_id = activeRunId;
+              rRec["run_id"] = activeRunId;
             }
           }
         }
@@ -735,7 +735,7 @@ export async function handleSendMessage(
   // Legacy per-request spawn path — enabled with SHIM_POOL_DISABLE=1.
   const { spawn } = await import("node:child_process");
   const args = buildLettaArgs(agentId, conversationId, text, { stream: wantStream });
-  const child = spawn(process.env.LETTA_BIN || "letta", args, {
+  const child = spawn(process.env["LETTA_BIN"] || "letta", args, {
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });

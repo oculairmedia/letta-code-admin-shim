@@ -41,10 +41,10 @@ import type {
   UsageStatisticsEvent,
 } from "./types/letta-stream.js";
 
-const LETTA_BIN = process.env.LETTA_BIN || "letta";
-const MAX_WORKERS = Number(process.env.SHIM_POOL_MAX ?? 10);
-const IDLE_EVICT_MS = Number(process.env.SHIM_POOL_IDLE_SEC ?? 300) * 1000;
-const SPAWN_TIMEOUT_MS = Number(process.env.SHIM_POOL_SPAWN_TIMEOUT ?? 15000);
+const LETTA_BIN = process.env["LETTA_BIN"] || "letta";
+const MAX_WORKERS = Number(process.env["SHIM_POOL_MAX"] ?? 10);
+const IDLE_EVICT_MS = Number(process.env["SHIM_POOL_IDLE_SEC"] ?? 300) * 1000;
+const SPAWN_TIMEOUT_MS = Number(process.env["SHIM_POOL_SPAWN_TIMEOUT"] ?? 15000);
 const HOUSEKEEP_INTERVAL_MS = 30_000;
 
 /**
@@ -143,7 +143,7 @@ function logLine(msg: string): void {
 function isLettaStreamFrame(value: unknown): value is LettaStreamFrame {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.type === "string";
+  return typeof v["type"] === "string";
 }
 
 /** Pull the inner event when present, else fall back to the frame itself. */
@@ -417,12 +417,12 @@ class Worker {
             const evAsRec = ev as unknown as Record<string, unknown>;
             const frameAsRec = frame as unknown as Record<string, unknown>;
             const evModel =
-              "model" in ev && typeof evAsRec.model === "string"
-                ? (evAsRec.model)
+              "model" in ev && typeof evAsRec["model"] === "string"
+                ? (evAsRec["model"] as string)
                 : undefined;
             const frameModel =
-              "model" in frame && typeof frameAsRec.model === "string"
-                ? (frameAsRec.model)
+              "model" in frame && typeof frameAsRec["model"] === "string"
+                ? (frameAsRec["model"] as string)
                 : undefined;
             recordRunStep(runHandle, {
               stop_reason: stopReasonRaw,
@@ -465,7 +465,7 @@ class Worker {
       }
       // Wait for the result frame OR child exit. Add a generous safety
       // timeout so a stuck worker doesn't block the chain forever.
-      const TURN_TIMEOUT_MS = Number(process.env.SHIM_POOL_TURN_TIMEOUT ?? 180_000);
+      const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 180_000);
       await new Promise<void>((r) => {
         const start = Date.now();
         const poll = setInterval(() => {

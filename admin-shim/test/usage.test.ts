@@ -240,7 +240,7 @@ test("usage: ?statuses=completed excludes cancelled runs", async (t) => {
   for (let i = 0; i < 30; i += 1) {
     const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
     const arr = body as Array<{ id: string }>;
-    if (arr.length >= 1) { runId = arr[0].id; break; }
+    if (arr.length >= 1) { runId = arr[0]!.id; break; }
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.ok(runId);
@@ -319,12 +319,12 @@ test("usage: group_by=agent — breakdown per agent, sorted by total_tokens desc
   assert.ok(Array.isArray(b.breakdown));
   assert.equal(b.breakdown!.length, 2);
   // sorted by total_tokens desc → heavy first
-  assert.equal(b.breakdown![0].key, heavy);
-  assert.equal(b.breakdown![0].total_tokens, 24);
-  assert.equal(b.breakdown![0].run_count, 2);
-  assert.equal(b.breakdown![1].key, light);
-  assert.equal(b.breakdown![1].total_tokens, 12);
-  assert.equal(b.breakdown![1].run_count, 1);
+  assert.equal(b.breakdown![0]!.key, heavy);
+  assert.equal(b.breakdown![0]!.total_tokens, 24);
+  assert.equal(b.breakdown![0]!.run_count, 2);
+  assert.equal(b.breakdown![1]!.key, light);
+  assert.equal(b.breakdown![1]!.total_tokens, 12);
+  assert.equal(b.breakdown![1]!.run_count, 1);
 });
 
 test("usage: group_by=conversation — breakdown per conversation_id", async (t) => {
@@ -344,10 +344,10 @@ test("usage: group_by=conversation — breakdown per conversation_id", async (t)
   const keys = b.breakdown!.map((br) => br.key).sort();
   assert.deepEqual(keys, ["conv-x", "default"]);
   const byKey = Object.fromEntries(b.breakdown!.map((br) => [br.key, br]));
-  assert.equal(byKey["default"].run_count, 2);
-  assert.equal(byKey["default"].total_tokens, 24);
-  assert.equal(byKey["conv-x"].run_count, 1);
-  assert.equal(byKey["conv-x"].total_tokens, 12);
+  assert.equal(byKey["default"]!.run_count, 2);
+  assert.equal(byKey["default"]!.total_tokens, 24);
+  assert.equal(byKey["conv-x"]!.run_count, 1);
+  assert.equal(byKey["conv-x"]!.total_tokens, 12);
 });
 
 test("usage: group_by=day — breakdown bucket per YYYY-MM-DD", async (t) => {
@@ -364,9 +364,9 @@ test("usage: group_by=day — breakdown bucket per YYYY-MM-DD", async (t) => {
   const b = body as UsageSummary;
   // Both turns happen in the same calendar day in wall-clock time.
   assert.equal(b.breakdown!.length, 1);
-  assert.match(b.breakdown![0].key, /^\d{4}-\d{2}-\d{2}$/);
-  assert.equal(b.breakdown![0].run_count, 2);
-  assert.equal(b.breakdown![0].total_tokens, 24);
+  assert.match(b.breakdown![0]!.key, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(b.breakdown![0]!.run_count, 2);
+  assert.equal(b.breakdown![0]!.total_tokens, 24);
 });
 
 test("usage: group_by=model — sums per-step usage from steps.jsonl", async (t) => {
@@ -386,11 +386,11 @@ test("usage: group_by=model — sums per-step usage from steps.jsonl", async (t)
   const b = body as UsageSummary;
   assert.ok(Array.isArray(b.breakdown));
   assert.equal(b.breakdown!.length, 1);
-  assert.equal(b.breakdown![0].key, "unknown");
+  assert.equal(b.breakdown![0]!.key, "unknown");
   // bash-tool step1+step2: p=6+1=7, c=97+8=105, t=103+9=112
-  assert.equal(b.breakdown![0].prompt_tokens, 7);
-  assert.equal(b.breakdown![0].completion_tokens, 105);
-  assert.equal(b.breakdown![0].total_tokens, 112);
+  assert.equal(b.breakdown![0]!.prompt_tokens, 7);
+  assert.equal(b.breakdown![0]!.completion_tokens, 105);
+  assert.equal(b.breakdown![0]!.total_tokens, 112);
   // The run-level total in this aggregation is also the step sum:
   assert.equal(b.total.total_tokens, 112);
 });

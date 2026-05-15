@@ -70,17 +70,17 @@ export function agentToLettaState(
   const created = record._ctimeMs ? new Date(record._ctimeMs).toISOString() : new Date().toISOString();
   const updated = record._mtimeMs ? new Date(record._mtimeMs).toISOString() : created;
 
-  const providerType = typeof settings.provider_type === "string" ? settings.provider_type : null;
+  const providerType = typeof settings["provider_type"] === "string" ? settings["provider_type"] : null;
   const contextWindow =
-    typeof settings.context_window_limit === "number" ? settings.context_window_limit : 200000;
-  const temperature = typeof settings.temperature === "number" ? settings.temperature : 1.0;
-  const maxTokens = typeof settings.max_tokens === "number" ? settings.max_tokens : 16384;
+    typeof settings["context_window_limit"] === "number" ? settings["context_window_limit"] : 200000;
+  const temperature = typeof settings["temperature"] === "number" ? settings["temperature"] : 1.0;
+  const maxTokens = typeof settings["max_tokens"] === "number" ? settings["max_tokens"] : 16384;
 
   const llmConfig: LlmConfig = {
     model,
     display_name: model,
     model_endpoint_type: providerType === "lmstudio" ? "openai" : (providerType ?? "openai"),
-    model_endpoint: process.env.LMSTUDIO_BASE_URL || "https://api.openai.com/v1",
+    model_endpoint: process.env["LMSTUDIO_BASE_URL"] || "https://api.openai.com/v1",
     provider_name: provider,
     provider_category: "base",
     model_wrapper: null,
@@ -95,7 +95,7 @@ export function agentToLettaState(
 
   const embeddingConfig: EmbeddingConfig = {
     embedding_endpoint_type: "openai",
-    embedding_endpoint: process.env.LMSTUDIO_BASE_URL || "https://api.openai.com/v1",
+    embedding_endpoint: process.env["LMSTUDIO_BASE_URL"] || "https://api.openai.com/v1",
     embedding_model: "text-embedding-3-small",
     embedding_dim: 1536,
     embedding_chunk_size: 300,

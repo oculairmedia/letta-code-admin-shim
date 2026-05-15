@@ -53,7 +53,7 @@ test("fixture frames match LettaStreamFrame discriminators", () => {
     const path = join(FIXTURE_DIR, file);
     const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim());
     for (let i = 0; i < lines.length; i++) {
-      const raw: unknown = JSON.parse(lines[i]);
+      const raw: unknown = JSON.parse(lines[i]!);
       // Bind via a typed alias so tsc verifies the asserted shape during
       // `npm run typecheck`.
       const frame = raw as LettaStreamFrame;

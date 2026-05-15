@@ -461,13 +461,13 @@ export interface Step {
   run_id: string | null;
   agent_id: string | null;
   created_at: string;
-  model?: string | null;
-  stop_reason?: string | null;
+  model?: string | null | undefined;
+  stop_reason?: string | null | undefined;
   /** `null` is a legitimate value, not just absence: when a stop_reason
    * fires with no preceding usage_statistics frame, agent-pool writes
    * `"usage":null` to steps.jsonl explicitly (so the field's presence
    * itself signals "step boundary observed"). */
-  usage?: Partial<RunUsage> | null;
+  usage?: Partial<RunUsage> | null | undefined;
   [k: string]: unknown;
 }
 

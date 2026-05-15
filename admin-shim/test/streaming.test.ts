@@ -194,8 +194,8 @@ test("streaming: multi-tool-bash-read emits TWO tool_call_messages in order", as
     "tool_call_ids must be distinct",
   );
   // Indexes must be ordered
-  const i0 = result.frames.indexOf(tools[0]);
-  const i1 = result.frames.indexOf(tools[1]);
+  const i0 = result.frames.indexOf(tools[0]!);
+  const i1 = result.frames.indexOf(tools[1]!);
   assert.ok(i0 < i1, "Bash tool_call must precede Read tool_call");
 });
 
@@ -245,7 +245,7 @@ test("streaming: every turn frame carries the same run_id", async (t) => {
   assert.ok(runIds.size > 0, "at least one frame must carry a run_id");
   assert.equal(runIds.size, 1, `all run_ids must match; got ${[...runIds].join(",")}`);
   const [runId] = runIds as Set<string>;
-  assert.match(runId, /^run-/, "run_id should look like run-<uuid> (shim-generated, not letta-code's local-run-N)");
+  assert.match(runId!, /^run-/, "run_id should look like run-<uuid> (shim-generated, not letta-code's local-run-N)");
 });
 
 // ─── 8. tagAsOptimistic: cm-stream- on text, NOT on tool_calls ────────
@@ -523,8 +523,8 @@ test("streaming: tool-then-text emits tool_call_message then one coalesced assis
   const assistants = framesOfType(result.frames, "assistant_message");
   assert.equal(tools.length, 1, "tool-then-text has one Bash call");
   assert.equal(assistants.length, 1, "post-tool assistant chunks must coalesce to 1 frame");
-  const tIdx = result.frames.indexOf(tools[0]);
-  const aIdx = result.frames.indexOf(assistants[0]);
+  const tIdx = result.frames.indexOf(tools[0]!);
+  const aIdx = result.frames.indexOf(assistants[0]!);
   assert.ok(tIdx < aIdx, "tool_call must come before the trailing assistant_message");
 });
 

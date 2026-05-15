@@ -27,9 +27,32 @@ import {
   writeOtidForLocalId,
 } from "./store.js";
 import type { LettaMessage } from "./types/wire.js";
+import type {
+  BridgeSendMessageArgs as PublicBridgeSendMessageArgs,
+  BridgeSendMessageHooks as PublicBridgeSendMessageHooks,
+  ChannelAccount as PublicChannelAccount,
+  ChannelAdapter as PublicChannelAdapter,
+  ChannelHost as PublicChannelHost,
+  ChannelPlugin as PublicChannelPlugin,
+  HostLogger as PublicHostLogger,
+} from "./types/channel-plugin.js";
+
+// Re-export the public, channel-agnostic types so external callers can pick
+// them up from this module too. The runtime shape below is unchanged — the
+// host continues to load plugins as `unknown` and duck-type-narrow on
+// `createAdapter` (Hard Rule #3).
+export type {
+  PublicBridgeSendMessageArgs as ChannelBridgeSendMessageArgs,
+  PublicBridgeSendMessageHooks as ChannelBridgeSendMessageHooks,
+  PublicChannelAccount,
+  PublicChannelAdapter,
+  PublicChannelHost,
+  PublicChannelPlugin,
+  PublicHostLogger,
+};
 
 function channelDir(): string {
-  const root = process.env.LETTA_HOME || join(homedir(), ".letta");
+  const root = process.env["LETTA_HOME"] || join(homedir(), ".letta");
   return join(root, "channels", "mobile");
 }
 
@@ -140,7 +163,7 @@ async function bridgeSendMessage(
       // Bare-shape variants (StopReasonMessage, UsageStatisticsMessage) do
       // not declare `run_id`, but the .mjs unconditionally added it at
       // runtime; mirror that exactly by writing through a Record cast.
-      if (meta?.runId) (reshaped as unknown as Record<string, unknown>).run_id = meta.runId;
+      if (meta?.runId) (reshaped as unknown as Record<string, unknown>)["run_id"] = meta.runId;
       const mt = reshaped.message_type;
       if (mt === "stop_reason") {
         pendingStop = reshaped;

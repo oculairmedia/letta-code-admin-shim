@@ -177,9 +177,9 @@ test("runs: one turn → listRuns returns one record with correct ids", async (t
   const arr = body as RunRecord[];
   assert.ok(Array.isArray(arr));
   assert.equal(arr.length, 1);
-  assert.equal(arr[0].id, runId);
-  assert.equal(arr[0].agent_id, agentId);
-  assert.equal(arr[0].conversation_id, "default");
+  assert.equal(arr[0]!.id, runId);
+  assert.equal(arr[0]!.agent_id, agentId);
+  assert.equal(arr[0]!.conversation_id, "default");
 });
 
 test("runs: multiple turns → listRuns ordered desc by created_at", async (t) => {
@@ -197,9 +197,9 @@ test("runs: multiple turns → listRuns ordered desc by created_at", async (t) =
   const arr = body as RunRecord[];
   assert.equal(arr.length, 3);
   // desc — most recent first
-  assert.equal(arr[0].id, c.runId);
-  assert.equal(arr[1].id, b.runId);
-  assert.equal(arr[2].id, a.runId);
+  assert.equal(arr[0]!.id, c.runId);
+  assert.equal(arr[1]!.id, b.runId);
+  assert.equal(arr[2]!.id, a.runId);
 });
 
 test("runs: listRuns filters by agent_id, conversation_id, statuses", async (t) => {
@@ -218,7 +218,7 @@ test("runs: listRuns filters by agent_id, conversation_id, statuses", async (t) 
   const byA1 = await getJson(`${shim.url}/v1/runs/?agent_id=${a1}`);
   const byA1Arr = byA1.body as RunRecord[];
   assert.equal(byA1Arr.length, 1);
-  assert.equal(byA1Arr[0].agent_id, a1);
+  assert.equal(byA1Arr[0]!.agent_id, a1);
 
   // conversation_id filter
   const byConv = await getJson(`${shim.url}/v1/runs/?conversation_id=default`);
@@ -259,7 +259,7 @@ test("runs: listRuns?active=true returns 1 mid-turn, 0 once finished", async (t)
     const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
     const arr = body as RunRecord[];
     if (arr.length >= 1) {
-      assert.equal(arr[0].status, "running");
+      assert.equal(arr[0]!.status, "running");
       sawActive = true;
       break;
     }
@@ -285,7 +285,7 @@ test("runs: listRuns?active=false returns the completed runs", async (t) => {
   const { body } = await getJson(`${shim.url}/v1/runs/?active=false`);
   const arr = body as RunRecord[];
   assert.equal(arr.length, 1);
-  assert.equal(arr[0].status, "completed");
+  assert.equal(arr[0]!.status, "completed");
 });
 
 test("runs: listRuns pagination — ?limit=2&before=<id>", async (t) => {
@@ -306,15 +306,15 @@ test("runs: listRuns pagination — ?limit=2&before=<id>", async (t) => {
   const { body } = await getJson(`${shim.url}/v1/runs/?limit=2&after=${c.runId}`);
   const arr = body as RunRecord[];
   assert.equal(arr.length, 2);
-  assert.equal(arr[0].id, b.runId);
-  assert.equal(arr[1].id, a.runId);
+  assert.equal(arr[0]!.id, b.runId);
+  assert.equal(arr[1]!.id, a.runId);
 
   // And ?before=a → entries appearing BEFORE a (newer) → [c, b]; limit=2.
   const fwd = await getJson(`${shim.url}/v1/runs/?limit=2&before=${a.runId}`);
   const fwdArr = fwd.body as RunRecord[];
   assert.equal(fwdArr.length, 2);
-  assert.equal(fwdArr[0].id, c.runId);
-  assert.equal(fwdArr[1].id, b.runId);
+  assert.equal(fwdArr[0]!.id, c.runId);
+  assert.equal(fwdArr[1]!.id, b.runId);
 });
 
 test("runs: GET /v1/runs/{id} response includes all vanilla + shim fields", async (t) => {
@@ -429,8 +429,8 @@ test("runs: GET /v1/runs/{id}/steps — plain=1 step, bash-tool=2 steps with usa
   const p1Arr = p1.body as RunStep[];
   assert.equal(p1.status, 200);
   assert.equal(p1Arr.length, 1);
-  assert.ok(p1Arr[0].usage, "step record should carry per-step usage");
-  assert.ok(p1Arr[0].stop_reason, "step record should carry stop_reason");
+  assert.ok(p1Arr[0]!.usage, "step record should carry per-step usage");
+  assert.ok(p1Arr[0]!.stop_reason, "step record should carry stop_reason");
 
   // bash-tool: 2 steps (tool-call step + final assistant step)
   const aBash = seedAgent(shim.stateDir, { id: "agent-steps-bash" });
@@ -545,7 +545,7 @@ test("runs: cancel via POST /v1/agents/{id}/messages/cancel with run_ids", async
   for (let i = 0; i < 30; i += 1) {
     const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
     const arr = body as RunRecord[];
-    if (arr.length >= 1) { runId = arr[0].id; break; }
+    if (arr.length >= 1) { runId = arr[0]!.id; break; }
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.ok(runId, "should observe an active run before cancel");
@@ -588,7 +588,7 @@ test("runs: cancel with empty run_ids cancels ALL active runs for the agent", as
   for (let i = 0; i < 30; i += 1) {
     const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
     const arr = body as RunRecord[];
-    if (arr.length >= 1) { runId = arr[0].id; break; }
+    if (arr.length >= 1) { runId = arr[0]!.id; break; }
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.ok(runId);
@@ -636,7 +636,7 @@ test("runs: cancel unknown run returns not_found; cancel wrong agent returns age
   for (let i = 0; i < 30; i += 1) {
     const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
     const arr = body as RunRecord[];
-    if (arr.length >= 1) { runId = arr[0].id; break; }
+    if (arr.length >= 1) { runId = arr[0]!.id; break; }
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.ok(runId);
@@ -718,7 +718,7 @@ test("runs: cancelled run still produces a persisted record", async (t) => {
   for (let i = 0; i < 30; i += 1) {
     const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
     const arr = body as RunRecord[];
-    if (arr.length >= 1) { runId = arr[0].id; break; }
+    if (arr.length >= 1) { runId = arr[0]!.id; break; }
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.ok(runId);
