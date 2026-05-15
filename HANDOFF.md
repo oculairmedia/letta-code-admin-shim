@@ -42,7 +42,7 @@ tmux new-session -d -s lettashim '... see HANDOFF for the full env block ...'
 Full restart command (one-liner):
 
 ```bash
-tmux new-session -d -s lettashim 'env HOME=/opt/stacks/letta-code-parallel/home LETTA_LOCAL_BACKEND_DIR=/opt/stacks/letta-code-parallel/migrator/out LMSTUDIO_BASE_URL=http://localhost:8082/v1 LETTA_BASE_URL=http://127.0.0.1:0 LETTA_LOCAL_BACKEND_EXPERIMENTAL=1 NODE_PATH=/opt/stacks/letta-code-parallel/admin-shim/node_modules node --import tsx/esm /opt/stacks/letta-code-parallel/admin-shim/server.mjs 2>&1 | tee /tmp/admin-shim.log'
+tmux new-session -d -s lettashim 'env HOME=/opt/stacks/letta-code-parallel/home LETTA_LOCAL_BACKEND_DIR=/opt/stacks/letta-code-parallel/migrator/out LMSTUDIO_BASE_URL=http://localhost:8082/v1 LETTA_BASE_URL=http://127.0.0.1:0 LETTA_LOCAL_BACKEND_EXPERIMENTAL=1 NODE_PATH=/opt/stacks/letta-code-parallel/admin-shim/node_modules node --import tsx/esm /opt/stacks/letta-code-parallel/admin-shim/server.ts 2>&1 | tee /tmp/admin-shim.log'
 ```
 
 ## The migration plan

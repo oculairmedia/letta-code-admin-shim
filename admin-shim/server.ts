@@ -16,7 +16,8 @@
  *   POST   /v1/agents/{id}/messages              send + stream (next iter)
  */
 
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import { URL } from "node:url";
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -24,7 +25,6 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import {
-  getAgentIdForConversation,
   getAgentRecord,
   getConversation,
   listAgents,
@@ -37,6 +37,8 @@ import {
   readSystemPrompt,
   resolveConversationId,
   _internals as storeInternals,
+  type OnDiskAgentRecord,
+  type OnDiskConversation,
 } from "./lib/store.js";
 import {
   agentToLettaState,
@@ -52,6 +54,7 @@ import {
   getRun,
   listRunSteps,
   listRuns,
+  type ListRunsParams,
 } from "./lib/runs.js";
 import { getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
 import { WebSocketServer } from "ws";
@@ -59,7 +62,12 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.SHIM_PORT || 8291);
 const HOST = process.env.SHIM_HOST || "0.0.0.0";
 
-function json(res, status, body, extraHeaders = {}) {
+function json(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   const payload = Buffer.from(JSON.stringify(body));
   res.writeHead(status, {
     "Content-Type": "application/json",
@@ -72,17 +80,22 @@ function json(res, status, body, extraHeaders = {}) {
   res.end(payload);
 }
 
-function notFound(res, what = "not found") {
+function notFound(res: ServerResponse, what: string = "not found"): void {
   json(res, 404, { detail: what });
 }
 
-function parsePagination(searchParams) {
+interface Pagination {
+  limit: number;
+  offset: number;
+}
+
+function parsePagination(searchParams: URLSearchParams): Pagination {
   const limit = Number(searchParams.get("limit") ?? 50);
   const offset = Number(searchParams.get("offset") ?? 0);
   return { limit: Number.isFinite(limit) ? limit : 50, offset: Number.isFinite(offset) ? offset : 0 };
 }
 
-function defaultConversationForAgent(agentId) {
+function defaultConversationForAgent(agentId: string): OnDiskConversation | null {
   return getConversation("default", agentId);
 }
 
@@ -93,7 +106,7 @@ function defaultConversationForAgent(agentId) {
 // When this changes, the client should treat the cache as a different
 // universe and self-invalidate. See README "Server identity" section.
 const SERVER_ID_FILE = join(storeInternals.storageDir(), ".shim-server-id");
-function readOrCreateServerId() {
+function readOrCreateServerId(): string {
   try {
     if (existsSync(SERVER_ID_FILE)) {
       const cached = readFileSync(SERVER_ID_FILE, "utf8").trim();
@@ -105,7 +118,7 @@ function readOrCreateServerId() {
     mkdirSync(join(SERVER_ID_FILE, ".."), { recursive: true });
     writeFileSync(SERVER_ID_FILE, fresh + "\n");
   } catch (err) {
-    console.error(`server_id persist failed: ${err.message}`);
+    console.error(`server_id persist failed: ${(err as Error).message}`);
   }
   return fresh;
 }
@@ -114,7 +127,7 @@ const SERVER_VERSION = "shim-0.2.0";
 const SERVER_STARTED_AT = new Date().toISOString();
 console.log(`server_id: ${SERVER_ID}`);
 
-function handleHealth(_req, res) {
+function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, {
     version: SERVER_VERSION,
     status: "ok",
@@ -124,11 +137,11 @@ function handleHealth(_req, res) {
   });
 }
 
-function handlePoolStats(_req, res) {
+function handlePoolStats(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, getAgentPool().stats());
 }
 
-function handleAgentsList(req, res, url) {
+function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const { limit, offset } = parsePagination(url.searchParams);
   const tagFilter = url.searchParams.getAll("tags");
   const nameFilter = url.searchParams.get("name");
@@ -138,12 +151,12 @@ function handleAgentsList(req, res, url) {
   }
   if (nameFilter) {
     agents = agents.filter((a) =>
-      (a.name ?? "").toLowerCase().includes(nameFilter.toLowerCase()),
+      ((a.name as string | undefined) ?? "").toLowerCase().includes(nameFilter.toLowerCase()),
     );
   }
   const sliced = agents.slice(offset, offset + limit);
   const projected = sliced.map((a) => {
-    const conv = defaultConversationForAgent(a.id);
+    defaultConversationForAgent(a.id);
     const messages = listMessages("default", a.id);
     const blocks = readBlocksForAgent(a.id);
     return agentToLettaState(a, { messages, blocks });
@@ -151,21 +164,21 @@ function handleAgentsList(req, res, url) {
   json(res, 200, projected);
 }
 
-function handleAgentsCount(_req, res) {
+function handleAgentsCount(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, listAgents().length);
 }
 
 // Stale-id alias table — mobile may have cached an agent_id from an earlier
 // migration revision. Map those legacy ids to the canonical current id so
 // mobile's cached navigation doesn't break.
-const AGENT_ID_ALIASES = {
+const AGENT_ID_ALIASES: Record<string, string> = {
   // pre-rev6 migrator generated these from a name-hash; rev6 onward uses
   // the original Letta-server UUIDs. Map the hashes to their canonical ids.
   "agent-migrated-77d0a4b78ede9f8d9e1b279b": "agent-597b5756-2915-4560-ba6b-91005f085166",
   "agent-migrated-eeb0dbb6d6117617453ba793": "agent-2fae4a23-1caa-460d-9033-9f30ac84ed5e",
 };
 
-function resolveAgentRecord(agentId) {
+function resolveAgentRecord(agentId: string): OnDiskAgentRecord | null {
   let a = getAgentRecord(agentId);
   if (a) return a;
   const canonical = AGENT_ID_ALIASES[agentId];
@@ -179,7 +192,7 @@ function resolveAgentRecord(agentId) {
   return null;
 }
 
-function handleAgentDetail(req, res, agentId) {
+function handleAgentDetail(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
   const a = resolveAgentRecord(agentId);
   if (!a) return notFound(res, `agent ${agentId}`);
   const messages = listMessages("default", a.id);
@@ -187,7 +200,12 @@ function handleAgentDetail(req, res, agentId) {
   json(res, 200, agentToLettaState(a, { messages, blocks }));
 }
 
-function handleAgentMessages(req, res, url, agentId) {
+function handleAgentMessages(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  agentId: string,
+): void {
   const a = resolveAgentRecord(agentId);
   if (!a) return notFound(res, `agent ${agentId}`);
   const { limit } = parsePagination(url.searchParams);
@@ -201,7 +219,12 @@ function handleAgentMessages(req, res, url, agentId) {
   );
 }
 
-function handleAgentContext(req, res, url, agentId) {
+function handleAgentContext(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  agentId: string,
+): void {
   const a = resolveAgentRecord(agentId);
   if (!a) return notFound(res, `agent ${agentId}`);
   // mobile passes the synthesized external conv id; resolve to internal.
@@ -211,7 +234,11 @@ function handleAgentContext(req, res, url, agentId) {
     : resolveConversationId(requestedConv) ?? { conversationId: requestedConv, agentId };
   const sp = readSystemPrompt(resolved.conversationId, resolved.agentId);
   const messages = listMessages(resolved.conversationId, resolved.agentId);
-  const systemPrompt = sp?.content ?? a.system ?? "";
+  const spContent =
+    sp && typeof sp === "object" && "content" in sp && typeof (sp as { content: unknown }).content === "string"
+      ? (sp as { content: string }).content
+      : undefined;
+  const systemPrompt = spContent ?? (typeof a.system === "string" ? a.system : "") ?? "";
   json(res, 200, {
     context_window_size_current:
       Math.ceil(systemPrompt.length / 4) + messages.length * 50,
@@ -240,12 +267,12 @@ function handleAgentContext(req, res, url, agentId) {
   });
 }
 
-function handleAgentBlocks(req, res, agentId) {
+function handleAgentBlocks(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
   if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
   json(res, 200, readBlocksForAgent(agentId));
 }
 
-function handleBlocksList(_req, res) {
+function handleBlocksList(_req: IncomingMessage, res: ServerResponse): void {
   // Union of all per-agent blocks. Real Letta has globally addressable blocks
   // but LocalBackend doesn't, so we synthesize.
   const all = [];
@@ -255,7 +282,7 @@ function handleBlocksList(_req, res) {
   json(res, 200, all);
 }
 
-function handleBlockDetail(req, res, blockId) {
+function handleBlockDetail(_req: IncomingMessage, res: ServerResponse, blockId: string): void {
   for (const a of listAgents()) {
     const blocks = readBlocksForAgent(a.id);
     const hit = blocks.find((b) => b.id === blockId);
@@ -264,7 +291,14 @@ function handleBlockDetail(req, res, blockId) {
   notFound(res, `block ${blockId}`);
 }
 
-function vanillaModel({ handle, name, contextWindow = 200000, maxTokens = 16384 }) {
+interface VanillaModelOptions {
+  handle: string;
+  name: string;
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
+function vanillaModel({ handle, name, contextWindow = 200000, maxTokens = 16384 }: VanillaModelOptions): Record<string, unknown> {
   // Full vanilla Letta server model shape — every field the FastAPI server
   // surfaces, including reasoning/effort/etc fields mobile UI may reflect.
   return {
@@ -302,7 +336,7 @@ function vanillaModel({ handle, name, contextWindow = 200000, maxTokens = 16384 
   };
 }
 
-function handleModels(_req, res) {
+function handleModels(_req: IncomingMessage, res: ServerResponse): void {
   // Surface the model(s) we have wired through the lmstudio provider — and
   // a couple of common handles so mobile's model picker has options.
   json(res, 200, [
@@ -314,7 +348,12 @@ function handleModels(_req, res) {
   ]);
 }
 
-const BUILTIN_TOOL_DEFINITIONS = [
+interface BuiltinToolDefinition {
+  name: string;
+  description: string;
+}
+
+const BUILTIN_TOOL_DEFINITIONS: BuiltinToolDefinition[] = [
   { name: "Bash", description: "Execute a bash command on the client machine." },
   { name: "Read", description: "Read a file from the local filesystem." },
   { name: "Write", description: "Create or overwrite a file on the local filesystem." },
@@ -331,7 +370,7 @@ const BUILTIN_TOOL_DEFINITIONS = [
   { name: "ExitPlanMode", description: "Exit plan mode." },
 ];
 
-function vanillaTool({ name, description }) {
+function vanillaTool({ name, description }: BuiltinToolDefinition): Record<string, unknown> {
   // Deterministic id so successive calls return the same tool id.
   const idHash = Buffer.from(`tool:${name}`).toString("base64url").slice(0, 24).toLowerCase();
   return {
@@ -360,11 +399,11 @@ function vanillaTool({ name, description }) {
   };
 }
 
-function handleTools(_req, res) {
+function handleTools(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, BUILTIN_TOOL_DEFINITIONS.map(vanillaTool));
 }
 
-function handleToolDetail(_req, res, toolId) {
+function handleToolDetail(_req: IncomingMessage, res: ServerResponse, toolId: string): void {
   const match = BUILTIN_TOOL_DEFINITIONS
     .map(vanillaTool)
     .find((t) => t.id === toolId);
@@ -372,7 +411,13 @@ function handleToolDetail(_req, res, toolId) {
   json(res, 200, match);
 }
 
-function vanillaProvider({ name, providerType, baseUrl }) {
+interface VanillaProviderOptions {
+  name: string;
+  providerType: string;
+  baseUrl: string;
+}
+
+function vanillaProvider({ name, providerType, baseUrl }: VanillaProviderOptions): Record<string, unknown> {
   const idHash = Buffer.from(`provider:${name}`).toString("base64url").slice(0, 24).toLowerCase();
   return {
     id: `provider-${idHash}`,
@@ -392,7 +437,7 @@ function vanillaProvider({ name, providerType, baseUrl }) {
   };
 }
 
-function handleProviders(_req, res) {
+function handleProviders(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, [
     vanillaProvider({
       name: "lmstudio-local",
@@ -402,20 +447,25 @@ function handleProviders(_req, res) {
   ]);
 }
 
-async function sendMessage(req, res, agentId, conversationId) {
+async function sendMessage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  agentId: string,
+  conversationId?: string,
+): Promise<void> {
   if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
   try {
     await handleSendMessage(req, res, agentId, { conversationId });
   } catch (err) {
     if (!res.writableEnded) {
-      json(res, 500, { detail: `chat dispatch failed: ${err.message}` });
+      json(res, 500, { detail: `chat dispatch failed: ${(err as Error).message}` });
     }
   }
 }
 
 // ── /v1/conversations namespace ────────────────────────────────────
 
-function handleConversationsList(req, res, url) {
+function handleConversationsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const { limit, offset } = parsePagination(url.searchParams);
   const agentId = url.searchParams.get("agent_id") ?? undefined;
   const items = agentId ? listConversationsForAgent(agentId) : listAllConversations();
@@ -423,19 +473,19 @@ function handleConversationsList(req, res, url) {
   json(res, 200, items.slice(offset, offset + limit).map(conversationToLetta));
 }
 
-function handleConversationDetail(req, res, conversationId) {
+function handleConversationDetail(_req: IncomingMessage, res: ServerResponse, conversationId: string): void {
   const conv = getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   json(res, 200, conversationToLetta(conv));
 }
 
-async function handleConversationCreate(req, res, url) {
+async function handleConversationCreate(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const body = await readJsonBody(req);
   // mobile sends agent_id BOTH in query string AND in body — accept either.
   const agentId =
     url.searchParams.get("agent_id") ??
-    body.agent_id ??
-    body.agentId;
+    (body.agent_id as string | null | undefined) ??
+    (body.agentId as string | null | undefined);
   if (!agentId || !resolveAgentRecord(agentId)) {
     return json(res, 400, { detail: "agent_id required (and must exist)" });
   }
@@ -443,9 +493,9 @@ async function handleConversationCreate(req, res, url) {
   // Vanilla Letta server behaviour: every POST creates a brand-new
   // conversation. Mobile's chat lifecycle depends on this (each fresh-route
   // chat screen creates a fresh conv); idempotency here breaks mobile UX.
-  const conversationId = body.id ?? `conv-${cryptoRandomUUID()}`;
+  const conversationId = (body.id as string | null | undefined) ?? `conv-${cryptoRandomUUID()}`;
   const now = new Date().toISOString();
-  const conv = {
+  const conv: OnDiskConversation = {
     id: conversationId,
     agent_id: agentId,
     archived: false,
@@ -453,7 +503,7 @@ async function handleConversationCreate(req, res, url) {
     created_at: now,
     updated_at: now,
     last_message_at: now,
-    summary: body.summary ?? null,
+    summary: (body.summary as string | null | undefined) ?? null,
     in_context_message_ids: [],
   };
   const key = `conversation:${conversationId}`;
@@ -464,15 +514,15 @@ async function handleConversationCreate(req, res, url) {
   json(res, 201, conversationToLetta(conv));
 }
 
-async function handleConversationUpdate(req, res, conversationId) {
+async function handleConversationUpdate(req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
   const conv = getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   const body = await readJsonBody(req);
-  const next = {
+  const next: OnDiskConversation = {
     ...conv,
-    summary: body.summary ?? conv.summary,
-    archived: body.archived ?? conv.archived,
-    archived_at: body.archived === true ? new Date().toISOString() : conv.archived_at,
+    summary: (body.summary as string | null | undefined) ?? conv.summary,
+    archived: (body.archived as unknown) ?? (conv as Record<string, unknown>).archived,
+    archived_at: body.archived === true ? new Date().toISOString() : (conv as Record<string, unknown>).archived_at as string | null | undefined,
     updated_at: new Date().toISOString(),
   };
   const key = conv.id === "default" ? `default:${conv.agent_id}` : `conversation:${conv.id}`;
@@ -481,7 +531,7 @@ async function handleConversationUpdate(req, res, conversationId) {
   json(res, 200, conversationToLetta(next));
 }
 
-function handleConversationDelete(req, res, conversationId) {
+function handleConversationDelete(_req: IncomingMessage, res: ServerResponse, conversationId: string): void {
   const conv = getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   if (conv.id === "default") {
@@ -493,7 +543,12 @@ function handleConversationDelete(req, res, conversationId) {
   json(res, 200, { id: conv.id, deleted: true });
 }
 
-function handleConversationMessagesList(req, res, url, externalConvId) {
+function handleConversationMessagesList(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  externalConvId: string,
+): void {
   const resolved = resolveConversationId(externalConvId);
   if (!resolved) {
     // Unknown conv (e.g. cached client-side from a prior Python-Letta-server
@@ -510,18 +565,21 @@ function handleConversationMessagesList(req, res, url, externalConvId) {
   const otidMap = readOtidMap(resolved.conversationId, resolved.agentId);
   const out = [];
   for (const m of items) {
-    const projected = localMessageToConversationMessages(m, {
+    // .mjs passed agentId/conversationId here too; the function ignores them
+    // (only realTimes/otidMap are read). Preserved structurally via the cast.
+    const scope = {
       agentId: resolved.agentId,
       conversationId: externalConvId,
       realTimes,
       otidMap,
-    });
+    };
+    const projected = localMessageToConversationMessages(m, scope);
     for (const p of projected) out.push(p);
   }
   json(res, 200, out);
 }
 
-async function handleConversationSendMessage(req, res, externalConvId) {
+async function handleConversationSendMessage(req: IncomingMessage, res: ServerResponse, externalConvId: string): Promise<void> {
   const resolved = resolveConversationId(externalConvId);
   if (!resolved) return notFound(res, `conversation ${externalConvId}`);
   // letta-code's --conversation expects the INTERNAL id (e.g. "default" or
@@ -529,7 +587,7 @@ async function handleConversationSendMessage(req, res, externalConvId) {
   await sendMessage(req, res, resolved.agentId, resolved.conversationId);
 }
 
-function handleConversationStream(req, res, externalConvId) {
+function handleConversationStream(req: IncomingMessage, res: ServerResponse, externalConvId: string): void {
   // Ambient stream stub. Mobile polls this even for conversations that
   // don't exist locally (e.g. cached from a prior Python-Letta-server
   // session). Always return 200 with a keep-alive SSE so mobile's
@@ -551,7 +609,7 @@ function handleConversationStream(req, res, externalConvId) {
   req.on("close", () => clearInterval(ping));
 }
 
-function handleConversationCancel(req, res, conversationId) {
+function handleConversationCancel(_req: IncomingMessage, res: ServerResponse, conversationId: string): void {
   // Phase 1: there's no shared subprocess registry yet. Acknowledge so the
   // client UI clears any pending state.
   const conv = getConversation(conversationId);
@@ -559,7 +617,7 @@ function handleConversationCancel(req, res, conversationId) {
   json(res, 200, { id: conv.id, status: "accepted" });
 }
 
-function handleConversationStub(req, res, conversationId, op) {
+function handleConversationStub(_req: IncomingMessage, res: ServerResponse, conversationId: string, op: string): void {
   if (!getConversation(conversationId)) return notFound(res, `conversation ${conversationId}`);
   json(res, 501, { detail: `conversation op ${op} not yet implemented in Phase 1` });
 }
@@ -570,7 +628,7 @@ function handleConversationStub(req, res, conversationId, op) {
 // status, lists active runs for resume detection, and POSTs cancels.
 // See lib/runs.mjs for the data model and lifecycle.
 
-function parseBoolParam(searchParams, name) {
+function parseBoolParam(searchParams: URLSearchParams, name: string): boolean | null {
   const raw = searchParams.get(name);
   if (raw == null) return null;
   if (raw === "true") return true;
@@ -578,34 +636,34 @@ function parseBoolParam(searchParams, name) {
   return null;
 }
 
-function handleRunsList(req, res, url) {
+function handleRunsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const { limit } = parsePagination(url.searchParams);
-  const params = {
+  const params: ListRunsParams & { agentIds?: string[]; statuses?: string[] } = {
     agentId: url.searchParams.get("agent_id") ?? undefined,
     agentIds: url.searchParams.getAll("agent_ids"),
     conversationId: url.searchParams.get("conversation_id") ?? undefined,
-    active: parseBoolParam(url.searchParams, "active"),
-    background: parseBoolParam(url.searchParams, "background"),
+    active: parseBoolParam(url.searchParams, "active") ?? undefined,
+    background: parseBoolParam(url.searchParams, "background") ?? undefined,
     statuses: url.searchParams.getAll("statuses"),
     stopReason: url.searchParams.get("stop_reason") ?? undefined,
     before: url.searchParams.get("before") ?? undefined,
     after: url.searchParams.get("after") ?? undefined,
     limit,
-    order: url.searchParams.get("order") ?? "desc",
-    ascending: parseBoolParam(url.searchParams, "ascending"),
+    order: (url.searchParams.get("order") ?? "desc") as "asc" | "desc",
+    ascending: parseBoolParam(url.searchParams, "ascending") ?? undefined,
   };
   if (params.agentIds?.length === 0) delete params.agentIds;
   if (params.statuses?.length === 0) delete params.statuses;
   json(res, 200, listRuns(params));
 }
 
-function handleRunDetail(req, res, runId) {
+function handleRunDetail(_req: IncomingMessage, res: ServerResponse, runId: string): void {
   const run = getRun(runId);
   if (!run) return notFound(res, `run ${runId}`);
   json(res, 200, run);
 }
 
-function handleRunMessages(req, res, url, runId) {
+function handleRunMessages(_req: IncomingMessage, res: ServerResponse, url: URL, runId: string): void {
   const run = getRun(runId);
   if (!run) return notFound(res, `run ${runId}`);
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
@@ -623,16 +681,19 @@ function handleRunMessages(req, res, url, runId) {
   const realTimes = readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = readOtidMap(resolved.conversationId, resolved.agentId);
   const runMessageIds = new Set(run.message_ids ?? []);
-  let out = [];
+  let out: Array<{ id?: string }> = [];
   for (const m of items) {
     if (!runMessageIds.has(m?.id)) continue;
-    const projected = localMessageToConversationMessages(m, {
+    // .mjs passed agentId/conversationId here too; the function ignores them
+    // (only realTimes/otidMap are read). Preserved structurally via the cast.
+    const scope = {
       agentId: resolved.agentId,
       conversationId: run.conversation_id,
       realTimes,
       otidMap,
-    });
-    for (const p of projected) out.push(p);
+    };
+    const projected = localMessageToConversationMessages(m, scope);
+    for (const p of projected) out.push(p as { id?: string });
   }
   if (order === "desc") out = out.reverse();
   if (after) {
@@ -647,22 +708,22 @@ function handleRunMessages(req, res, url, runId) {
   json(res, 200, out);
 }
 
-function handleRunUsage(req, res, runId) {
+function handleRunUsage(_req: IncomingMessage, res: ServerResponse, runId: string): void {
   const run = getRun(runId);
   if (!run) return notFound(res, `run ${runId}`);
-  const u = run.usage ?? {};
+  const u = (run.usage ?? {}) as Record<string, unknown>;
   json(res, 200, {
-    completion_tokens: u.completion_tokens ?? 0,
-    prompt_tokens: u.prompt_tokens ?? 0,
-    total_tokens: u.total_tokens ?? 0,
-    step_count: u.step_count ?? run.num_steps ?? 0,
-    cached_input_tokens: u.cached_input_tokens ?? 0,
-    cache_write_tokens: u.cache_write_tokens ?? 0,
-    reasoning_tokens: u.reasoning_tokens ?? 0,
+    completion_tokens: (u.completion_tokens as number | undefined) ?? 0,
+    prompt_tokens: (u.prompt_tokens as number | undefined) ?? 0,
+    total_tokens: (u.total_tokens as number | undefined) ?? 0,
+    step_count: (u.step_count as number | undefined) ?? run.num_steps ?? 0,
+    cached_input_tokens: (u.cached_input_tokens as number | undefined) ?? 0,
+    cache_write_tokens: (u.cache_write_tokens as number | undefined) ?? 0,
+    reasoning_tokens: (u.reasoning_tokens as number | undefined) ?? 0,
   });
 }
 
-function handleRunMetrics(req, res, runId) {
+function handleRunMetrics(_req: IncomingMessage, res: ServerResponse, runId: string): void {
   const run = getRun(runId);
   if (!run) return notFound(res, `run ${runId}`);
   // vanilla RunMetrics: { id, organization_id, agent_id, project_id,
@@ -684,19 +745,19 @@ function handleRunMetrics(req, res, runId) {
   });
 }
 
-function handleRunSteps(req, res, url, runId) {
+function handleRunSteps(_req: IncomingMessage, res: ServerResponse, url: URL, runId: string): void {
   const run = getRun(runId);
   if (!run) return notFound(res, `run ${runId}`);
   const steps = listRunSteps(runId, {
     before: url.searchParams.get("before") ?? undefined,
     after: url.searchParams.get("after") ?? undefined,
     limit: Number(url.searchParams.get("limit") ?? 100),
-    order: url.searchParams.get("order") ?? "desc",
+    order: (url.searchParams.get("order") ?? "desc") as "asc" | "desc",
   });
   json(res, 200, steps);
 }
 
-async function handleRunDelete(req, res, runId) {
+async function handleRunDelete(_req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
   const ok = deleteRun(runId);
   if (!ok) return notFound(res, `run ${runId}`);
   json(res, 200, { id: runId, deleted: true });
@@ -708,7 +769,7 @@ async function handleRunDelete(req, res, runId) {
 // optional grouping. Mobile/clients call this instead of fanning out
 // `/v1/runs/{id}/steps` for every run in a window.
 
-function handleUsageSummary(req, res, url) {
+function handleUsageSummary(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const allowedGroupBy = new Set(["agent", "conversation", "model", "day"]);
   const groupBy = url.searchParams.get("group_by");
   if (groupBy && !allowedGroupBy.has(groupBy)) {
@@ -723,22 +784,25 @@ function handleUsageSummary(req, res, url) {
     start: url.searchParams.get("start") ?? undefined,
     end: url.searchParams.get("end") ?? undefined,
     statuses: url.searchParams.getAll("statuses"),
-    groupBy: groupBy ?? null,
+    groupBy: (groupBy as "agent" | "conversation" | "model" | "day" | null) ?? null,
   });
   json(res, 200, result);
 }
 
-async function handleAgentMessagesCancel(req, res, agentId) {
+async function handleAgentMessagesCancel(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
   // Vanilla shape: POST /v1/agents/{agent_id}/messages/cancel with body
   // `{ run_ids: ["run-..."] }`. If run_ids is omitted/empty, vanilla
   // cancels ALL active runs for the agent. Returns a map { run_id: status }.
   const body = await readJsonBody(req);
-  let runIds = Array.isArray(body?.run_ids) ? body.run_ids.filter((x) => typeof x === "string") : null;
+  const rawRunIds = (body as { run_ids?: unknown }).run_ids;
+  let runIds: string[] | null = Array.isArray(rawRunIds)
+    ? rawRunIds.filter((x): x is string => typeof x === "string")
+    : null;
   if (!runIds || runIds.length === 0) {
     const active = listRuns({ agentId, active: true, limit: 100 });
     runIds = active.map((r) => r.id);
   }
-  const out = {};
+  const out: Record<string, string> = {};
   for (const id of runIds) {
     const run = getRun(id);
     if (!run) {
@@ -756,27 +820,33 @@ async function handleAgentMessagesCancel(req, res, agentId) {
 
 // ── helpers ────────────────────────────────────────────────────────
 
-function cryptoRandomUUID() {
+function cryptoRandomUUID(): string {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-async function readJsonBody(req) {
-  const buf = await new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const buf: Buffer = await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
   if (buf.length === 0) return {};
-  try { return JSON.parse(buf.toString("utf8")); } catch { return {}; }
+  try {
+    const parsed: unknown = JSON.parse(buf.toString("utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return {};
+  } catch { return {}; }
 }
 
 // ── router ────────────────────────────────────────────────────────
 
-function pad(s, n) { return String(s).padEnd(n); }
+function pad(s: unknown, n: number): string { return String(s).padEnd(n); }
 
 const server = createServer((req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const url = new URL(req.url ?? "", `http://${req.headers.host || "localhost"}`);
   const { pathname } = url;
   const started = Date.now();
   const remote = req.socket.remoteAddress?.replace(/^::ffff:/, "") ?? "?";
@@ -791,13 +861,13 @@ const server = createServer((req, res) => {
   let respBytes = 0;
   const origWrite = res.write.bind(res);
   const origEnd = res.end.bind(res);
-  res.write = (chunk, ...rest) => {
-    if (chunk) respBytes += Buffer.byteLength(chunk);
-    return origWrite(chunk, ...rest);
+  (res as { write: (...args: unknown[]) => boolean }).write = (chunk: unknown, ...rest: unknown[]): boolean => {
+    if (chunk) respBytes += Buffer.byteLength(chunk as string | Buffer);
+    return (origWrite as (...args: unknown[]) => boolean)(chunk, ...rest);
   };
-  res.end = (chunk, ...rest) => {
-    if (chunk) respBytes += Buffer.byteLength(chunk);
-    return origEnd(chunk, ...rest);
+  (res as { end: (...args: unknown[]) => ServerResponse }).end = (chunk?: unknown, ...rest: unknown[]): ServerResponse => {
+    if (chunk) respBytes += Buffer.byteLength(chunk as string | Buffer);
+    return (origEnd as (...args: unknown[]) => ServerResponse)(chunk, ...rest);
   };
 
   res.on("close", () => {
@@ -833,30 +903,30 @@ const server = createServer((req, res) => {
   if (req.method === "GET" && pathname === "/v1/models") return handleModels(req, res);
 
   const agentDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/?$/);
-  if (agentDetail && req.method === "GET") return handleAgentDetail(req, res, agentDetail[1]);
+  if (agentDetail && req.method === "GET") return handleAgentDetail(req, res, agentDetail[1]!);
 
   const agentMessages = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/messages\/?$/);
-  if (agentMessages && req.method === "GET") return handleAgentMessages(req, res, url, agentMessages[1]);
-  if (agentMessages && req.method === "POST") return sendMessage(req, res, agentMessages[1]);
+  if (agentMessages && req.method === "GET") return handleAgentMessages(req, res, url, agentMessages[1]!);
+  if (agentMessages && req.method === "POST") return sendMessage(req, res, agentMessages[1]!);
 
   const agentContext = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/context\/?$/);
-  if (agentContext && req.method === "GET") return handleAgentContext(req, res, url, agentContext[1]);
+  if (agentContext && req.method === "GET") return handleAgentContext(req, res, url, agentContext[1]!);
 
   const agentBlocks = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/core-memory\/blocks\/?$/);
-  if (agentBlocks && req.method === "GET") return handleAgentBlocks(req, res, agentBlocks[1]);
+  if (agentBlocks && req.method === "GET") return handleAgentBlocks(req, res, agentBlocks[1]!);
 
   if (req.method === "GET" && pathname === "/v1/blocks") return handleBlocksList(req, res);
   if (req.method === "GET" && (pathname === "/v1/blocks/count" || pathname === "/v1/blocks/count/"))
     return json(res, 200, 0);
   const blockDetail = pathname.match(/^\/v1\/blocks\/([^/]+)\/?$/);
-  if (blockDetail && req.method === "GET") return handleBlockDetail(req, res, blockDetail[1]);
+  if (blockDetail && req.method === "GET") return handleBlockDetail(req, res, blockDetail[1]!);
 
   // ── Endpoints we partially populate from letta-code state ──
   if (pathname === "/v1/tools" && req.method === "GET") return handleTools(req, res);
   if (pathname === "/v1/tools/count" && req.method === "GET")
     return json(res, 200, BUILTIN_TOOL_DEFINITIONS.length);
   const toolDetail = pathname.match(/^\/v1\/tools\/(tool-[^/]+)\/?$/);
-  if (toolDetail && req.method === "GET") return handleToolDetail(req, res, toolDetail[1]);
+  if (toolDetail && req.method === "GET") return handleToolDetail(req, res, toolDetail[1]!);
   if (pathname === "/v1/providers" && req.method === "GET") return handleProviders(req, res);
   if (pathname === "/v1/models/embedding" && req.method === "GET") {
     return json(res, 200, [
@@ -880,11 +950,11 @@ const server = createServer((req, res) => {
   // but we have no source data. Return empty arrays to match the vanilla
   // success shape rather than 404. Accept both bare and trailing-slash
   // forms because mobile sometimes appends "/" before query strings. ──
-  const stubList = ({ pn, methods = ["GET"] }) =>
-    methods.includes(req.method) &&
+  const stubList = ({ pn, methods = ["GET"] }: { pn: string; methods?: string[] }): boolean =>
+    methods.includes(req.method ?? "") &&
     (pathname === pn || pathname === pn + "/") &&
     (json(res, 200, []), true);
-  const stubCount = ({ pn }) =>
+  const stubCount = ({ pn }: { pn: string }): boolean =>
     req.method === "GET" &&
     (pathname === pn || pathname === pn + "/") &&
     (json(res, 200, 0), true);
@@ -920,20 +990,20 @@ const server = createServer((req, res) => {
     return json(res, 200, listRuns({ limit: 10000 }).length);
   }
   const runMessages = pathname.match(/^\/v1\/runs\/(run-[^/]+)\/messages\/?$/);
-  if (runMessages && req.method === "GET") return handleRunMessages(req, res, url, runMessages[1]);
+  if (runMessages && req.method === "GET") return handleRunMessages(req, res, url, runMessages[1]!);
   const runUsage = pathname.match(/^\/v1\/runs\/(run-[^/]+)\/usage\/?$/);
-  if (runUsage && req.method === "GET") return handleRunUsage(req, res, runUsage[1]);
+  if (runUsage && req.method === "GET") return handleRunUsage(req, res, runUsage[1]!);
   const runMetrics = pathname.match(/^\/v1\/runs\/(run-[^/]+)\/metrics\/?$/);
-  if (runMetrics && req.method === "GET") return handleRunMetrics(req, res, runMetrics[1]);
+  if (runMetrics && req.method === "GET") return handleRunMetrics(req, res, runMetrics[1]!);
   const runSteps = pathname.match(/^\/v1\/runs\/(run-[^/]+)\/steps\/?$/);
-  if (runSteps && req.method === "GET") return handleRunSteps(req, res, url, runSteps[1]);
+  if (runSteps && req.method === "GET") return handleRunSteps(req, res, url, runSteps[1]!);
   const runDetail = pathname.match(/^\/v1\/runs\/(run-[^/]+)\/?$/);
   if (runDetail) {
-    if (req.method === "GET") return handleRunDetail(req, res, runDetail[1]);
-    if (req.method === "DELETE") return handleRunDelete(req, res, runDetail[1]);
+    if (req.method === "GET") return handleRunDetail(req, res, runDetail[1]!);
+    if (req.method === "DELETE") return handleRunDelete(req, res, runDetail[1]!);
   }
   const agentCancel = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/messages\/cancel\/?$/);
-  if (agentCancel && req.method === "POST") return handleAgentMessagesCancel(req, res, agentCancel[1]);
+  if (agentCancel && req.method === "POST") return handleAgentMessagesCancel(req, res, agentCancel[1]!);
 
   // /shim/v1/usage — aggregate token tracking (shim extension, not vanilla)
   if (req.method === "GET" && (pathname === "/shim/v1/usage/summary" || pathname === "/shim/v1/usage/summary/")) {
@@ -947,22 +1017,22 @@ const server = createServer((req, res) => {
   }
   const convMessages = pathname.match(/^\/v1\/conversations\/([^/]+)\/messages\/?$/);
   if (convMessages) {
-    if (req.method === "GET") return handleConversationMessagesList(req, res, url, convMessages[1]);
-    if (req.method === "POST") return handleConversationSendMessage(req, res, convMessages[1]);
+    if (req.method === "GET") return handleConversationMessagesList(req, res, url, convMessages[1]!);
+    if (req.method === "POST") return handleConversationSendMessage(req, res, convMessages[1]!);
   }
   const convCancel = pathname.match(/^\/v1\/conversations\/([^/]+)\/cancel\/?$/);
-  if (convCancel && req.method === "POST") return handleConversationCancel(req, res, convCancel[1]);
+  if (convCancel && req.method === "POST") return handleConversationCancel(req, res, convCancel[1]!);
   const convFork = pathname.match(/^\/v1\/conversations\/([^/]+)\/fork\/?$/);
-  if (convFork && req.method === "POST") return handleConversationStub(req, res, convFork[1], "fork");
+  if (convFork && req.method === "POST") return handleConversationStub(req, res, convFork[1]!, "fork");
   const convRecompile = pathname.match(/^\/v1\/conversations\/([^/]+)\/recompile\/?$/);
-  if (convRecompile && req.method === "POST") return handleConversationStub(req, res, convRecompile[1], "recompile");
+  if (convRecompile && req.method === "POST") return handleConversationStub(req, res, convRecompile[1]!, "recompile");
   const convStream = pathname.match(/^\/v1\/conversations\/([^/]+)\/stream\/?$/);
-  if (convStream && req.method === "POST") return handleConversationStream(req, res, convStream[1]);
+  if (convStream && req.method === "POST") return handleConversationStream(req, res, convStream[1]!);
   const convDetail = pathname.match(/^\/v1\/conversations\/([^/]+)\/?$/);
   if (convDetail) {
-    if (req.method === "GET") return handleConversationDetail(req, res, convDetail[1]);
-    if (req.method === "PATCH") return handleConversationUpdate(req, res, convDetail[1]);
-    if (req.method === "DELETE") return handleConversationDelete(req, res, convDetail[1]);
+    if (req.method === "GET") return handleConversationDetail(req, res, convDetail[1]!);
+    if (req.method === "PATCH") return handleConversationUpdate(req, res, convDetail[1]!);
+    if (req.method === "DELETE") return handleConversationDelete(req, res, convDetail[1]!);
   }
 
   notFound(res, `${req.method} ${pathname}`);
@@ -972,7 +1042,8 @@ server.listen(PORT, HOST, () => {
   // Report the actual bound port — SHIM_PORT=0 lets the OS assign one,
   // which the test harness uses to avoid port collisions across parallel
   // suite invocations.
-  const actualPort = server.address()?.port ?? PORT;
+  const addr = server.address();
+  const actualPort = typeof addr === "object" && addr ? addr.port : PORT;
   console.log(`letta-code admin shim listening on http://${HOST}:${actualPort}`);
   console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env.LETTA_LOCAL_BACKEND_DIR ?? "(default)"}`);
 });
@@ -983,10 +1054,11 @@ server.listen(PORT, HOST, () => {
 // transport (Phase 1 of the mobile-as-channel epic). Other paths get a
 // 404 on upgrade so unknown WS targets don't hang.
 const wss = new WebSocketServer({ noServer: true });
-let mobileAdapter = null;
+type MobileAdapter = Awaited<ReturnType<typeof getMobileChannelAdapter>>;
+let mobileAdapter: MobileAdapter = null;
 
-server.on("upgrade", async (req, socket, head) => {
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+server.on("upgrade", async (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+  const url = new URL(req.url ?? "", `http://${req.headers.host || "localhost"}`);
   if (url.pathname !== "/shim/v1/mobile") {
     socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
     socket.destroy();
@@ -1004,17 +1076,17 @@ server.on("upgrade", async (req, socket, head) => {
       return;
     }
   } catch (err) {
-    console.error(`[mobile-channel] adapter load failed: ${err.message}`);
+    console.error(`[mobile-channel] adapter load failed: ${(err as Error).message}`);
     socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    mobileAdapter.acceptConnection(ws, req);
+  wss.handleUpgrade(req, socket as never, head, (ws) => {
+    mobileAdapter!.acceptConnection(ws, req);
   });
 });
 
-async function gracefulShutdown() {
+async function gracefulShutdown(): Promise<void> {
   try { await getAgentPool().stopAll(); } catch {}
   try { await mobileAdapter?.stop?.(); } catch {}
   server.close(() => process.exit(0));

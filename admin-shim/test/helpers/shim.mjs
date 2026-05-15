@@ -120,7 +120,7 @@ export async function startShim(opts = {}) {
   delete env.LETTA_API_KEY;
   delete env.LETTA_API_URL;
 
-  const serverPath = join(ADMIN_SHIM_ROOT, "server.mjs");
+  const serverPath = join(ADMIN_SHIM_ROOT, "server.ts");
   // Run via `node <mock> args...` since LETTA_BIN points at a .mjs file.
   // The agent-pool uses `spawn(LETTA_BIN, args)` — for the mock to actually
   // execute, we need it interpreted by node. Easiest: wrap it.

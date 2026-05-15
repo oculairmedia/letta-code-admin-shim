@@ -4,10 +4,10 @@
   "private": true,
   "description": "HTTP shim exposing a Letta-server-compatible REST surface on top of letta-code's LocalBackend. Also hosts the mobile channel WS endpoint.",
   "type": "module",
-  "main": "server.mjs",
+  "main": "server.ts",
   "scripts": {
-    "start": "node --import tsx/esm server.mjs",
-    "dev": "tsx watch server.mjs",
+    "start": "node --import tsx/esm server.ts",
+    "dev": "tsx watch server.ts",
     "test": "node --import tsx/esm --test --test-concurrency=1 --test-reporter=spec test/*.test.mjs",
     "test:watch": "node --import tsx/esm --test --test-concurrency=1 --watch test/*.test.mjs",
     "typecheck": "tsc --noEmit",
