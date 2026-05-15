@@ -33,18 +33,37 @@ import {
   externalConvId,
   openMobileWs,
 } from "./helpers/index.js";
+import type { ShimHandle } from "./helpers/shim.js";
+import type { MobileWsHandle } from "./helpers/ws.js";
+
+// ── types ─────────────────────────────────────────────────────────
+
+interface SetupAuthedOptions {
+  env?: Record<string, string | undefined>;
+  agentId?: string;
+}
+
+interface SetupAuthedResult {
+  shim: ShimHandle;
+  conn: MobileWsHandle;
+  agentId: string;
+  convId: string;
+}
 
 const WS_TIMEOUT_MS = 8_000;
 
 // Convenience setup: shim + agent + default conversation + an open authed WS.
 // Returns the conn handle plus the conv id / agent id for send_message bodies.
-async function setupAuthed(t, opts = {}) {
+async function setupAuthed(
+  t: { after: (fn: () => unknown) => void },
+  opts: SetupAuthedOptions = {},
+): Promise<SetupAuthedResult> {
   const shim = await startShim({ env: opts.env });
   t.after(() => shim.stop());
   const agentId = seedAgent(shim.stateDir, { id: opts.agentId ?? `agent-ws-${Date.now()}` });
   seedConversation(shim.stateDir, agentId);
   const convId = externalConvId(agentId);
-  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
   return { shim, conn, agentId, convId };
 }
@@ -54,9 +73,11 @@ async function setupAuthed(t, opts = {}) {
 test("ws: hello/welcome handshake — server_id, session_id, device_id in welcome", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
-  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, deviceId: "dev-handshake-1" });
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, deviceId: "dev-handshake-1" });
   t.after(() => conn.close());
-  const welcome = conn.frames.find((f) => f.type === "welcome");
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { server_id: string; session_id: string; device_id: string }
+    | undefined;
   assert.ok(welcome, "welcome frame must be present after hello");
   assert.equal(typeof welcome.server_id, "string", "welcome.server_id required");
   assert.ok(welcome.server_id.length > 0, "server_id non-empty");
@@ -70,18 +91,18 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
 test("ws: wrong token → error{invalid_token} and connection closes", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
-  let conn;
+  let conn: MobileWsHandle;
   try {
-    conn = await openMobileWs(shim.url, { token: "totally-wrong", timeoutMs: WS_TIMEOUT_MS });
+    conn = await openMobileWs(shim.url!, { token: "totally-wrong", timeoutMs: WS_TIMEOUT_MS });
   } catch (err) {
     // openMobileWs internally awaits the welcome — if the server errors first,
     // the helper rejects with "socket closed (...) before welcome".
-    assert.match(err.message, /socket closed|welcome/, "expected close-on-auth-failure");
+    assert.match((err as Error).message, /socket closed|welcome/, "expected close-on-auth-failure");
     return;
   }
   t.after(() => conn.close());
   // If we got here, find the error frame.
-  const err = conn.frames.find((f) => f.type === "error");
+  const err = conn.frames.find((f) => f.type === "error") as unknown as { code: string } | undefined;
   assert.ok(err, "error frame must be sent before close");
   assert.equal(err.code, "invalid_token");
   // Wait briefly for the close to propagate.
@@ -94,7 +115,7 @@ test("ws: wrong token → error{invalid_token} and connection closes", async (t)
 test("ws: sending a non-hello frame first → error{protocol_violation}", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
-  const conn = await openMobileWs(shim.url, {
+  const conn = await openMobileWs(shim.url!, {
     token: shim.mobileToken,
     skipHello: true,
     timeoutMs: WS_TIMEOUT_MS,
@@ -102,7 +123,8 @@ test("ws: sending a non-hello frame first → error{protocol_violation}", async 
   t.after(() => conn.close());
   // Send a send_message before the hello.
   conn.send({ type: "send_message", agent_id: "agent-x", conversation_id: "default", text: "hi" });
-  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS });
+  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as
+    { code: string; message?: string };
   assert.equal(err.code, "protocol_violation");
   assert.match(err.message ?? "", /hello/i, "message should mention hello");
 });
@@ -144,7 +166,11 @@ test("ws: bash-tool trace yields a tool_call_message over the wire", async (t) =
   const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
   const tcs = turn.filter((f) => f.type === "tool_call_message");
   assert.equal(tcs.length, 1, `expected 1 tool_call_message, got ${tcs.length}`);
-  const tc = tcs[0];
+  const tc = tcs[0] as unknown as {
+    tool_call?: { name?: string; tool_call_id?: string };
+    run_id?: unknown;
+    turn_id?: unknown;
+  };
   assert.equal(tc.tool_call?.name, "Bash");
   assert.ok(tc.tool_call?.tool_call_id, "tool_call_id required");
   assert.ok(tc.run_id, "tool_call_message must carry run_id");
@@ -167,10 +193,10 @@ test("ws: every post-turn_started frame carries run_id", async (t) => {
   // turn_started itself MAY omit run_id (fires before onRunCreated).
   // Everything after it must have one.
   const after = turn.slice(turnStartedIdx + 1);
-  const missing = after.filter((f) => !f.run_id);
+  const missing = after.filter((f) => !(f as { run_id?: unknown }).run_id);
   assert.equal(missing.length, 0, `frames after turn_started missing run_id: ${missing.map((f) => f.type).join(",")}`);
   // All run_ids in `after` must be the same.
-  const ids = new Set(after.map((f) => f.run_id));
+  const ids = new Set(after.map((f) => (f as { run_id?: unknown }).run_id));
   assert.equal(ids.size, 1, `mixed run_ids across the turn: ${[...ids].join(",")}`);
 });
 
@@ -191,7 +217,7 @@ test("ws: turn_done follows stop_reason (post-stamp sentinel)", async (t) => {
   assert.ok(sIdx >= 0 && dIdx >= 0, "both stop_reason and turn_done required");
   assert.ok(sIdx < dIdx, `turn_done must come after stop_reason (s=${sIdx}, d=${dIdx})`);
   // turn_done.status should be "completed" on a clean turn.
-  assert.equal(turn[dIdx].status, "completed");
+  assert.equal((turn[dIdx] as unknown as { status: string }).status, "completed");
 });
 
 // ─── 8. otid propagation ────────────────────────────────────────────
@@ -212,7 +238,7 @@ test("ws: otid in send_message propagates to disk sidecar via the otid bind", as
     role: "user",
     content: "prior user message",
   });
-  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
 
   const myOtid = "cm-ws-otid-roundtrip";
@@ -228,7 +254,7 @@ test("ws: otid in send_message propagates to disk sidecar via the otid bind", as
   const b64url = Buffer.from(`default:${agentId}`).toString("base64url");
   const sidecarPath = join(shim.stateDir, "conversations", b64url, "_otid-map.json");
   assert.ok(existsSync(sidecarPath), `expected _otid-map.json at ${sidecarPath}`);
-  const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+  const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as Record<string, string>;
   assert.equal(
     sidecar[seededId],
     myOtid,
@@ -251,7 +277,7 @@ test("ws: literal `default` conv id with multiple agents routes to the CLIENT-su
   const seededA = seedMessage(shim.stateDir, agentA, "default", { role: "user", content: "A's prior message" });
   seedMessage(shim.stateDir, agentB, "default", { role: "user", content: "B's prior message" });
 
-  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
   const myOtid = "cm-multi-agent-default";
   conn.send({
@@ -270,7 +296,7 @@ test("ws: literal `default` conv id with multiple agents routes to the CLIENT-su
   const sidecarB = join(shim.stateDir, "conversations", keyB, "_otid-map.json");
   assert.ok(existsSync(sidecarA), `sidecar must exist at agent-A's key`);
   assert.equal(existsSync(sidecarB), false, `sidecar must NOT leak to agent-B's key`);
-  const parsed = JSON.parse(readFileSync(sidecarA, "utf8"));
+  const parsed = JSON.parse(readFileSync(sidecarA, "utf8")) as Record<string, string>;
   assert.equal(parsed[seededA], myOtid, `otid must bind to A's seeded message: ${JSON.stringify(parsed)}`);
 });
 
@@ -287,7 +313,7 @@ test("ws: external conv id (conv-default-<agentId>) resolves like SSE — otid s
     role: "user",
     content: "prior user message",
   });
-  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
 
   const myOtid = "cm-ws-extid-bind";
@@ -307,7 +333,7 @@ test("ws: external conv id (conv-default-<agentId>) resolves like SSE — otid s
     existsSync(internalSidecar),
     `sidecar must land at the internal-key dir; got list: ${readdirSync(join(shim.stateDir, "conversations")).join(",")}`,
   );
-  const sidecar = JSON.parse(readFileSync(internalSidecar, "utf8"));
+  const sidecar = JSON.parse(readFileSync(internalSidecar, "utf8")) as Record<string, string>;
   assert.equal(sidecar[seededId], myOtid, `otid must bind via the internal pair: ${JSON.stringify(sidecar)}`);
 
   // And there should NOT be a stray external-key dir, which would prove
@@ -344,13 +370,14 @@ test("ws: second send_message during in-flight turn → error{protocol_violation
     text: "another reply",
     otid: "cm-ws-sf-2",
   });
-  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS });
+  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as
+    { code: string; message?: string };
   assert.equal(err.code, "protocol_violation");
   assert.match(err.message ?? "", /in flight/i, "should mention an in-flight turn");
   // The connection must NOT have closed — single-flight is a soft error.
   assert.equal(conn.closed, false, "single-flight error must NOT close the socket");
   // The original turn must still complete cleanly.
-  const done = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS });
+  const done = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status: string };
   assert.equal(done.status, "completed");
 });
 
@@ -367,11 +394,11 @@ test("ws: cancel with run_id flips the Run to cancelled", async (t) => {
     otid: "cm-ws-cancel",
   });
   // Wait for the first frame that carries a run_id.
-  let runId = null;
+  let runId: string | null = null;
   const startWait = Date.now();
   while (Date.now() - startWait < WS_TIMEOUT_MS) {
-    const f = conn.frames.find((x) => x.run_id);
-    if (f) { runId = f.run_id; break; }
+    const f = conn.frames.find((x) => (x as { run_id?: unknown }).run_id);
+    if (f) { runId = (f as unknown as { run_id: string }).run_id; break; }
     await new Promise((r) => setTimeout(r, 25));
   }
   if (!runId) {
@@ -385,7 +412,7 @@ test("ws: cancel with run_id flips the Run to cancelled", async (t) => {
   // Query the run record — must be cancelled or completed (race).
   const res = await fetch(`${shim.url}/v1/runs/${runId}`);
   assert.equal(res.status, 200);
-  const run = await res.json();
+  const run = await res.json() as { status: string };
   assert.ok(
     ["cancelled", "completed"].includes(run.status),
     `run status should settle to cancelled or completed, got ${run.status}`,
@@ -397,7 +424,8 @@ test("ws: cancel with run_id flips the Run to cancelled", async (t) => {
 test("ws: cancel with no run_id and no active turn → error{protocol_violation}", async (t) => {
   const { conn } = await setupAuthed(t);
   conn.send({ type: "cancel" });
-  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS });
+  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as
+    { code: string; message?: string };
   assert.equal(err.code, "protocol_violation");
   assert.match(err.message ?? "", /run_id/i);
   assert.equal(conn.closed, false, "missing-run_id cancel must NOT close the socket");
@@ -413,12 +441,14 @@ test("ws: server emits periodic ping frames", async (t) => {
   t.after(() => shim.stop());
   // Rewrite the mobile accounts.json with a 200ms ping cadence.
   const accountsPath = join(shim.homeDir, ".letta", "channels", "mobile", "accounts.json");
-  const accounts = JSON.parse(readFileSync(accountsPath, "utf8"));
+  const accounts = JSON.parse(readFileSync(accountsPath, "utf8")) as {
+    accounts: Array<{ config: { pingIntervalMs: number } }>;
+  };
   accounts.accounts[0].config.pingIntervalMs = 200;
   const { writeFileSync } = await import("node:fs");
   writeFileSync(accountsPath, JSON.stringify(accounts, null, 2));
 
-  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
   // Wait long enough for at least 2 pings.
   const ping = await conn.waitFor("ping", { timeoutMs: 3_000 });
@@ -445,7 +475,7 @@ test("ws: unknown frame types are ignored silently (forward-compat)", async (t) 
   // No error should arrive in a short window.
   await new Promise((r) => setTimeout(r, 200));
   const errs = conn.frames.slice(beforeLen).filter((f) => f.type === "error");
-  assert.equal(errs.length, 0, `unknown frame type must not produce an error, got: ${errs.map((e) => e.code).join(",")}`);
+  assert.equal(errs.length, 0, `unknown frame type must not produce an error, got: ${errs.map((e) => (e as { code?: string }).code).join(",")}`);
   assert.equal(conn.closed, false, "unknown frame must not close the socket");
   // Sanity check: a subsequent valid send_message still works.
   conn.send({
@@ -472,7 +502,7 @@ test("ws: a normal turn completes without crashing the handler (backpressure-saf
     text: "explain in detail with long text", // forces text-only-long (17 chunks)
     otid: "cm-ws-bp",
   });
-  const done = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS });
+  const done = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status: string };
   assert.equal(done.status, "completed", "long-trace turn should complete");
 });
 
@@ -492,7 +522,7 @@ test("ws: shim logs `mobile-channel adapter ready` on first WS upgrade", async (
   const shim = await startShim();
   t.after(() => shim.stop());
   // Opening + handshake forces getMobileChannelAdapter to fire.
-  const conn = await openMobileWs(shim.url, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
   // Give the adapter-ready log line a moment to flush.
   await shim.waitForLogLine(/mobile-channel.*adapter ready|adapter ready \(accepts inbound WS/, { timeoutMs: 2_000 });
@@ -513,7 +543,11 @@ test("ws: assistant_message carries non-empty content on a normal reply", async 
     otid: "cm-ws-content",
   });
   const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
-  const a = turn.find((f) => f.type === "assistant_message" && f.content && f.content.length > 0);
+  const a = turn.find((f) => {
+    if (f.type !== "assistant_message") return false;
+    const c = (f as { content?: string }).content;
+    return typeof c === "string" && c.length > 0;
+  }) as unknown as { content: string } | undefined;
   assert.ok(a, "at least one assistant_message must carry content");
   assert.match(a.content.toLowerCase(), /pong/);
 });
@@ -529,7 +563,8 @@ test("ws: turn_started includes agent_id, conversation_id, turn_id", async (t) =
     text: "reply with pong",
     otid: "cm-ws-ts",
   });
-  const ts = await conn.waitFor("turn_started", { timeoutMs: WS_TIMEOUT_MS });
+  const ts = await conn.waitFor("turn_started", { timeoutMs: WS_TIMEOUT_MS }) as unknown as
+    { agent_id: string; conversation_id: string; turn_id: string };
   assert.equal(ts.agent_id, agentId);
   assert.equal(ts.conversation_id, convId);
   assert.match(ts.turn_id, /^turn-/);
@@ -545,7 +580,7 @@ test("ws: send_message with missing agent_id → error{protocol_violation}, no c
     conversation_id: "anything",
     text: "hi",
   });
-  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS });
+  const err = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { code: string };
   assert.equal(err.code, "protocol_violation");
   assert.equal(conn.closed, false, "validation error must NOT close the socket");
 });
@@ -562,7 +597,8 @@ test("ws: stop_reason frame carries reason field (`end_turn` on clean turn)", as
     otid: "cm-ws-sr",
   });
   const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
-  const stop = turn.find((f) => f.type === "stop_reason");
+  const stop = turn.find((f) => f.type === "stop_reason") as unknown as
+    { reason: string; turn_id?: unknown } | undefined;
   assert.ok(stop, "stop_reason must be present");
   assert.equal(stop.reason, "end_turn");
   assert.ok(stop.turn_id, "stop_reason must carry turn_id");

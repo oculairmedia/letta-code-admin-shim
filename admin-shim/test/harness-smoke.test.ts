@@ -14,7 +14,11 @@ test("harness: shim starts, serves /v1/health, stops cleanly", async (t) => {
 
   const res = await fetch(`${shim.url}/v1/health/`);
   assert.equal(res.status, 200);
-  const body = await res.json();
+  const body = await res.json() as {
+    status: string;
+    server_id: string;
+    backend: string;
+  };
   assert.equal(body.status, "ok");
   assert.ok(body.server_id, "server_id should be set");
   assert.ok(body.backend, "backend should be set");
@@ -32,7 +36,7 @@ test("harness: seeded agent appears in GET /v1/agents", async (t) => {
 
   const res = await fetch(`${shim.url}/v1/agents`);
   assert.equal(res.status, 200);
-  const agents = await res.json();
+  const agents = await res.json() as Array<{ id: string; name: string }>;
   assert.ok(Array.isArray(agents), "agents should be an array");
   const found = agents.find((a) => a.id === agentId);
   assert.ok(found, `seeded agent ${agentId} should be listed (got ${agents.map((a) => a.id)})`);
@@ -50,6 +54,9 @@ test("harness: two shims on different ports run in parallel", async (t) => {
   ]);
   assert.equal(resA.status, 200);
   assert.equal(resB.status, 200);
-  const [bodyA, bodyB] = await Promise.all([resA.json(), resB.json()]);
+  const [bodyA, bodyB] = await Promise.all([resA.json(), resB.json()]) as [
+    { server_id: string },
+    { server_id: string },
+  ];
   assert.notEqual(bodyA.server_id, bodyB.server_id, "server_ids must differ");
 });

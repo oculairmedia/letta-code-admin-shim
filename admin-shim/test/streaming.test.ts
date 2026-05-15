@@ -35,13 +35,44 @@ import {
   framesOfType,
   indexOfType,
 } from "./helpers/index.js";
+import type { ShimHandle } from "./helpers/shim.js";
+import type { SseFrame, StreamMessagesResult } from "./helpers/sse.js";
+
+// ── types ─────────────────────────────────────────────────────────
+
+interface SetupShimOptions {
+  agentId?: string;
+  env?: Record<string, string | undefined>;
+}
+
+interface SetupShimResult {
+  shim: ShimHandle;
+  agentId: string;
+  convId: string;
+  messagesUrl: string;
+}
+
+interface RunTurnOptions extends SetupShimOptions {
+  otid?: string;
+  text?: string;
+  streaming?: boolean;
+}
+
+interface RunTurnResult extends SetupShimResult {
+  otid: string;
+  text: string;
+  result: StreamMessagesResult;
+}
 
 const STREAM_TIMEOUT_MS = 5_000;
 
 // Convenience: build a fresh shim + seeded agent + default conversation and
 // return everything the test needs. Uses externalConvId so the URL form
 // matches what mobile sends.
-async function setupShim(t, { agentId = `agent-stream-${Date.now()}`, env } = {}) {
+async function setupShim(
+  t: { after: (fn: () => unknown) => void },
+  { agentId = `agent-stream-${Date.now()}`, env }: SetupShimOptions = {},
+): Promise<SetupShimResult> {
   const shim = await startShim({ env });
   t.after(() => shim.stop());
   const id = seedAgent(shim.stateDir, { id: agentId });
@@ -54,7 +85,10 @@ async function setupShim(t, { agentId = `agent-stream-${Date.now()}`, env } = {}
   };
 }
 
-async function runTurn(t, opts = {}) {
+async function runTurn(
+  t: { after: (fn: () => unknown) => void },
+  opts: RunTurnOptions = {},
+): Promise<RunTurnResult> {
   const ctx = await setupShim(t, opts);
   const otid = opts.otid ?? `cm-test-${Math.random().toString(36).slice(2, 10)}`;
   const text = opts.text ?? "reply with pong";
@@ -104,10 +138,11 @@ test("streaming: multi-step (6 chunks) coalesces to a single assistant_message",
   assert.equal(
     assistants.length,
     1,
-    `expected 1 coalesced assistant_message, got ${assistants.length}: ${assistants.map((a) => (a.content ?? "").slice(0, 20)).join(" | ")}`,
+    `expected 1 coalesced assistant_message, got ${assistants.length}: ${assistants.map((a) => ((a as { content?: string }).content ?? "").slice(0, 20)).join(" | ")}`,
   );
   // Content should be the full concatenation
-  assert.ok((assistants[0].content ?? "").length > 100, "concatenated content should be substantial");
+  const a0 = assistants[0] as { content?: string };
+  assert.ok((a0.content ?? "").length > 100, "concatenated content should be substantial");
 });
 
 test("streaming: text-only-long (17 chunks) coalesces to a single assistant_message", async (t) => {
@@ -120,7 +155,8 @@ test("streaming: text-only-long (17 chunks) coalesces to a single assistant_mess
     `text-only-long must coalesce to 1 frame, got ${assistants.length}`,
   );
   // 17 chunks → > 200 chars at minimum
-  assert.ok((assistants[0].content ?? "").length > 200, "coalesced essay-length reply should be > 200 chars");
+  const a0 = assistants[0] as { content?: string };
+  assert.ok((a0.content ?? "").length > 200, "coalesced essay-length reply should be > 200 chars");
 });
 
 // ─── 4. approval_request_message → tool_call_message remap ───────────
@@ -129,7 +165,7 @@ test("streaming: bash-tool trace emits tool_call_message (remap from approval_re
   const { result } = await runTurn(t, { text: "run bash echo hello" });
   const tools = framesOfType(result.frames, "tool_call_message");
   assert.equal(tools.length, 1, `expected 1 tool_call_message, got ${tools.length}`);
-  const tc = tools[0];
+  const tc = tools[0] as { id: string; tool_call?: { name?: string; tool_call_id?: string } };
   assert.equal(tc.tool_call?.name, "Bash", "tool_call.name should be Bash");
   assert.ok(tc.tool_call?.tool_call_id, "tool_call_id should be present");
   assert.equal(
@@ -148,11 +184,13 @@ test("streaming: multi-tool-bash-read emits TWO tool_call_messages in order", as
   const { result } = await runTurn(t, { text: "use both tools: bash and read" });
   const tools = framesOfType(result.frames, "tool_call_message");
   assert.equal(tools.length, 2, `expected 2 tool_call_messages, got ${tools.length}`);
-  assert.equal(tools[0].tool_call?.name, "Bash");
-  assert.equal(tools[1].tool_call?.name, "Read");
+  const t0 = tools[0] as { tool_call?: { name?: string; tool_call_id?: string } };
+  const t1 = tools[1] as { tool_call?: { name?: string; tool_call_id?: string } };
+  assert.equal(t0.tool_call?.name, "Bash");
+  assert.equal(t1.tool_call?.name, "Read");
   assert.notEqual(
-    tools[0].tool_call?.tool_call_id,
-    tools[1].tool_call?.tool_call_id,
+    t0.tool_call?.tool_call_id,
+    t1.tool_call?.tool_call_id,
     "tool_call_ids must be distinct",
   );
   // Indexes must be ordered
@@ -200,11 +238,13 @@ test("streaming: every turn frame carries the same run_id", async (t) => {
       f.message_type !== "usage_statistics", // bare envelope, no run_id
   );
   const runIds = new Set(
-    turnFrames.map((f) => f.run_id).filter((v) => v !== undefined && v !== null),
+    turnFrames
+      .map((f) => (f as { run_id?: unknown }).run_id)
+      .filter((v) => v !== undefined && v !== null),
   );
   assert.ok(runIds.size > 0, "at least one frame must carry a run_id");
   assert.equal(runIds.size, 1, `all run_ids must match; got ${[...runIds].join(",")}`);
-  const [runId] = runIds;
+  const [runId] = runIds as Set<string>;
   assert.match(runId, /^run-/, "run_id should look like run-<uuid> (shim-generated, not letta-code's local-run-N)");
 });
 
@@ -214,12 +254,14 @@ test("streaming: assistant_message.id has cm-stream- prefix; tool_call_message.i
   const { result } = await runTurn(t, { text: "run bash echo hello" });
   const assistants = framesOfType(result.frames, "assistant_message");
   for (const a of assistants) {
-    assert.match(a.id, /^cm-stream-/, `assistant_message.id should be cm-stream-…, got ${a.id}`);
+    const aId = (a as { id: string }).id;
+    assert.match(aId, /^cm-stream-/, `assistant_message.id should be cm-stream-…, got ${aId}`);
   }
   const tools = framesOfType(result.frames, "tool_call_message");
   for (const tc of tools) {
-    assert.match(tc.id, /^toolcall-/, `tool_call_message.id should be toolcall-…, got ${tc.id}`);
-    assert.doesNotMatch(tc.id, /^cm-stream-/, "tool_call_message must NOT carry the optimistic prefix");
+    const tcId = (tc as { id: string }).id;
+    assert.match(tcId, /^toolcall-/, `tool_call_message.id should be toolcall-…, got ${tcId}`);
+    assert.doesNotMatch(tcId, /^cm-stream-/, "tool_call_message must NOT carry the optimistic prefix");
   }
 });
 
@@ -233,8 +275,8 @@ test("streaming: tool_return_message is NOT emitted in the stream (letta-code om
 
 test("streaming: per-type date offsets — tool_call < assistant within a turn", async (t) => {
   const { result } = await runTurn(t, { text: "run bash echo hello" });
-  const toolCall = framesOfType(result.frames, "tool_call_message")[0];
-  const assistant = framesOfType(result.frames, "assistant_message").slice(-1)[0];
+  const toolCall = framesOfType(result.frames, "tool_call_message")[0] as { date: string } | undefined;
+  const assistant = framesOfType(result.frames, "assistant_message").slice(-1)[0] as { date: string } | undefined;
   assert.ok(toolCall && assistant, "fixture should have both frame types");
   const tcDate = Date.parse(toolCall.date);
   const aDate = Date.parse(assistant.date);
@@ -250,8 +292,8 @@ test("streaming: per-type date offsets — tool_call < assistant within a turn",
 
 test("streaming: assistant_message dates within a single turn equal turnStart+40ms", async (t) => {
   const { result } = await runTurn(t, { text: "reply with pong" });
-  const assistant = framesOfType(result.frames, "assistant_message")[0];
-  const ping = framesOfType(result.frames, "ping")[0];
+  const assistant = framesOfType(result.frames, "assistant_message")[0] as { date: string } | undefined;
+  const ping = framesOfType(result.frames, "ping")[0] as { date: string } | undefined;
   assert.ok(assistant && ping);
   // assistant.date - ping.date should be ~40ms (offsets: ping=0, assistant=40).
   // Allow ±50ms slack since the ping uses isoNow() and the offset is
@@ -295,7 +337,7 @@ test("streaming: otid bind — POSTed otid is recorded in _otid-map.json sidecar
   const b64url = Buffer.from(`default:${agentId}`).toString("base64url");
   const sidecarPath = join(shim.stateDir, "conversations", b64url, "_otid-map.json");
   assert.ok(existsSync(sidecarPath), `_otid-map.json should exist at ${sidecarPath}`);
-  const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8"));
+  const sidecar = JSON.parse(readFileSync(sidecarPath, "utf8")) as Record<string, string>;
   assert.equal(
     sidecar[seededId],
     myOtid,
@@ -326,7 +368,9 @@ test("streaming: otid bind is a no-op when no otid is supplied", async (t) => {
 
 test("streaming: stop_reason is a bare envelope (no id/date wrapper)", async (t) => {
   const { result } = await runTurn(t, { text: "reply with pong" });
-  const stop = result.frames.find((f) => f.message_type === "stop_reason");
+  const stop = result.frames.find((f) => f.message_type === "stop_reason") as
+    | { message_type: string; stop_reason: string; id?: unknown; date?: unknown; otid?: unknown }
+    | undefined;
   assert.ok(stop, "stop_reason must be present");
   assert.equal(stop.message_type, "stop_reason");
   assert.equal(stop.stop_reason, "end_turn");
@@ -349,7 +393,9 @@ test("streaming: empty-reply trace still emits stop_reason + [DONE]", async (t) 
 
 test("streaming: usage_statistics carries prompt/completion/total token fields", async (t) => {
   const { result } = await runTurn(t, { text: "reply with pong" });
-  const usage = result.frames.find((f) => f.message_type === "usage_statistics");
+  const usage = result.frames.find((f) => f.message_type === "usage_statistics") as
+    | (SseFrame & { id?: unknown })
+    | undefined;
   assert.ok(usage, "usage_statistics frame must be present");
   for (const key of [
     "prompt_tokens",
@@ -373,16 +419,20 @@ test("streaming: run_id from the stream is queryable at GET /v1/runs/{run_id}", 
   const { shim, result } = await runTurn(t, { text: "reply with pong" });
   // Pick a turn frame with a run_id (anything but stop_reason / usage_statistics).
   const turnFrame = result.frames.find(
-    (f) =>
-      f.run_id &&
-      f.message_type !== "stop_reason" &&
-      f.message_type !== "usage_statistics",
+    (f) => {
+      const fr = f as { run_id?: unknown; message_type: string };
+      return (
+        fr.run_id &&
+        fr.message_type !== "stop_reason" &&
+        fr.message_type !== "usage_statistics"
+      );
+    },
   );
   assert.ok(turnFrame, "at least one turn frame should carry run_id");
-  const runId = turnFrame.run_id;
+  const runId = (turnFrame as { run_id: string }).run_id;
   const res = await fetch(`${shim.url}/v1/runs/${runId}`);
   assert.equal(res.status, 200, `GET /v1/runs/${runId} should be 200`);
-  const run = await res.json();
+  const run = await res.json() as { id: string; status: string };
   assert.equal(run.id, runId, "run record id must match the streamed run_id");
   // Status will normally be "completed" by the time the turn ends.
   assert.ok(
@@ -394,7 +444,7 @@ test("streaming: run_id from the stream is queryable at GET /v1/runs/{run_id}", 
 // ─── 14. Streaming default vs explicit non-stream ───────────────────
 
 test("streaming: omitting `streaming` defaults to streaming SSE", async (t) => {
-  const { shim, messagesUrl } = await setupShim(t);
+  const { messagesUrl } = await setupShim(t);
   const result = await streamMessages(
     messagesUrl,
     { messages: [{ role: "user", content: "reply with pong", otid: "cm-default" }] },
@@ -419,7 +469,11 @@ test("streaming: streaming:false returns a single JSON envelope, no SSE", async 
   assert.equal(res.status, 200);
   const ct = res.headers.get("content-type") ?? "";
   assert.match(ct, /application\/json/, `streaming:false should be JSON, got ${ct}`);
-  const body = await res.json();
+  const body = await res.json() as {
+    messages: unknown[];
+    stop_reason: { message_type: string };
+    usage: { total_tokens: number };
+  };
   assert.ok(Array.isArray(body.messages), "non-stream response includes `messages` array");
   assert.ok(body.stop_reason && body.stop_reason.message_type === "stop_reason");
   assert.ok(body.usage && typeof body.usage.total_tokens === "number");
@@ -454,7 +508,8 @@ test("streaming: read-tool trace emits one Read tool_call_message", async (t) =>
   const { result } = await runTurn(t, { text: "use the read tool on a file" });
   const tools = framesOfType(result.frames, "tool_call_message");
   assert.equal(tools.length, 1, `expected 1 tool_call, got ${tools.length}`);
-  assert.equal(tools[0].tool_call?.name, "Read");
+  const t0 = tools[0] as { tool_call?: { name?: string } };
+  assert.equal(t0.tool_call?.name, "Read");
 });
 
 // ─── 18. tool-then-text: tool followed by coalesced assistant block ───
@@ -477,7 +532,7 @@ test("streaming: tool-then-text emits tool_call_message then one coalesced assis
 
 test("streaming: coalesced assistant_message retains the source otid", async (t) => {
   const { result } = await runTurn(t, { text: "bullet list three things about TCP/IP" });
-  const a = framesOfType(result.frames, "assistant_message")[0];
+  const a = framesOfType(result.frames, "assistant_message")[0] as { otid?: unknown } | undefined;
   assert.ok(a, "assistant frame present");
   assert.ok(typeof a.otid === "string" && a.otid.length > 0, `otid should survive coalesce, got ${a.otid}`);
   // multi-step's source otid starts with "provider-assistant-"
@@ -488,7 +543,7 @@ test("streaming: coalesced assistant_message retains the source otid", async (t)
 
 test("streaming: multi-step concatenated content reads as the full essay", async (t) => {
   const { result } = await runTurn(t, { text: "bullet list three things about TCP/IP" });
-  const a = framesOfType(result.frames, "assistant_message")[0];
+  const a = framesOfType(result.frames, "assistant_message")[0] as { content: string } | undefined;
   assert.ok(a);
   // The 6 chunks together form a multi-bullet reply mentioning TCP, IP, and
   // a version distinction — pick a few stable tokens.

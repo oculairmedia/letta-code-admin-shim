@@ -1,4 +1,3 @@
-// @ts-check
 /**
  * Type-assertion test for letta-code's raw stream-json fixtures.
  *
@@ -6,11 +5,11 @@
  * and asserts the discriminator is recognized by `LettaStreamFrame` (and for
  * `stream_event`, that the inner `message_type` is recognized too).
  *
- * The JSDoc `@type` annotation below binds parsed frames to the public union.
- * `// @ts-check` at the top of this file tells tsc to actually verify the
- * body during `npm run typecheck`, so a future maintainer who introduces a
- * new frame variant in a fixture without extending `lib/types/letta-stream.ts`
- * will see the test fail at both type-check time and runtime.
+ * The typed binding below ties parsed frames to the public union.
+ * `tsc --noEmit` actually verifies the body during `npm run typecheck`, so a
+ * future maintainer who introduces a new frame variant in a fixture without
+ * extending `lib/types/letta-stream.ts` will see the test fail at both
+ * type-check time and runtime.
  */
 
 import { test } from "node:test";
@@ -19,11 +18,12 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import type { LettaStreamFrame } from "../lib/types/letta-stream.js";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = join(__dirname, "fixtures", "stream-traces");
 
-/** @type {ReadonlySet<string>} */
-const TOP_LEVEL_TYPES = new Set([
+const TOP_LEVEL_TYPES: ReadonlySet<string> = new Set([
   "system",
   "queue_item_enqueued",
   "queue_batch_dequeued",
@@ -33,8 +33,7 @@ const TOP_LEVEL_TYPES = new Set([
   "result",
 ]);
 
-/** @type {ReadonlySet<string>} */
-const INNER_MESSAGE_TYPES = new Set([
+const INNER_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   "assistant_message",
   "reasoning_message",
   "approval_request_message",
@@ -54,11 +53,10 @@ test("fixture frames match LettaStreamFrame discriminators", () => {
     const path = join(FIXTURE_DIR, file);
     const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim());
     for (let i = 0; i < lines.length; i++) {
-      const raw = JSON.parse(lines[i]);
-      // The JSDoc binding below is what makes tsc verify the asserted shape
-      // when `// @ts-check` is on at the top of the file.
-      /** @type {import('../lib/types/letta-stream.js').LettaStreamFrame} */
-      const frame = raw;
+      const raw: unknown = JSON.parse(lines[i]);
+      // Bind via a typed alias so tsc verifies the asserted shape during
+      // `npm run typecheck`.
+      const frame = raw as LettaStreamFrame;
       frameCount++;
 
       assert.ok(

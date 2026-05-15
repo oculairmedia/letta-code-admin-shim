@@ -8,8 +8,8 @@
   "scripts": {
     "start": "node --import tsx/esm server.ts",
     "dev": "tsx watch server.ts",
-    "test": "node --import tsx/esm --test --test-concurrency=1 --test-reporter=spec test/*.test.mjs",
-    "test:watch": "node --import tsx/esm --test --test-concurrency=1 --watch test/*.test.mjs",
+    "test": "node --import tsx/esm --test --test-concurrency=1 --test-reporter=spec test/*.test.ts",
+    "test:watch": "node --import tsx/esm --test --test-concurrency=1 --watch test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "echo 'not yet — phase 6' && exit 0"
   },

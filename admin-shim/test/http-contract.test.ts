@@ -23,9 +23,9 @@ import {
 
 // ── helpers ─────────────────────────────────────────────────────────
 
-async function getJson(url) {
+async function getJson(url: string): Promise<{ res: Response; body: unknown }> {
   const res = await fetch(url);
-  let body = null;
+  let body: unknown = null;
   try { body = await res.json(); } catch { /* non-JSON */ }
   return { res, body };
 }
@@ -37,12 +37,19 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/health/`);
+  const b = body as {
+    status: string;
+    backend: string;
+    server_id: string;
+    server_started_at: string;
+    version: string;
+  };
   assert.equal(res.status, 200);
-  assert.equal(body.status, "ok");
-  assert.equal(body.backend, "letta-code-local");
-  assert.ok(body.server_id, "server_id present");
-  assert.ok(body.server_started_at, "server_started_at present");
-  assert.ok(body.version, "version present");
+  assert.equal(b.status, "ok");
+  assert.equal(b.backend, "letta-code-local");
+  assert.ok(b.server_id, "server_id present");
+  assert.ok(b.server_started_at, "server_started_at present");
+  assert.ok(b.version, "version present");
 });
 
 test("GET /v1/health (no trailing slash) is also served", async (t) => {
@@ -50,8 +57,9 @@ test("GET /v1/health (no trailing slash) is also served", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/health`);
+  const b = body as { status: string };
   assert.equal(res.status, 200);
-  assert.equal(body.status, "ok");
+  assert.equal(b.status, "ok");
 });
 
 // ── agents list / count / detail ────────────────────────────────────
@@ -97,8 +105,16 @@ test("GET /v1/agents lists seeded agents with vanilla AgentState shape", async (
   const { res, body } = await getJson(`${shim.url}/v1/agents`);
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(body));
-  assert.equal(body.length, 1);
-  const a = body[0];
+  const arr = body as Array<{
+    id: string;
+    name: string;
+    system: string;
+    tools: unknown[];
+    memory: { blocks: Array<{ label: string }> };
+    llm_config: { model: string; model_endpoint_type: string };
+  }>;
+  assert.equal(arr.length, 1);
+  const a = arr[0];
   assert.equal(a.id, id);
   assert.equal(a.name, "Listy");
   assert.equal(a.system, "Be brief.");
@@ -126,7 +142,8 @@ test("GET /v1/agents orders by mtime descending", async (t) => {
   seedAgent(shim.stateDir, { id: "agent-mtime-new", name: "New" });
 
   const { body } = await getJson(`${shim.url}/v1/agents`);
-  const ids = body.map((a) => a.id);
+  const arr = body as Array<{ id: string }>;
+  const ids = arr.map((a) => a.id);
   assert.equal(ids[0], "agent-mtime-new", `expected newest first, got ${ids.join(",")}`);
   assert.equal(ids[1], "agent-mtime-old");
 });
@@ -142,16 +159,19 @@ test("GET /v1/agents honors limit and offset", async (t) => {
   }
 
   const all = await getJson(`${shim.url}/v1/agents`);
-  assert.equal(all.body.length, 4);
+  const allArr = all.body as Array<{ id: string }>;
+  assert.equal(allArr.length, 4);
 
   const limited = await getJson(`${shim.url}/v1/agents?limit=2`);
-  assert.equal(limited.body.length, 2);
+  const limitedArr = limited.body as Array<{ id: string }>;
+  assert.equal(limitedArr.length, 2);
 
   const offset = await getJson(`${shim.url}/v1/agents?limit=2&offset=2`);
-  assert.equal(offset.body.length, 2);
+  const offsetArr = offset.body as Array<{ id: string }>;
+  assert.equal(offsetArr.length, 2);
   // Ensure they're different slices
-  const limitIds = limited.body.map((a) => a.id);
-  const offsetIds = offset.body.map((a) => a.id);
+  const limitIds = limitedArr.map((a) => a.id);
+  const offsetIds = offsetArr.map((a) => a.id);
   for (const id of limitIds) assert.ok(!offsetIds.includes(id), `slices should not overlap`);
 });
 
@@ -161,10 +181,11 @@ test("GET /v1/agents/{id} returns the agent record", async (t) => {
 
   const id = seedAgent(shim.stateDir, { id: "agent-detail-001", name: "Detailed" });
   const { res, body } = await getJson(`${shim.url}/v1/agents/${id}`);
+  const b = body as { id: string; name: string; agent_type: string };
   assert.equal(res.status, 200);
-  assert.equal(body.id, id);
-  assert.equal(body.name, "Detailed");
-  assert.equal(body.agent_type, "memgpt_agent");
+  assert.equal(b.id, id);
+  assert.equal(b.name, "Detailed");
+  assert.equal(b.agent_type, "memgpt_agent");
 });
 
 test("GET /v1/agents/{unknown} returns 404 with { detail }", async (t) => {
@@ -172,9 +193,10 @@ test("GET /v1/agents/{unknown} returns 404 with { detail }", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/agents/agent-does-not-exist`);
+  const b = body as { detail: string };
   assert.equal(res.status, 404);
-  assert.equal(typeof body.detail, "string");
-  assert.match(body.detail, /agent-does-not-exist/);
+  assert.equal(typeof b.detail, "string");
+  assert.match(b.detail, /agent-does-not-exist/);
 });
 
 // ── agent messages ──────────────────────────────────────────────────
@@ -211,9 +233,18 @@ test("GET /v1/agents/{id}/messages returns vanilla-shaped messages", async (t) =
   });
 
   const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/messages`);
+  const arr = body as Array<{
+    id: string;
+    role: string;
+    message_type: string;
+    agent_id: string;
+    conversation_id: string;
+    content: Array<{ type: string; text: string }>;
+    otid: string;
+  }>;
   assert.equal(res.status, 200);
-  assert.equal(body.length, 2);
-  const u = body[0];
+  assert.equal(arr.length, 2);
+  const u = arr[0];
   assert.equal(u.id, "ui-msg-u1");
   assert.equal(u.role, "user");
   assert.equal(u.message_type, "user_message");
@@ -225,7 +256,7 @@ test("GET /v1/agents/{id}/messages returns vanilla-shaped messages", async (t) =
   // otid defaults to localMsg.id in localMessageToLettaMessage
   assert.equal(u.otid, "ui-msg-u1");
 
-  const a = body[1];
+  const a = arr[1];
   assert.equal(a.message_type, "assistant_message");
   assert.equal(a.role, "assistant");
 });
@@ -246,12 +277,14 @@ test("GET /v1/agents/{id}/messages honors limit and before", async (t) => {
   }
 
   const limited = await getJson(`${shim.url}/v1/agents/${id}/messages?limit=2`);
-  assert.equal(limited.body.length, 2);
+  const limitedArr = limited.body as Array<{ id: string }>;
+  assert.equal(limitedArr.length, 2);
   // store.listMessages slices from the END when limit is given
-  assert.deepEqual(limited.body.map((m) => m.id), ["ui-msg-3", "ui-msg-4"]);
+  assert.deepEqual(limitedArr.map((m) => m.id), ["ui-msg-3", "ui-msg-4"]);
 
   const before = await getJson(`${shim.url}/v1/agents/${id}/messages?before=ui-msg-3`);
-  assert.deepEqual(before.body.map((m) => m.id), ["ui-msg-0", "ui-msg-1", "ui-msg-2"]);
+  const beforeArr = before.body as Array<{ id: string }>;
+  assert.deepEqual(beforeArr.map((m) => m.id), ["ui-msg-0", "ui-msg-1", "ui-msg-2"]);
 });
 
 test("GET /v1/agents/{unknown}/messages returns 404", async (t) => {
@@ -259,8 +292,9 @@ test("GET /v1/agents/{unknown}/messages returns 404", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/agents/agent-nope/messages`);
+  const b = body as { detail: string };
   assert.equal(res.status, 404);
-  assert.equal(typeof body.detail, "string");
+  assert.equal(typeof b.detail, "string");
 });
 
 // ── agent context ──────────────────────────────────────────────────
@@ -274,15 +308,23 @@ test("GET /v1/agents/{id}/context returns context-window overview", async (t) =>
   seedMessage(shim.stateDir, id, "default", { id: "ctx-m1", role: "user", content: "hey" });
 
   const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/context`);
+  const b = body as {
+    num_messages: number;
+    num_archival_memory: number;
+    num_recall_memory: number;
+    messages: unknown[];
+    system_prompt: string;
+    context_window_size_max: number;
+  };
   assert.equal(res.status, 200);
-  assert.equal(body.num_messages, 1);
-  assert.equal(body.num_archival_memory, 0);
-  assert.equal(body.num_recall_memory, 1);
-  assert.ok(Array.isArray(body.messages));
-  assert.equal(body.messages.length, 1);
+  assert.equal(b.num_messages, 1);
+  assert.equal(b.num_archival_memory, 0);
+  assert.equal(b.num_recall_memory, 1);
+  assert.ok(Array.isArray(b.messages));
+  assert.equal(b.messages.length, 1);
   // system_prompt is taken from the conv's system-prompt.json (seeded helper)
-  assert.equal(typeof body.system_prompt, "string");
-  assert.ok(body.context_window_size_max > 0);
+  assert.equal(typeof b.system_prompt, "string");
+  assert.ok(b.context_window_size_max > 0);
 });
 
 test("GET /v1/agents/{unknown}/context returns 404", async (t) => {
@@ -290,8 +332,9 @@ test("GET /v1/agents/{unknown}/context returns 404", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/agents/agent-ghost/context`);
+  const b = body as { detail: string };
   assert.equal(res.status, 404);
-  assert.equal(typeof body.detail, "string");
+  assert.equal(typeof b.detail, "string");
 });
 
 // ── core-memory blocks ─────────────────────────────────────────────
@@ -308,12 +351,20 @@ test("GET /v1/agents/{id}/core-memory/blocks returns memfs-derived blocks", asyn
   const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/core-memory/blocks`);
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(body));
-  assert.equal(body.length, 2);
-  const byLabel = Object.fromEntries(body.map((b) => [b.label, b]));
+  const arr = body as Array<{
+    id: string;
+    label: string;
+    value: string;
+    limit: number;
+    tags: unknown[];
+    read_only: boolean;
+  }>;
+  assert.equal(arr.length, 2);
+  const byLabel = Object.fromEntries(arr.map((b) => [b.label, b]));
   assert.equal(byLabel.persona.value, "I am persona-text");
   assert.equal(byLabel.human.value, "user-text");
   // Required vanilla Block fields
-  for (const b of body) {
+  for (const b of arr) {
     assert.ok(b.id, "block.id present");
     assert.equal(typeof b.label, "string");
     assert.equal(typeof b.value, "string");
@@ -328,8 +379,9 @@ test("GET /v1/agents/{unknown}/core-memory/blocks returns 404", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/agents/agent-no/core-memory/blocks`);
+  const b = body as { detail: string };
   assert.equal(res.status, 404);
-  assert.equal(typeof body.detail, "string");
+  assert.equal(typeof b.detail, "string");
 });
 
 // ── /v1/blocks (cross-agent) ───────────────────────────────────────
@@ -350,8 +402,9 @@ test("GET /v1/blocks unions blocks across all agents", async (t) => {
   const { res, body } = await getJson(`${shim.url}/v1/blocks`);
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(body));
+  const arr = body as unknown[];
   // 1 from A + 2 from B = 3
-  assert.equal(body.length, 3);
+  assert.equal(arr.length, 3);
 });
 
 test("GET /v1/blocks/{id} returns a single block", async (t) => {
@@ -364,12 +417,14 @@ test("GET /v1/blocks/{id} returns a single block", async (t) => {
   });
   // First fetch the list to learn the synthesized id
   const list = await getJson(`${shim.url}/v1/agents/${id}/core-memory/blocks`);
-  const blockId = list.body[0].id;
+  const listArr = list.body as Array<{ id: string }>;
+  const blockId = listArr[0].id;
 
   const { res, body } = await getJson(`${shim.url}/v1/blocks/${blockId}`);
+  const b = body as { id: string; value: string };
   assert.equal(res.status, 200);
-  assert.equal(body.id, blockId);
-  assert.equal(body.value, "find me");
+  assert.equal(b.id, blockId);
+  assert.equal(b.value, "find me");
 });
 
 test("GET /v1/blocks/{unknown} returns 404", async (t) => {
@@ -377,8 +432,9 @@ test("GET /v1/blocks/{unknown} returns 404", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/blocks/block-nonexistent`);
+  const b = body as { detail: string };
   assert.equal(res.status, 404);
-  assert.equal(typeof body.detail, "string");
+  assert.equal(typeof b.detail, "string");
 });
 
 // ── conversations ──────────────────────────────────────────────────
@@ -393,12 +449,13 @@ test("GET /v1/conversations lists across agents and emits external ids", async (
   seedConversation(shim.stateDir, b);
 
   const { res, body } = await getJson(`${shim.url}/v1/conversations`);
+  const arr = body as Array<{ id: string; agent_id: string; in_context_message_ids: unknown[] }>;
   assert.equal(res.status, 200);
-  assert.equal(body.length, 2);
+  assert.equal(arr.length, 2);
   // Both should have synthesized external ids
-  const ids = body.map((c) => c.id).sort();
+  const ids = arr.map((c) => c.id).sort();
   assert.deepEqual(ids, [`conv-default-${a}`, `conv-default-${b}`].sort());
-  for (const c of body) {
+  for (const c of arr) {
     assert.ok(c.agent_id);
     assert.ok(Array.isArray(c.in_context_message_ids));
   }
@@ -413,9 +470,10 @@ test("GET /v1/conversations/{external-default-id} resolves to the agent's defaul
 
   const extId = externalConvId(id);
   const { res, body } = await getJson(`${shim.url}/v1/conversations/${extId}`);
+  const b = body as { id: string; agent_id: string };
   assert.equal(res.status, 200);
-  assert.equal(body.id, extId);
-  assert.equal(body.agent_id, id);
+  assert.equal(b.id, extId);
+  assert.equal(b.agent_id, id);
 });
 
 test("GET /v1/conversations/{explicit-id} resolves to explicit conv", async (t) => {
@@ -426,9 +484,10 @@ test("GET /v1/conversations/{explicit-id} resolves to explicit conv", async (t) 
   seedConversation(shim.stateDir, aid, { id: "conv-explicit-1" });
 
   const { res, body } = await getJson(`${shim.url}/v1/conversations/conv-explicit-1`);
+  const b = body as { id: string; agent_id: string };
   assert.equal(res.status, 200);
-  assert.equal(body.id, "conv-explicit-1");
-  assert.equal(body.agent_id, aid);
+  assert.equal(b.id, "conv-explicit-1");
+  assert.equal(b.agent_id, aid);
 });
 
 test("GET /v1/conversations/{unknown}/messages returns [] (mobile-friendly)", async (t) => {
@@ -447,8 +506,9 @@ test("GET /v1/conversations/{unknown} returns 404 on detail", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/conversations/conv-unknown`);
+  const b = body as { detail: string };
   assert.equal(res.status, 404);
-  assert.equal(typeof body.detail, "string");
+  assert.equal(typeof b.detail, "string");
 });
 
 // ── conversation messages — projection contract ─────────────────────
@@ -468,9 +528,17 @@ test("GET /v1/conversations/{ext}/messages projects user message with otid=local
 
   const ext = externalConvId(aid);
   const { res, body } = await getJson(`${shim.url}/v1/conversations/${ext}/messages`);
+  const arr = body as Array<{
+    id: string;
+    message_type: string;
+    otid: string;
+    content: string;
+    name: string | null;
+    is_err: unknown;
+  }>;
   assert.equal(res.status, 200);
-  assert.equal(body.length, 1);
-  const m = body[0];
+  assert.equal(arr.length, 1);
+  const m = arr[0];
   assert.equal(m.id, "ui-msg-projU");
   assert.equal(m.message_type, "user_message");
   // The crucial contract: no otid map, so otid echoes localMsg.id.
@@ -496,8 +564,9 @@ test("GET /v1/conversations/{ext}/messages strips <system-reminder> envelopes fr
 
   const ext = externalConvId(aid);
   const { body } = await getJson(`${shim.url}/v1/conversations/${ext}/messages`);
-  assert.equal(body.length, 1);
-  assert.equal(body[0].content, "hello there");
+  const arr = body as Array<{ content: string }>;
+  assert.equal(arr.length, 1);
+  assert.equal(arr[0].content, "hello there");
 });
 
 test("GET /v1/conversations/{ext}/messages honors order=asc / order=desc", async (t) => {
@@ -512,10 +581,12 @@ test("GET /v1/conversations/{ext}/messages honors order=asc / order=desc", async
 
   const ext = externalConvId(aid);
   const asc = await getJson(`${shim.url}/v1/conversations/${ext}/messages?order=asc`);
-  assert.deepEqual(asc.body.map((m) => m.id), ["po-1", "po-2", "po-3"]);
+  const ascArr = asc.body as Array<{ id: string }>;
+  assert.deepEqual(ascArr.map((m) => m.id), ["po-1", "po-2", "po-3"]);
 
   const desc = await getJson(`${shim.url}/v1/conversations/${ext}/messages?order=desc`);
-  assert.deepEqual(desc.body.map((m) => m.id), ["po-3", "po-2", "po-1"]);
+  const descArr = desc.body as Array<{ id: string }>;
+  assert.deepEqual(descArr.map((m) => m.id), ["po-3", "po-2", "po-1"]);
 });
 
 test("GET /v1/conversations/{ext}/messages honors limit and before", async (t) => {
@@ -535,11 +606,13 @@ test("GET /v1/conversations/{ext}/messages honors limit and before", async (t) =
   const ext = externalConvId(aid);
 
   const lim = await getJson(`${shim.url}/v1/conversations/${ext}/messages?limit=2`);
+  const limArr = lim.body as Array<{ id: string }>;
   // listMessages tails the array; ascending order is default
-  assert.deepEqual(lim.body.map((m) => m.id), ["pp-3", "pp-4"]);
+  assert.deepEqual(limArr.map((m) => m.id), ["pp-3", "pp-4"]);
 
   const before = await getJson(`${shim.url}/v1/conversations/${ext}/messages?before=pp-3`);
-  assert.deepEqual(before.body.map((m) => m.id), ["pp-0", "pp-1", "pp-2"]);
+  const beforeArr = before.body as Array<{ id: string }>;
+  assert.deepEqual(beforeArr.map((m) => m.id), ["pp-0", "pp-1", "pp-2"]);
 });
 
 test("GET /v1/conversations/{ext}/messages projects assistant text into assistant_message", async (t) => {
@@ -557,8 +630,9 @@ test("GET /v1/conversations/{ext}/messages projects assistant text into assistan
 
   const ext = externalConvId(aid);
   const { body } = await getJson(`${shim.url}/v1/conversations/${ext}/messages`);
-  assert.equal(body.length, 1);
-  const m = body[0];
+  const arr = body as Array<{ message_type: string; content: string; otid: string }>;
+  assert.equal(arr.length, 1);
+  const m = arr[0];
   assert.equal(m.message_type, "assistant_message");
   assert.equal(m.content, "result is 42");
   assert.equal(m.otid, "ui-msg-asst");
@@ -574,16 +648,18 @@ test("conversation external-id translation: conv-default-{A} resolves; bare lite
 
   // External-id form: conv-default-{agentId} — matches the regex branch of resolveConversationId.
   const viaExt = await getJson(`${shim.url}/v1/conversations/conv-default-${aid}/messages`);
+  const viaExtArr = viaExt.body as unknown[];
   assert.equal(viaExt.res.status, 200);
-  assert.equal(viaExt.body.length, 1);
+  assert.equal(viaExtArr.length, 1);
 
   // Bare literal "default" is ambiguous on /v1/conversations/* (every agent
   // has one) — the resolver refuses to disk-scan it to avoid mis-routing
   // on a multi-agent backend. handleConversationMessagesList returns a
   // mobile-friendly 200-empty rather than 404 for unresolved ids.
   const viaDefault = await getJson(`${shim.url}/v1/conversations/default/messages`);
+  const viaDefaultArr = viaDefault.body as unknown[];
   assert.equal(viaDefault.res.status, 200);
-  assert.equal(viaDefault.body.length, 0, "literal `default` must NOT resolve via disk-scan");
+  assert.equal(viaDefaultArr.length, 0, "literal `default` must NOT resolve via disk-scan");
 });
 
 test("multi-agent default disambiguation: bare literal `default` doesn't disk-scan to the wrong agent", async (t) => {
@@ -604,15 +680,18 @@ test("multi-agent default disambiguation: bare literal `default` doesn't disk-sc
   // Each external id resolves to its agent's messages exactly.
   const viaA = await getJson(`${shim.url}/v1/conversations/conv-default-${aA}/messages`);
   const viaB = await getJson(`${shim.url}/v1/conversations/conv-default-${aB}/messages`);
-  assert.equal(viaA.body.length, 1);
-  assert.equal(viaB.body.length, 1);
-  assert.equal(viaA.body[0].content, "A's prior");
-  assert.equal(viaB.body[0].content, "B's prior");
+  const viaAArr = viaA.body as Array<{ content: string }>;
+  const viaBArr = viaB.body as Array<{ content: string }>;
+  assert.equal(viaAArr.length, 1);
+  assert.equal(viaBArr.length, 1);
+  assert.equal(viaAArr[0].content, "A's prior");
+  assert.equal(viaBArr[0].content, "B's prior");
 
   // Bare literal "default" → 200 empty, never leaks either agent's messages.
   const viaDefault = await getJson(`${shim.url}/v1/conversations/default/messages`);
+  const viaDefaultArr = viaDefault.body as unknown[];
   assert.equal(viaDefault.res.status, 200);
-  assert.equal(viaDefault.body.length, 0, "literal `default` must not leak any agent's messages");
+  assert.equal(viaDefaultArr.length, 0, "literal `default` must not leak any agent's messages");
 });
 
 // ── conversation create (POST) ─────────────────────────────────────
@@ -629,14 +708,19 @@ test("POST /v1/conversations creates and returns the conversation", async (t) =>
     body: JSON.stringify({ agent_id: aid }),
   });
   assert.equal(res.status, 201);
-  const body = await res.json();
+  const body = await res.json() as {
+    id: string;
+    agent_id: string;
+    in_context_message_ids: unknown[];
+  };
   assert.ok(body.id);
   assert.equal(body.agent_id, aid);
   assert.ok(Array.isArray(body.in_context_message_ids));
 
   // It should now show up in the list.
   const list = await getJson(`${shim.url}/v1/conversations`);
-  const ids = list.body.map((c) => c.id);
+  const listArr = list.body as Array<{ id: string }>;
+  const ids = listArr.map((c) => c.id);
   assert.ok(ids.includes(body.id), `created conv ${body.id} should be listed (got ${ids})`);
 });
 
@@ -650,7 +734,7 @@ test("POST /v1/conversations without agent_id returns 400", async (t) => {
     body: "{}",
   });
   assert.equal(res.status, 400);
-  const body = await res.json();
+  const body = await res.json() as { detail: string };
   assert.equal(typeof body.detail, "string");
 });
 
@@ -663,8 +747,9 @@ test("GET /v1/models returns non-empty list with handle/model_endpoint_type", as
   const { res, body } = await getJson(`${shim.url}/v1/models`);
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(body));
-  assert.ok(body.length > 0, "should expose at least one model");
-  for (const m of body) {
+  const arr = body as Array<{ handle: string; model_endpoint_type: string; model_type: string }>;
+  assert.ok(arr.length > 0, "should expose at least one model");
+  for (const m of arr) {
     assert.equal(typeof m.handle, "string");
     assert.equal(m.model_endpoint_type, "openai");
     assert.equal(m.model_type, "llm");
@@ -678,10 +763,11 @@ test("GET /v1/providers returns at least one provider with required fields", asy
   const { res, body } = await getJson(`${shim.url}/v1/providers`);
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(body));
-  assert.ok(body.length >= 1);
-  assert.equal(typeof body[0].id, "string");
-  assert.equal(typeof body[0].name, "string");
-  assert.equal(typeof body[0].provider_type, "string");
+  const arr = body as Array<{ id: string; name: string; provider_type: string }>;
+  assert.ok(arr.length >= 1);
+  assert.equal(typeof arr[0].id, "string");
+  assert.equal(typeof arr[0].name, "string");
+  assert.equal(typeof arr[0].provider_type, "string");
 });
 
 test("GET /v1/tools returns the builtin tool definitions", async (t) => {
@@ -691,13 +777,19 @@ test("GET /v1/tools returns the builtin tool definitions", async (t) => {
   const { res, body } = await getJson(`${shim.url}/v1/tools`);
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(body));
-  assert.ok(body.length > 0);
-  const names = body.map((t) => t.name);
+  const arr = body as Array<{
+    id: string;
+    name: string;
+    json_schema: object;
+    tool_type: string;
+  }>;
+  assert.ok(arr.length > 0);
+  const names = arr.map((t) => t.name);
   for (const expected of ["Bash", "Read", "Write", "Edit"]) {
     assert.ok(names.includes(expected), `tool list should include ${expected}`);
   }
   // Each tool has the vanilla shape
-  for (const t of body) {
+  for (const t of arr) {
     assert.match(t.id, /^tool-/);
     assert.equal(typeof t.json_schema, "object");
     assert.equal(t.tool_type, "custom");
@@ -709,7 +801,8 @@ test("GET /v1/tools/{tool_id} returns the matching builtin", async (t) => {
   t.after(() => shim.stop());
 
   const list = await getJson(`${shim.url}/v1/tools`);
-  const bash = list.body.find((it) => it.name === "Bash");
+  const listArr = list.body as Array<{ id: string; name: string }>;
+  const bash = listArr.find((it) => it.name === "Bash");
   assert.ok(bash, "Bash must be in the list");
 
   const { res, body } = await getJson(`${shim.url}/v1/tools/${bash.id}`);
@@ -722,8 +815,9 @@ test("GET /v1/tools/{tool_id} returns 404 for an unknown id", async (t) => {
   t.after(() => shim.stop());
 
   const { res, body } = await getJson(`${shim.url}/v1/tools/tool-doesnotexist`);
+  const b = body as { detail: string };
   assert.equal(res.status, 404);
-  assert.match(body.detail, /tool tool-doesnotexist/);
+  assert.match(b.detail, /tool tool-doesnotexist/);
 });
 
 // ── messages search ────────────────────────────────────────────────
@@ -807,11 +901,15 @@ test("agent record exposes system from agent record and blocks from memfs", asyn
   seedConversation(shim.stateDir, aid);
 
   const { res, body } = await getJson(`${shim.url}/v1/agents/${aid}`);
+  const b = body as {
+    system: string;
+    memory: { blocks: Array<{ label: string; value: string }> };
+  };
   assert.equal(res.status, 200);
   // system from the agent record
-  assert.equal(body.system, "You are a strict reviewer.");
+  assert.equal(b.system, "You are a strict reviewer.");
   // memory.blocks contains all three labels with correct values
-  const byLabel = Object.fromEntries(body.memory.blocks.map((b) => [b.label, b]));
+  const byLabel = Object.fromEntries(b.memory.blocks.map((bl) => [bl.label, bl]));
   assert.equal(byLabel.persona.value, "I am a strict reviewer.");
   assert.equal(byLabel.human.value, "User is a developer.");
   assert.equal(byLabel.project.value, "Project: admin-shim.");
@@ -825,7 +923,7 @@ test("unknown path returns 404 with { detail } describing the request", async (t
 
   const res = await fetch(`${shim.url}/v1/totally-bogus-endpoint`);
   assert.equal(res.status, 404);
-  const body = await res.json();
+  const body = await res.json() as { detail: string };
   assert.equal(typeof body.detail, "string");
   assert.match(body.detail, /totally-bogus-endpoint/);
 });
@@ -836,7 +934,7 @@ test("DELETE on /v1/agents falls through to 404 (no DELETE route defined)", asyn
 
   const res = await fetch(`${shim.url}/v1/agents`, { method: "DELETE" });
   assert.equal(res.status, 404);
-  const body = await res.json();
+  const body = await res.json() as { detail: string };
   assert.equal(typeof body.detail, "string");
   assert.match(body.detail, /DELETE/);
 });

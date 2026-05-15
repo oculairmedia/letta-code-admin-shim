@@ -34,10 +34,63 @@ import {
   externalConvId,
   streamMessages,
 } from "./helpers/index.js";
+import type { ShimHandle } from "./helpers/shim.js";
+import type { SseFrame } from "./helpers/sse.js";
+
+// ── types ─────────────────────────────────────────────────────────
+
+interface UsageTotal {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_input_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  run_count: number;
+}
+
+interface UsageBreakdown {
+  key: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  run_count: number;
+}
+
+interface UsageSummary {
+  total: UsageTotal;
+  breakdown?: UsageBreakdown[];
+}
+
+interface RunStepUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  cached_input_tokens?: number;
+}
+
+interface RunStep {
+  usage?: RunStepUsage;
+}
+
+interface SendTurnOptions {
+  convId?: string;
+  timeoutMs?: number;
+}
+
+interface SendTurnResult {
+  runId: string | undefined;
+  frames: SseFrame[];
+}
 
 // ── helpers ───────────────────────────────────────────────────────
 
-async function sendTurn(shim, agentId, content, { convId, timeoutMs = 10_000 } = {}) {
+async function sendTurn(
+  shim: ShimHandle,
+  agentId: string,
+  content: string,
+  { convId, timeoutMs = 10_000 }: SendTurnOptions = {},
+): Promise<SendTurnResult> {
   const conv = convId ?? externalConvId(agentId);
   const { frames, status } = await streamMessages(
     `${shim.url}/v1/conversations/${conv}/messages`,
@@ -45,13 +98,15 @@ async function sendTurn(shim, agentId, content, { convId, timeoutMs = 10_000 } =
     { timeoutMs },
   );
   assert.equal(status, 200);
-  const runId = frames.map((f) => f.run_id).find((id) => typeof id === "string");
+  const runId = frames
+    .map((f) => (f as { run_id?: unknown }).run_id)
+    .find((id): id is string => typeof id === "string");
   return { runId, frames };
 }
 
-async function getJson(url) {
+async function getJson(url: string): Promise<{ status: number; body: unknown }> {
   const res = await fetch(url);
-  let body = null;
+  let body: unknown = null;
   try { body = await res.json(); } catch {}
   return { status: res.status, body };
 }
@@ -63,8 +118,9 @@ test("usage: empty shim returns zeroed total + run_count=0", async (t) => {
   t.after(() => shim.stop());
 
   const { status, body } = await getJson(`${shim.url}/shim/v1/usage/summary`);
+  const b = body as UsageSummary;
   assert.equal(status, 200);
-  assert.deepEqual(body.total, {
+  assert.deepEqual(b.total, {
     prompt_tokens: 0,
     completion_tokens: 0,
     total_tokens: 0,
@@ -73,7 +129,7 @@ test("usage: empty shim returns zeroed total + run_count=0", async (t) => {
     reasoning_tokens: 0,
     run_count: 0,
   });
-  assert.equal(body.breakdown, undefined, "no group_by → no breakdown");
+  assert.equal(b.breakdown, undefined, "no group_by → no breakdown");
 });
 
 test("usage: one plain turn → total_tokens=12, run_count=1", async (t) => {
@@ -85,11 +141,12 @@ test("usage: one plain turn → total_tokens=12, run_count=1", async (t) => {
   await sendTurn(shim, agentId, "reply with pong");
 
   const { body } = await getJson(`${shim.url}/shim/v1/usage/summary`);
+  const b = body as UsageSummary;
   // plain trace: prompt=6, completion=6, total=12 (single step, single frame)
-  assert.equal(body.total.prompt_tokens, 6);
-  assert.equal(body.total.completion_tokens, 6);
-  assert.equal(body.total.total_tokens, 12);
-  assert.equal(body.total.run_count, 1);
+  assert.equal(b.total.prompt_tokens, 6);
+  assert.equal(b.total.completion_tokens, 6);
+  assert.equal(b.total.total_tokens, 12);
+  assert.equal(b.total.run_count, 1);
 });
 
 test("usage: multiple turns sum correctly across runs", async (t) => {
@@ -104,11 +161,12 @@ test("usage: multiple turns sum correctly across runs", async (t) => {
   await sendTurn(shim, agentId, "reply with pong");
 
   const { body } = await getJson(`${shim.url}/shim/v1/usage/summary`);
+  const b = body as UsageSummary;
   // 3 × plain trace
-  assert.equal(body.total.prompt_tokens, 18);
-  assert.equal(body.total.completion_tokens, 18);
-  assert.equal(body.total.total_tokens, 36);
-  assert.equal(body.total.run_count, 3);
+  assert.equal(b.total.prompt_tokens, 18);
+  assert.equal(b.total.completion_tokens, 18);
+  assert.equal(b.total.total_tokens, 36);
+  assert.equal(b.total.run_count, 3);
 });
 
 test("usage: filter by agent_id isolates one agent's usage", async (t) => {
@@ -125,12 +183,14 @@ test("usage: filter by agent_id isolates one agent's usage", async (t) => {
   await sendTurn(shim, a2, "reply with pong");
 
   const onlyA1 = await getJson(`${shim.url}/shim/v1/usage/summary?agent_id=${a1}`);
-  assert.equal(onlyA1.body.total.total_tokens, 12);
-  assert.equal(onlyA1.body.total.run_count, 1);
+  const onlyA1b = onlyA1.body as UsageSummary;
+  assert.equal(onlyA1b.total.total_tokens, 12);
+  assert.equal(onlyA1b.total.run_count, 1);
 
   const onlyA2 = await getJson(`${shim.url}/shim/v1/usage/summary?agent_id=${a2}`);
-  assert.equal(onlyA2.body.total.total_tokens, 24);
-  assert.equal(onlyA2.body.total.run_count, 2);
+  const onlyA2b = onlyA2.body as UsageSummary;
+  assert.equal(onlyA2b.total.total_tokens, 24);
+  assert.equal(onlyA2b.total.run_count, 2);
 });
 
 test("usage: filter by conversation_id isolates one conversation's usage", async (t) => {
@@ -145,12 +205,14 @@ test("usage: filter by conversation_id isolates one conversation's usage", async
   await sendTurn(shim, agentId, "reply with pong", { convId: "conv-extra" });
 
   const def = await getJson(`${shim.url}/shim/v1/usage/summary?conversation_id=default`);
-  assert.equal(def.body.total.run_count, 1);
-  assert.equal(def.body.total.total_tokens, 12);
+  const defb = def.body as UsageSummary;
+  assert.equal(defb.total.run_count, 1);
+  assert.equal(defb.total.total_tokens, 12);
 
   const other = await getJson(`${shim.url}/shim/v1/usage/summary?conversation_id=conv-extra`);
-  assert.equal(other.body.total.run_count, 1);
-  assert.equal(other.body.total.total_tokens, 12);
+  const otherb = other.body as UsageSummary;
+  assert.equal(otherb.total.run_count, 1);
+  assert.equal(otherb.total.total_tokens, 12);
 });
 
 test("usage: ?statuses=completed excludes cancelled runs", async (t) => {
@@ -174,10 +236,11 @@ test("usage: ?statuses=completed excludes cancelled runs", async (t) => {
     { messages: [{ role: "user", content: "reply with pong" }], streaming: true },
     { timeoutMs: 15_000 },
   );
-  let runId = null;
+  let runId: string | null = null;
   for (let i = 0; i < 30; i += 1) {
     const { body } = await getJson(`${shim.url}/v1/runs/?active=true`);
-    if (body.length >= 1) { runId = body[0].id; break; }
+    const arr = body as Array<{ id: string }>;
+    if (arr.length >= 1) { runId = arr[0].id; break; }
     await new Promise((r) => setTimeout(r, 100));
   }
   assert.ok(runId);
@@ -191,18 +254,21 @@ test("usage: ?statuses=completed excludes cancelled runs", async (t) => {
   // No filter — both runs included; cancelled run never set usage, so totals
   // still reflect only the completed run.
   const all = await getJson(`${shim.url}/shim/v1/usage/summary`);
-  assert.equal(all.body.total.run_count, 2);
-  assert.equal(all.body.total.total_tokens, 12);
+  const allb = all.body as UsageSummary;
+  assert.equal(allb.total.run_count, 2);
+  assert.equal(allb.total.total_tokens, 12);
 
   // statuses=completed — one run, totals unchanged.
   const completed = await getJson(`${shim.url}/shim/v1/usage/summary?statuses=completed`);
-  assert.equal(completed.body.total.run_count, 1);
-  assert.equal(completed.body.total.total_tokens, 12);
+  const completedb = completed.body as UsageSummary;
+  assert.equal(completedb.total.run_count, 1);
+  assert.equal(completedb.total.total_tokens, 12);
 
   // statuses=cancelled — one run, zero tokens (cancel happened before usage frame).
   const cancelled = await getJson(`${shim.url}/shim/v1/usage/summary?statuses=cancelled`);
-  assert.equal(cancelled.body.total.run_count, 1);
-  assert.equal(cancelled.body.total.total_tokens, 0);
+  const cancelledb = cancelled.body as UsageSummary;
+  assert.equal(cancelledb.total.run_count, 1);
+  assert.equal(cancelledb.total.total_tokens, 0);
 });
 
 test("usage: start/end window filters runs by created_at", async (t) => {
@@ -220,7 +286,8 @@ test("usage: start/end window filters runs by created_at", async (t) => {
   const inRange = await getJson(
     `${shim.url}/shim/v1/usage/summary?start=${encodeURIComponent(before)}&end=${encodeURIComponent(after)}`,
   );
-  assert.equal(inRange.body.total.run_count, 1);
+  const inRangeb = inRange.body as UsageSummary;
+  assert.equal(inRangeb.total.run_count, 1);
 
   // Window strictly in the future — should exclude it.
   const future = new Date(Date.now() + 60_000).toISOString();
@@ -228,8 +295,9 @@ test("usage: start/end window filters runs by created_at", async (t) => {
   const outOfRange = await getJson(
     `${shim.url}/shim/v1/usage/summary?start=${encodeURIComponent(future)}&end=${encodeURIComponent(farFuture)}`,
   );
-  assert.equal(outOfRange.body.total.run_count, 0);
-  assert.equal(outOfRange.body.total.total_tokens, 0);
+  const outOfRangeb = outOfRange.body as UsageSummary;
+  assert.equal(outOfRangeb.total.run_count, 0);
+  assert.equal(outOfRangeb.total.total_tokens, 0);
 });
 
 test("usage: group_by=agent — breakdown per agent, sorted by total_tokens desc", async (t) => {
@@ -247,15 +315,16 @@ test("usage: group_by=agent — breakdown per agent, sorted by total_tokens desc
   await sendTurn(shim, light, "reply with pong");
 
   const { body } = await getJson(`${shim.url}/shim/v1/usage/summary?group_by=agent`);
-  assert.ok(Array.isArray(body.breakdown));
-  assert.equal(body.breakdown.length, 2);
+  const b = body as UsageSummary;
+  assert.ok(Array.isArray(b.breakdown));
+  assert.equal(b.breakdown!.length, 2);
   // sorted by total_tokens desc → heavy first
-  assert.equal(body.breakdown[0].key, heavy);
-  assert.equal(body.breakdown[0].total_tokens, 24);
-  assert.equal(body.breakdown[0].run_count, 2);
-  assert.equal(body.breakdown[1].key, light);
-  assert.equal(body.breakdown[1].total_tokens, 12);
-  assert.equal(body.breakdown[1].run_count, 1);
+  assert.equal(b.breakdown![0].key, heavy);
+  assert.equal(b.breakdown![0].total_tokens, 24);
+  assert.equal(b.breakdown![0].run_count, 2);
+  assert.equal(b.breakdown![1].key, light);
+  assert.equal(b.breakdown![1].total_tokens, 12);
+  assert.equal(b.breakdown![1].run_count, 1);
 });
 
 test("usage: group_by=conversation — breakdown per conversation_id", async (t) => {
@@ -271,9 +340,10 @@ test("usage: group_by=conversation — breakdown per conversation_id", async (t)
   await sendTurn(shim, agentId, "reply with pong", { convId: "conv-x" });
 
   const { body } = await getJson(`${shim.url}/shim/v1/usage/summary?group_by=conversation`);
-  const keys = body.breakdown.map((b) => b.key).sort();
+  const b = body as UsageSummary;
+  const keys = b.breakdown!.map((br) => br.key).sort();
   assert.deepEqual(keys, ["conv-x", "default"]);
-  const byKey = Object.fromEntries(body.breakdown.map((b) => [b.key, b]));
+  const byKey = Object.fromEntries(b.breakdown!.map((br) => [br.key, br]));
   assert.equal(byKey["default"].run_count, 2);
   assert.equal(byKey["default"].total_tokens, 24);
   assert.equal(byKey["conv-x"].run_count, 1);
@@ -291,11 +361,12 @@ test("usage: group_by=day — breakdown bucket per YYYY-MM-DD", async (t) => {
   await sendTurn(shim, agentId, "reply with pong");
 
   const { body } = await getJson(`${shim.url}/shim/v1/usage/summary?group_by=day`);
+  const b = body as UsageSummary;
   // Both turns happen in the same calendar day in wall-clock time.
-  assert.equal(body.breakdown.length, 1);
-  assert.match(body.breakdown[0].key, /^\d{4}-\d{2}-\d{2}$/);
-  assert.equal(body.breakdown[0].run_count, 2);
-  assert.equal(body.breakdown[0].total_tokens, 24);
+  assert.equal(b.breakdown!.length, 1);
+  assert.match(b.breakdown![0].key, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(b.breakdown![0].run_count, 2);
+  assert.equal(b.breakdown![0].total_tokens, 24);
 });
 
 test("usage: group_by=model — sums per-step usage from steps.jsonl", async (t) => {
@@ -312,15 +383,16 @@ test("usage: group_by=model — sums per-step usage from steps.jsonl", async (t)
   await sendTurn(shim, agentId, "run bash echo hello"); // bash-tool: 2 steps
 
   const { body } = await getJson(`${shim.url}/shim/v1/usage/summary?group_by=model`);
-  assert.ok(Array.isArray(body.breakdown));
-  assert.equal(body.breakdown.length, 1);
-  assert.equal(body.breakdown[0].key, "unknown");
+  const b = body as UsageSummary;
+  assert.ok(Array.isArray(b.breakdown));
+  assert.equal(b.breakdown!.length, 1);
+  assert.equal(b.breakdown![0].key, "unknown");
   // bash-tool step1+step2: p=6+1=7, c=97+8=105, t=103+9=112
-  assert.equal(body.breakdown[0].prompt_tokens, 7);
-  assert.equal(body.breakdown[0].completion_tokens, 105);
-  assert.equal(body.breakdown[0].total_tokens, 112);
+  assert.equal(b.breakdown![0].prompt_tokens, 7);
+  assert.equal(b.breakdown![0].completion_tokens, 105);
+  assert.equal(b.breakdown![0].total_tokens, 112);
   // The run-level total in this aggregation is also the step sum:
-  assert.equal(body.total.total_tokens, 112);
+  assert.equal(b.total.total_tokens, 112);
 });
 
 test("usage: invalid group_by → 400 listing allowed values", async (t) => {
@@ -328,10 +400,11 @@ test("usage: invalid group_by → 400 listing allowed values", async (t) => {
   t.after(() => shim.stop());
 
   const { status, body } = await getJson(`${shim.url}/shim/v1/usage/summary?group_by=bogus`);
+  const b = body as { detail: string };
   assert.equal(status, 400);
-  assert.equal(typeof body.detail, "string");
+  assert.equal(typeof b.detail, "string");
   for (const allowed of ["agent", "conversation", "model", "day"]) {
-    assert.match(body.detail, new RegExp(allowed));
+    assert.match(b.detail, new RegExp(allowed));
   }
 });
 
@@ -349,8 +422,9 @@ test("usage: steps.jsonl per-step usages sum to the run-level total for bash-too
   const { runId } = await sendTurn(shim, agentId, "run bash echo hello");
 
   const { body: steps } = await getJson(`${shim.url}/v1/runs/${runId}/steps`);
-  assert.equal(steps.length, 2);
-  const sum = steps.reduce(
+  const stepsArr = steps as RunStep[];
+  assert.equal(stepsArr.length, 2);
+  const sum = stepsArr.reduce(
     (acc, s) => ({
       prompt_tokens: acc.prompt_tokens + (s.usage?.prompt_tokens ?? 0),
       completion_tokens: acc.completion_tokens + (s.usage?.completion_tokens ?? 0),
@@ -377,10 +451,11 @@ test("usage: cached_input_tokens propagates through aggregation", async (t) => {
   await sendTurn(shim, agentId, "run bash echo hello");
 
   const { body } = await getJson(`${shim.url}/shim/v1/usage/summary`);
-  assert.equal(body.total.cached_input_tokens, 20133);
-  assert.equal(body.total.run_count, 1);
+  const b = body as UsageSummary;
+  assert.equal(b.total.cached_input_tokens, 20133);
+  assert.equal(b.total.run_count, 1);
   // run-level total_tokens reflects step1 only (see file header):
-  assert.equal(body.total.total_tokens, 103);
+  assert.equal(b.total.total_tokens, 103);
 });
 
 test("usage: agent_ids[] multi-match filter", async (t) => {
@@ -401,6 +476,7 @@ test("usage: agent_ids[] multi-match filter", async (t) => {
   const { body } = await getJson(
     `${shim.url}/shim/v1/usage/summary?agent_ids=${a}&agent_ids=${c}`,
   );
-  assert.equal(body.total.run_count, 2);
-  assert.equal(body.total.total_tokens, 24);
+  const sum = body as UsageSummary;
+  assert.equal(sum.total.run_count, 2);
+  assert.equal(sum.total.total_tokens, 24);
 });

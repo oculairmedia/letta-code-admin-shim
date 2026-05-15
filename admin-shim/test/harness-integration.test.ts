@@ -40,7 +40,8 @@ test("integration: POST /v1/conversations/{id}/messages streams plain trace", as
   // Plain trace coalesces to one assistant_message containing "pong"
   const assistants = framesOfType(frames, "assistant_message");
   assert.equal(assistants.length, 1, `expected 1 assistant_message, got ${assistants.length}`);
-  assert.match(assistants[0].content, /pong/i, `assistant content should mention pong, got: ${assistants[0].content}`);
+  const a0 = assistants[0] as { content: string };
+  assert.match(a0.content, /pong/i, `assistant content should mention pong, got: ${a0.content}`);
 
   // stop_reason + usage in vanilla order
   const stopIdx = frames.findIndex((f) => f.message_type === "stop_reason");
@@ -68,6 +69,7 @@ test("integration: bash-tool trace yields a tool_call_message", async (t) => {
 
   const tools = framesOfType(frames, "tool_call_message");
   assert.equal(tools.length, 1, "should have one tool_call_message");
-  assert.equal(tools[0].tool_call?.name, "Bash");
-  assert.match(tools[0].id, /^toolcall-/);
+  const t0 = tools[0] as { tool_call?: { name?: string }; id: string };
+  assert.equal(t0.tool_call?.name, "Bash");
+  assert.match(t0.id, /^toolcall-/);
 });
