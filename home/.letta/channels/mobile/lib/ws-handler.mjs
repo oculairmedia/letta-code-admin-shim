@@ -212,27 +212,43 @@ export function handleConnection(ws, request, host) {
                 log(`backpressure: bufferedAmount=${ws.bufferedAmount} > ${HIGH_WATER}, dropping ${mt}`);
                 return;
               }
+              // lcp-cv3: pass the upstream id through to the envelope so
+              // mobile's findByServerId can merge streamed chunks. For
+              // assistant/reasoning the host now stamps `cm-stream-<otid>` /
+              // `cm-reason-<otid>` so every chunk of the same logical
+              // message shares an id. tool_call_message / tool_return_message
+              // ids carry `toolcall-` / `toolreturn-` prefixes from the
+              // upstream reshape — preserve them for mobile's distinctBy{id}
+              // dedup. makeFrame's auto-generated random id was masking all
+              // of these and made the stream look like one final chunk.
+              const upstreamId = typeof outFrame.id === "string" && outFrame.id.length > 0
+                ? outFrame.id
+                : undefined;
               if (mt === "assistant_message") {
                 safeSend(ws, makeFrame("assistant_message", {
                   ...base,
+                  ...(upstreamId ? { id: upstreamId } : {}),
                   content: outFrame.content ?? "",
                   otid: outFrame.otid ?? null,
                 }), log);
               } else if (mt === "reasoning_message") {
                 safeSend(ws, makeFrame("reasoning_message", {
                   ...base,
+                  ...(upstreamId ? { id: upstreamId } : {}),
                   reasoning: outFrame.reasoning ?? "",
                   signature: outFrame.signature ?? null,
                 }), log);
               } else if (mt === "tool_call_message") {
                 safeSend(ws, makeFrame("tool_call_message", {
                   ...base,
+                  ...(upstreamId ? { id: upstreamId } : {}),
                   tool_call: outFrame.tool_call ?? null,
                   tool_calls: outFrame.tool_calls ?? null,
                 }), log);
               } else if (mt === "tool_return_message") {
                 safeSend(ws, makeFrame("tool_return_message", {
                   ...base,
+                  ...(upstreamId ? { id: upstreamId } : {}),
                   tool_call_id: outFrame.tool_call_id ?? null,
                   status: outFrame.status ?? "success",
                   tool_return: outFrame.tool_return ?? null,

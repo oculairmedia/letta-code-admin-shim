@@ -135,27 +135,20 @@ async function bridgeSendMessage(
   const pool = getAgentPool();
   const worker = await pool.get(effectiveConvId, effectiveAgentId);
 
-  // Buffer assistant_message chunks for server-side coalescing so the
-  // mobile channel matches vanilla's "one assistant_message per turn"
-  // contract — identical to how the REST stream path coalesces.
-  // chunkBuffer is an array of content strings joined once at flush
-  // time (lcp-86o); the previous `prev.content + new.content` per
-  // chunk was O(n^2) in total chunk count for long streams.
-  let pendingAssistant: BridgeFrame | null = null;
-  let chunkBuffer: string[] | null = null;
+  // lcp-cv3: stream assistant_message and reasoning_message chunks as
+  // they arrive — DO NOT coalesce server-side. Mobile's stream ingest
+  // (TimelineSyncIngest.kt) expects PURE DELTAS per the lettabot-uww.11
+  // contract: it finds the existing event by serverId and appends new
+  // content. To merge correctly each chunk must share the same id, so we
+  // stamp a stable per-otid id (`cm-stream-<otid>` for assistants,
+  // `cm-reason-<otid>` for reasoning). Without otid we fall back to the
+  // upstream id, which means no merging happens and each chunk renders
+  // as its own bubble (degraded but not broken).
+  //
+  // stop_reason and usage_statistics still buffer to end-of-turn so they
+  // arrive AFTER the final assistant chunk regardless of upstream order.
   let pendingStop: BridgeFrame | null = null;
   let pendingUsage: BridgeFrame | null = null;
-
-  const flushPendingAssistant = (): void => {
-    if (pendingAssistant) {
-      if (chunkBuffer && pendingAssistant.message_type === "assistant_message") {
-        pendingAssistant.content = chunkBuffer.join("");
-      }
-      onFrame(pendingAssistant);
-      pendingAssistant = null;
-      chunkBuffer = null;
-    }
-  };
 
   const turn = await worker.runTurn(text, {
     onRunCreated: (runId: string) => {
@@ -174,40 +167,35 @@ async function bridgeSendMessage(
       if (meta?.runId) (reshaped as unknown as Record<string, unknown>)["run_id"] = meta.runId;
       const mt = reshaped.message_type;
       if (mt === "stop_reason") {
-        pendingStop = reshaped;
+        // lcp-c4d: first-wins (run-record contract).
+        if (pendingStop === null) pendingStop = reshaped;
         return;
       }
       if (mt === "usage_statistics") {
-        pendingUsage = reshaped;
+        if (pendingUsage === null) pendingUsage = reshaped;
         return;
       }
+      // Stable per-otid id so mobile's findByServerId merges chunks of
+      // the same logical message. Spec §2.2 + §4.2 prescribes the
+      // `cm-stream-` prefix for assistants; reasoning follows the same
+      // pattern with `cm-reason-` (mobile dedups reasoning the same way).
       if (mt === "assistant_message") {
-        if (
-          pendingAssistant &&
-          pendingAssistant.message_type === "assistant_message" &&
-          pendingAssistant.otid &&
-          pendingAssistant.otid === reshaped.otid
-        ) {
-          // Push into the chunk buffer instead of `content + content`.
-          if (!chunkBuffer) chunkBuffer = [pendingAssistant.content ?? ""];
-          chunkBuffer.push(reshaped.content ?? "");
-          pendingAssistant.id = reshaped.id;
-          pendingAssistant.date = reshaped.date;
-          pendingAssistant.seq_id = reshaped.seq_id;
-          return;
+        const otid = (reshaped as { otid?: string | null }).otid;
+        if (typeof otid === "string" && otid.length > 0) {
+          (reshaped as unknown as Record<string, unknown>)["id"] = `cm-stream-${otid}`;
         }
-        flushPendingAssistant();
-        pendingAssistant = { ...reshaped };
-        chunkBuffer = null;
-        return;
+      } else if (mt === "reasoning_message") {
+        const otid = (reshaped as { otid?: string | null }).otid;
+        if (typeof otid === "string" && otid.length > 0) {
+          (reshaped as unknown as Record<string, unknown>)["id"] = `cm-reason-${otid}`;
+        }
       }
-      flushPendingAssistant();
       onFrame(reshaped);
     },
   });
 
-  // End-of-turn tail in vanilla order: assistant → stop_reason → usage.
-  flushPendingAssistant();
+  // End-of-turn tail: stop_reason → usage_statistics. Assistant chunks
+  // were already forwarded inline above.
   if (pendingStop) onFrame(pendingStop);
   if (pendingUsage) onFrame(pendingUsage);
 

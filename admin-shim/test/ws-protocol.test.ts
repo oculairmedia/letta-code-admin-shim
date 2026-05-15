@@ -536,7 +536,7 @@ test("ws: shim logs `mobile-channel adapter ready` on first WS upgrade", async (
 
 // ─── 18. assistant_message content arrives non-empty ────────────────
 
-test("ws: assistant_message carries non-empty content on a normal reply", async (t) => {
+test("ws: assistant_message chunks concatenate to the full reply (lcp-cv3 streaming)", async (t) => {
   const { conn, agentId, convId } = await setupAuthed(t);
   conn.send({
     type: "send_message",
@@ -546,13 +546,35 @@ test("ws: assistant_message carries non-empty content on a normal reply", async 
     otid: "cm-ws-content",
   });
   const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
-  const a = turn.find((f) => {
-    if (f.type !== "assistant_message") return false;
-    const c = (f as { content?: string }).content;
-    return typeof c === "string" && c.length > 0;
-  }) as unknown as { content: string } | undefined;
-  assert.ok(a, "at least one assistant_message must carry content");
-  assert.match(a.content.toLowerCase(), /pong/);
+  // lcp-cv3: assistant_message is now streamed as pure deltas; each
+  // chunk of the same logical message shares the same envelope id
+  // (cm-stream-<upstream_otid>) and content is only the delta. The
+  // <upstream_otid> is letta-code's per-assistant-message otid, NOT
+  // the mobile-supplied user-message otid — one turn may produce
+  // multiple distinct assistant_messages (e.g. with interleaved tool
+  // calls), each needing its own stable id across its chunks.
+  const assistants = turn.filter((f) => f.type === "assistant_message") as unknown as Array<{
+    id?: string; content?: string;
+  }>;
+  assert.ok(assistants.length > 0, "at least one assistant_message must arrive");
+  const joined = assistants.map((a) => a.content ?? "").join("");
+  assert.match(joined.toLowerCase(), /pong/, `concatenated content must include pong, got: ${joined}`);
+  // Every chunk's id must start with cm-stream- and be non-empty.
+  for (const a of assistants) {
+    assert.ok(
+      typeof a.id === "string" && a.id.startsWith("cm-stream-") && a.id.length > "cm-stream-".length,
+      `assistant_message id must start with cm-stream-, got: ${a.id}`,
+    );
+  }
+  // Group chunks by id and verify each group concatenates to non-empty
+  // content (i.e. ids are stable across chunks of the same message).
+  const byId = new Map<string, string>();
+  for (const a of assistants) {
+    byId.set(a.id ?? "", (byId.get(a.id ?? "") ?? "") + (a.content ?? ""));
+  }
+  for (const [id, content] of byId) {
+    assert.ok(content.length > 0, `group ${id} concatenated to empty content`);
+  }
 });
 
 // ─── 19. turn_started carries agent + conv ids ──────────────────────
