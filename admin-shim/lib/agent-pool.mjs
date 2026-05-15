@@ -32,7 +32,7 @@ import {
   recordRunMessage,
   recordRunStep,
   recordRunTool,
-} from "./runs.mjs";
+} from "./runs.js";
 
 const LETTA_BIN = process.env.LETTA_BIN || "letta";
 const MAX_WORKERS = Number(process.env.SHIM_POOL_MAX ?? 10);
@@ -482,4 +482,4 @@ export function getAgentPool() {
 // directly. `cancelRun(runId)` triggers the onCancel hook registered in
 // runTurn, which SIGTERMs the worker and flips the Run's status to
 // "cancelled".
-export { cancelRun } from "./runs.mjs";
+export { cancelRun } from "./runs.js";

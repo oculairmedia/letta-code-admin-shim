@@ -6,10 +6,10 @@
   "type": "module",
   "main": "server.mjs",
   "scripts": {
-    "start": "node server.mjs",
+    "start": "node --import tsx/esm server.mjs",
     "dev": "tsx watch server.mjs",
-    "test": "node --test --test-concurrency=1 --test-reporter=spec test/*.test.mjs",
-    "test:watch": "node --test --test-concurrency=1 --watch test/*.test.mjs",
+    "test": "node --import tsx/esm --test --test-concurrency=1 --test-reporter=spec test/*.test.mjs",
+    "test:watch": "node --import tsx/esm --test --test-concurrency=1 --watch test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "build": "echo 'not yet — phase 6' && exit 0"
   },

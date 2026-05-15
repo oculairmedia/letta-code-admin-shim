@@ -124,7 +124,7 @@ export async function startShim(opts = {}) {
   // Run via `node <mock> args...` since LETTA_BIN points at a .mjs file.
   // The agent-pool uses `spawn(LETTA_BIN, args)` — for the mock to actually
   // execute, we need it interpreted by node. Easiest: wrap it.
-  const child = spawn("node", [serverPath], {
+  const child = spawn("node", ["--import", "tsx/esm", serverPath], {
     env,
     stdio: ["ignore", "pipe", "pipe"],
   });

@@ -52,7 +52,7 @@ import {
   getRun,
   listRunSteps,
   listRuns,
-} from "./lib/runs.mjs";
+} from "./lib/runs.js";
 import { getMobileChannelAdapter } from "./lib/mobile-channel-host.mjs";
 import { WebSocketServer } from "ws";
 
