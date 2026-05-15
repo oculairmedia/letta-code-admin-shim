@@ -384,7 +384,18 @@ function makeOpeningPing(runId?: string | null): PingMessage {
  * "im chat works"); mobile renders one bubble per frame, which looks ugly.
  */
 export function coalesceAssistantFrames(frames: LettaMessage[]): LettaMessage[] {
+  // Buffer chunks in an array and join once per group, instead of
+  // `prev.content + f.content` per chunk (allocates a new growing string
+  // every step — O(n^2) in total chunks for a long stream). See lcp-86o.
   const out: LettaMessage[] = [];
+  let groupParts: string[] | null = null; // accumulator for out[out.length-1]
+  const flushGroup = (): void => {
+    const tail = out[out.length - 1];
+    if (groupParts && tail && tail.message_type === "assistant_message") {
+      tail.content = groupParts.join("");
+    }
+    groupParts = null;
+  };
   for (const f of frames) {
     const prev = out[out.length - 1];
     if (
@@ -394,14 +405,19 @@ export function coalesceAssistantFrames(frames: LettaMessage[]): LettaMessage[] 
       prev.otid &&
       prev.otid === f.otid
     ) {
-      prev.content = (prev.content ?? "") + (f.content ?? "");
+      // Continuation of the current group. Seed the buffer with the prev
+      // content on the first continuation, then push each new chunk.
+      if (!groupParts) groupParts = [prev.content ?? ""];
+      groupParts.push(f.content ?? "");
       prev.id = f.id; // keep the latest id
       prev.date = f.date;
       prev.seq_id = f.seq_id;
     } else {
+      flushGroup();
       out.push({ ...f });
     }
   }
+  flushGroup();
   return out;
 }
 
