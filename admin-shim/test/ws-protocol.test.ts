@@ -653,11 +653,14 @@ test("ws: lcp-srk — turn_done carries lossy=false + drop_count=0 on a clean tu
   });
   const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
   const done = turn.find((f) => f.type === "turn_done") as unknown as
-    { status: string; lossy?: boolean; drop_count?: number } | undefined;
+    { status: string; lossy?: boolean; drop_count?: number; error_code?: unknown; error_message?: unknown } | undefined;
   assert.ok(done, "turn_done required");
   assert.equal(done.status, "completed", "clean turn must complete");
   assert.equal(done.lossy, false, "no drops on a clean turn → lossy:false");
   assert.equal(done.drop_count, 0, "drop_count must be 0 on a clean turn");
+  // lcp-gs2: error fields are present but null on non-failed turns.
+  assert.equal(done.error_code, null, "error_code null on completed turn");
+  assert.equal(done.error_message, null, "error_message null on completed turn");
 });
 
 // ─── 21c. lcp-sep: tool_call frames may stream progressive args ────

@@ -12,6 +12,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   startShim,
@@ -952,4 +954,101 @@ test("GET /v1/runs returns [] and /v1/runs/count returns 0 when no runs", async 
   const count = await getJson(`${shim.url}/v1/runs/count`);
   assert.equal(count.res.status, 200);
   assert.equal(count.body, 0);
+});
+
+// ─── lcp-0xm: messages.jsonl schema migration (parts ↔ content) ─────
+
+// Write a raw record into messages.jsonl using a caller-supplied shape.
+// Bypasses seedMessage's "parts"-only path so we can simulate
+// post-migration records (content-only) AND mixed legacy + new files.
+function appendRawMessageRecord(
+  stateDir: string,
+  agentId: string,
+  conversationId: string,
+  record: Record<string, unknown>,
+): void {
+  const key = conversationId === "default"
+    ? `default:${agentId}`
+    : `conversation:${conversationId}`;
+  // Match the b64url helper in lib/store.ts (Buffer.from(...).toString("base64url")).
+  const b64 = Buffer.from(key).toString("base64url");
+  const path = join(stateDir, "conversations", b64, "messages.jsonl");
+  appendFileSync(path, JSON.stringify(record) + "\n");
+}
+
+test("lcp-0xm: post-migration records with `content` (no `parts`) are read and projected", async (t) => {
+  // letta local-backend migrate-transcripts renamed the per-record text
+  // payload from `parts` -> `content`. The shim's listMessages used to
+  // require `parts` and silently dropped every migrated record, hiding
+  // entire conversation histories. Regression: ensure a content-only
+  // record is read, normalized, and projected with the same text body
+  // a legacy parts-only record would produce.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const aid = seedAgent(shim.stateDir, { id: "agent-schema-0xm" });
+  seedConversation(shim.stateDir, aid);
+  // Legacy shape via seedMessage (parts).
+  seedMessage(shim.stateDir, aid, "default", {
+    id: "ui-msg-legacy-1",
+    role: "user",
+    content: "typed via parts",
+    sourceMessageIndex: 0,
+  });
+  // New shape: content array, no parts. Same element schema.
+  appendRawMessageRecord(shim.stateDir, aid, "default", {
+    id: "ui-msg-migrated-1",
+    role: "user",
+    content: [{ type: "text", text: "typed via content" }],
+    metadata: {
+      created_at: "2026-01-01T00:00:02.000Z",
+      updated_at: "2026-01-01T00:00:02.000Z",
+      agent_id: aid,
+      conversation_id: "default",
+    },
+    timestamp: 1735689602000,
+  });
+
+  const ext = externalConvId(aid);
+  const { res, body } = await getJson(`${shim.url}/v1/conversations/${ext}/messages`);
+  assert.equal(res.status, 200);
+  const arr = body as Array<{ id: string; content: string; message_type: string }>;
+  // Both records must come through.
+  assert.equal(arr.length, 2, `both legacy + migrated records must list; got: ${arr.map((m) => m.id).join(",")}`);
+  const byId = new Map(arr.map((m) => [m.id, m]));
+  assert.equal(byId.get("ui-msg-legacy-1")?.content, "typed via parts");
+  assert.equal(byId.get("ui-msg-migrated-1")?.content, "typed via content",
+    "post-migration record must project its text body");
+  // message_type derived from role works identically for both shapes.
+  assert.equal(byId.get("ui-msg-migrated-1")?.message_type, "user_message");
+});
+
+test("lcp-0xm: malformed record (neither parts nor content) is filtered out", async (t) => {
+  // The isLocalMessage filter still rejects records that have neither
+  // `parts` nor `content`. That guards against truly garbage lines —
+  // we don't want a partial file to wedge the messages endpoint.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const aid = seedAgent(shim.stateDir, { id: "agent-schema-bad" });
+  seedConversation(shim.stateDir, aid);
+  seedMessage(shim.stateDir, aid, "default", {
+    id: "ui-msg-ok",
+    role: "user",
+    content: "valid",
+    sourceMessageIndex: 0,
+  });
+  // No parts, no content — should be dropped.
+  appendRawMessageRecord(shim.stateDir, aid, "default", {
+    id: "ui-msg-bad",
+    role: "user",
+    metadata: { created_at: "2026-01-01T00:00:02.000Z" },
+  });
+
+  const ext = externalConvId(aid);
+  const { res, body } = await getJson(`${shim.url}/v1/conversations/${ext}/messages`);
+  assert.equal(res.status, 200);
+  const arr = body as Array<{ id: string }>;
+  assert.equal(arr.length, 1);
+  assert.equal(arr[0]!.id, "ui-msg-ok");
 });

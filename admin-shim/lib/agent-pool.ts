@@ -242,7 +242,16 @@ class Worker {
         this.frameHandler = null;
         handler({ type: "__exit__", exit_code: code, stderr: this.stderrBuf });
       }
-      logLine(`worker conv=${this.conversationId} exited code=${code}`);
+      // lcp-gs2 follow-up: dump the worker's stderr tail on a non-zero
+      // exit so spawn failures surface in the shim log instead of
+      // requiring us to manually re-run letta to learn what went
+      // wrong. Clamp to 1KB so a long traceback doesn't flood.
+      if (code !== 0 && this.stderrBuf) {
+        const tail = this.stderrBuf.slice(-1024).replace(/\n/g, " | ");
+        logLine(`worker conv=${this.conversationId} exited code=${code} stderr="${tail}"`);
+      } else {
+        logLine(`worker conv=${this.conversationId} exited code=${code}`);
+      }
     });
     this.child.on("error", (err: Error) => {
       this.dead = true;

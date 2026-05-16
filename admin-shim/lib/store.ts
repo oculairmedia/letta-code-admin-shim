@@ -215,8 +215,27 @@ function isLocalMessage(value: unknown): value is LocalMessage {
   if (!isRecord(value)) return false;
   if (typeof value["id"] !== "string") return false;
   if (typeof value["role"] !== "string") return false;
-  if (!Array.isArray(value["parts"])) return false;
+  // Legacy on-disk format used `parts`; the post-pi-backup migration
+  // (letta local-backend migrate-transcripts) renamed it to `content`
+  // with an identical element shape. Accept either — normalizeMessage
+  // below maps `content` -> `parts` so downstream translate.ts code
+  // keeps reading `m.parts` without a schema-aware branch.
+  if (!Array.isArray(value["parts"]) && !Array.isArray(value["content"])) return false;
   return true;
+}
+
+/**
+ * Post-migration messages.jsonl uses `content` instead of `parts`. Mirror
+ * the field onto `parts` so the rest of the shim (translate.ts, sidecar
+ * stampers, etc.) doesn't need to know about the on-disk schema bump.
+ * Idempotent: legacy records with `parts` already set pass through.
+ */
+function normalizeMessage(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  if (!Array.isArray(value["parts"]) && Array.isArray(value["content"])) {
+    return { ...value, parts: value["content"] };
+  }
+  return value;
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -443,7 +462,9 @@ export async function listMessages(
   const key = conversationKey(conversationId, agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
   const items = await readJsonlOrEmptyAsync(join(dir, "messages.jsonl"));
-  let scoped: LocalMessage[] = items.filter(isLocalMessage);
+  // Normalize content -> parts BEFORE filtering so post-migration records
+  // pass isLocalMessage (which still requires a non-empty parts array).
+  let scoped: LocalMessage[] = items.map(normalizeMessage).filter(isLocalMessage);
   if (before) {
     const idx = scoped.findIndex((m) => m.id === before);
     if (idx >= 0) scoped = scoped.slice(0, idx);

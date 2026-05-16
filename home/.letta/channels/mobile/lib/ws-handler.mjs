@@ -360,12 +360,19 @@ export function handleConnection(ws, request, host) {
               : (turnResult?.exit || turnResult?.timeout || turnResult?.dead)
                 ? "failed"
                 : "completed";
+            // lcp-gs2: when the worker died mid-turn (status=failed) we
+            // don't have an error message to surface from this path —
+            // the failure surfaced via a turnResult flag, not a thrown
+            // Error. Emit null error fields so the wire shape stays
+            // consistent across success / cancel / failed paths.
             safeSend(ws, makeFrame("turn_done", {
               turn_id: turnId,
               run_id: activeRunId ?? null,
               status,
               lossy: droppedFrameCount > 0,
               drop_count: droppedFrameCount,
+              error_code: null,
+              error_message: null,
             }), log);
           }
         } catch (err) {
@@ -377,14 +384,18 @@ export function handleConnection(ws, request, host) {
             // turn_done to emit.
           } else {
             log(`send_message failed: ${err.stack ?? err.message}`);
-            // lcp-axv: locked sequence on failure — emit error FIRST so
-            // mobile can capture the message, then turn_done(status:
-            // "failed") to close the turn lifecycle. Without the
-            // turn_done mobile's "agent typing" UI would never clear.
+            // lcp-axv + lcp-gs2: emit error frame first (forward-compat
+            // for consumers that still ingest standalone error frames),
+            // then turn_done(status:failed) carrying the same code +
+            // message inline so the failure is atomic-by-frame for
+            // mobile dispatchers. Mobile MAY read either; turn_done's
+            // own fields are now authoritative for terminal failures.
+            const errCode = ERROR_CODES.INTERNAL;
+            const errMessage = err.message ?? "send failed";
             if (!closed) {
               safeSend(ws, makeFrame("error", {
-                code: ERROR_CODES.INTERNAL,
-                message: err.message ?? "send failed",
+                code: errCode,
+                message: errMessage,
                 turn_id: turnId,
                 run_id: activeRunId ?? null,
               }), log);
@@ -394,6 +405,8 @@ export function handleConnection(ws, request, host) {
                 status: "failed",
                 lossy: droppedFrameCount > 0,
                 drop_count: droppedFrameCount,
+                error_code: errCode,
+                error_message: errMessage,
               }), log);
             }
           }
