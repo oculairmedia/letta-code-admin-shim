@@ -179,6 +179,15 @@ async function bridgeSendMessage(
   let pendingStop: BridgeFrame | null = null;
   let pendingUsage: BridgeFrame | null = null;
 
+  // Smoothing intentionally NOT done server-side. lcp-cv3 contract:
+  // forward every chunk as a pure delta. The mobile renderer (Android
+  // app/src/main/java/com/letta/mobile/ui/screens/chat/
+  // StreamingDisplayTextSmoother.kt) already implements char-velocity
+  // smoothing with a 60fps reveal loop — adding server-side batching
+  // would introduce first-chunk latency without UX win. A no-op
+  // StreamCoalescer module remains in lib/ for non-smoothing clients
+  // (future web channel etc.) to opt into; not wired into this path.
+  //
   // lcp-dlj: content_parts wins over text when present and non-empty.
   // letta-code's headless stdin accepts either shape on MessageCreate.content.
   const userInput: string | unknown[] =
