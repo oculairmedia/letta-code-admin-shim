@@ -463,6 +463,59 @@ test("GET /v1/conversations lists across agents and emits external ids", async (
   }
 });
 
+test("GET /v1/conversations reflects last_message_at bumps after a turn (lcp-5ky)", async (t) => {
+  // Regression: the listAllConversations cache is keyed on the conversations
+  // root mtime, which doesn't change when a child conversation.json is
+  // rewritten in place. Without an explicit invalidate the mobile list
+  // shows stale recent-activity ordering forever — defended here.
+  //
+  // The mock letta binary doesn't write to messages.jsonl, so we pre-seed
+  // an unstamped user message before triggering the turn. That gives
+  // stampNewMessages something to write a sidecar entry for, which is the
+  // path that fires bumpConversationLastMessageAt. With the cache
+  // invalidate in place, the second GET sees the bumped timestamp; without
+  // it, the GET returns the original (pre-bump) value.
+  const { openMobileWs } = await import("./helpers/index.js");
+  const shim = await startShim();
+  t.after(() => shim.stop());
+  const agentId = seedAgent(shim.stateDir, { id: "agent-bump-1" });
+  seedConversation(shim.stateDir, agentId);
+
+  const before = await getJson(`${shim.url}/v1/conversations`);
+  const beforeRow = (before.body as Array<{ id: string; last_message_at: string | null }>)
+    .find((c) => c.id === externalConvId(agentId));
+  assert.ok(beforeRow, "seeded conv must appear in the list");
+  const beforeIso = beforeRow.last_message_at ?? "";
+
+  // Pre-seed a user message so stampNewMessages has work to do.
+  seedMessage(shim.stateDir, agentId, "default", {
+    role: "user",
+    content: "pre-seed for bump test",
+  });
+
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: 8000 });
+  t.after(() => conn.close());
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: externalConvId(agentId),
+    text: "reply with pong",
+    otid: "cm-bump-1",
+  });
+  await conn.collectTurn({ timeoutMs: 8000 });
+
+  const after = await getJson(`${shim.url}/v1/conversations`);
+  const afterRow = (after.body as Array<{ id: string; last_message_at: string | null }>)
+    .find((c) => c.id === externalConvId(agentId));
+  assert.ok(afterRow, "conv must still appear post-turn");
+  const afterIso = afterRow.last_message_at ?? "";
+  assert.ok(afterIso, "last_message_at must be populated after a turn");
+  assert.ok(
+    afterIso > beforeIso,
+    `last_message_at must advance after a turn: before=${beforeIso} after=${afterIso}`,
+  );
+});
+
 test("GET /v1/conversations/{external-default-id} resolves to the agent's default conv", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());

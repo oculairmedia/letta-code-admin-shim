@@ -324,12 +324,13 @@ export function listConversationsForAgent(agentId: string): OnDiskConversation[]
   return out;
 }
 
-// lcp-5e5: dir-mtime cache of the conversation list. Same staleness
-// caveat as listAgents — content-only updates to an existing
-// conversation.json (e.g. last_message_at bumps) don't invalidate.
-// Per-conv detail fetches (getConversation, listConversationsForAgent)
-// bypass this cache and read the file directly, so detail freshness
-// is preserved.
+// lcp-5e5 + lcp-5ky: dir-mtime cache of the conversation list. The
+// dir-mtime check catches conv-add and conv-remove, but content-only
+// writes to an existing conversation.json (e.g. last_message_at bumps
+// during a turn) don't change the parent dir's mtime and would silently
+// serve stale timestamps. The writer path (bumpConversationLastMessageAt)
+// calls .invalidate() to drop the cached snapshot — that keeps the
+// mobile conversations list correctly ordered by recent activity.
 const _listAllConversationsCached = makeDirMtimeCache(
   () => join(storageDir(), "conversations"),
   async () => {
@@ -375,14 +376,24 @@ export function listAllConversations(): Promise<OnDiskConversation[]> {
  * lcp-5e5 (listAgents / listAllConversations — staleness window is
  * acceptable for mobile's poll cadence; see those callers).
  */
+interface DirMtimeCache<T> {
+  (): Promise<T>;
+  /**
+   * Drop the cached snapshot so the next caller re-runs the loader. Use
+   * after a content-only write that wouldn't bump the directory's mtime
+   * (e.g. updating a field inside an existing child file).
+   */
+  invalidate: () => void;
+}
+
 function makeDirMtimeCache<T>(
   rootFn: () => string,
   loader: () => Promise<T>,
-): () => Promise<T> {
+): DirMtimeCache<T> {
   let cached: T | null = null;
   let cachedMtimeMs = -1;
   let inflight: Promise<T> | null = null;
-  return async () => {
+  const fn = async (): Promise<T> => {
     const root = rootFn();
     let mtimeMs = -1;
     try { mtimeMs = (await fsStat(root)).mtimeMs; } catch {}
@@ -401,6 +412,11 @@ function makeDirMtimeCache<T>(
     })();
     return inflight;
   };
+  (fn as DirMtimeCache<T>).invalidate = () => {
+    cached = null;
+    cachedMtimeMs = -1;
+  };
+  return fn as DirMtimeCache<T>;
 }
 
 // lcp-efg cache: external conv id -> ResolvedConversation. Invalidated when
@@ -655,7 +671,13 @@ async function bumpConversationLastMessageAt(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[store] conversation.json bump failed for ${conversationId}: ${msg}`);
+    return;
   }
+  // lcp-5ky: drop the listAllConversations cache so the next GET
+  // /v1/conversations sees the fresh last_message_at. The dir-mtime cache
+  // key only catches conv-add / conv-remove, not in-place writes — without
+  // this the mobile list shows stale recent-activity ordering forever.
+  _listAllConversationsCached.invalidate();
 }
 
 export function readBlocksForAgent(agentId: string): Block[] {
