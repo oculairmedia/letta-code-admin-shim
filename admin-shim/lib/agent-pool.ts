@@ -25,6 +25,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { listMessages, stampNewMessages } from "./store.js";
+import { augmentUserInputForA2ui, type A2uiCapability } from "./a2ui-adapter.js";
 import {
   createRun,
   finalizeRun,
@@ -88,6 +89,8 @@ export interface RunTurnOptions {
    * that when calling createRun().
    */
   runHandle?: RunHandle;
+  /** A2UI capability negotiated for this session; absent keeps legacy prompts unchanged. */
+  a2uiCapability?: A2uiCapability | null;
 }
 
 /**
@@ -318,7 +321,7 @@ class Worker {
    * Turns are queued on the per-worker chain so two simultaneous callers
    * can't interleave.
    */
-  runTurn(userInput: string | unknown[], { onFrame, turnStartedAt: passedStart, onRunCreated, runHandle: providedRunHandle }: RunTurnOptions = {}): Promise<RunTurnResult> {
+  runTurn(userInput: string | unknown[], { onFrame, turnStartedAt: passedStart, onRunCreated, runHandle: providedRunHandle, a2uiCapability }: RunTurnOptions = {}): Promise<RunTurnResult> {
     const previous = this.chain;
     let resolveTurn!: (value: RunTurnResult) => void;
     const turnPromise = new Promise<RunTurnResult>((r) => (resolveTurn = r));
@@ -503,8 +506,15 @@ class Worker {
         // parts array carrying inline text + image blocks. letta-code's
         // headless mode (headless.ts ~L1770) accepts both shapes directly
         // — MessageCreate.content is a union of string | ContentBlock[].
+        // DEBUG (lcp-dlj follow-up): log userInput shape to diagnose
+        // image strip happening between shim stdin write and disk write.
+        const effectiveUserInput = augmentUserInputForA2ui(userInput, a2uiCapability);
+        const inputShape = Array.isArray(effectiveUserInput)
+          ? `array[${effectiveUserInput.length}] types=${effectiveUserInput.map((p) => (p && typeof p === "object" && "type" in (p as Record<string, unknown>)) ? (p as Record<string, unknown>)["type"] : typeof p).join(",")}`
+          : `string(${effectiveUserInput.length}ch)`;
+        logLine(`stdin.write conv=${this.conversationId} shape=${inputShape}`);
         this.child!.stdin.write(
-          JSON.stringify({ type: "user", message: { content: userInput } }) + "\n",
+          JSON.stringify({ type: "user", message: { content: effectiveUserInput } }) + "\n",
         );
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);

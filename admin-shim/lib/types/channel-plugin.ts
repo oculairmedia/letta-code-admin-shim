@@ -25,6 +25,7 @@
  */
 
 import type { LettaMessage } from "./wire.js";
+import type { A2uiCapability, A2uiServerCapabilities } from "../a2ui-adapter.js";
 
 // ─── Frame surfaced from the worker pool to the plugin via onFrame ─────
 
@@ -64,6 +65,7 @@ export interface BridgeSendMessageArgs {
    */
   content_parts?: unknown[] | null;
   otid?: string | null;
+  a2ui_capability?: A2uiCapability | null;
 }
 
 /**
@@ -125,6 +127,7 @@ export interface ChannelAccount {
 export interface ChannelHost {
   log: (msg: string) => void;
   getServerId: () => string;
+  getA2uiServerCapabilities?: () => A2uiServerCapabilities;
   bridgeSendMessage: (
     args: BridgeSendMessageArgs,
     onFrame: (frame: BridgeFrame) => void,
