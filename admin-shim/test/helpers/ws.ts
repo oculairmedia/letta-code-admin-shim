@@ -46,6 +46,7 @@ export interface OpenMobileWsOptions {
   path?: string;
   timeoutMs?: number;
   skipHello?: boolean;
+  helloExtras?: Record<string, unknown>;
 }
 
 export interface MobileWsHandle {
@@ -67,6 +68,7 @@ export async function openMobileWs(httpUrl: string, {
   path = "/shim/v1/mobile",
   timeoutMs = 5000,
   skipHello = false,
+  helloExtras = {},
 }: OpenMobileWsOptions = {}): Promise<MobileWsHandle> {
   const wsUrl = httpUrl.replace(/^http/, "ws") + path;
   const ws = new WebSocket(wsUrl);
@@ -151,6 +153,7 @@ export async function openMobileWs(httpUrl: string, {
       token,
       device_id: deviceId,
       client_version: clientVersion,
+      ...helloExtras,
     });
     await handle.waitFor("welcome", { timeoutMs });
   }
