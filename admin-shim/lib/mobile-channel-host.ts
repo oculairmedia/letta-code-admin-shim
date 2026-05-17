@@ -22,7 +22,12 @@ import type { IncomingMessage } from "node:http";
 import { reshapeFrame } from "./chat.js";
 import { cancelRun, getAgentPool } from "./agent-pool.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
-import { createRun } from "./runs.js";
+import {
+  A2uiStreamSplitter,
+  validateA2uiMessage,
+  type A2uiBlock,
+} from "./a2ui-stream-splitter.js";
+import { createRun, recordA2uiUserAction } from "./runs.js";
 import {
   findUnmappedTailUserMessageId,
   resolveConversationId,
@@ -30,6 +35,9 @@ import {
 } from "./store.js";
 import type { LettaMessage } from "./types/wire.js";
 import type {
+  A2uiFrameMessage,
+  A2uiUserAction,
+  A2uiUserActionAck,
   BridgeSendMessageArgs as PublicBridgeSendMessageArgs,
   BridgeSendMessageHooks as PublicBridgeSendMessageHooks,
   ChannelAccount as PublicChannelAccount,
@@ -51,6 +59,9 @@ export type {
   PublicChannelHost,
   PublicChannelPlugin,
   PublicHostLogger,
+  A2uiFrameMessage,
+  A2uiUserAction,
+  A2uiUserActionAck,
 };
 
 function channelDir(): string {
@@ -92,8 +103,12 @@ function loadAccount(): MobileAccount | null {
  * before forwarding so mobile can correlate to `/v1/runs/{id}`. The
  * `run_id` field exists on every `LettaMessageBase` variant so the cast
  * below is structurally narrowing only.
+ *
+ * When A2UI is negotiated for the session the host also synthesizes
+ * {@link A2uiFrameMessage} entries — one per `<a2ui-json>` block extracted
+ * from the assistant_message text stream.
  */
-type BridgeFrame = LettaMessage;
+type BridgeFrame = LettaMessage | A2uiFrameMessage;
 
 /** Args to `bridgeSendMessage`. */
 interface BridgeSendMessageArgs {
@@ -180,6 +195,27 @@ async function bridgeSendMessage(
   // arrive AFTER the final assistant chunk regardless of upstream order.
   let pendingStop: BridgeFrame | null = null;
   let pendingUsage: BridgeFrame | null = null;
+  // Per-otid splitters: each logical assistant message gets its own splitter
+  // so trailing-tag hold-back doesn't leak across distinct assistant bubbles
+  // (rare on a single turn, but possible for multi-step turns).
+  const splittersByOtid = new Map<string, A2uiStreamSplitter>();
+  const a2uiEnabled = a2ui_capability != null;
+  const newSplitter = (): A2uiStreamSplitter =>
+    new A2uiStreamSplitter({ validate: validateA2uiMessage });
+  const buildA2uiFrame = (
+    block: A2uiBlock,
+    otid: string | null,
+    runId: string | null,
+  ): A2uiFrameMessage => ({
+    message_type: "a2ui_frame",
+    run_id: runId,
+    otid,
+    a2ui: block.parsed,
+    raw: block.raw,
+    ok: block.ok,
+    parse_error: block.parseError,
+    validation_error: block.validationError,
+  });
 
   // Smoothing intentionally NOT done server-side. lcp-cv3 contract:
   // forward every chunk as a pure delta. The mobile renderer (Android
@@ -229,6 +265,36 @@ async function bridgeSendMessage(
         if (typeof otid === "string" && otid.length > 0) {
           (reshaped as unknown as Record<string, unknown>)["id"] = `cm-stream-${otid}`;
         }
+        // A2UI: pull `<a2ui-json>` blocks out of the assistant text. The
+        // splitter emits separate A2UI frames downstream and replaces the
+        // assistant_message content with the surrounding conversational
+        // text. Splitter only runs when a capability was negotiated; in
+        // that case the model has the v0.9 prompt and may emit blocks.
+        if (a2uiEnabled) {
+          const otidKey = typeof otid === "string" && otid.length > 0 ? otid : "__no-otid__";
+          let splitter = splittersByOtid.get(otidKey);
+          if (!splitter) {
+            splitter = newSplitter();
+            splittersByOtid.set(otidKey, splitter);
+          }
+          const contentDelta = typeof (reshaped as { content?: unknown }).content === "string"
+            ? (reshaped as { content: string }).content
+            : "";
+          const split = splitter.feed(contentDelta);
+          // Emit the user-visible text delta (may be empty when the chunk
+          // was 100% tag bytes). Skip pure no-op chunks so we don't ship
+          // empty bubbles down the wire.
+          if (split.text.length > 0) {
+            (reshaped as unknown as Record<string, unknown>)["content"] = split.text;
+            onFrame(reshaped);
+          }
+          // Forward each completed A2UI block as a host-synthesized frame.
+          const runId = (reshaped as { run_id?: string | null }).run_id ?? null;
+          for (const block of split.frames) {
+            onFrame(buildA2uiFrame(block, otid ?? null, runId));
+          }
+          return;
+        }
       } else if (mt === "reasoning_message") {
         const otid = (reshaped as { otid?: string | null }).otid;
         if (typeof otid === "string" && otid.length > 0) {
@@ -238,6 +304,35 @@ async function bridgeSendMessage(
       onFrame(reshaped);
     },
   });
+
+  // End-of-turn tail: drain each splitter's pending state. Any text the
+  // splitter was holding back as a possible tag opening flushes to a final
+  // assistant_message delta; unclosed `<a2ui-json>` blocks are logged and
+  // dropped so the renderer never observes a truncated A2UI frame.
+  if (a2uiEnabled) {
+    for (const [otidKey, splitter] of splittersByOtid) {
+      const flush = splitter.flush();
+      if (flush.text.length > 0) {
+        const fakeOtid = otidKey === "__no-otid__" ? null : otidKey;
+        onFrame({
+          id: fakeOtid ? `cm-stream-${fakeOtid}` : `cm-stream-flush-${Date.now()}`,
+          date: new Date().toISOString(),
+          name: null,
+          message_type: "assistant_message",
+          otid: fakeOtid,
+          sender_id: null,
+          step_id: null,
+          is_err: null,
+          seq_id: null,
+          run_id: null,
+          content: flush.text,
+        });
+      }
+      if (flush.unclosed) {
+        console.error(`[mobile-channel] A2UI splitter ended mid-tag (otid=${otidKey})`);
+      }
+    }
+  }
 
   // End-of-turn tail: stop_reason → usage_statistics. Assistant chunks
   // were already forwarded inline above.
@@ -281,6 +376,33 @@ interface GetMobileChannelAdapterOptions {
 }
 
 /**
+ * Phase 5: handle an inbound A2UI user_action frame. Records the action
+ * to the run sidecar and returns a synchronous ack. The actual
+ * tool-dispatcher gate integration ships in a follow-up bead once
+ * letta-code exposes a stable approval API; for now the recorded
+ * action is the canonical source of truth for downstream consumers.
+ */
+function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
+  const actionId =
+    typeof action.action_id === "string" && action.action_id.length > 0
+      ? action.action_id
+      : `act-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  if (typeof action.name !== "string" || action.name.length === 0) {
+    return { action_id: actionId, status: "rejected", reason: "missing event name" };
+  }
+  recordA2uiUserAction({
+    run_id: action.run_id,
+    session_id: action.session_id,
+    turn_id: action.turn_id,
+    surface_id: action.surface_id,
+    name: action.name,
+    context: action.context ?? {},
+    action_id: actionId,
+  });
+  return { action_id: actionId, status: "accepted" };
+}
+
+/**
  * The `host` object the shim hands the channel plugin. Mirrors the
  * informal contract the plugin reads in `acceptConnection` (see
  * home/.letta/channels/mobile/plugin.mjs):
@@ -288,6 +410,7 @@ interface GetMobileChannelAdapterOptions {
  *  - `getServerId()` — server identity for the welcome envelope
  *  - `bridgeSendMessage(args, onFrame, hooks)` — turn driver
  *  - `cancelRun(runId)` — cancel hook from the worker pool
+ *  - `handleUserAction(action)` — A2UI user_action ingestion
  */
 interface MobileChannelHost {
   log: (msg: string) => void;
@@ -295,6 +418,7 @@ interface MobileChannelHost {
   getA2uiServerCapabilities: typeof getA2uiServerCapabilities;
   bridgeSendMessage: typeof bridgeSendMessage;
   cancelRun: (runId: string) => boolean;
+  handleUserAction: typeof handleUserAction;
 }
 
 /**
@@ -391,6 +515,7 @@ async function createMobileChannelAdapter(
     getA2uiServerCapabilities,
     bridgeSendMessage,
     cancelRun: (runId: string) => cancelRun(runId),
+    handleUserAction,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();

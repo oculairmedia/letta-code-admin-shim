@@ -75,6 +75,7 @@ function pickTrace(content) {
   if (forced) return forced;
   const t = (content ?? "").toLowerCase();
   // Order matters — most specific first.
+  if (/(approval card|a2ui|show .*card|render.*approval|approve.*scope)/.test(t)) return "a2ui-card";
   if (/(interleav|step-a|one at a time|three.*step)/.test(t)) return "interleaved-tools";
   if (/(both.*tool|two.*tool|bash.*and.*read|multi.*tool)/.test(t)) return "multi-tool-bash-read";
   if (/(tool.*then|then explain|long explanation|paragraph)/.test(t) && /(bash|shell|echo)/.test(t)) {

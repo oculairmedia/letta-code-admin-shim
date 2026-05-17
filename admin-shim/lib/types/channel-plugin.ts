@@ -30,14 +30,41 @@ import type { A2uiCapability, A2uiServerCapabilities } from "../a2ui-adapter.js"
 // ─── Frame surfaced from the worker pool to the plugin via onFrame ─────
 
 /**
- * A vanilla-shaped frame emitted by the worker pool for one streamed turn.
- * The host stamps `run_id` onto every frame before calling `onFrame` so the
- * plugin can correlate to `/v1/runs/{id}` without inspecting the worker.
+ * Host-synthesized frame carrying one A2UI v0.9 message extracted from the
+ * model's text stream. The host emits these alongside ordinary
+ * {@link LettaMessage} frames when A2UI is negotiated for the session. The
+ * channel plugin is responsible for wrapping it into a channel-specific
+ * envelope (e.g. the mobile WS `a2ui_frame` type).
  *
- * Identical to {@link LettaMessage} — re-exported under a friendlier name
- * for plugin authors who don't want to learn the wire-types tree.
+ * `ok` is the union of parse and (when configured) schema validation. A
+ * frame with `ok === false` carries the raw bytes plus a diagnostic field
+ * so the plugin can choose to drop it or surface it to the client.
  */
-export type BridgeFrame = LettaMessage;
+export interface A2uiFrameMessage {
+  message_type: "a2ui_frame";
+  /** Run id this frame belongs to (stamped by the host). */
+  run_id: string | null;
+  /** Otid of the assistant_message the A2UI block was carried inside. */
+  otid: string | null;
+  /** The parsed A2UI message (a single object or an array of messages). Null when parse failed. */
+  a2ui: unknown;
+  /** Raw JSON bytes between the `<a2ui-json>` tags. */
+  raw: string;
+  /** True iff parse succeeded AND (when configured) validation passed. */
+  ok: boolean;
+  /** JSON.parse error message, when parsing failed. */
+  parse_error: string | null;
+  /** Validator-reported failure reason, when validation failed. */
+  validation_error: string | null;
+}
+
+/**
+ * A frame emitted by the worker pool (or synthesized by the host) for one
+ * streamed turn. The host stamps `run_id` onto every frame before calling
+ * `onFrame` so the plugin can correlate to `/v1/runs/{id}` without
+ * inspecting the worker.
+ */
+export type BridgeFrame = LettaMessage | A2uiFrameMessage;
 
 // ─── Inputs to the host's send-message bridge ──────────────────────────
 
@@ -134,6 +161,53 @@ export interface ChannelHost {
     hooks?: BridgeSendMessageHooks,
   ) => Promise<unknown>;
   cancelRun: (runId: string) => boolean;
+  /**
+   * Phase 5: dispatch a `user_action` frame from the channel back to the
+   * agent. Returns the action id (echoed back to the channel so the
+   * plugin can ack the round-trip).
+   *
+   * For Phase-5 scope this is a recording hook: the host writes the
+   * action into the run sidecar / log so a follow-up integration can
+   * pick it up. The shim does NOT yet inject the action into letta-code's
+   * tool dispatcher — that integration ships in a follow-up bead once
+   * letta-code exposes a stable approval API.
+   */
+  handleUserAction?: (action: A2uiUserAction) => Promise<A2uiUserActionAck> | A2uiUserActionAck;
+}
+
+/**
+ * Inbound user-action payload, carried by the mobile WS `user_action`
+ * frame. Mirrors A2UI v0.9 `Action.event`: a server-side event name plus
+ * an opaque context bag the renderer populated from the surface state.
+ *
+ * Surface and run/turn correlation is supplied by the channel layer; the
+ * agent integration consumes the (run_id, name, context) triple.
+ */
+export interface A2uiUserAction {
+  /** Channel-supplied session id (mobile WS sess-<uuid>). */
+  session_id: string;
+  /** Run id this action targets. May be null when no turn is active. */
+  run_id: string | null;
+  /** Turn id this action targets. May be null. */
+  turn_id: string | null;
+  /** A2UI surface this action originated from. */
+  surface_id: string | null;
+  /** Event name from `Action.event.name` (free-form, agent-defined). */
+  name: string;
+  /** Event context bag from `Action.event.context`. */
+  context: Record<string, unknown>;
+  /** Optional client-generated action id for ack correlation. */
+  action_id?: string | null;
+}
+
+/** Synchronous-ish ack the host returns to the channel for a user_action. */
+export interface A2uiUserActionAck {
+  /** Server-assigned action id (echoes the client's when provided). */
+  action_id: string;
+  /** "accepted" — host queued the action; "rejected" — host refused (with reason). */
+  status: "accepted" | "rejected";
+  /** Human-readable reason; populated when status === "rejected". */
+  reason?: string;
 }
 
 // ─── Mobile-channel-specific extras ────────────────────────────────────

@@ -291,6 +291,47 @@ frame does). The server does **not** require `pong`s in Phase 1.
 { "v": 1, "type": "pong", "id": "…", "ts": "…" }
 ```
 
+#### `user_action`
+
+A2UI v0.9 client→server action. Emitted by the renderer when the user
+interacts with a surface (`Action.event` from the A2UI Basic Catalog —
+e.g. a `ToolApprovalCard` choice). Only meaningful when A2UI was
+negotiated in `hello`; non-A2UI clients should not emit this frame.
+
+```json
+{ "v": 1, "type": "user_action", "id": "…", "ts": "…",
+  "run_id": "run-…",
+  "turn_id": "turn-…",
+  "surface_id": "approval-1",
+  "name": "tool_approval_choice",
+  "context": { "tool_call_id": "tcid-…", "scope": "once" },
+  "action_id": "act-…" }
+```
+
+- `name` — **required**, non-empty. Matches `Action.event.name` from the
+  surface. Free-form; agreed between agent and renderer.
+- `context` — optional object. Mirrors `Action.event.context`. When
+  present must be a JSON object (not array). Servers reject non-object
+  values with `protocol_violation` and keep the socket open.
+- `run_id` / `turn_id` / `surface_id` — optional but recommended for
+  audit correlation. The shim records them verbatim alongside the action.
+- `action_id` — optional client id for ack correlation. When omitted the
+  shim mints `act-<ts>-<rand>` and echoes it in `user_action_ack`.
+
+Outcome: server appends an entry to
+`state/runs/<run_id>/user-actions.jsonl` (or `unbound-<session>/…` when
+run_id is null) and replies with `user_action_ack`. The shim does **not**
+yet inject the action into letta-code's tool dispatcher — a follow-up
+bead wires it once letta-code exposes a stable approval API.
+
+Errors:
+
+- Missing `name` → `error{protocol_violation}`; socket stays open.
+- `context` not an object → `error{protocol_violation}`; socket stays
+  open.
+- Handler not wired (channel host built without `handleUserAction`) →
+  `error{internal_error}`; socket stays open.
+
 ### 2.2 Server → client frames
 
 Every server frame carries the base envelope (`v`, `type`, `id`, `ts`).
@@ -334,6 +375,68 @@ Emitted immediately after `welcome` only when A2UI was negotiated.
 
 This frame confirms the server-side A2UI contract for the session. Older
 clients remain safe because unknown server frame types are ignored silently.
+
+#### `a2ui_frame`
+
+A2UI v0.9 server→client message. Emitted only when A2UI was negotiated.
+The shim parses `<a2ui-json>` blocks out of the assistant text stream
+(`lib/a2ui-stream-splitter.ts`) and forwards each block as its own frame
+ahead of `turn_done`. Conversational text around the blocks still flows
+through `assistant_message` deltas — the renderer composes both.
+
+```json
+{ "v": 1, "type": "a2ui_frame", "id": "…", "ts": "…",
+  "turn_id": "turn-…",
+  "run_id": "run-…",
+  "otid": "provider-assistant-…",
+  "ok": true,
+  "a2ui": {
+    "version": "v0.9",
+    "createSurface": { "surfaceId": "approval-1", "catalogId": "basic" }
+  } }
+```
+
+- `ok` — `true` when JSON parse and structural validation succeeded.
+  When `false` the frame includes `parse_error` and/or `validation_error`
+  diagnostic strings; the `a2ui` field may be `null` or a partially
+  parsed value.
+- `a2ui` — the parsed A2UI v0.9 message. Either a single message object
+  (createSurface / updateComponents / updateDataModel / deleteSurface)
+  or an array of those when the model emitted multiple messages inside a
+  single tag.
+- `otid` — echoes the otid of the assistant_message the block was carried
+  in. Lets the renderer associate the A2UI surface with the bubble that
+  introduced it.
+
+Structural validator coverage (`validateA2uiMessage`):
+
+- `version: "v0.9"` required at top level.
+- Exactly one of `createSurface | updateComponents | updateDataModel | deleteSurface` present.
+- All variants require a non-empty `surfaceId`.
+- `createSurface` additionally requires a non-empty `catalogId`.
+- `updateComponents` requires a non-empty `components` array; each entry
+  must have a non-empty `id` and a non-empty `component` discriminator.
+
+Deeper catalog-level validation (component property types, allowed enums)
+runs in the renderer — keeping the shim's check structural keeps the
+boundary clear when the v0.9 catalog evolves.
+
+#### `user_action_ack`
+
+Reply to a client `user_action` frame. Always lands; `status` carries
+the outcome.
+
+```json
+{ "v": 1, "type": "user_action_ack", "id": "…", "ts": "…",
+  "action_id": "act-…",
+  "status": "accepted" }
+```
+
+- `status` ∈ `"accepted" | "rejected"`. `"rejected"` adds a `reason`
+  field describing the refusal (e.g. an unknown event name once the
+  agent integration ships).
+- `action_id` echoes the client-supplied id, or carries the
+  server-minted id when the client omitted one.
 
 #### `error`
 

@@ -361,6 +361,21 @@ export function handleConnection(ws, request, host) {
                   cached_input_tokens: outFrame.cached_input_tokens,
                   reasoning_tokens: outFrame.reasoning_tokens,
                 }), log);
+              } else if (mt === "a2ui_frame") {
+                // Phase 4: A2UI frame extracted from the assistant text
+                // stream. Body carries the parsed A2UI v0.9 message (or
+                // null + diagnostics when parse/validation failed). The
+                // renderer applies the message to its surface state; the
+                // shim doesn't track surface state itself.
+                safeSend(ws, makeFrame("a2ui_frame", {
+                  turn_id: turnId,
+                  run_id: runId ?? null,
+                  otid: outFrame.otid ?? null,
+                  ok: outFrame.ok !== false,
+                  a2ui: outFrame.a2ui ?? null,
+                  ...(outFrame.parse_error ? { parse_error: outFrame.parse_error } : {}),
+                  ...(outFrame.validation_error ? { validation_error: outFrame.validation_error } : {}),
+                }), log);
               }
               // ping / unknown types: drop silently. Forward-compat rule.
             },
@@ -468,6 +483,46 @@ export function handleConnection(ws, request, host) {
           sendError(ERROR_CODES.RUN_NOT_FOUND, `run ${targetRunId} not active`, { close: false });
         } else {
           log(`cancel accepted run=${targetRunId}`);
+        }
+        break;
+      }
+      case "user_action": {
+        // Phase 5: A2UI user_action ingestion. Forward to the host's
+        // sidecar recorder and reply with `user_action_ack`. The shim
+        // does NOT yet wire this into letta-code's tool dispatcher —
+        // recording the action is sufficient for the contract that
+        // mobile builds against.
+        if (typeof frame.name !== "string" || frame.name.length === 0) {
+          sendError(ERROR_CODES.PROTOCOL_VIOLATION, "user_action requires a non-empty name", { close: false });
+          return;
+        }
+        if (frame.context !== undefined && (frame.context === null || typeof frame.context !== "object" || Array.isArray(frame.context))) {
+          sendError(ERROR_CODES.PROTOCOL_VIOLATION, "user_action.context must be an object when present", { close: false });
+          return;
+        }
+        const handler = typeof host.handleUserAction === "function" ? host.handleUserAction : null;
+        if (!handler) {
+          sendError(ERROR_CODES.INTERNAL, "user_action handler not wired", { close: false });
+          return;
+        }
+        try {
+          const ack = await handler({
+            session_id: sessionId,
+            run_id: typeof frame.run_id === "string" ? frame.run_id : null,
+            turn_id: typeof frame.turn_id === "string" ? frame.turn_id : null,
+            surface_id: typeof frame.surface_id === "string" ? frame.surface_id : null,
+            name: frame.name,
+            context: frame.context ?? {},
+            action_id: typeof frame.action_id === "string" ? frame.action_id : null,
+          });
+          safeSend(ws, makeFrame("user_action_ack", {
+            action_id: ack.action_id,
+            status: ack.status,
+            ...(ack.reason ? { reason: ack.reason } : {}),
+          }), log);
+        } catch (err) {
+          log(`user_action handler failed: ${err.stack ?? err.message}`);
+          sendError(ERROR_CODES.INTERNAL, err.message ?? "user_action failed", { close: false });
         }
         break;
       }

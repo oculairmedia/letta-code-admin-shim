@@ -66,6 +66,13 @@ function createMobileAdapter(account, host) {
         getA2uiServerCapabilities: () => host.getA2uiServerCapabilities?.() ?? { enabled: false },
         sendMessage: host.bridgeSendMessage,
         cancelRun: host.cancelRun ?? (() => false),
+        // Phase 5: forward user_action ingestion to the outer host's
+        // sidecar recorder. ws-handler short-circuits to internal_error
+        // when this is missing — so wiring it here is required for the
+        // user_action round-trip to succeed.
+        handleUserAction: host.handleUserAction
+          ? (action) => host.handleUserAction(action)
+          : undefined,
       });
     },
   };

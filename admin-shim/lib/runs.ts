@@ -201,6 +201,10 @@ function stepsFile(runId: string): string {
   return join(runDir(runId), "steps.jsonl");
 }
 
+function userActionsFile(runId: string): string {
+  return join(runDir(runId), "user-actions.jsonl");
+}
+
 /**
  * Best-effort read of a JSON file. Returns `null` on any error
  * (missing, malformed, permission). Caller is responsible for narrowing
@@ -362,6 +366,41 @@ export function recordRunTool(
   if (!handle || !toolName) return;
   if (handle.record.tools_used.includes(toolName)) return;
   handle.record.tools_used.push(toolName);
+}
+
+/**
+ * Phase 5: append a user_action sidecar entry under
+ * `state/runs/<run-id>/user-actions.jsonl`. Channel adapters call this
+ * when an A2UI user_action frame arrives. The shim does NOT yet inject
+ * the action into letta-code's tool dispatcher — that integration lives
+ * in a follow-up bead once letta-code exposes a stable approval API.
+ * Until then the sidecar is the canonical record and downstream callers
+ * (debug tooling, replay) read it directly.
+ *
+ * `runId` may be null when the action lands outside a turn; the entry
+ * is still appended under a deterministic `unbound-<sessionId>` bucket
+ * so the audit trail is preserved.
+ */
+export function recordA2uiUserAction(entry: {
+  run_id: string | null;
+  session_id: string;
+  turn_id: string | null;
+  surface_id: string | null;
+  name: string;
+  context: Record<string, unknown>;
+  action_id: string;
+}): void {
+  const bucket = entry.run_id ?? `unbound-${entry.session_id}`;
+  try {
+    mkdirSync(runDir(bucket), { recursive: true });
+    appendFileSync(
+      userActionsFile(bucket),
+      JSON.stringify({ ...entry, recorded_at: nowIso() }) + "\n",
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] user-action append failed for ${bucket}: ${msg}`);
+  }
 }
 
 export function recordRunStep(
