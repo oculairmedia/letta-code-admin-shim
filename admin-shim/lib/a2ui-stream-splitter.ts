@@ -30,13 +30,16 @@ export interface A2uiBlock {
   /**
    * The result of `JSON.parse(raw)` when parseable, else `null`.
    *
-   * The A2UI v0.9 prompt advertises that the JSON part is "a single,
-   * raw JSON object (usually a list of A2UI messages)" — so the parsed
-   * shape may be a top-level array of messages or a single message
-   * object. Callers should handle both.
+   * The A2UI v0.9 server-to-client schema is a single message object.
+   * Multiple messages should be emitted as multiple adjacent
+   * `<a2ui-json>` blocks, not as a top-level array inside one block.
    */
   parsed: unknown;
-  /** True when both parse and validation (when configured) succeeded. */
+  /**
+   * True when JSON parse and the configured structural/envelope validator
+   * succeeded. This does not mean the renderer's catalog/schema validation
+   * will accept every component in the surface.
+   */
   ok: boolean;
   /** Parse error message when JSON.parse failed; else null. */
   parseError: string | null;
@@ -62,6 +65,16 @@ export interface FlushResult {
   unclosed: boolean;
 }
 
+export interface A2uiMetrics {
+  total_frames: number;
+  parse_ok: number;
+  parse_err: number;
+  validate_ok: number;
+  validate_err: number;
+  widget_types_seen: string[];
+  splitter_overhead_ms: number;
+}
+
 export interface SplitterOptions {
   /**
    * Optional validator. Receives the parsed JSON and returns null when
@@ -70,6 +83,16 @@ export interface SplitterOptions {
    * JSON parseability is enforced.
    */
   validate?: (message: unknown) => string | null;
+  /** Fires once from flush() with this splitter's per-turn metrics. */
+  onMetrics?: (metrics: A2uiMetrics) => void;
+  /** Fires inline when JSON.parse fails for a completed block. */
+  onParseError?: (raw: string, error: string) => void;
+  /** Fires inline when the validator rejects a parseable completed block. */
+  onValidationError?: (raw: string, error: string, widgetType: string | null) => void;
+}
+
+export interface A2uiValidationOptions {
+  expectedCatalogId?: string | undefined;
 }
 
 /**
@@ -90,13 +113,28 @@ export class A2uiStreamSplitter {
   private pending = "";
   private jsonBuf = "";
   private readonly validate: ((message: unknown) => string | null) | null;
+  private readonly onMetrics: ((metrics: A2uiMetrics) => void) | null;
+  private readonly onParseError: ((raw: string, error: string) => void) | null;
+  private readonly onValidationError: ((raw: string, error: string, widgetType: string | null) => void) | null;
+  private totalFrames = 0;
+  private parseOk = 0;
+  private parseErr = 0;
+  private validateOk = 0;
+  private validateErr = 0;
+  private splitterOverheadMs = 0;
+  private readonly widgetTypesSeen = new Set<string>();
 
   constructor(options: SplitterOptions = {}) {
     this.validate = options.validate ?? null;
+    this.onMetrics = options.onMetrics ?? null;
+    this.onParseError = options.onParseError ?? null;
+    this.onValidationError = options.onValidationError ?? null;
   }
 
   /** Feed the next chunk of model text. */
   feed(delta: string): SplitterOutput {
+    const started = Date.now();
+    try {
     if (typeof delta !== "string" || delta.length === 0) {
       return { text: "", frames: [] };
     }
@@ -137,6 +175,9 @@ export class A2uiStreamSplitter {
       }
     }
     return { text, frames };
+    } finally {
+      this.splitterOverheadMs += Date.now() - started;
+    }
   }
 
   /**
@@ -144,6 +185,8 @@ export class A2uiStreamSplitter {
    * possible tag opening, and reports whether the stream ended mid-tag.
    */
   flush(): FlushResult {
+    const started = Date.now();
+    try {
     if (this.mode === "tag") {
       this.mode = "text";
       this.jsonBuf = "";
@@ -153,6 +196,22 @@ export class A2uiStreamSplitter {
     const text = this.pending;
     this.pending = "";
     return { text, unclosed: false };
+    } finally {
+      this.splitterOverheadMs += Date.now() - started;
+      this.onMetrics?.(this.snapshotMetrics());
+    }
+  }
+
+  private snapshotMetrics(): A2uiMetrics {
+    return {
+      total_frames: this.totalFrames,
+      parse_ok: this.parseOk,
+      parse_err: this.parseErr,
+      validate_ok: this.validateOk,
+      validate_err: this.validateErr,
+      widget_types_seen: [...this.widgetTypesSeen].sort(),
+      splitter_overhead_ms: this.splitterOverheadMs,
+    };
   }
 
   private completeBlock(raw: string): A2uiBlock {
@@ -163,12 +222,27 @@ export class A2uiStreamSplitter {
     } catch (err) {
       parseError = err instanceof Error ? err.message : String(err);
     }
+    this.totalFrames += 1;
     let validationError: string | null = null;
+    const widgetType = parseError === null ? firstWidgetType(parsed) : null;
+    if (widgetType) this.widgetTypesSeen.add(widgetType);
+    if (parseError !== null) {
+      this.parseErr += 1;
+      this.onParseError?.(raw, parseError);
+    } else {
+      this.parseOk += 1;
+    }
     if (parseError === null && this.validate) {
       try {
         validationError = this.validate(parsed);
       } catch (err) {
         validationError = err instanceof Error ? err.message : String(err);
+      }
+      if (validationError === null) {
+        this.validateOk += 1;
+      } else {
+        this.validateErr += 1;
+        this.onValidationError?.(raw, validationError, widgetType);
       }
     }
     return {
@@ -181,30 +255,38 @@ export class A2uiStreamSplitter {
   }
 }
 
+function firstWidgetType(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const updateComponents = (value as Record<string, unknown>)["updateComponents"];
+  if (!updateComponents || typeof updateComponents !== "object" || Array.isArray(updateComponents)) return null;
+  const components = (updateComponents as Record<string, unknown>)["components"];
+  if (!Array.isArray(components)) return null;
+  for (const component of components) {
+    if (!component || typeof component !== "object" || Array.isArray(component)) continue;
+    const widget = (component as Record<string, unknown>)["component"];
+    if (typeof widget === "string" && widget.length > 0) return widget;
+  }
+  return null;
+}
+
 /**
  * Structural validator for A2UI v0.9 server-to-client messages.
  *
- * Accepts a single message object OR a top-level array of message
- * objects. Returns null when the value matches one of the four v0.9
- * message variants (createSurface, updateComponents, updateDataModel,
- * deleteSurface) with the minimum required keys. Otherwise returns a
- * short human-readable explanation.
+  * Accepts a single message object. Returns null when the value matches one
+  * of the four v0.9 message variants (createSurface, updateComponents,
+  * updateDataModel, deleteSurface) with the minimum required keys. Otherwise
+  * returns a short human-readable explanation. Top-level arrays are rejected
+  * for upstream A2UI v0.9 interop; emit multiple adjacent `<a2ui-json>`
+  * blocks when a turn needs multiple messages.
  *
  * This is intentionally narrow — it covers the structural shape that
  * downstream renderers depend on; deeper component-tree validation
  * lives in the renderer (which already runs the upstream catalog
  * schema).
  */
-export function validateA2uiMessage(value: unknown): string | null {
+export function validateA2uiMessage(value: unknown, options: A2uiValidationOptions = {}): string | null {
   if (value === null || value === undefined) return "value is null or undefined";
-  if (Array.isArray(value)) {
-    if (value.length === 0) return "array body must contain at least one message";
-    for (let i = 0; i < value.length; i += 1) {
-      const err = validateA2uiMessage(value[i]);
-      if (err !== null) return `message[${i}]: ${err}`;
-    }
-    return null;
-  }
+  if (Array.isArray(value)) return "top-level arrays are not valid A2UI v0.9 message envelopes; emit multiple <a2ui-json> blocks instead";
   if (typeof value !== "object") return `expected object, got ${typeof value}`;
   const obj = value as Record<string, unknown>;
   if (obj["version"] !== "v0.9") return "missing or non-v0.9 version field";
@@ -228,6 +310,12 @@ export function validateA2uiMessage(value: unknown): string | null {
   if (variant === "createSurface") {
     if (typeof innerRec["catalogId"] !== "string" || innerRec["catalogId"].length === 0) {
       return "createSurface requires non-empty catalogId";
+    }
+    if (options.expectedCatalogId !== undefined && innerRec["catalogId"] !== options.expectedCatalogId) {
+      return `createSurface catalogId must match negotiated catalog ${options.expectedCatalogId}`;
+    }
+    if (innerRec["sendDataModel"] === true) {
+      return "createSurface.sendDataModel=true is not supported by this shim profile";
     }
   } else if (variant === "updateComponents") {
     const components = innerRec["components"];

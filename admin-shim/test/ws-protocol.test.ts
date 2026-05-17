@@ -116,6 +116,7 @@ test("ws: hello can negotiate A2UI capability when server support is enabled", a
   assert.equal(capabilities.version, "0.9");
   assert.equal(capabilities.catalog_id, "basic");
   assert.ok(Array.isArray(capabilities.supported_widgets));
+  assert.deepEqual(capabilities.supported_widgets, ["Text", "Button", "Card", "List", "TextField", "ChoicePicker"]);
 });
 
 test("ws: A2UI request is ignored when server support is disabled", async (t) => {
@@ -137,6 +138,99 @@ test("ws: A2UI request is ignored when server support is disabled", async (t) =>
   assert.equal(welcome.a2ui_negotiated, false);
   assert.equal(welcome.a2ui, null);
   assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+});
+
+test("ws: A2UI version mismatch returns negotiated=false with reason", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    helloExtras: {
+      a2ui_version: "0.10",
+      supported_catalogs: ["basic"],
+      supported_widgets: ["Text"],
+    },
+  });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: unknown; a2ui_rejection_reason?: string }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, false);
+  assert.equal(welcome.a2ui, null);
+  assert.equal(welcome.a2ui_rejection_reason, "version_mismatch");
+  assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+});
+
+test("ws: A2UI catalog mismatch returns negotiated=false with reason", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    helloExtras: {
+      a2ui_version: "0.9",
+      supported_catalogs: ["enterprise"],
+      supported_widgets: ["Text"],
+    },
+  });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: unknown; a2ui_rejection_reason?: string }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, false);
+  assert.equal(welcome.a2ui, null);
+  assert.equal(welcome.a2ui_rejection_reason, "catalog_mismatch");
+  assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+});
+
+test("ws: A2UI-enabled server does not negotiate when client omits a2ui_version", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const agentId = seedAgent(shim.stateDir, { id: `agent-no-a2ui-${Date.now()}` });
+  seedConversation(shim.stateDir, agentId);
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: unknown; a2ui_rejection_reason?: string }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, false);
+  assert.equal(welcome.a2ui, null);
+  assert.equal(welcome.a2ui_rejection_reason, undefined);
+  assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: externalConvId(agentId),
+    text: "show approval card",
+    otid: "cm-no-a2ui-schema",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  assert.equal(turn.some((f) => f.type === "a2ui_frame"), false);
+});
+
+test("ws: inbound A2UI frames are rejected when A2UI was not negotiated", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+
+  conn.send({ type: "user_action", name: "tool_approval_choice", context: {} });
+  const userActionErr = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { code?: string; message?: string };
+  assert.equal(userActionErr.code, "protocol_violation");
+  assert.match(userActionErr.message ?? "", /negotiated A2UI/);
+  assert.equal(conn.closed, false, "socket remains open after soft protocol error");
+
+  const conn2 = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn2.close());
+
+  conn2.send({ type: "a2ui_frame", ok: true, a2ui: { version: "v0.9" } });
+  const a2uiFrameErr = await conn2.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { code?: string; message?: string };
+  assert.equal(a2uiFrameErr.code, "protocol_violation");
+  assert.match(a2uiFrameErr.message ?? "", /server-to-client/);
+  assert.equal(conn2.closed, false, "socket remains open after soft protocol error");
 });
 
 // ─── 2. Auth failure ────────────────────────────────────────────────

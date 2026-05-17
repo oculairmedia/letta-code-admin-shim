@@ -37,11 +37,11 @@ export const SERVER_FRAMES = Object.freeze([
   "welcome", // { server_id, session_id, device_id, a2ui_negotiated?, a2ui? }
   "a2ui_capabilities", // { version, catalog_id, supported_catalogs, supported_widgets }
   "a2ui_frame", // { turn_id, run_id, otid?, ok, a2ui, raw?, parse_error?, validation_error? }
-                  // One A2UI v0.9 message extracted from the assistant
-                  // text stream. Body is the parsed message (a single
-                  // object or an array of messages) ready for the
-                  // renderer. `ok=false` carries diagnostic fields the
-                  // client may surface in a debug panel.
+                  // One A2UI v0.9 message object extracted from the
+                  // assistant text stream. Multiple messages arrive as
+                  // multiple a2ui_frame envelopes, not as a top-level array.
+                  // `ok=false` carries diagnostic fields the client may
+                  // surface in a debug panel.
   "user_action_ack", // { action_id, status, reason? }
                   // Ack for a `user_action` frame.
   "error", // { code, message, turn_id? }

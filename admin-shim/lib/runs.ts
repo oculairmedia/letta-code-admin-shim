@@ -403,6 +403,99 @@ export function recordA2uiUserAction(entry: {
   }
 }
 
+/**
+ * Approval decision scope: Once (single call), Session (all calls in this
+ * conversation), Forever (all calls across all conversations), or Deny.
+ */
+export type ApprovalScope = "Once" | "Session" | "Forever" | "Deny";
+
+/**
+ * Approval decision record persisted to sidecar JSONL.
+ */
+export interface ApprovalDecisionRecord {
+  action_id: string;
+  tool_name: string;
+  decision: "approve" | "deny" | "timeout";
+  scope: ApprovalScope;
+  reason: string;
+  timestamp: string;
+  user_id?: string;
+  recorded_at: string;
+}
+
+/**
+ * Record an approval decision to the sidecar JSONL file.
+ * Append-only; no read-modify-write race.
+ */
+export function recordApprovalDecision(
+  runId: string,
+  entry: Omit<ApprovalDecisionRecord, "recorded_at">,
+): void {
+  try {
+    mkdirSync(runDir(runId), { recursive: true });
+    appendFileSync(
+      approvalDecisionsFile(runId),
+      JSON.stringify({ ...entry, recorded_at: nowIso() }) + "\n",
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-decision append failed for ${runId}: ${msg}`);
+  }
+}
+
+/**
+ * Load approval decisions from sidecar and build a scope cache.
+ * Returns a map of tool_name → { scope, timestamp } for Session/Forever decisions.
+ * Used at turn-start to auto-approve cached decisions without user round-trip.
+ */
+export function loadApprovalScopeCache(runId: string): Map<string, { scope: ApprovalScope; timestamp: string }> {
+  const cache = new Map<string, { scope: ApprovalScope; timestamp: string }>();
+  try {
+    const path = approvalDecisionsFile(runId);
+    if (!existsSync(path)) return cache;
+    
+    const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const record = JSON.parse(line) as unknown;
+        if (
+          typeof record === "object" &&
+          record !== null &&
+          "tool_name" in record &&
+          "decision" in record &&
+          "scope" in record &&
+          "timestamp" in record &&
+          typeof (record as Record<string, unknown>)["tool_name"] === "string" &&
+          typeof (record as Record<string, unknown>)["decision"] === "string" &&
+          typeof (record as Record<string, unknown>)["scope"] === "string" &&
+          typeof (record as Record<string, unknown>)["timestamp"] === "string"
+        ) {
+          const r = record as Record<string, unknown>;
+          const toolName = r["tool_name"] as string;
+          const decision = r["decision"] as string;
+          const scope = r["scope"] as string;
+          const timestamp = r["timestamp"] as string;
+          
+          // Only cache approve decisions with Session/Forever scope
+          if (decision === "approve" && (scope === "Session" || scope === "Forever")) {
+            cache.set(toolName, { scope: scope as ApprovalScope, timestamp });
+          }
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-scope cache load failed for ${runId}: ${msg}`);
+  }
+  return cache;
+}
+
+function approvalDecisionsFile(runId: string): string {
+  return join(runDir(runId), "approval-decisions.jsonl");
+}
+
 export function recordRunStep(
   handle: RunHandle | null | undefined,
   step: RecordStepInput = {},

@@ -74,7 +74,7 @@ async function setupAuthedA2ui(t: { after: (fn: () => unknown) => void }, opts: 
 }
 
 test("a2ui-ws: assistant_message with <a2ui-json> blocks splits into text + a2ui_frame envelopes", async (t) => {
-  const { conn, agentId, convId } = await setupAuthedA2ui(t);
+  const { shim, conn, agentId, convId } = await setupAuthedA2ui(t);
   conn.send({
     type: "send_message",
     agent_id: agentId,
@@ -102,6 +102,23 @@ test("a2ui-ws: assistant_message with <a2ui-json> blocks splits into text + a2ui
   assert.doesNotMatch(assistantText, /<\/a2ui-json>/, "raw close tag must not leak to text");
   assert.match(assistantText, /Here is the approval card/);
   assert.match(assistantText, /Tap a choice to continue/);
+
+  await shim.waitForLogLine(/"module":"a2ui".*"event":"turn_metrics"/, { timeoutMs: WS_TIMEOUT_MS });
+  const metricsLine = shim.readLog().split("\n").find((line) => line.includes('"module":"a2ui"') && line.includes('"event":"turn_metrics"'));
+  assert.ok(metricsLine, "expected structured a2ui metrics log line");
+  const metrics = JSON.parse(metricsLine) as Record<string, unknown>;
+  assert.equal(metrics["level"], "info");
+  assert.equal(metrics["module"], "a2ui");
+  assert.equal(metrics["event"], "turn_metrics");
+  assert.equal(typeof metrics["run_id"], "string");
+  assert.equal(typeof metrics["agent_id"], "string");
+  assert.equal(typeof metrics["total_frames"], "number");
+  assert.equal(typeof metrics["parse_ok"], "number");
+  assert.equal(typeof metrics["parse_err"], "number");
+  assert.equal(typeof metrics["validate_ok"], "number");
+  assert.equal(typeof metrics["validate_err"], "number");
+  assert.ok(Array.isArray(metrics["widget_types_seen"]));
+  assert.equal(typeof metrics["splitter_overhead_ms"], "number");
 });
 
 test("a2ui-ws: a2ui_frame is suppressed when capability is not negotiated", async (t) => {

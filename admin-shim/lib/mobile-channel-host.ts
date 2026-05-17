@@ -26,6 +26,7 @@ import {
   A2uiStreamSplitter,
   validateA2uiMessage,
   type A2uiBlock,
+  type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
 import { createRun, recordA2uiUserAction } from "./runs.js";
 import {
@@ -200,8 +201,43 @@ async function bridgeSendMessage(
   // (rare on a single turn, but possible for multi-step turns).
   const splittersByOtid = new Map<string, A2uiStreamSplitter>();
   const a2uiEnabled = a2ui_capability != null;
+  const a2uiMetricsVerbosity = process.env["A2UI_METRICS_VERBOSITY"] ?? "normal";
+  const a2uiMetricsEnabled = a2uiMetricsVerbosity !== "off";
+  const a2uiMetrics: A2uiMetrics = {
+    total_frames: 0,
+    parse_ok: 0,
+    parse_err: 0,
+    validate_ok: 0,
+    validate_err: 0,
+    widget_types_seen: [],
+    splitter_overhead_ms: 0,
+  };
+  const a2uiWidgetsSeen = new Set<string>();
+  const truncateA2uiRaw = (raw: string): string => raw.length > 200 ? `${raw.slice(0, 200)}…` : raw;
+  const mergeA2uiMetrics = (metrics: A2uiMetrics): void => {
+    a2uiMetrics.total_frames += metrics.total_frames;
+    a2uiMetrics.parse_ok += metrics.parse_ok;
+    a2uiMetrics.parse_err += metrics.parse_err;
+    a2uiMetrics.validate_ok += metrics.validate_ok;
+    a2uiMetrics.validate_err += metrics.validate_err;
+    a2uiMetrics.splitter_overhead_ms += metrics.splitter_overhead_ms;
+    for (const widget of metrics.widget_types_seen) a2uiWidgetsSeen.add(widget);
+  };
+  const logA2uiWarning = (payload: Record<string, unknown>): void => {
+    if (!a2uiMetricsEnabled) return;
+    console.error(JSON.stringify({ level: "warn", module: "a2ui", run_id: runHandle.id, agent_id: effectiveAgentId, ...payload }));
+  };
   const newSplitter = (): A2uiStreamSplitter =>
-    new A2uiStreamSplitter({ validate: validateA2uiMessage });
+    new A2uiStreamSplitter({
+      validate: (message) => validateA2uiMessage(message, { expectedCatalogId: a2ui_capability?.catalogId }),
+      onMetrics: mergeA2uiMetrics,
+      onParseError: (raw, error) => {
+        logA2uiWarning({ event: "parse_error", error, raw: truncateA2uiRaw(raw) });
+      },
+      onValidationError: (raw, error, widgetType) => {
+        logA2uiWarning({ event: "validation_error", widget_type: widgetType, error, raw: truncateA2uiRaw(raw) });
+      },
+    });
   const buildA2uiFrame = (
     block: A2uiBlock,
     otid: string | null,
@@ -331,6 +367,22 @@ async function bridgeSendMessage(
       if (flush.unclosed) {
         console.error(`[mobile-channel] A2UI splitter ended mid-tag (otid=${otidKey})`);
       }
+    }
+    if (a2uiMetricsEnabled) {
+      console.log(JSON.stringify({
+        level: "info",
+        module: "a2ui",
+        event: "turn_metrics",
+        run_id: runHandle.id,
+        agent_id: effectiveAgentId,
+        total_frames: a2uiMetrics.total_frames,
+        parse_ok: a2uiMetrics.parse_ok,
+        parse_err: a2uiMetrics.parse_err,
+        validate_ok: a2uiMetrics.validate_ok,
+        validate_err: a2uiMetrics.validate_err,
+        widget_types_seen: [...a2uiWidgetsSeen].sort(),
+        splitter_overhead_ms: a2uiMetrics.splitter_overhead_ms,
+      }));
     }
   }
 

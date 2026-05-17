@@ -33,9 +33,12 @@ import {
   recordRunMessage,
   recordRunStep,
   recordRunTool,
+  recordApprovalDecision,
+  loadApprovalScopeCache,
   setRunCancelHandler,
   type RunHandle,
   type UsageInput,
+  type ApprovalScope,
 } from "./runs.js";
 import type {
   LettaStreamFrame,
@@ -66,6 +69,100 @@ interface ExitFrame {
  * death. The collector branches on `type === "__exit__"` and never
  * forwards that branch to the caller-supplied onFrame.
  */
+
+/**
+ * Approval gate state for a single approval_request_message.
+ * Resolves when user decision arrives or timeout fires.
+ */
+interface ApprovalGateState {
+  toolName: string;
+  toolCallId: string;
+  resolve: (decision: ApprovalDecision) => void;
+  reject: (error: Error) => void;
+  timeoutHandle: NodeJS.Timeout;
+}
+
+/**
+ * User approval decision routed from mobile WS channel.
+ */
+interface ApprovalDecision {
+  decision: "approve" | "deny";
+  scope: ApprovalScope;
+  reason: string;
+  userId?: string;
+}
+
+/**
+ * Map of pending approval gates keyed by run_id.
+ * Each run can have at most one active approval gate at a time
+ * (turns are serialized per worker).
+ */
+const approvalGates = new Map<string, ApprovalGateState>();
+
+/**
+ * Resolve a pending approval gate with a user decision.
+ * Called from mobile-channel-host.ts:handleUserAction() when a user_action
+ * frame arrives with approval decision.
+ */
+export function resolveApprovalGate(
+  runId: string,
+  decision: ApprovalDecision,
+): boolean {
+  const gate = approvalGates.get(runId);
+  if (!gate) return false;
+  
+  clearTimeout(gate.timeoutHandle);
+  approvalGates.delete(runId);
+  gate.resolve(decision);
+  return true;
+}
+
+/**
+ * Reject a pending approval gate (e.g., on worker disconnect).
+ * Called from worker SIGTERM handler or on turn timeout.
+ */
+export function rejectApprovalGate(runId: string, error: Error): boolean {
+  const gate = approvalGates.get(runId);
+  if (!gate) return false;
+  
+  clearTimeout(gate.timeoutHandle);
+  approvalGates.delete(runId);
+  gate.reject(error);
+  return true;
+}
+
+/**
+ * Wait for an approval decision from the mobile WS channel.
+ * Returns { decision, scope, reason } on success.
+ * Throws on timeout or worker disconnect.
+ * 
+ * Timeout is 30s per approval request (separate from turn timeout).
+ */
+function waitForApprovalDecision(
+  runId: string,
+  toolName: string,
+  toolCallId: string,
+): Promise<ApprovalDecision> {
+  return new Promise((resolve, reject) => {
+    const APPROVAL_TIMEOUT_MS = 30_000;
+    
+    const timeoutHandle = setTimeout(() => {
+      approvalGates.delete(runId);
+      reject(new Error(`approval_timeout: no decision for ${toolName} within ${APPROVAL_TIMEOUT_MS}ms`));
+    }, APPROVAL_TIMEOUT_MS);
+    
+    const gate: ApprovalGateState = {
+      toolName,
+      toolCallId,
+      resolve,
+      reject,
+      timeoutHandle,
+    };
+    
+    approvalGates.set(runId, gate);
+  });
+}
+
 type WorkerFrame = LettaStreamFrame | ExitFrame;
 
 /** Options accepted by `Worker#runTurn`. */
@@ -376,6 +473,16 @@ class Worker {
           try { onRunCreated(runHandle.id); } catch {}
         }
       }
+
+      // Load approval scope cache from sidecar. Session/Forever decisions
+
+
+      // auto-approve without user round-trip; Once/Deny require user action.
+
+
+      const approvalScopeCache = loadApprovalScopeCache(runHandle.id);
+
+
 
       const frames: LettaStreamFrame[] = [];
       // `finished` is the lifecycle latch the turn-wait loop polls. Each

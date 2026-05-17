@@ -149,7 +149,7 @@ test("a2ui-splitter: validator accepts a well-formed createSurface message", () 
   assert.equal(out.frames[0]!.validationError, null);
 });
 
-test("a2ui-splitter: validator accepts an array body containing valid messages", () => {
+test("a2ui-splitter: validator rejects top-level arrays; emit multiple blocks instead", () => {
   const sp = new A2uiStreamSplitter({ validate: validateA2uiMessage });
   const body = JSON.stringify([
     { version: "v0.9", createSurface: { surfaceId: "s1", catalogId: "basic" } },
@@ -163,7 +163,8 @@ test("a2ui-splitter: validator accepts an array body containing valid messages",
   ]);
   const out = sp.feed(`<a2ui-json>${body}</a2ui-json>`);
   assert.equal(out.frames.length, 1);
-  assert.equal(out.frames[0]!.ok, true);
+  assert.equal(out.frames[0]!.ok, false);
+  assert.match(out.frames[0]!.validationError ?? "", /top-level arrays/);
 });
 
 test("validateA2uiMessage: rejects missing surfaceId, missing catalogId, empty components", () => {
@@ -174,6 +175,17 @@ test("validateA2uiMessage: rejects missing surfaceId, missing catalogId, empty c
   assert.match(
     validateA2uiMessage({ version: "v0.9", createSurface: { surfaceId: "s1" } }) ?? "",
     /catalogId/,
+  );
+  assert.match(
+    validateA2uiMessage(
+      { version: "v0.9", createSurface: { surfaceId: "s1", catalogId: "https://a2ui.org/specification/v0_9/basic_catalog.json" } },
+      { expectedCatalogId: "basic" },
+    ) ?? "",
+    /negotiated catalog basic/,
+  );
+  assert.match(
+    validateA2uiMessage({ version: "v0.9", createSurface: { surfaceId: "s1", catalogId: "basic", sendDataModel: true } }) ?? "",
+    /sendDataModel=true is not supported/,
   );
   assert.match(
     validateA2uiMessage({ version: "v0.9", updateComponents: { surfaceId: "s1", components: [] } }) ?? "",
@@ -189,4 +201,41 @@ test("validateA2uiMessage: rejects missing surfaceId, missing catalogId, empty c
     }) ?? "",
     /component discriminator/,
   );
+});
+
+test("a2ui-splitter: metrics callback fires with stable schema on flush", () => {
+  let captured: unknown = null;
+  const sp = new A2uiStreamSplitter({
+    validate: validateA2uiMessage,
+    onMetrics: (metrics) => { captured = metrics; },
+  });
+  sp.feed('<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s1","components":[{"id":"root","component":"Text"}]}}</a2ui-json>');
+  sp.flush();
+
+  assert.ok(captured, "expected metrics callback");
+  const metrics = captured as Record<string, unknown>;
+  assert.equal(metrics["total_frames"], 1);
+  assert.equal(metrics["parse_ok"], 1);
+  assert.equal(metrics["parse_err"], 0);
+  assert.equal(metrics["validate_ok"], 1);
+  assert.equal(metrics["validate_err"], 0);
+  assert.deepEqual(metrics["widget_types_seen"], ["Text"]);
+  assert.equal(typeof metrics["splitter_overhead_ms"], "number");
+});
+
+test("a2ui-splitter: parse and validation failure callbacks include diagnostics", () => {
+  const parseErrors: string[] = [];
+  const validationErrors: Array<{ error: string; widgetType: string | null }> = [];
+  const sp = new A2uiStreamSplitter({
+    validate: validateA2uiMessage,
+    onParseError: (_raw, error) => { parseErrors.push(error); },
+    onValidationError: (_raw, error, widgetType) => { validationErrors.push({ error, widgetType }); },
+  });
+  sp.feed('<a2ui-json>{"version":"v0.9"</a2ui-json>');
+  sp.feed('<a2ui-json>{"version":"v0.9","updateComponents":{"surfaceId":"s1","components":[{"id":"root"}]}}</a2ui-json>');
+
+  assert.equal(parseErrors.length, 1);
+  assert.equal(validationErrors.length, 1);
+  assert.match(validationErrors[0]!.error, /component discriminator/);
+  assert.equal(validationErrors[0]!.widgetType, null);
 });

@@ -135,6 +135,7 @@ export function handleConnection(ws, request, host) {
       const serverA2ui = typeof host.getA2uiServerCapabilities === "function"
         ? host.getA2uiServerCapabilities()
         : { enabled: false };
+      let a2uiRejectionReason = null;
       if (frame.a2ui_version) {
         const supportedCatalogs = Array.isArray(frame.supported_catalogs) ? frame.supported_catalogs.filter((v) => typeof v === "string") : [];
         const supportedWidgets = Array.isArray(frame.supported_widgets) ? frame.supported_widgets.filter((v) => typeof v === "string") : [];
@@ -142,15 +143,31 @@ export function handleConnection(ws, request, host) {
         const catalogId = typeof serverA2ui.catalogId === "string" ? serverA2ui.catalogId : "basic";
         const catalogMatches = supportedCatalogs.length === 0 || supportedCatalogs.includes(catalogId);
         if (serverA2ui.enabled && versionMatches && catalogMatches) {
+          const serverWidgets = Array.isArray(serverA2ui.supportedWidgets) ? serverA2ui.supportedWidgets.filter((v) => typeof v === "string") : [];
+          const serverWidgetSet = new Set(serverWidgets);
+          const negotiatedWidgets = supportedWidgets.filter((widget) => serverWidgetSet.has(widget));
+          let themeHints = null;
+          if (frame.theme_hints && typeof frame.theme_hints === "object" && !Array.isArray(frame.theme_hints)) {
+            themeHints = { ...frame.theme_hints };
+            if (themeHints.primaryColor !== undefined && (typeof themeHints.primaryColor !== "string" || !/^#[0-9a-fA-F]{6}$/.test(themeHints.primaryColor))) {
+              log("a2ui theme_hints.primaryColor ignored: expected ^#[0-9a-fA-F]{6}$");
+              delete themeHints.primaryColor;
+            }
+            if (Object.keys(themeHints).length === 0) themeHints = null;
+          }
           a2uiCapability = {
             version: frame.a2ui_version,
             catalogId,
             supportedCatalogs: supportedCatalogs.length > 0 ? supportedCatalogs : [catalogId],
-            supportedWidgets,
-            ...(frame.theme_hints && typeof frame.theme_hints === "object" && !Array.isArray(frame.theme_hints) ? { themeHints: frame.theme_hints } : {}),
+            supportedWidgets: negotiatedWidgets.length > 0 ? negotiatedWidgets : serverWidgets,
+            ...(themeHints ? { themeHints } : {}),
           };
-          log(`a2ui negotiated: version=${frame.a2ui_version} catalog=${catalogId} widgets=[${supportedWidgets.join(",")}]`);
+          log(`a2ui negotiated: version=${frame.a2ui_version} catalog=${catalogId} widgets=[${a2uiCapability.supportedWidgets.join(",")}]`);
         } else {
+          if (!serverA2ui.enabled) a2uiRejectionReason = "disabled";
+          else if (!versionMatches) a2uiRejectionReason = "version_mismatch";
+          else if (!catalogMatches) a2uiRejectionReason = "catalog_mismatch";
+          else a2uiRejectionReason = "unsupported";
           log(`a2ui rejected: serverEnabled=${serverA2ui.enabled} versionMatches=${versionMatches} (got=${frame.a2ui_version} want=${serverA2ui.version}) catalogMatches=${catalogMatches} (got=[${supportedCatalogs.join(",")}] want=${catalogId})`);
         }
       } else {
@@ -174,6 +191,7 @@ export function handleConnection(ws, request, host) {
             version: a2uiCapability.version,
             catalog_id: a2uiCapability.catalogId,
           } : null,
+          ...(a2uiRejectionReason ? { a2ui_rejection_reason: a2uiRejectionReason } : {}),
         }),
         log,
       );
@@ -497,6 +515,10 @@ export function handleConnection(ws, request, host) {
         // does NOT yet wire this into letta-code's tool dispatcher —
         // recording the action is sufficient for the contract that
         // mobile builds against.
+        if (!a2uiCapability) {
+          sendError(ERROR_CODES.PROTOCOL_VIOLATION, "user_action requires negotiated A2UI capability", { close: false });
+          return;
+        }
         if (typeof frame.name !== "string" || frame.name.length === 0) {
           sendError(ERROR_CODES.PROTOCOL_VIOLATION, "user_action requires a non-empty name", { close: false });
           return;
@@ -531,6 +553,9 @@ export function handleConnection(ws, request, host) {
         }
         break;
       }
+      case "a2ui_frame":
+        sendError(ERROR_CODES.PROTOCOL_VIOLATION, "a2ui_frame is server-to-client only", { close: false });
+        break;
       case "ack":
         // Phase 1: log and move on. Phase 2 wires this into the sync cursor.
         break;

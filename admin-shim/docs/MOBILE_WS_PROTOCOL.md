@@ -158,7 +158,7 @@ First frame on every connection. Must arrive before anything else.
   "client_version": "letta-mobile/0.6.1 (android)",
   "a2ui_version": "0.9",
   "supported_catalogs": ["basic"],
-  "supported_widgets": ["Text", "Button", "ToolApprovalCard"],
+  "supported_widgets": ["Text", "Button", "Card"],
   "theme_hints": { "color_scheme": "dark" }
 }
 ```
@@ -169,10 +169,23 @@ the requested version matches `A2UI_VERSION`, and the requested catalogs include
 `A2UI_CATALOG_ID`. Non-A2UI clients omit these fields and keep the exact Phase-1
 text/tool behavior.
 
+A2UI version strings intentionally differ by layer: handshake and capability
+frames use the shim-local form (`"0.9"`, no `v` prefix), while A2UI JSON
+message envelopes inside `a2ui_frame.a2ui` use the upstream spec form
+(`"v0.9"`).
+
 - `token` — **required**. Constant-time matched. Wrong → `error{invalid_token}` + close (code 4000 with reason `invalid_token`).
 - `device_id` — optional; if omitted, server assigns `anon-<uuid>`. The
   same id is echoed in `welcome.device_id`.
 - `client_version` — optional; logged for telemetry only.
+- `a2ui_version` — optional dynamic-UI request. Use the handshake form
+  (`"0.9"`) here, not the envelope form (`"v0.9"`).
+- `theme_hints` — optional A2UI styling hints for the model prompt. If it
+  includes `primaryColor`, the shim only forwards strict 6-digit hex values
+  matching `^#[0-9a-fA-F]{6}$`; invalid shorthand (`#FFF`), `rgba()`, or
+  named colors are dropped and logged. `color_scheme` (`light` / `dark` /
+  `system`) is a preference hint and does **not** map directly to
+  `theme.primaryColor`.
 
 Kotlin:
 
@@ -297,6 +310,9 @@ A2UI v0.9 client→server action. Emitted by the renderer when the user
 interacts with a surface (`Action.event` from the A2UI Basic Catalog —
 e.g. a `ToolApprovalCard` choice). Only meaningful when A2UI was
 negotiated in `hello`; non-A2UI clients should not emit this frame.
+Only `Action` shapes carrying an `event` field map to `user_action`
+frames for agent processing. `functionCall` actions are renderer-local —
+handle them in the client without a WebSocket round-trip.
 
 ```json
 { "v": 1, "type": "user_action", "id": "…", "ts": "…",
@@ -329,6 +345,8 @@ Errors:
 - Missing `name` → `error{protocol_violation}`; socket stays open.
 - `context` not an object → `error{protocol_violation}`; socket stays
   open.
+- A2UI not negotiated for the session → `error{protocol_violation}`;
+  socket stays open.
 - Handler not wired (channel host built without `handleUserAction`) →
   `error{internal_error}`; socket stays open.
 
@@ -357,6 +375,9 @@ Type-specific fields below.
   this field; current server frames include `false` when not negotiated.
 - `a2ui` — negotiated A2UI version/catalog summary, or `null` when A2UI is
   not active for the session.
+- `a2ui_rejection_reason` — present only when the client requested A2UI and
+  negotiation failed. Current values are `disabled`, `version_mismatch`,
+  `catalog_mismatch`, or `unsupported`.
 
 Test: `ws: hello/welcome handshake — server_id, session_id, device_id in welcome`.
 Test: `ws: hello can negotiate A2UI capability when server support is enabled`.
@@ -370,11 +391,14 @@ Emitted immediately after `welcome` only when A2UI was negotiated.
   "version": "0.9",
   "catalog_id": "basic",
   "supported_catalogs": ["basic"],
-  "supported_widgets": ["Text", "Button", "ToolApprovalCard"] }
+  "supported_widgets": ["Text", "Button", "Card", "List", "TextField", "ChoicePicker"] }
 ```
 
 This frame confirms the server-side A2UI contract for the session. Older
 clients remain safe because unknown server frame types are ignored silently.
+Like `hello.a2ui_version`, `version` uses the handshake/capability form
+(`"0.9"`). A2UI message bodies carried later in `a2ui_frame.a2ui` still use
+the upstream envelope form (`"v0.9"`).
 
 #### `a2ui_frame`
 
@@ -397,13 +421,18 @@ through `assistant_message` deltas — the renderer composes both.
 ```
 
 - `ok` — `true` when JSON parse and structural validation succeeded.
+  This means envelope-valid, not render-valid: renderer-side catalog/schema
+  checks may still reject component trees, references, or per-widget props.
   When `false` the frame includes `parse_error` and/or `validation_error`
-  diagnostic strings; the `a2ui` field may be `null` or a partially
-  parsed value.
+  diagnostic strings; the `a2ui` field may be `null` or a partially parsed
+  value.
 - `a2ui` — the parsed A2UI v0.9 message. Either a single message object
-  (createSurface / updateComponents / updateDataModel / deleteSurface)
-  or an array of those when the model emitted multiple messages inside a
-  single tag.
+  (createSurface / updateComponents / updateDataModel / deleteSurface).
+  Top-level arrays are rejected for upstream A2UI v0.9 interop; if a turn
+  needs multiple A2UI messages, the model emits multiple adjacent
+  `<a2ui-json>` blocks and the shim forwards one `a2ui_frame` per block.
+  Its `version` field uses the upstream envelope form (`"v0.9"`), unlike
+  the handshake/capability fields that use `"0.9"`.
 - `otid` — echoes the otid of the assistant_message the block was carried
   in. Lets the renderer associate the A2UI surface with the bubble that
   introduced it.
@@ -414,6 +443,15 @@ Structural validator coverage (`validateA2uiMessage`):
 - Exactly one of `createSurface | updateComponents | updateDataModel | deleteSurface` present.
 - All variants require a non-empty `surfaceId`.
 - `createSurface` additionally requires a non-empty `catalogId`.
+  During mobile negotiation the shim also rejects `createSurface.catalogId`
+  values that do not match the negotiated catalog (`basic`). The embedded
+  upstream Basic Catalog schema is rewritten in the prompt to use this same
+  short wire slug, avoiding mixed URL-vs-slug catalog ids.
+- `createSurface.sendDataModel: true` is rejected in this shim profile. The
+  mobile `user_action` frame remains a recording/ack path and does not yet
+  deliver full surface data models into the agent dispatcher, so accepting
+  `sendDataModel` would make form submissions look successful while dropping
+  values.
 - `updateComponents` requires a non-empty `components` array; each entry
   must have a non-empty `id` and a non-empty `component` discriminator.
 

@@ -36,9 +36,11 @@ import type { A2uiCapability, A2uiServerCapabilities } from "../a2ui-adapter.js"
  * channel plugin is responsible for wrapping it into a channel-specific
  * envelope (e.g. the mobile WS `a2ui_frame` type).
  *
- * `ok` is the union of parse and (when configured) schema validation. A
- * frame with `ok === false` carries the raw bytes plus a diagnostic field
- * so the plugin can choose to drop it or surface it to the client.
+ * `ok` means the host parsed the block and its structural/envelope validator
+ * accepted the A2UI message variant. It is not a renderability guarantee:
+ * catalog-level component validation still belongs to the renderer. A frame
+ * with `ok === false` carries the raw bytes plus a diagnostic field so the
+ * plugin can choose to drop it or surface it to the client.
  */
 export interface A2uiFrameMessage {
   message_type: "a2ui_frame";
@@ -50,7 +52,7 @@ export interface A2uiFrameMessage {
   a2ui: unknown;
   /** Raw JSON bytes between the `<a2ui-json>` tags. */
   raw: string;
-  /** True iff parse succeeded AND (when configured) validation passed. */
+  /** True iff parse and structural/envelope validation passed. */
   ok: boolean;
   /** JSON.parse error message, when parsing failed. */
   parse_error: string | null;
