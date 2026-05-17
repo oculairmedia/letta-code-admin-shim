@@ -149,7 +149,12 @@ export function handleConnection(ws, request, host) {
             supportedWidgets,
             ...(frame.theme_hints && typeof frame.theme_hints === "object" && !Array.isArray(frame.theme_hints) ? { themeHints: frame.theme_hints } : {}),
           };
+          log(`a2ui negotiated: version=${frame.a2ui_version} catalog=${catalogId} widgets=[${supportedWidgets.join(",")}]`);
+        } else {
+          log(`a2ui rejected: serverEnabled=${serverA2ui.enabled} versionMatches=${versionMatches} (got=${frame.a2ui_version} want=${serverA2ui.version}) catalogMatches=${catalogMatches} (got=[${supportedCatalogs.join(",")}] want=${catalogId})`);
         }
+      } else {
+        log(`a2ui not requested: hello has no a2ui_version field (serverEnabled=${serverA2ui.enabled})`);
       }
       device = recordDeviceConnect({
         deviceId,

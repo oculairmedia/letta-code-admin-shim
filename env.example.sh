@@ -41,11 +41,21 @@ export SHIM_HOST="${SHIM_HOST:-0.0.0.0}"
 # export SHIM_POOL_IDLE_SEC=300
 # export SHIM_POOL_TURN_TIMEOUT=180000
 
-# Optional: A2UI dynamic UI support. Disabled unless the client opts in AND
-# A2UI_ENABLED is true. Phase 1 uses the upstream v0.9 Basic Catalog contract.
-# export A2UI_ENABLED=0
-# export A2UI_VERSION=0.9
-# export A2UI_CATALOG_ID=basic
+# A2UI dynamic UI support. The shim injects the v0.9 Basic Catalog grammar
+# into the upstream model's system prompt when a WS client opts in via
+# its `hello` frame (a2ui_version + supported_catalogs + supported_widgets)
+# AND A2UI_ENABLED=1 here. Off by default keeps non-A2UI clients on the
+# exact phase-1 text/tool behavior; on flips the whole pipeline (prompt
+# injection, stream splitter, a2ui_frame emission, user_action ingestion).
+#
+# Mobile shows a "· A2UI" badge in the chip when negotiation succeeds.
+# Verify with `tail -f /tmp/shim-restart.log` — the ws-handler logs
+# "a2ui negotiated …" / "a2ui rejected …" / "a2ui not requested …" per
+# hello so you can diagnose mismatches without instrumentation.
+export A2UI_ENABLED="${A2UI_ENABLED:-1}"
+export A2UI_VERSION="${A2UI_VERSION:-0.9}"
+export A2UI_CATALOG_ID="${A2UI_CATALOG_ID:-basic}"
+# Optional prompt overrides — uncomment to customize.
 # export A2UI_ROLE_DESCRIPTION="You are a Letta agent that can emit A2UI dynamic interface messages when useful."
 # export A2UI_UI_DESCRIPTION="Use the A2UI v0.9 Basic Catalog to create concise, safe, task-focused UI surfaces for the connected client."
 
