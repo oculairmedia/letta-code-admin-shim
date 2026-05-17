@@ -155,9 +155,19 @@ First frame on every connection. Must arrive before anything else.
   "v": 1, "type": "hello", "id": "…", "ts": "…",
   "token": "shared-secret-from-accounts.json",
   "device_id": "android-emanuel-pixel-7",
-  "client_version": "letta-mobile/0.6.1 (android)"
+  "client_version": "letta-mobile/0.6.1 (android)",
+  "a2ui_version": "0.9",
+  "supported_catalogs": ["basic"],
+  "supported_widgets": ["Text", "Button", "ToolApprovalCard"],
+  "theme_hints": { "color_scheme": "dark" }
 }
 ```
+
+The `a2ui_*` fields are optional. When present, they request dynamic UI mode
+for this WS session. The server only negotiates A2UI when `A2UI_ENABLED=1`,
+the requested version matches `A2UI_VERSION`, and the requested catalogs include
+`A2UI_CATALOG_ID`. Non-A2UI clients omit these fields and keep the exact Phase-1
+text/tool behavior.
 
 - `token` — **required**. Constant-time matched. Wrong → `error{invalid_token}` + close (code 4000 with reason `invalid_token`).
 - `device_id` — optional; if omitted, server assigns `anon-<uuid>`. The
@@ -292,15 +302,38 @@ Type-specific fields below.
 { "v": 1, "type": "welcome", "id": "…", "ts": "…",
   "server_id": "9c2d7e4f-…",
   "session_id": "sess-1f6c8a4d-…",
-  "device_id": "android-emanuel-pixel-7" }
+  "device_id": "android-emanuel-pixel-7",
+  "a2ui_negotiated": true,
+  "a2ui": { "version": "0.9", "catalog_id": "basic" } }
 ```
 
 - `server_id` — universe cache key (see §1).
 - `session_id` — server-assigned, `sess-<uuid>`. Logging only.
 - `device_id` — echoes the client's `hello.device_id` (or the assigned
   `anon-<uuid>`).
+- `a2ui_negotiated` — `true` only when the client requested A2UI in `hello`
+  and the server accepted it for this session. Non-A2UI clients may ignore
+  this field; current server frames include `false` when not negotiated.
+- `a2ui` — negotiated A2UI version/catalog summary, or `null` when A2UI is
+  not active for the session.
 
 Test: `ws: hello/welcome handshake — server_id, session_id, device_id in welcome`.
+Test: `ws: hello can negotiate A2UI capability when server support is enabled`.
+
+#### `a2ui_capabilities`
+
+Emitted immediately after `welcome` only when A2UI was negotiated.
+
+```json
+{ "v": 1, "type": "a2ui_capabilities", "id": "…", "ts": "…",
+  "version": "0.9",
+  "catalog_id": "basic",
+  "supported_catalogs": ["basic"],
+  "supported_widgets": ["Text", "Button", "ToolApprovalCard"] }
+```
+
+This frame confirms the server-side A2UI contract for the session. Older
+clients remain safe because unknown server frame types are ignored silently.
 
 #### `error`
 

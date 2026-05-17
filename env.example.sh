@@ -41,6 +41,14 @@ export SHIM_HOST="${SHIM_HOST:-0.0.0.0}"
 # export SHIM_POOL_IDLE_SEC=300
 # export SHIM_POOL_TURN_TIMEOUT=180000
 
+# Optional: A2UI dynamic UI support. Disabled unless the client opts in AND
+# A2UI_ENABLED is true. Phase 1 uses the upstream v0.9 Basic Catalog contract.
+# export A2UI_ENABLED=0
+# export A2UI_VERSION=0.9
+# export A2UI_CATALOG_ID=basic
+# export A2UI_ROLE_DESCRIPTION="You are a Letta agent that can emit A2UI dynamic interface messages when useful."
+# export A2UI_UI_DESCRIPTION="Use the A2UI v0.9 Basic Catalog to create concise, safe, task-focused UI surfaces for the connected client."
+
 echo "letta-code shim env active:"
 echo "  SHIM_ROOT=$SHIM_ROOT"
 echo "  HOME=$HOME"
