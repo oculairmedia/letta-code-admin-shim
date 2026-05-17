@@ -122,6 +122,9 @@ if (process.env["LETTA_MOCK_MODEL"]) {
 }
 emit(initFrame);
 
+/** @type {any[] | null} */
+let pendingApprovalFrames = null;
+
 /** @param {string} content */
 function emitTurn(content) {
   const traceName = pickTrace(content);
@@ -131,14 +134,68 @@ function emitTurn(content) {
   // tests can observe the time ordering.
   const delay = Number(process.env["LETTA_MOCK_DELAY_MS"] ?? 0);
   let i = 1;
+  const approvalGate = process.env["LETTA_MOCK_APPROVAL_GATE"] === "1";
   const tick = () => {
     if (i >= frames.length) return;
-    emit(rewrite(frames[i]));
+    const frame = rewrite(frames[i]);
+    emit(frame);
     i += 1;
+    if (
+      approvalGate &&
+      frame?.type === "stream_event" &&
+      frame?.event?.message_type === "stop_reason" &&
+      frame?.event?.stop_reason === "requires_approval"
+    ) {
+      pendingApprovalFrames = frames.slice(i).map(rewrite);
+      return;
+    }
     if (delay > 0) setTimeout(tick, delay);
     else tick();
   };
   tick();
+}
+
+/** @param {unknown} reason */
+function emitApprovalDenial(reason) {
+  const now = new Date().toISOString();
+  emit({
+    type: "stream_event",
+    event: {
+      id: `approval-denied-${Date.now()}`,
+      date: now,
+      agent_id: agentId,
+      conversation_id: conversationId,
+      message_type: "assistant_message",
+      content: [{ type: "text", text: `Tool call denied: ${reason}` }],
+      run_id: "local-run-denied",
+      seq_id: 1,
+    },
+    session_id: sessionId,
+    uuid: `approval-denied-${Date.now()}`,
+    timestamp: now,
+  });
+  emit({
+    type: "stream_event",
+    event: { message_type: "stop_reason", stop_reason: "end_turn", run_id: "local-run-denied", seq_id: 2 },
+    session_id: sessionId,
+    uuid: `approval-denied-stop-${Date.now()}`,
+    timestamp: now,
+  });
+  emit({
+    type: "result",
+    subtype: "success",
+    session_id: sessionId,
+    duration_ms: 1,
+    duration_api_ms: 0,
+    num_turns: 1,
+    result: `Tool call denied: ${reason}`,
+    agent_id: agentId,
+    conversation_id: conversationId,
+    run_ids: [],
+    usage: null,
+    uuid: `result-denied-${Date.now()}`,
+    timestamp: now,
+  });
 }
 
 /**
@@ -170,6 +227,23 @@ rl.on("line", (line) => {
   if (!line.trim()) return;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
+  if (msg?.type === "approval" || msg?.type === "approval_response") {
+    const approved = msg?.message?.approve === true || msg?.message?.approvals?.[0]?.approve === true;
+    const directApproval = msg?.approvals?.[0];
+    const approvedViaDirect = directApproval?.type === "tool" || directApproval?.approve === true;
+    const deniedViaDirect = directApproval?.approve === false;
+    const finalApproved = approved || approvedViaDirect;
+    const reason = directApproval?.reason ?? msg?.message?.reason ?? msg?.message?.approvals?.[0]?.reason ?? "approval_response";
+    const frames = pendingApprovalFrames;
+    pendingApprovalFrames = null;
+    if (!frames) return;
+    if (finalApproved && !deniedViaDirect) {
+      for (const frame of frames) emit(frame);
+    } else {
+      emitApprovalDenial(String(reason));
+    }
+    return;
+  }
   if (msg?.type !== "user") return;
   emitTurn(flattenContentToText(msg?.message?.content));
 });

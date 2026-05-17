@@ -34,6 +34,7 @@ import {
   recordRunStep,
   recordRunTool,
   recordApprovalDecision,
+  recordApprovalPolicy,
   loadApprovalScopeCache,
   setRunCancelHandler,
   type RunHandle,
@@ -90,6 +91,7 @@ interface ApprovalDecision {
   scope: ApprovalScope;
   reason: string;
   userId?: string;
+  actionId: string;
 }
 
 /**
@@ -144,7 +146,7 @@ function waitForApprovalDecision(
   toolCallId: string,
 ): Promise<ApprovalDecision> {
   return new Promise((resolve, reject) => {
-    const APPROVAL_TIMEOUT_MS = 30_000;
+    const APPROVAL_TIMEOUT_MS = Number(process.env["A2UI_APPROVAL_TIMEOUT_MS"] ?? 30_000);
     
     const timeoutHandle = setTimeout(() => {
       approvalGates.delete(runId);
@@ -161,6 +163,41 @@ function waitForApprovalDecision(
     
     approvalGates.set(runId, gate);
   });
+}
+
+function approvalRequestToolCall(frame: LettaStreamFrame): { toolName: string; toolCallId: string } | null {
+  const ev = frameEvent(frame);
+  if (!("message_type" in ev) || ev.message_type !== "approval_request_message") return null;
+  if (!("tool_call" in ev) || !ev.tool_call || typeof ev.tool_call !== "object") return null;
+  const toolCall = ev.tool_call as { name?: unknown; tool_call_id?: unknown };
+  if (typeof toolCall.name !== "string" || typeof toolCall.tool_call_id !== "string") return null;
+  return { toolName: toolCall.name, toolCallId: toolCall.tool_call_id };
+}
+
+function writeApprovalResponse(
+  child: ChildProcessWithoutNullStreams | null,
+  toolCallId: string,
+  approved: boolean,
+  reason: string,
+): void {
+  if (!child || child.killed || !child.stdin.writable) return;
+  child.stdin.write(JSON.stringify({
+    type: "approval",
+    approvals: approved
+      ? [{
+          type: "tool",
+          tool_call_id: toolCallId,
+          tool_return: "approved",
+          status: "success",
+          reason,
+        }]
+      : [{
+          type: "approval",
+          tool_call_id: toolCallId,
+          approve: false,
+          reason,
+        }],
+  }) + "\n");
 }
 
 type WorkerFrame = LettaStreamFrame | ExitFrame;
@@ -282,7 +319,7 @@ class Worker {
   lastUsedAt: number;
   spawnedAt: number;
   chain: Promise<unknown>;
-  frameHandler: ((frame: WorkerFrame) => void) | null;
+  frameHandler: ((frame: WorkerFrame) => void | Promise<void>) | null;
   private _onReady: (() => void) | null = null;
 
   constructor({ conversationId, agentId }: WorkerOptions) {
@@ -407,7 +444,7 @@ class Worker {
 
       // Skip system init frames for subsequent turns (none expected) and
       // route everything else to the active turn handler.
-      if (this.frameHandler) this.frameHandler(frame);
+      if (this.frameHandler) void this.frameHandler(frame);
     }
   }
 
@@ -480,7 +517,7 @@ class Worker {
       // auto-approve without user round-trip; Once/Deny require user action.
 
 
-      const approvalScopeCache = loadApprovalScopeCache(runHandle.id);
+      const approvalScopeCache = loadApprovalScopeCache(runHandle.id, this.conversationId);
 
 
 
@@ -506,7 +543,7 @@ class Worker {
       // to the step record. This is what makes per-step token tracking
       // possible (without it we'd only have the run-level aggregate).
       let pendingStepUsage: UsageInput | null = null;
-      const collector = (frame: WorkerFrame): void => {
+      const collector = async (frame: WorkerFrame): Promise<void> => {
         if (frame.type === "__exit__") {
           finished = { exit: true, code: frame.exit_code, stderr: frame.stderr };
           return;
@@ -588,6 +625,76 @@ class Worker {
             pendingStepUsage = null;
           }
         } catch {}
+        const approvalRequest = a2uiCapability ? approvalRequestToolCall(frame) : null;
+        if (approvalRequest) {
+          if (onFrame) {
+            try { onFrame(frame, { runId: runHandle.id }); } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              logLine(`onFrame error: ${msg}`);
+            }
+          }
+          const cached = approvalScopeCache.get(approvalRequest.toolName);
+          const timestamp = new Date().toISOString();
+          if (cached) {
+            recordApprovalDecision(runHandle.id, {
+              action_id: `cached-${approvalRequest.toolCallId}`,
+              tool_name: approvalRequest.toolName,
+              decision: "approve",
+              scope: cached.scope,
+              reason: "cached_approval",
+              timestamp,
+            });
+            writeApprovalResponse(this.child, approvalRequest.toolCallId, true, "cached_approval");
+          } else {
+            try {
+              const decision = await waitForApprovalDecision(
+                runHandle.id,
+                approvalRequest.toolName,
+                approvalRequest.toolCallId,
+              );
+              recordApprovalDecision(runHandle.id, {
+                action_id: decision.actionId,
+                tool_name: approvalRequest.toolName,
+                decision: decision.decision,
+                scope: decision.scope,
+                reason: decision.reason,
+                timestamp,
+                ...(decision.userId ? { user_id: decision.userId } : {}),
+              });
+              if (decision.decision === "approve" && (decision.scope === "Session" || decision.scope === "Forever")) {
+                recordApprovalPolicy(runHandle.id, this.conversationId, {
+                  action_id: decision.actionId,
+                  tool_name: approvalRequest.toolName,
+                  scope: decision.scope,
+                  timestamp,
+                  ...(decision.userId ? { user_id: decision.userId } : {}),
+                });
+                approvalScopeCache.set(approvalRequest.toolName, { scope: decision.scope, timestamp });
+              }
+              writeApprovalResponse(
+                this.child,
+                approvalRequest.toolCallId,
+                decision.decision === "approve",
+                decision.reason,
+              );
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err);
+              recordApprovalDecision(runHandle.id, {
+                action_id: `timeout-${approvalRequest.toolCallId}`,
+                tool_name: approvalRequest.toolName,
+                decision: reason.startsWith("approval_timeout") ? "timeout" : "deny",
+                scope: "Deny",
+                reason,
+                timestamp,
+              });
+              writeApprovalResponse(this.child, approvalRequest.toolCallId, false, reason);
+            }
+          }
+          if (frame.type === "result") {
+            finished = { done: true };
+          }
+          return;
+        }
         if (onFrame) {
           try { onFrame(frame, { runId: runHandle.id }); } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);

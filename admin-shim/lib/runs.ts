@@ -423,6 +423,21 @@ export interface ApprovalDecisionRecord {
   recorded_at: string;
 }
 
+export interface ApprovalScopeCacheEntry {
+  scope: Extract<ApprovalScope, "Session" | "Forever">;
+  timestamp: string;
+}
+
+interface ApprovalPolicyRecord {
+  tool_name: string;
+  scope: Extract<ApprovalScope, "Session" | "Forever">;
+  conversation_id: string | null;
+  timestamp: string;
+  run_id: string;
+  action_id: string;
+  user_id?: string;
+}
+
 /**
  * Record an approval decision to the sidecar JSONL file.
  * Append-only; no read-modify-write race.
@@ -444,12 +459,67 @@ export function recordApprovalDecision(
 }
 
 /**
+ * Persist reusable approval scopes. `Session` is keyed to the conversation;
+ * `Forever` is global. The append-only audit trail remains
+ * approval-decisions.jsonl under the run; this compact JSON file is the fast
+ * policy cache used at turn start.
+ */
+export function recordApprovalPolicy(
+  runId: string,
+  conversationId: string | null | undefined,
+  entry: {
+    action_id: string;
+    tool_name: string;
+    scope: Extract<ApprovalScope, "Session" | "Forever">;
+    timestamp: string;
+    user_id?: string;
+  },
+): void {
+  try {
+    const path = approvalsFile();
+    const existing = readApprovalPolicies(path);
+    const nextRecord: ApprovalPolicyRecord = {
+      tool_name: entry.tool_name,
+      scope: entry.scope,
+      conversation_id: entry.scope === "Session" ? conversationId ?? null : null,
+      timestamp: entry.timestamp,
+      run_id: runId,
+      action_id: entry.action_id,
+      ...(entry.user_id ? { user_id: entry.user_id } : {}),
+    };
+    const filtered = existing.filter((record) => {
+      if (record.tool_name !== nextRecord.tool_name) return true;
+      if (nextRecord.scope === "Forever") return record.scope !== "Forever";
+      return !(record.scope === "Session" && record.conversation_id === nextRecord.conversation_id);
+    });
+    mkdirSync(storageDir(), { recursive: true });
+    writeFileSync(path, JSON.stringify([...filtered, nextRecord], null, 2) + "\n");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-policy write failed for ${runId}: ${msg}`);
+  }
+}
+
+/**
  * Load approval decisions from sidecar and build a scope cache.
  * Returns a map of tool_name → { scope, timestamp } for Session/Forever decisions.
  * Used at turn-start to auto-approve cached decisions without user round-trip.
  */
-export function loadApprovalScopeCache(runId: string): Map<string, { scope: ApprovalScope; timestamp: string }> {
-  const cache = new Map<string, { scope: ApprovalScope; timestamp: string }>();
+export function loadApprovalScopeCache(
+  runId: string,
+  conversationId: string | null = null,
+): Map<string, ApprovalScopeCacheEntry> {
+  const cache = new Map<string, ApprovalScopeCacheEntry>();
+  try {
+    for (const record of readApprovalPolicies(approvalsFile())) {
+      if (record.scope === "Forever" || record.conversation_id === conversationId) {
+        cache.set(record.tool_name, { scope: record.scope, timestamp: record.timestamp });
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-policy cache load failed: ${msg}`);
+  }
   try {
     const path = approvalDecisionsFile(runId);
     if (!existsSync(path)) return cache;
@@ -478,7 +548,7 @@ export function loadApprovalScopeCache(runId: string): Map<string, { scope: Appr
           
           // Only cache approve decisions with Session/Forever scope
           if (decision === "approve" && (scope === "Session" || scope === "Forever")) {
-            cache.set(toolName, { scope: scope as ApprovalScope, timestamp });
+            cache.set(toolName, { scope, timestamp });
           }
         }
       } catch {
@@ -490,6 +560,49 @@ export function loadApprovalScopeCache(runId: string): Map<string, { scope: Appr
     console.error(`[runs] approval-scope cache load failed for ${runId}: ${msg}`);
   }
   return cache;
+}
+
+function readApprovalPolicies(path: string): ApprovalPolicyRecord[] {
+  if (!existsSync(path)) return [];
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!Array.isArray(parsed)) return [];
+  const records: ApprovalPolicyRecord[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null) continue;
+    const rec = item as Record<string, unknown>;
+    const toolName = rec["tool_name"];
+    const scope = rec["scope"];
+    const timestamp = rec["timestamp"];
+    const runId = rec["run_id"];
+    const actionId = rec["action_id"];
+    const conversationId = rec["conversation_id"];
+    const userId = rec["user_id"];
+    if (
+      typeof toolName !== "string" ||
+      (scope !== "Session" && scope !== "Forever") ||
+      typeof timestamp !== "string" ||
+      typeof runId !== "string" ||
+      typeof actionId !== "string" ||
+      (conversationId !== null && typeof conversationId !== "string") ||
+      (userId !== undefined && typeof userId !== "string")
+    ) {
+      continue;
+    }
+    records.push({
+      tool_name: toolName,
+      scope,
+      conversation_id: conversationId,
+      timestamp,
+      run_id: runId,
+      action_id: actionId,
+      ...(userId ? { user_id: userId } : {}),
+    });
+  }
+  return records;
+}
+
+function approvalsFile(): string {
+  return join(storageDir(), "approvals.json");
 }
 
 function approvalDecisionsFile(runId: string): string {

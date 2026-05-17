@@ -47,12 +47,30 @@ function findAssistantFrames(frames: { type: string }[]): AssistantFrame[] {
   return frames.filter((f) => f.type === "assistant_message") as AssistantFrame[];
 }
 
-async function setupAuthedA2ui(t: { after: (fn: () => unknown) => void }, opts: { negotiate?: boolean } = {}) {
+async function waitForFrameAfter(
+  conn: MobileWsHandle,
+  before: number,
+  type: string,
+  timeoutMs = WS_TIMEOUT_MS,
+): Promise<{ type: string; [k: string]: unknown }> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const found = conn.frames.slice(before).find((frame) => frame.type === type);
+    if (found) return found;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`waitForFrameAfter(${type}) timed out after ${timeoutMs}ms`);
+}
+
+async function setupAuthedA2ui(
+  t: { after: (fn: () => unknown) => void },
+  opts: { negotiate?: boolean; env?: Record<string, string | undefined> } = {},
+) {
   const negotiate = opts.negotiate !== false;
   const shim = await startShim({
     env: negotiate
-      ? { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" }
-      : { A2UI_ENABLED: "0" },
+      ? { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic", ...opts.env }
+      : { A2UI_ENABLED: "0", ...opts.env },
   });
   t.after(() => shim.stop());
   const agentId = seedAgent(shim.stateDir, { id: `agent-a2ui-${Date.now()}` });
@@ -135,6 +153,162 @@ test("a2ui-ws: a2ui_frame is suppressed when capability is not negotiated", asyn
   // Raw tags pass through to mobile as plain text (mobile dedup handles it).
   const assistantText = findAssistantFrames(turn).map((f) => f.content).join("");
   assert.match(assistantText, /<a2ui-json>/);
+});
+
+test("a2ui-ws: approval user_action resolves gated tool and records approval decision", async (t) => {
+  const { shim, conn, agentId, convId } = await setupAuthedA2ui(t, {
+    env: { LETTA_MOCK_APPROVAL_GATE: "1", LETTA_MOCK_FORCE_TRACE: "bash-tool" },
+  });
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "run bash echo capturetest",
+    otid: "cm-a2ui-approval-once",
+  });
+  const toolCall = await conn.waitFor("tool_call_message", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+    run_id?: string;
+    tool_call?: { tool_call_id?: string };
+  };
+  assert.ok(toolCall.run_id, "tool_call_message must carry active run_id");
+  assert.equal(toolCall.tool_call?.tool_call_id, "toolu_01QyUwQvFzwz1AvaCQhodr2A");
+
+  conn.send({
+    type: "user_action",
+    run_id: toolCall.run_id,
+    surface_id: "approval-1",
+    name: "tool_approval_choice",
+    context: { tool_call_id: toolCall.tool_call?.tool_call_id, scope: "Once" },
+    action_id: "act-approval-once",
+  });
+  const ack = await conn.waitFor("user_action_ack", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status?: string };
+  assert.equal(ack.status, "accepted");
+  const turnDone = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status?: string };
+  assert.equal(turnDone.status, "completed");
+
+  const path = join(shim.stateDir, "runs", toolCall.run_id, "approval-decisions.jsonl");
+  assert.ok(existsSync(path), "approval decision sidecar must be written");
+  const decisions = readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.deepEqual(decisions.map((d) => d["decision"]), ["approve"]);
+  assert.equal(decisions[0]?.["scope"], "Once");
+  assert.equal(decisions[0]?.["action_id"], "act-approval-once");
+});
+
+test("a2ui-ws: approval timeout auto-denies and records timeout decision", async (t) => {
+  const { shim, conn, agentId, convId } = await setupAuthedA2ui(t, {
+    env: {
+      LETTA_MOCK_APPROVAL_GATE: "1",
+      LETTA_MOCK_FORCE_TRACE: "bash-tool",
+      A2UI_APPROVAL_TIMEOUT_MS: "100",
+    },
+  });
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "run bash echo capturetest",
+    otid: "cm-a2ui-approval-timeout",
+  });
+  const toolCall = await conn.waitFor("tool_call_message", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { run_id?: string };
+  assert.ok(toolCall.run_id, "tool_call_message must carry active run_id");
+  const turnDone = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status?: string };
+  assert.equal(turnDone.status, "completed");
+
+  const path = join(shim.stateDir, "runs", toolCall.run_id, "approval-decisions.jsonl");
+  assert.ok(existsSync(path), "timeout decision sidecar must be written");
+  const decisions = readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.deepEqual(decisions.map((d) => d["decision"]), ["timeout"]);
+  assert.equal(decisions[0]?.["scope"], "Deny");
+});
+
+test("a2ui-ws: approval scope=Session auto-approves the next matching tool call", async (t) => {
+  const { shim, conn, agentId, convId } = await setupAuthedA2ui(t, {
+    env: { LETTA_MOCK_APPROVAL_GATE: "1", LETTA_MOCK_FORCE_TRACE: "bash-tool" },
+  });
+
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "run bash echo capturetest",
+    otid: "cm-a2ui-session-1",
+  });
+  const firstToolCall = await conn.waitFor("tool_call_message", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+    run_id?: string;
+    tool_call?: { tool_call_id?: string };
+  };
+  assert.ok(firstToolCall.run_id, "first tool call must carry run_id");
+  conn.send({
+    type: "user_action",
+    run_id: firstToolCall.run_id,
+    surface_id: "approval-1",
+    name: "tool_approval_choice",
+    context: { tool_call_id: firstToolCall.tool_call?.tool_call_id, scope: "Session" },
+    action_id: "act-approval-session",
+  });
+  await conn.waitFor("user_action_ack", { timeoutMs: WS_TIMEOUT_MS });
+  await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS });
+
+  const beforeSecond = conn.frames.length;
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "run bash echo capturetest again",
+    otid: "cm-a2ui-session-2",
+  });
+  await waitForFrameAfter(conn, beforeSecond, "turn_done");
+  const secondTurn = conn.frames.slice(beforeSecond);
+  const secondToolCall = secondTurn.find((frame) => frame.type === "tool_call_message") as unknown as { run_id?: string } | undefined;
+  assert.ok(secondToolCall, "second turn must emit a tool call");
+  assert.ok(secondToolCall.run_id, "second tool call must carry run_id");
+  const turnDone = secondTurn.find((frame) => frame.type === "turn_done") as unknown as { status?: string } | undefined;
+  assert.ok(turnDone, "second turn must finish");
+  assert.equal(turnDone.status, "completed");
+
+  const approvalsJson = JSON.parse(readFileSync(join(shim.stateDir, "approvals.json"), "utf8")) as Array<Record<string, unknown>>;
+  assert.equal(approvalsJson[0]?.["scope"], "Session");
+  const secondDecisionPath = join(shim.stateDir, "runs", secondToolCall.run_id, "approval-decisions.jsonl");
+  const secondDecisions = readFileSync(secondDecisionPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(secondDecisions[0]?.["reason"], "cached_approval");
+  assert.equal(secondDecisions[0]?.["scope"], "Session");
+});
+
+test("a2ui-ws: approval scope=Deny refuses the gated tool and records denial", async (t) => {
+  const { shim, conn, agentId, convId } = await setupAuthedA2ui(t, {
+    env: { LETTA_MOCK_APPROVAL_GATE: "1", LETTA_MOCK_FORCE_TRACE: "bash-tool" },
+  });
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "run bash echo capturetest",
+    otid: "cm-a2ui-deny",
+  });
+  const toolCall = await conn.waitFor("tool_call_message", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+    run_id?: string;
+    tool_call?: { tool_call_id?: string };
+  };
+  assert.ok(toolCall.run_id, "tool call must carry run_id");
+  conn.send({
+    type: "user_action",
+    run_id: toolCall.run_id,
+    surface_id: "approval-1",
+    name: "tool_approval_choice",
+    context: { tool_call_id: toolCall.tool_call?.tool_call_id, scope: "Deny", reason: "user cancelled" },
+    action_id: "act-approval-deny",
+  });
+  await conn.waitFor("user_action_ack", { timeoutMs: WS_TIMEOUT_MS });
+  const assistant = await conn.waitFor("assistant_message", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { content?: string };
+  assert.match(assistant.content ?? "", /Tool call denied: user cancelled/);
+  const turnDone = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status?: string };
+  assert.equal(turnDone.status, "completed");
+
+  const path = join(shim.stateDir, "runs", toolCall.run_id, "approval-decisions.jsonl");
+  const decisions = readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  assert.equal(decisions[0]?.["decision"], "deny");
+  assert.equal(decisions[0]?.["scope"], "Deny");
+  assert.equal(decisions[0]?.["reason"], "user cancelled");
 });
 
 test("a2ui-ws: user_action frame returns user_action_ack and is recorded to the run sidecar", async (t) => {

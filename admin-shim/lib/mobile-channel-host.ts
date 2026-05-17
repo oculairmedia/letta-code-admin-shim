@@ -20,7 +20,7 @@ import { pathToFileURL } from "node:url";
 import type { IncomingMessage } from "node:http";
 
 import { reshapeFrame } from "./chat.js";
-import { cancelRun, getAgentPool } from "./agent-pool.js";
+import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
 import {
   A2uiStreamSplitter,
@@ -28,7 +28,7 @@ import {
   type A2uiBlock,
   type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
-import { createRun, recordA2uiUserAction } from "./runs.js";
+import { createRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
 import {
   findUnmappedTailUserMessageId,
   resolveConversationId,
@@ -451,7 +451,57 @@ function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
     context: action.context ?? {},
     action_id: actionId,
   });
+
+  const approvalDecision = approvalDecisionFromAction(action, actionId);
+  if (approvalDecision && action.run_id) {
+    resolveApprovalGate(action.run_id, approvalDecision);
+  }
   return { action_id: actionId, status: "accepted" };
+}
+
+function approvalDecisionFromAction(
+  action: A2uiUserAction,
+  actionId: string,
+): { decision: "approve" | "deny"; scope: ApprovalScope; reason: string; userId?: string; actionId: string } | null {
+  if (action.name !== "tool_approval_choice") return null;
+  const context = action.context;
+  const rawScope = typeof context["scope"] === "string" ? context["scope"] : "Once";
+  const normalizedScope = normalizeApprovalScope(rawScope);
+  if (!normalizedScope) return null;
+  const rawDecision = context["decision"];
+  const rawApprove = context["approve"];
+  const decision: "approve" | "deny" =
+    normalizedScope === "Deny" || rawDecision === "deny" || rawApprove === false
+      ? "deny"
+      : "approve";
+  const reason = typeof context["reason"] === "string"
+    ? context["reason"]
+    : decision === "deny"
+      ? "user_denied"
+      : "user_approved";
+  const userId = typeof context["user_id"] === "string" ? context["user_id"] : undefined;
+  return {
+    decision,
+    scope: normalizedScope,
+    reason,
+    actionId,
+    ...(userId ? { userId } : {}),
+  };
+}
+
+function normalizeApprovalScope(value: string): ApprovalScope | null {
+  switch (value.toLowerCase()) {
+    case "once":
+      return "Once";
+    case "session":
+      return "Session";
+    case "forever":
+      return "Forever";
+    case "deny":
+      return "Deny";
+    default:
+      return null;
+  }
 }
 
 /**
