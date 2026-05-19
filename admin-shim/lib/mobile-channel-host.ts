@@ -212,6 +212,7 @@ async function bridgeSendMessage(
     widget_types_seen: [],
     splitter_overhead_ms: 0,
   };
+  let a2uiFramesDelivered = 0;
   const a2uiWidgetsSeen = new Set<string>();
   const truncateA2uiRaw = (raw: string): string => raw.length > 200 ? `${raw.slice(0, 200)}…` : raw;
   const mergeA2uiMetrics = (metrics: A2uiMetrics): void => {
@@ -252,6 +253,10 @@ async function bridgeSendMessage(
     parse_error: block.parseError,
     validation_error: block.validationError,
   });
+  const emitA2uiFrame = (frame: A2uiFrameMessage): void => {
+    a2uiFramesDelivered += 1;
+    onFrame(frame);
+  };
 
   // Smoothing intentionally NOT done server-side. lcp-cv3 contract:
   // forward every chunk as a pure delta. The mobile renderer (Android
@@ -327,7 +332,7 @@ async function bridgeSendMessage(
           // Forward each completed A2UI block as a host-synthesized frame.
           const runId = (reshaped as { run_id?: string | null }).run_id ?? null;
           for (const block of split.frames) {
-            onFrame(buildA2uiFrame(block, otid ?? null, runId));
+            emitA2uiFrame(buildA2uiFrame(block, otid ?? null, runId));
           }
           return;
         }
@@ -375,7 +380,7 @@ async function bridgeSendMessage(
         event: "turn_metrics",
         run_id: runHandle.id,
         agent_id: effectiveAgentId,
-        total_frames: a2uiMetrics.total_frames,
+        total_frames: a2uiFramesDelivered,
         parse_ok: a2uiMetrics.parse_ok,
         parse_err: a2uiMetrics.parse_err,
         validate_ok: a2uiMetrics.validate_ok,
