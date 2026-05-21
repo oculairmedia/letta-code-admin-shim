@@ -8,7 +8,7 @@
  *       first_seen_at: ISO date,
  *       last_seen_at: ISO date,
  *       client_version: string,
- *       token_hash: string  // SHA-256 of the accepted token, for audit
+ *       token_hash: string | null  // SHA-256 of accepted token when present
  *     }
  *
  * Phase 2 will add cursor, pairings, push-registration files alongside.
@@ -29,6 +29,7 @@ function devicePath(deviceId) {
 }
 
 function hashToken(token) {
+  if (typeof token !== "string" || token.length === 0) return null;
   return createHash("sha256").update(token, "utf8").digest("hex").slice(0, 16);
 }
 

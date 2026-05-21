@@ -21,6 +21,7 @@ Read + chat coverage proven against the migrated Meridian agent.
 | `/v1/agents/{id}/core-memory/blocks` | GET | ✓ |
 | `/v1/blocks`, `/v1/blocks/{id}` | GET | ✓ |
 | `/v1/models` | GET | ✓ (single entry, expand later) |
+| `/v1/crons`, `/v1/crons/{id}`, `/v1/crons/scheduler` | GET | ✓ read-only mirror — mutations go over the mobile WS, see [§ Scheduled prompts](#scheduled-prompts) |
 | anything else | * | 404 — mobile UI degrades gracefully |
 
 ## Run
@@ -68,6 +69,42 @@ admin-shim/
 - Auth — currently open; gate behind a bearer token once we wire up a real client
 - The "cached_input_tokens" returned in usage right now includes the entire
   system prompt + history. Phase 2 cache reporting tweaks.
+
+## Durable execution
+
+The shim survives partial failures — mobile network drops, app
+restarts, shim restarts, cron downtime — without losing user-visible
+state. Four primitives:
+
+| Primitive | What it gives you |
+|---|---|
+| Per-run frame log | `state/runs/<id>/frames.jsonl` — every WS frame appended with a monotonic `seq`. Replayable on reconnect. |
+| `subscribe(run, cursor)` WS frame | Reconnecting clients resume from a known `seq` — see [§11 of MOBILE_WS_PROTOCOL.md](docs/MOBILE_WS_PROTOCOL.md#11-reconnect-resume). |
+| Worker survives WS disconnect | A dropped socket does NOT cancel the in-flight letta-code worker. The turn continues to disk. |
+| Cron `last_tick_at` + catch-up | Scheduler restart computes a catch-up window and fires missed prompts exactly once (1h cap default). |
+
+Full design + on-disk layout + non-goals:
+[`docs/DURABLE_EXECUTION.md`](docs/DURABLE_EXECUTION.md).
+
+## Scheduled prompts
+
+The shim exposes a cron-style "scheduled prompt" feature so an agent
+can fire on a schedule (every 5 minutes, every Monday at 8am, a
+one-shot in 30 minutes, etc). Writes go over the mobile WS
+(`/shim/v1/mobile`), reads are mirrored to plain HTTP.
+
+| Surface | Frames / routes |
+|---|---|
+| WS frames | `cron_list` / `cron_add` / `cron_get` / `cron_delete` / `cron_delete_all` (+ `*_response` replies). Live `crons_updated` push on every mutation, scheduler fire, and external write. |
+| REST (read-only) | `GET /v1/crons` (filters: `?agent_id=` / `?conversation_id=`), `GET /v1/crons/{id}`, `GET /v1/crons/scheduler` |
+| Store | `$LETTA_HOME/crons.json` — shared with the bundled `letta cron` CLI so the agent's self-schedule skill interoperates. |
+| Scheduler | In-process under the shim's systemd unit (one process holds the lease at a time). Toggle with `SHIM_CRON_ENABLED=0` to opt out. |
+
+Full wire contract + 19-field `CronTask` schema:
+[`docs/MOBILE_WS_PROTOCOL.md` §10](docs/MOBILE_WS_PROTOCOL.md#10-cron--scheduled-prompts).
+
+Mutation routing rationale (and why there's no `POST /v1/crons`):
+[`docs/DIVERGENCE.md` §5](docs/DIVERGENCE.md).
 
 ## Known caveats
 

@@ -31,6 +31,23 @@ export const CLIENT_FRAMES = Object.freeze([
                   // (e.g. ToolApprovalCard scope choice). Routed back into
                   // the host's user-action sidecar; ack arrives as a
                   // `user_action_ack` frame.
+  "subscribe", // { run_id, cursor? }
+                  // lcp-p74.2: replay+live-tail subscription for an in-flight
+                  // or completed run. Cursor is the last `seq` the client has
+                  // received (0 or omitted = from start). Server replays each
+                  // frame with seq > cursor wrapped in a `subscribe_frame`
+                  // envelope, then continues live-tailing new appends. When
+                  // the run reaches a terminal state and the tail catches up,
+                  // server emits `subscribe_done`.
+  "cron_list", // { request_id?, agent_id?, conversation_id? } — read crons.json
+  "cron_add", // { request_id?, agent_id, conversation_id?, name, description,
+              //   prompt, recurring, cron? | every? | at?, timezone? }
+              // Exactly one of cron/every/at must be supplied. `every` accepts
+              // "5m"/"2h"/"1d"; `at` accepts "3pm"/"in 30m". Server resolves
+              // to a 5-field cron + optional scheduled_for.
+  "cron_get", // { request_id?, task_id }
+  "cron_delete", // { request_id?, task_id }
+  "cron_delete_all", // { request_id?, agent_id }
 ]);
 
 export const SERVER_FRAMES = Object.freeze([
@@ -42,8 +59,10 @@ export const SERVER_FRAMES = Object.freeze([
                   // multiple a2ui_frame envelopes, not as a top-level array.
                   // `ok=false` carries diagnostic fields the client may
                   // surface in a debug panel.
-  "user_action_ack", // { action_id, status, reason? }
+  "user_action_ack", // { action_id, status, reason?, routed_as? }
                   // Ack for a `user_action` frame.
+  "user_action_outcome", // { frame_id, action_id?, outcome, detail? }
+                  // UI-facing outcome for a `user_action` frame.
   "error", // { code, message, turn_id? }
   "ping", // (no extras)
   "turn_started", // { agent_id, conversation_id, turn_id, run_id }
@@ -56,6 +75,27 @@ export const SERVER_FRAMES = Object.freeze([
   "turn_done", // { turn_id, run_id, status }
                   // Sentinel emitted AFTER stamping/sidecar writes so mobile
                   // can safely GET /messages without racing the disk.
+  "subscribe_frame", // { run_id, seq, frame }
+                  // lcp-p74.2: a replayed frame from a run's frames.jsonl
+                  // (or a live-tailed new append). `frame` is the BridgeFrame
+                  // shape the host emitted at write time; the client renders
+                  // it the same way it would a live frame of the same
+                  // `message_type`. `seq` is the cursor the client should
+                  // remember for resume.
+  "subscribe_done", // { run_id, last_seq, status }
+                  // lcp-p74.2: subscription complete because the run has
+                  // reached a terminal state (completed/failed/cancelled/
+                  // expired) AND the tail has caught up. `last_seq` is the
+                  // largest seq the server has emitted for this subscription.
+  "cron_list_response", // { request_id?, success, tasks?, error? }
+  "cron_add_response", // { request_id?, success, task?, error?, warning? }
+  "cron_get_response", // { request_id?, success, task?, error? }
+  "cron_delete_response", // { request_id?, success, error? }
+  "cron_delete_all_response", // { request_id?, success, count?, error? }
+  "crons_updated", // { reason, tasks_active, at }
+                  // Server push when crons.json changes. Reasons: client_mutation,
+                  // scheduler_write (a tick fired a task), external_write (the
+                  // bundled letta CLI or self-schedule skill wrote the file).
 ]);
 
 export const ERROR_CODES = Object.freeze({

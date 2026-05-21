@@ -173,7 +173,7 @@ test("a2ui-ws: approval user_action resolves gated tool and records approval dec
   assert.ok(toolCall.run_id, "tool_call_message must carry active run_id");
   assert.equal(toolCall.tool_call?.tool_call_id, "toolu_01QyUwQvFzwz1AvaCQhodr2A");
 
-  conn.send({
+  const actionFrame = conn.send({
     type: "user_action",
     run_id: toolCall.run_id,
     surface_id: "approval-1",
@@ -183,6 +183,17 @@ test("a2ui-ws: approval user_action resolves gated tool and records approval dec
   });
   const ack = await conn.waitFor("user_action_ack", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status?: string };
   assert.equal(ack.status, "accepted");
+  const outcome = await conn.waitFor("user_action_outcome", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+    frame_id?: string;
+    action_id?: string;
+    outcome?: string;
+    detail?: { action_id?: string; routed_as?: string };
+  };
+  assert.equal(outcome.frame_id, actionFrame["id"]);
+  assert.equal(outcome.action_id, "act-approval-once");
+  assert.equal(outcome.outcome, "matched_approval");
+  assert.equal(outcome.detail?.action_id, "act-approval-once");
+  assert.equal(outcome.detail?.routed_as, "approval");
   const turnDone = await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { status?: string };
   assert.equal(turnDone.status, "completed");
 
@@ -311,6 +322,115 @@ test("a2ui-ws: approval scope=Deny refuses the gated tool and records denial", a
   assert.equal(decisions[0]?.["reason"], "user cancelled");
 });
 
+test("a2ui-ws: non-approval user_action injects a synthetic agent turn", async (t) => {
+  const { shim, conn, agentId, convId } = await setupAuthedA2ui(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "show approval card",
+    otid: "cm-a2ui-action-seed",
+  });
+  const seedTurn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const turnStarted = seedTurn.find((frame) => frame.type === "turn_started") as unknown as { run_id?: string } | undefined;
+  assert.ok(turnStarted?.run_id, "seed turn must expose a run_id for action correlation");
+
+  const beforeAction = conn.frames.length;
+  const actionFrame = conn.send({
+    type: "user_action",
+    run_id: turnStarted.run_id,
+    surface_id: "final-roundtrip-test-btn",
+    component_id: "primary-submit",
+    name: "a2ui.final.submit",
+    context: { componentId: "primary-submit", value: "confirmed" },
+    action_id: "act-non-approval-1",
+  });
+  const ack = await waitForFrameAfter(conn, beforeAction, "user_action_ack") as unknown as { status?: string; routed_as?: string };
+  assert.equal(ack.status, "accepted");
+  assert.equal(ack.routed_as, "synthetic_input");
+  const outcome = await waitForFrameAfter(conn, beforeAction, "user_action_outcome") as unknown as {
+    frame_id?: string;
+    action_id?: string;
+    outcome?: string;
+    detail?: { action_id?: string; routed_as?: string; synthetic_turn_id?: string };
+  };
+  assert.equal(outcome.frame_id, actionFrame["id"]);
+  assert.equal(outcome.action_id, "act-non-approval-1");
+  assert.equal(outcome.outcome, "injected_as_input");
+  assert.equal(outcome.detail?.action_id, "act-non-approval-1");
+  assert.equal(outcome.detail?.routed_as, "synthetic_input");
+  assert.match(outcome.detail?.synthetic_turn_id ?? "", /^turn-/);
+  await waitForFrameAfter(conn, beforeAction, "turn_done");
+  const actionTurn = conn.frames.slice(beforeAction);
+  assert.ok(actionTurn.some((frame) => frame.type === "turn_started"), "synthetic action must create a new turn");
+  assert.ok(actionTurn.some((frame) => frame.type === "assistant_message"), "agent must respond to synthetic action input");
+
+  const sidecar = join(shim.stateDir, "runs", turnStarted.run_id, "user-actions.jsonl");
+  const entries = readFileSync(sidecar, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  const actionEntry = entries.find((entry) => entry["action_id"] === "act-non-approval-1");
+  assert.ok(actionEntry, "non-approval action must still be recorded to sidecar");
+  assert.equal(actionEntry["routed_as"], "synthetic_input");
+  assert.equal(actionEntry["component_id"], "primary-submit");
+});
+
+test("a2ui-ws: non-approval user_action without run_id uses session run fallback", async (t) => {
+  const { shim, conn, agentId, convId } = await setupAuthedA2ui(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "show approval card",
+    otid: "cm-a2ui-action-fallback-seed",
+  });
+  const seedTurn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const turnStarted = seedTurn.find((frame) => frame.type === "turn_started") as unknown as { run_id?: string } | undefined;
+  assert.ok(turnStarted?.run_id, "seed turn must expose a run_id for session fallback");
+
+  const beforeAction = conn.frames.length;
+  const actionFrame = conn.send({
+    type: "user_action",
+    run_id: null,
+    surface_id: "form-demo-1",
+    name: "submit",
+    context: { value: "confirmed" },
+    action_id: "act-no-run-id-fallback",
+  });
+  const ack = await waitForFrameAfter(conn, beforeAction, "user_action_ack") as unknown as { status?: string; routed_as?: string };
+  assert.equal(ack.status, "accepted");
+  assert.equal(ack.routed_as, "synthetic_input");
+  const outcome = await waitForFrameAfter(conn, beforeAction, "user_action_outcome") as unknown as {
+    frame_id?: string;
+    action_id?: string;
+    outcome?: string;
+    detail?: { action_id?: string; routed_as?: string; synthetic_turn_id?: string; run_id?: string | null };
+  };
+  assert.equal(outcome.frame_id, actionFrame["id"]);
+  assert.equal(outcome.action_id, "act-no-run-id-fallback");
+  assert.equal(outcome.outcome, "injected_as_input");
+  assert.equal(outcome.detail?.routed_as, "synthetic_input");
+  assert.match(outcome.detail?.synthetic_turn_id ?? "", /^turn-/);
+  const syntheticTurnStarted = await waitForFrameAfter(conn, beforeAction, "turn_started") as unknown as {
+    agent_id?: string;
+    conversation_id?: string;
+    source?: string;
+    turn_id?: string;
+    run_id?: string | null;
+  };
+  assert.equal(syntheticTurnStarted.agent_id, agentId);
+  assert.equal(syntheticTurnStarted.conversation_id, convId);
+  assert.equal(syntheticTurnStarted.source, "a2ui_user_action");
+  assert.equal(syntheticTurnStarted.turn_id, outcome.detail?.synthetic_turn_id);
+  assert.ok(syntheticTurnStarted.run_id, "fallback-routed synthetic turn must expose its new run_id");
+  await waitForFrameAfter(conn, beforeAction, "turn_done");
+
+  const sidecar = join(shim.stateDir, "runs", turnStarted.run_id, "user-actions.jsonl");
+  const entries = readFileSync(sidecar, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  const actionEntry = entries.find((entry) => entry["action_id"] === "act-no-run-id-fallback");
+  assert.ok(actionEntry, "fallback action must still be recorded against the session's last run");
+  assert.equal(actionEntry["routed_as"], "synthetic_input");
+  assert.equal(actionEntry["name"], "submit");
+});
+
 test("a2ui-ws: user_action frame returns user_action_ack and is recorded to the run sidecar", async (t) => {
   const { shim, conn, agentId, convId } = await setupAuthedA2ui(t);
   // Drive one turn so a run exists, then fire the user_action against its id.
@@ -327,7 +447,7 @@ test("a2ui-ws: user_action frame returns user_action_ack and is recorded to the 
   const runId = (a2uiFrame?.run_id ?? turnStarted?.run_id) as string | undefined;
   assert.ok(runId, "run_id must surface during the turn");
 
-  conn.send({
+  const actionFrame = conn.send({
     type: "user_action",
     run_id: runId!,
     turn_id: turnStarted?.run_id ?? null,
@@ -341,6 +461,15 @@ test("a2ui-ws: user_action frame returns user_action_ack and is recorded to the 
   };
   assert.equal(ack.action_id, "act-test-1");
   assert.equal(ack.status, "accepted");
+  const outcome = await conn.waitFor("user_action_outcome", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+    frame_id?: string;
+    outcome?: string;
+    detail?: { action_id?: string; routed_as?: string };
+  };
+  assert.equal(outcome.frame_id, actionFrame["id"]);
+  assert.equal(outcome.outcome, "recorded_only");
+  assert.equal(outcome.detail?.action_id, "act-test-1");
+  assert.equal(outcome.detail?.routed_as, "recorded_only");
 
   // Sidecar verification — locate the run dir under the shim's backend
   // and confirm user-actions.jsonl carries the recorded action.
@@ -375,12 +504,20 @@ test("a2ui-ws: user_action frame returns user_action_ack and is recorded to the 
 
 test("a2ui-ws: user_action with missing name → protocol_violation, no close", async (t) => {
   const { conn, agentId, convId } = await setupAuthedA2ui(t);
-  conn.send({
+  const actionFrame = conn.send({
     type: "user_action",
     run_id: null,
     surface_id: "x",
     context: {},
   });
+  const outcome = await conn.waitFor("user_action_outcome", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+    frame_id?: string;
+    outcome?: string;
+    detail?: { reason?: string };
+  };
+  assert.equal(outcome.frame_id, actionFrame["id"]);
+  assert.equal(outcome.outcome, "rejected");
+  assert.match(outcome.detail?.reason ?? "", /non-empty name/);
   const err = (await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS })) as unknown as { code: string };
   assert.equal(err.code, "protocol_violation");
   assert.equal(conn.closed, false, "socket must remain open after a soft protocol error");

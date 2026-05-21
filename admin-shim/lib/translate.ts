@@ -409,6 +409,52 @@ export function localMessageToConversationMessages(
     ];
   }
 
+  // lcp-kul: post-pi-backup letta-code (0.25.x) writes each tool result as
+  // a TOP-LEVEL row with role="toolResult" and top-level toolCallId /
+  // toolName / isError fields. The text payload lives in content[] (mapped
+  // to parts[] by store.normalizeMessage). Project one such row to one
+  // tool_return_message; without this branch the row falls through to the
+  // assistant-walk below and gets rendered as an assistant text bubble.
+  if (role === "toolResult") {
+    const top = localMsg as LocalMessage & {
+      toolCallId?: unknown;
+      toolName?: unknown;
+      isError?: unknown;
+    };
+    const callId = typeof top.toolCallId === "string" ? top.toolCallId : "";
+    const toolName = typeof top.toolName === "string" && top.toolName ? top.toolName : null;
+    const isError = top.isError === true;
+    const returnText = partsToText(parts);
+    const status = isError ? "error" : "success";
+    const tr: ToolReturn = {
+      tool_call_id: callId,
+      status,
+      stdout: null,
+      stderr: null,
+      func_response: returnText,
+      type: "tool",
+    };
+    const trMsg: ToolReturnMessage = {
+      id: callId ? `toolreturn-${callId}` : localMsg.id,
+      date: withTypeOffset(created, "tool_return_message"),
+      name: toolName,
+      message_type: "tool_return_message",
+      otid: projectedOtid,
+      sender_id: null,
+      step_id: null,
+      is_err: isError ? true : null,
+      seq_id: null,
+      run_id: projectedRunId,
+      tool_call_id: callId,
+      status,
+      tool_return: returnText,
+      stdout: null,
+      stderr: null,
+      tool_returns: [tr],
+    };
+    return [trMsg];
+  }
+
   // Assistant / tool: walk parts and emit per-part wire messages, grouping
   // consecutive text parts.
   const out: LettaMessage[] = [];
@@ -469,18 +515,33 @@ export function localMessageToConversationMessages(
       continue;
     }
 
-    if (part.type === "tool-call") {
+    // Legacy bare `tool-call` part AND new-shape camelCase `toolCall` part
+    // (lcp-kul: letta-code 0.25.x writes the latter — `id` instead of
+    // `toolCallId`, object args instead of string args).
+    if (part.type === "tool-call" || part.type === "toolCall") {
       flushText();
       // The native tool-${string} variant overlaps "tool-call" structurally in
-      // TS's template-literal union. Narrow via runtime field probe.
-      const tcPart = part as { arguments?: unknown; name?: unknown; toolCallId?: unknown };
+      // TS's template-literal union. Narrow via runtime field probe. The new
+      // `toolCall` variant uses `id` instead of `toolCallId`; accept either.
+      const tcPart = part as {
+        arguments?: unknown;
+        name?: unknown;
+        toolCallId?: unknown;
+        id?: unknown;
+      };
       const argsRaw = tcPart.arguments;
       const argsStr =
         typeof argsRaw === "string" ? argsRaw : JSON.stringify(argsRaw ?? {});
+      const callId =
+        typeof tcPart.toolCallId === "string" && tcPart.toolCallId
+          ? tcPart.toolCallId
+          : typeof tcPart.id === "string" && tcPart.id
+            ? tcPart.id
+            : "";
       const tc: ToolCall = {
         name: typeof tcPart.name === "string" && tcPart.name ? tcPart.name : "tool",
         arguments: argsStr,
-        tool_call_id: typeof tcPart.toolCallId === "string" ? tcPart.toolCallId : "",
+        tool_call_id: callId,
       };
       const tcMsg: ToolCallMessage = {
         // Use the same `toolcall-${id}` id format the stream reshape
@@ -620,6 +681,24 @@ export function localMessageToConversationMessages(
       out.push(trMsg);
       continue;
     }
+
+    // lcp-kul: any part whose type looks tool-shaped (`tool*`) but didn't
+    // match the branches above is a NEW letta-code schema variant we don't
+    // know how to project. Silently letting it fall through to assistant
+    // text bucket was exactly the regression class that triggered this
+    // bead — log loudly so the next drift surfaces in CI/logs instead of
+    // through "tool cards disappeared on reload" reports.
+    if (typeof part.type === "string" && /^tool/i.test(part.type)) {
+      console.warn(
+        JSON.stringify({
+          event: "translate.unknown_tool_part",
+          msg_id: localMsg.id,
+          part_index: i,
+          part_type: part.type,
+        }),
+      );
+      continue;
+    }
   }
   flushText();
   return out;
@@ -634,129 +713,3 @@ export function localMessageToConversationMessage(
   return localMessageToConversationMessages(localMsg, scope)[0] ?? null;
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// LocalMessage → legacy hybrid wire record
-// ──────────────────────────────────────────────────────────────────────
-
-interface LegacyContentPart {
-  type: "text";
-  text: string;
-  signature: string | null;
-}
-
-function partsToContent(parts: unknown): LegacyContentPart[] {
-  if (!Array.isArray(parts)) return [{ type: "text", text: "", signature: null }];
-  const out: LegacyContentPart[] = [];
-  for (const p of parts) {
-    if (
-      typeof p === "object" &&
-      p !== null &&
-      (p as { type?: unknown }).type === "text" &&
-      typeof (p as { text?: unknown }).text === "string"
-    ) {
-      out.push({ type: "text", text: (p as { text: string }).text, signature: null });
-    }
-  }
-  return out;
-}
-
-/**
- * Hybrid output shape emitted by `localMessageToLettaMessage`.
- *
- * Per Phase 2a audit (bead `lcp-b3j`), this function produces a record that
- * does NOT conform to any single `LettaMessage` variant — it includes
- * `role`, `content` (array), `tool_calls`, plus the approval/approval-array
- * fields all on one object. That bead tracks the legacy shape; behavior
- * must stay identical, so we model it explicitly here rather than try to
- * coerce it into the union.
- *
- * @see lcp-b3j (Phase 2a audit tracking the hybrid shape)
- */
-export interface LegacyLocalMessageWire {
-  id: string;
-  role: LocalMessageRole;
-  message_type:
-    | "user_message"
-    | "assistant_message"
-    | "system_message"
-    | "tool_call_message"
-    | "tool_return_message";
-  content: LegacyContentPart[];
-  name: string | null;
-  sender_id: string | null;
-  batch_item_id: string | null;
-  model: string | null;
-  agent_id: string;
-  conversation_id: string;
-  tool_calls: ToolCall[] | null;
-  tool_call_id: string | null;
-  tool_returns: ToolReturn[];
-  created_at: string;
-  updated_at: string;
-  date: string;
-  approve: boolean | null;
-  approval_request_id: string | null;
-  denial_reason: string | null;
-  approvals: unknown[];
-  otid: string;
-  group_id: string | null;
-  seq_id: number | null;
-  /** lcp-nwd: run that attributed this message; null when unowned. */
-  run_id: string | null;
-}
-
-export interface LocalMessageToLettaMessageScope {
-  agentId: string;
-  conversationId: string;
-  /** lcp-nwd: messageId -> runId lookup, same shape as
-   *  LocalMessageScope.runIdsByMessageId. Built by
-   *  runs.buildMessageRunMap(). */
-  runIdsByMessageId?: Record<string, string> | null;
-}
-
-export function localMessageToLettaMessage(
-  localMsg: LocalMessage,
-  { agentId, conversationId, runIdsByMessageId }: LocalMessageToLettaMessageScope,
-): LegacyLocalMessageWire {
-  const created = localMsg.metadata?.created_at ?? new Date().toISOString();
-  const role: LocalMessageRole = localMsg.role ?? ("system" as LocalMessageRole);
-  const textBody = partsToText(localMsg.parts);
-
-  // Best-effort message_type classification for mobile UI.
-  let messageType: LegacyLocalMessageWire["message_type"] = "system_message";
-  if (role === "user") messageType = "user_message";
-  else if (role === "assistant") {
-    messageType = textBody.startsWith("[tool-call]")
-      ? "tool_call_message"
-      : textBody.startsWith("[tool-result")
-        ? "tool_return_message"
-        : "assistant_message";
-  } else if (role === "system") messageType = "system_message";
-
-  return {
-    id: localMsg.id,
-    role,
-    message_type: messageType,
-    content: partsToContent(localMsg.parts),
-    name: null,
-    sender_id: null,
-    batch_item_id: null,
-    model: null,
-    agent_id: agentId,
-    conversation_id: conversationId,
-    tool_calls: null,
-    tool_call_id: null,
-    tool_returns: [],
-    created_at: created,
-    updated_at: localMsg.metadata?.updated_at ?? created,
-    date: created,
-    approve: null,
-    approval_request_id: null,
-    denial_reason: null,
-    approvals: [],
-    otid: localMsg.id,
-    group_id: null,
-    seq_id: null,
-    run_id: (runIdsByMessageId && localMsg?.id ? (runIdsByMessageId[localMsg.id] ?? null) : null),
-  };
-}

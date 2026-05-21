@@ -349,6 +349,171 @@ After a `protocol_violation` for `content_parts`, the `inFlight`
 latch is NOT set — mobile can retry the send immediately on the
 same socket with a corrected payload.
 
+## Streaming tool output (`tool_output_chunk`)
+
+Status: **specification only** (lcp-c8i). Emitter + renderer
+implementation lands in lcp-7wz. This section is the source of truth
+those two will code against.
+
+### Why
+
+Long-running tool calls (`Bash` invocations spanning multiple seconds,
+shell pipelines that produce output progressively, etc.) currently
+appear frozen on mobile because `tool_return_message` is the only
+tool-output-bearing frame and it's emitted atomically at process
+exit. `tool_output_chunk` interleaves incremental output frames
+between `tool_call_message` and `tool_return_message` so the renderer
+can paint output as it arrives.
+
+### Wire shape
+
+```json
+{ "v": 1, "type": "tool_output_chunk", "id": "…", "ts": "…",
+  "agent_id": "agent-…",
+  "conversation_id": "…",
+  "turn_id": "turn-…",
+  "run_id": "run-…",
+  "seq": 17,
+  "tool_call_id": "tcid-…",
+  "chunk_index": 0,
+  "stream": "stdout",
+  "data": "1\n",
+  "is_final_chunk": false }
+```
+
+Required fields:
+
+- `tool_call_id` — matches the `tool_call_message.tool_call_id` this
+  output belongs to. The renderer scopes the chunk to that bubble.
+- `chunk_index` — monotonic integer per `tool_call_id`, starts at `0`.
+- `stream` — one of `"stdout"` | `"stderr"`. Required so the renderer
+  can theme stderr differently (red, separate channel, etc.).
+- `data` — the chunk payload. UTF-8 string. MAY be empty (e.g. an
+  empty stderr line). The server MUST NOT split a UTF-8 grapheme
+  across chunks — chunk boundaries are byte-safe but also
+  codepoint-safe.
+
+Optional fields:
+
+- `is_final_chunk` — boolean. When `true`, no further
+  `tool_output_chunk` frames for this `tool_call_id` will arrive
+  before the terminal `tool_return_message`. Absent or `false` means
+  more chunks may follow. Convenience signal — the renderer doesn't
+  need it (the terminal `tool_return_message` is authoritative), but
+  it lets clients flush partial-line state proactively.
+
+Envelope fields (`v`, `type`, `id`, `ts`, `agent_id`, `conversation_id`,
+`turn_id`, `run_id`, `seq`) follow the same conventions as every other
+turn-scoped frame — see "Turn frame sequence" above. `seq` is the
+per-run frames.jsonl cursor (lcp-p74.2); chunks are persisted to the
+frame log like any other frame.
+
+### Ordering guarantees
+
+Per `tool_call_id`, `chunk_index` is monotonically increasing and
+gap-free. The server MUST emit chunks in order; a renderer that
+receives `chunk_index: 5` after `chunk_index: 3` MUST treat the
+intervening `4` as a server-side bug, not a reorder.
+
+Across different `tool_call_id`s in the same turn (e.g. two parallel
+tool calls — currently rare but allowed), chunks may interleave. The
+client groups by `tool_call_id`.
+
+### Relationship to `tool_return_message`
+
+`tool_return_message` is still the terminal frame for every tool
+call. It's emitted **after** the last `tool_output_chunk` (if any)
+and carries:
+
+- the final exit code,
+- aggregate metadata (duration, etc.),
+- the full assembled `stdout` / `stderr` strings (NOT just the tail).
+
+Servers MUST always emit a `tool_return_message` even when chunks
+were also sent — this is the "graceful degradation" contract for
+clients that ignore `tool_output_chunk`. The full assembled output on
+the terminal frame is the fallback path; the chunks are a UX nicety
+for clients that opt in.
+
+For short-running tool calls (under ~100ms wall-clock — exact
+threshold is an implementer choice and may be made env-configurable),
+servers SHOULD skip chunk emission entirely and emit only
+`tool_return_message`. Chunking has overhead; tiny outputs don't
+benefit.
+
+### Reconnect semantics
+
+`tool_output_chunk` frames are persisted to the per-run
+`frames.jsonl` (lcp-p74.1) like every other turn-scoped frame. A
+client that reconnects mid-tool-call sends the normal
+`subscribe(run_id, cursor)` frame; the server replays missed chunks
+(and any other frames) in `seq` order, then live-tails new appends.
+
+This is **option A** — server replays missed chunks via the existing
+subscribe mechanism. There is no separate `tool_output_replay_marker`
+frame. Clients MUST handle reconnect via subscribe — the contract
+does not allow a "missed chunks, here's a recap" alternative.
+
+### Backwards compatibility
+
+Clients that don't understand `tool_output_chunk` follow the forward-
+compat rule from the WS protocol: unknown frame types are silently
+dropped (`ws-handler.mjs` default branch). The terminal
+`tool_return_message` carries the full assembled output, so legacy
+clients still render the tool call correctly — they just don't see
+incremental progress.
+
+This means rolling out `tool_output_chunk` is safe to do server-first.
+Old clients get the existing behavior; new clients opt in by handling
+the frame.
+
+### Worked example
+
+A 3-second loop emitting one line per second:
+
+```text
+client → send_message { text: "for i in 1 2 3; do echo $i; sleep 1; done | bash" }
+
+server → turn_started
+server → tool_call_message {
+           tool_call: { name: "Bash", tool_call_id: "tcid-7a3" }
+         }
+server → tool_output_chunk { tool_call_id: "tcid-7a3", chunk_index: 0,
+                              stream: "stdout", data: "1\n" }
+        (~1s later)
+server → tool_output_chunk { tool_call_id: "tcid-7a3", chunk_index: 1,
+                              stream: "stdout", data: "2\n" }
+        (~1s later)
+server → tool_output_chunk { tool_call_id: "tcid-7a3", chunk_index: 2,
+                              stream: "stdout", data: "3\n",
+                              is_final_chunk: true }
+server → tool_return_message {
+           tool_call_id: "tcid-7a3",
+           status: "success",
+           tool_return: { exit_code: 0, output: "1\n2\n3\n" }
+         }
+server → stop_reason
+server → usage_statistics
+server → turn_done
+```
+
+The renderer paints "1" → "1\n2" → "1\n2\n3" as the chunks arrive,
+then locks in the final state when `tool_return_message` lands.
+
+### Non-goals (out of scope for the implementation bead lcp-7wz)
+
+- Per-chunk acknowledgement from the client. Backpressure is handled
+  the same way as other frames (`bufferedAmount` drop in
+  `ws-handler.mjs`); chunks that hit the high-water mark are simply
+  not sent (the client falls back to the terminal frame's assembled
+  output).
+- A cancel-during-tool-call frame distinct from the existing `cancel`.
+  Cancelling a turn cancels its in-flight tool calls; the existing
+  `cancel(run_id)` semantics apply.
+- Chunked output for non-`Bash` tools. The first emitter ships for
+  `Bash` only. Other tools (Read, Write, Grep, etc.) MAY adopt chunked
+  emission later — the wire shape is tool-agnostic.
+
 ## Frame field clarifications
 
 ### `stop_reason.stop_reason` values

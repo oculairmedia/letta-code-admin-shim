@@ -22,6 +22,7 @@ import {
   seedMessage,
   externalConvId,
 } from "./helpers/index.js";
+import type { LocalMessagePart } from "../lib/types/letta-stream.js";
 
 // ── helpers ─────────────────────────────────────────────────────────
 
@@ -216,6 +217,12 @@ test("GET /v1/agents/{id}/messages returns [] when no messages in default conv",
 });
 
 test("GET /v1/agents/{id}/messages returns vanilla-shaped messages", async (t) => {
+  // lcp-cox: this endpoint now fans out one LocalMessage → one or more
+  // vanilla LettaMessage variants, matching /v1/conversations/{id}/messages
+  // and what real Letta servers return. The old legacy-hybrid record (with
+  // top-level role / agent_id / conversation_id and content: Array<{type,
+  // text}>) is gone — mobile already handles both shapes via its loose
+  // LettaMessageSerializer.
   const shim = await startShim();
   t.after(() => shim.stop());
 
@@ -237,30 +244,157 @@ test("GET /v1/agents/{id}/messages returns vanilla-shaped messages", async (t) =
   const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/messages`);
   const arr = body as Array<{
     id: string;
-    role: string;
     message_type: string;
-    agent_id: string;
-    conversation_id: string;
-    content: Array<{ type: string; text: string }>;
+    content: string;
     otid: string;
+    name: string | null;
+    is_err: unknown;
   }>;
   assert.equal(res.status, 200);
   assert.equal(arr.length, 2);
   const u = arr[0]!;
   assert.equal(u.id, "ui-msg-u1");
-  assert.equal(u.role, "user");
   assert.equal(u.message_type, "user_message");
-  assert.equal(u.agent_id, id);
-  assert.equal(u.conversation_id, "default");
-  assert.ok(Array.isArray(u.content));
-  assert.equal(u.content[0]!.type, "text");
-  assert.equal(u.content[0]!.text, "hello world");
-  // otid defaults to localMsg.id in localMessageToLettaMessage
+  assert.equal(u.content, "hello world");
+  // otid defaults to localMsg.id when no mobile-supplied otid is recorded.
   assert.equal(u.otid, "ui-msg-u1");
+  assert.equal(u.name, null);
+  assert.equal(u.is_err, null);
 
   const a = arr[1]!;
+  assert.equal(a.id, "ui-msg-a1");
   assert.equal(a.message_type, "assistant_message");
-  assert.equal(a.role, "assistant");
+  assert.equal(a.content, "hi back");
+});
+
+test("GET /v1/agents/{id}/messages fans out tool turns to tool_call_message + tool_return_message (lcp-cox)", async (t) => {
+  // Regression gate: the legacy hybrid that this endpoint used to serve
+  // hard-coded tool_calls=null, so mobile saw tool turns as bare assistant
+  // bubbles on context-window inspection. After lcp-cox the endpoint uses
+  // the same fan-out projection as /v1/conversations/{id}/messages.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const id = seedAgent(shim.stateDir, { id: "agent-tool-001" });
+  seedConversation(shim.stateDir, id);
+  // user typed a request
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ui-msg-u1",
+    role: "user",
+    content: "list files",
+    sourceMessageIndex: 0,
+  });
+  // assistant emitted a new-shape toolCall part (letta-code 0.25.x)
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ui-msg-a1",
+    role: "assistant",
+    parts: [
+      { type: "text", text: "" },
+      {
+        // Cast — `toolCall` is the new-shape part type letta-code 0.25.x
+        // writes; the union here still accepts it via the new
+        // LocalMessageToolCallContentPart variant.
+        type: "toolCall",
+        id: "toolu_LCPCOX_01",
+        name: "Bash",
+        arguments: { command: "ls" },
+      } as unknown as LocalMessagePart,
+    ],
+    sourceMessageIndex: 1,
+  });
+  // top-level toolResult row (new shape)
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ui-msg-a1:tool-result:toolu_LCPCOX_01",
+    role: "toolResult",
+    parts: [{ type: "text", text: "README.md\nserver.ts\n" }],
+    sourceMessageIndex: 2,
+    extra: {
+      toolCallId: "toolu_LCPCOX_01",
+      toolName: "Bash",
+      isError: false,
+    },
+  });
+
+  const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/messages`);
+  const arr = body as Array<{
+    id: string;
+    message_type: string;
+    name?: string | null;
+    content?: string;
+    tool_call?: { tool_call_id: string; name: string; arguments: string };
+    tool_call_id?: string;
+    tool_return?: string;
+    status?: string;
+  }>;
+  assert.equal(res.status, 200);
+  const types = arr.map((m) => m.message_type);
+  assert.deepEqual(
+    types,
+    ["user_message", "tool_call_message", "tool_return_message"],
+    `fan-out drift: got [${types.join(", ")}]`,
+  );
+
+  const tc = arr[1]!;
+  assert.equal(tc.tool_call?.tool_call_id, "toolu_LCPCOX_01");
+  assert.equal(tc.tool_call?.name, "Bash");
+  assert.equal(tc.tool_call?.arguments, JSON.stringify({ command: "ls" }));
+  // Mobile dedups streamed and history-list copies of the same tool call
+  // by id — this shared id format is the dedup contract.
+  assert.equal(tc.id, "toolcall-toolu_LCPCOX_01");
+
+  const tr = arr[2]!;
+  assert.equal(tr.tool_call_id, "toolu_LCPCOX_01");
+  assert.equal(tr.name, "Bash");
+  assert.equal(tr.status, "success");
+  assert.equal(tr.tool_return, "README.md\nserver.ts\n");
+  assert.equal(tr.id, "toolreturn-toolu_LCPCOX_01");
+});
+
+test("GET /v1/agents/{id}/context.messages also fans out tool turns (lcp-cox)", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const id = seedAgent(shim.stateDir, { id: "agent-ctx-tool", systemPrompt: "sys" });
+  seedConversation(shim.stateDir, id);
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ctx-u1",
+    role: "user",
+    content: "do it",
+    sourceMessageIndex: 0,
+  });
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ctx-a1",
+    role: "assistant",
+    parts: [
+      {
+        type: "toolCall",
+        id: "toolu_CTX_01",
+        name: "Read",
+        arguments: { file_path: "/tmp/x" },
+      } as unknown as LocalMessagePart,
+    ],
+    sourceMessageIndex: 1,
+  });
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ctx-a1:tool-result:toolu_CTX_01",
+    role: "toolResult",
+    parts: [{ type: "text", text: "Error: ENOENT" }],
+    sourceMessageIndex: 2,
+    extra: { toolCallId: "toolu_CTX_01", toolName: "Read", isError: true },
+  });
+
+  const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/context`);
+  const b = body as { messages: Array<{ message_type: string; is_err?: unknown; status?: string }> };
+  assert.equal(res.status, 200);
+  const types = b.messages.map((m) => m.message_type);
+  assert.deepEqual(
+    types,
+    ["user_message", "tool_call_message", "tool_return_message"],
+    `context messages drift: got [${types.join(", ")}]`,
+  );
+  const tr = b.messages[2]!;
+  assert.equal(tr.is_err, true);
+  assert.equal(tr.status, "error");
 });
 
 test("GET /v1/agents/{id}/messages honors limit and before", async (t) => {

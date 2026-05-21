@@ -16,7 +16,7 @@
  *   POST   /v1/agents/{id}/messages              send + stream (next iter)
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { URL } from "node:url";
 
@@ -44,20 +44,27 @@ import {
   agentToLettaState,
   conversationToLetta,
   localMessageToConversationMessages,
-  localMessageToLettaMessage,
 } from "./lib/translate.js";
 import { handleSendMessage } from "./lib/chat.js";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.js";
+import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
 import {
   aggregateUsage,
   buildMessageRunMap,
   deleteRun,
   getRun,
+  inFlightMessageIds,
   listRunSteps,
   listRuns,
   type ListRunsParams,
 } from "./lib/runs.js";
-import { getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
+import { bridgeSendMessage, getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
+import {
+  getCronSchedulerStatus,
+  startCronScheduler,
+  stopCronScheduler,
+} from "./lib/cron-scheduler.js";
+import { getTask as getCronTask, listTasks as listCronTasks } from "./lib/crons.js";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
@@ -169,26 +176,15 @@ async function handleAgentsCount(_req: IncomingMessage, res: ServerResponse): Pr
   json(res, 200, (await listAgents()).length);
 }
 
-// Stale-id alias table — mobile may have cached an agent_id from an earlier
-// migration revision. Map those legacy ids to the canonical current id so
-// mobile's cached navigation doesn't break.
-const AGENT_ID_ALIASES: Record<string, string> = {
-  // pre-rev6 migrator generated these from a name-hash; rev6 onward uses
-  // the original Letta-server UUIDs. Map the hashes to their canonical ids.
-  "agent-migrated-77d0a4b78ede9f8d9e1b279b": "agent-597b5756-2915-4560-ba6b-91005f085166",
-  "agent-migrated-eeb0dbb6d6117617453ba793": "agent-2fae4a23-1caa-460d-9033-9f30ac84ed5e",
-};
-
 function resolveAgentRecord(agentId: string): OnDiskAgentRecord | null {
   let a = getAgentRecord(agentId);
   if (a) return a;
-  const canonical = AGENT_ID_ALIASES[agentId];
-  if (canonical) {
+  const canonical = resolveAgentIdAlias(agentId, (id) => getAgentRecord(id) != null);
+  if (canonical !== agentId) {
     a = getAgentRecord(canonical);
-    if (a) {
-      console.log(`[shim] agent alias: ${agentId} → ${canonical}`);
-      return a;
-    }
+    if (!a) return null;
+    console.log(`[shim] agent alias: ${agentId} → ${canonical}`);
+    return a;
   }
   return null;
 }
@@ -212,14 +208,36 @@ async function handleAgentMessages(
   const { limit } = parsePagination(url.searchParams);
   const before = url.searchParams.get("before") ?? undefined;
   const conversationId = url.searchParams.get("conversation_id") ?? "default";
-  const items = await listMessages(conversationId, agentId, { limit, before });
-  // lcp-nwd: attach run_id from run.message_ids attribution.
+  let items = await listMessages(conversationId, agentId, { limit, before });
+  // lcp-r0m: drop in-flight assistant/tool messages owned by an active run.
+  // Mirrors the filter in handleListConversationMessages — same race, same
+  // fix. See lib/runs.ts inFlightMessageIds for rationale.
+  const inFlight = inFlightMessageIds(agentId, conversationId);
+  if (inFlight.size > 0) {
+    items = items.filter((m) => {
+      const mid = (m as { id?: unknown }).id;
+      return typeof mid !== "string" || !inFlight.has(mid);
+    });
+  }
+  // lcp-cox: use the same fan-out projection as /v1/conversations/{id}/messages
+  // so tool turns surface as tool_call_message + tool_return_message wire
+  // frames (vanilla Letta shape) instead of the legacy hybrid that hard-coded
+  // tool_calls=null. Sidecars carry the real timestamps and mobile-supplied
+  // otids onto the projected messages.
+  const realTimes = await readMessageTimestamps(conversationId, agentId);
+  const otidMap = await readOtidMap(conversationId, agentId);
   const runIdsByMessageId = buildMessageRunMap({ agentId, conversationId });
-  json(
-    res,
-    200,
-    items.map((m) => localMessageToLettaMessage(m, { agentId, conversationId, runIdsByMessageId })),
-  );
+  const projected: ReturnType<typeof localMessageToConversationMessages> = [];
+  for (const m of items) {
+    for (const p of localMessageToConversationMessages(m, {
+      realTimes,
+      otidMap,
+      runIdsByMessageId,
+    })) {
+      projected.push(p);
+    }
+  }
+  json(res, 200, projected);
 }
 
 async function handleAgentContext(
@@ -247,6 +265,21 @@ async function handleAgentContext(
     agentId: resolved.agentId,
     conversationId: resolved.conversationId,
   });
+  // lcp-cox: fan out to vanilla LettaMessage shape — same as the
+  // /v1/conversations/{id}/messages path — so tool turns are visible in the
+  // context-window view too. Sidecars supply real timestamps + otid mapping.
+  const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
+  const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
+  const projected: ReturnType<typeof localMessageToConversationMessages> = [];
+  for (const m of messages) {
+    for (const p of localMessageToConversationMessages(m, {
+      realTimes,
+      otidMap,
+      runIdsByMessageId,
+    })) {
+      projected.push(p);
+    }
+  }
   json(res, 200, {
     context_window_size_current:
       Math.ceil(systemPrompt.length / 4) + messages.length * 50,
@@ -270,7 +303,7 @@ async function handleAgentContext(
     memory_filesystem: null,
     tool_usage_rules: null,
     directories: [],
-    messages: messages.map((m) => localMessageToLettaMessage(m, { agentId, conversationId: requestedConv, runIdsByMessageId })),
+    messages: projected,
     functions_definitions: [],
   });
 }
@@ -568,6 +601,18 @@ async function handleConversationMessagesList(
   const before = url.searchParams.get("before") ?? undefined;
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
   let items = await listMessages(resolved.conversationId, resolved.agentId, { limit, before });
+  // lcp-r0m: drop in-flight assistant/tool messages owned by an active run.
+  // The WS path is streaming pure deltas under cm-stream-<otid> for these
+  // messages; returning the cumulative snapshot here races the stream and
+  // produces incoherent text on the client (the 2026-05-19 "StandStanding
+  // by..." repro). On the next hydrate after turn_done they appear cleanly.
+  const inFlight = inFlightMessageIds(resolved.agentId, resolved.conversationId);
+  if (inFlight.size > 0) {
+    items = items.filter((m) => {
+      const mid = (m as { id?: unknown }).id;
+      return typeof mid !== "string" || !inFlight.has(mid);
+    });
+  }
   if (order === "desc") items = [...items].reverse();
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
@@ -649,6 +694,41 @@ function parseBoolParam(searchParams: URLSearchParams, name: string): boolean | 
   if (raw === "true") return true;
   if (raw === "false") return false;
   return null;
+}
+
+// ── /v1/crons (lcp-9h3) ───────────────────────────────────────────
+//
+// Read-only mirror of the cron store. Mutations live on the mobile WS
+// channel per the shim-new-features-mutations-ws-reads-may-mirror-rest
+// rule — POST/PUT/DELETE here returns 405 with a pointer to the WS
+// protocol.
+
+function handleCronsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
+  const agentId = url.searchParams.get("agent_id") ?? undefined;
+  const conversationId = url.searchParams.get("conversation_id") ?? undefined;
+  const filters: { agent_id?: string; conversation_id?: string } = {};
+  if (agentId) filters.agent_id = agentId;
+  if (conversationId) filters.conversation_id = conversationId;
+  json(res, 200, { tasks: listCronTasks(filters) });
+}
+
+function handleCronDetail(_req: IncomingMessage, res: ServerResponse, taskId: string): void {
+  const task = getCronTask(taskId);
+  if (!task) return notFound(res, `cron task ${taskId}`);
+  json(res, 200, task);
+}
+
+function handleCronScheduler(_req: IncomingMessage, res: ServerResponse): void {
+  json(res, 200, getCronSchedulerStatus());
+}
+
+function handleCronMethodNotAllowed(req: IncomingMessage, res: ServerResponse): void {
+  res.setHeader("Allow", "GET, OPTIONS");
+  json(res, 405, {
+    detail: `${req.method} not allowed on cron REST endpoints — mutations are WS-only`,
+    ws_endpoint: "/shim/v1/mobile",
+    ws_frames: ["cron_add", "cron_list", "cron_get", "cron_delete"],
+  });
 }
 
 function handleRunsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
@@ -866,6 +946,53 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
 
 function pad(s: unknown, n: number): string { return String(s).padEnd(n); }
 
+// Reverse-proxy /api/* through to vibesync's ApiServer. The Android client
+// uses the shim as its single base URL for both Letta routes (/v1/*) and
+// vibesync routes (/api/*); vibesync runs as a separate process on
+// VIBESYNC_HOST:VIBESYNC_PORT, so we splice the two surfaces here instead
+// of giving the client two URLs to configure. SSE works because we just
+// pipe the upstream response body straight through — no buffering.
+const VIBESYNC_PROXY_PREFIX = "/api/";
+const VIBESYNC_PROXY_HOST = process.env["VIBESYNC_HOST"] ?? "127.0.0.1";
+const VIBESYNC_PROXY_PORT = Number(process.env["VIBESYNC_PORT"] ?? 3099);
+
+function proxyToVibesync(req: IncomingMessage, res: ServerResponse): void {
+  // Copy headers but strip ones that don't apply to the upstream hop.
+  // - `host` would name the shim, not vibesync.
+  // - `content-length` is recomputed by the upstream agent.
+  // - `accept-encoding` is dropped so we don't have to decompress mid-pipe
+  //   (vibesync serves text/SSE; the bandwidth cost is negligible).
+  const upstreamHeaders: Record<string, string | string[] | undefined> = { ...req.headers };
+  delete upstreamHeaders["host"];
+  delete upstreamHeaders["content-length"];
+  delete upstreamHeaders["accept-encoding"];
+
+  const upstream = httpRequest({
+    host: VIBESYNC_PROXY_HOST,
+    port: VIBESYNC_PROXY_PORT,
+    method: req.method,
+    path: req.url ?? "/",
+    headers: upstreamHeaders,
+  }, (upstreamRes) => {
+    res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+    upstreamRes.pipe(res);
+  });
+
+  upstream.on("error", (err) => {
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+      res.end(`vibesync upstream unreachable: ${err.message}`);
+    } else {
+      // Headers already flushed (e.g. mid-SSE). Best we can do is close.
+      res.end();
+    }
+  });
+
+  // Forward request body (POST/PUT/PATCH). For GET this just ends the stream
+  // quickly with no payload.
+  req.pipe(upstream);
+}
+
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? "", `http://${req.headers.host || "localhost"}`);
   const { pathname } = url;
@@ -911,6 +1038,14 @@ const server = createServer((req, res) => {
     return res.end();
   }
 
+  // Reverse-proxy vibesync's /api/* surface through the same base URL so
+  // the Android client can drive both letta (/v1/*) and vibesync (/api/*)
+  // from one configured endpoint. Routed before any /v1 dispatch so the
+  // prefix match wins immediately.
+  if (pathname.startsWith(VIBESYNC_PROXY_PREFIX)) {
+    return proxyToVibesync(req, res);
+  }
+
   // Health
   if (req.method === "GET" && (pathname === "/v1/health/" || pathname === "/v1/health")) {
     return handleHealth(req, res);
@@ -919,8 +1054,11 @@ const server = createServer((req, res) => {
     return handlePoolStats(req, res);
   }
   // Agents
-  if (req.method === "GET" && pathname === "/v1/agents/count") return handleAgentsCount(req, res);
-  if (req.method === "GET" && pathname === "/v1/agents") return handleAgentsList(req, res, url);
+  // Canonical Letta defines these as `/v1/agents/` and `/v1/agents/count`
+  // (trailing slash on the collection). FastAPI's default redirect_slashes
+  // makes the non-slash form work too, so accept both here.
+  if (req.method === "GET" && (pathname === "/v1/agents/count" || pathname === "/v1/agents/count/")) return handleAgentsCount(req, res);
+  if (req.method === "GET" && (pathname === "/v1/agents" || pathname === "/v1/agents/")) return handleAgentsList(req, res, url);
   if (req.method === "GET" && pathname === "/v1/models") return handleModels(req, res);
 
   const agentDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/?$/);
@@ -1026,6 +1164,25 @@ const server = createServer((req, res) => {
   const agentCancel = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/messages\/cancel\/?$/);
   if (agentCancel && req.method === "POST") return handleAgentMessagesCancel(req, res, agentCancel[1]!);
 
+  // /v1/crons/* — read-only mirror of cron store (lcp-9h3).
+  // Mutations are WS-only per shim-new-features-mutations-ws-reads-may-mirror-rest.
+  if (pathname === "/v1/crons" || pathname === "/v1/crons/") {
+    if (req.method === "GET") return handleCronsList(req, res, url);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return handleCronMethodNotAllowed(req, res);
+  }
+  if (pathname === "/v1/crons/scheduler" || pathname === "/v1/crons/scheduler/") {
+    if (req.method === "GET") return handleCronScheduler(req, res);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return handleCronMethodNotAllowed(req, res);
+  }
+  const cronDetail = pathname.match(/^\/v1\/crons\/([a-zA-Z0-9_-]+)\/?$/);
+  if (cronDetail) {
+    if (req.method === "GET") return handleCronDetail(req, res, cronDetail[1]!);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return handleCronMethodNotAllowed(req, res);
+  }
+
   // /shim/v1/usage — aggregate token tracking (shim extension, not vanilla)
   if (req.method === "GET" && (pathname === "/shim/v1/usage/summary" || pathname === "/shim/v1/usage/summary/")) {
     return handleUsageSummary(req, res, url);
@@ -1067,6 +1224,33 @@ server.listen(PORT, HOST, () => {
   const actualPort = typeof addr === "object" && addr ? addr.port : PORT;
   console.log(`letta-code admin shim listening on http://${HOST}:${actualPort}`);
   console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env["LETTA_LOCAL_BACKEND_DIR"] ?? "(default)"}`);
+
+  // lcp-0mw: claim the cron scheduler lease and start ticking. Set
+  // SHIM_CRON_ENABLED=0 to opt out (tests do this so the suite doesn't
+  // race a live scheduler). Default is on because cron is the shim's
+  // canonical scheduler — bundled letta-code workers don't outlive
+  // their idle window.
+  if (process.env["SHIM_CRON_ENABLED"] !== "0") {
+    startCronScheduler({
+      fireTask: (task, wrappedPrompt) =>
+        bridgeSendMessage(
+          {
+            agent_id: task.agent_id,
+            conversation_id:
+              task.conversation_id === "default" ? `conv-default-${task.agent_id}` : task.conversation_id,
+            text: wrappedPrompt,
+            // lcp-4tv: cron fires are operator-initiated, not user-initiated.
+            // Mark them background so /v1/runs?background=true surfaces them
+            // distinctly from regular mobile turns.
+            background: true,
+          },
+          // Cron-driven turns persist to disk via the bridge's internal
+          // `emit()`; mobile clients can later subscribe(run_id, cursor)
+          // to replay. No live WS client is necessarily attached.
+          () => {},
+        ).then(() => undefined),
+    });
+  }
 });
 
 // ── Mobile channel WS upgrade route ───────────────────────────────
@@ -1108,6 +1292,7 @@ server.on("upgrade", async (req: IncomingMessage, socket: Duplex, head: Buffer) 
 });
 
 async function gracefulShutdown(): Promise<void> {
+  try { stopCronScheduler(); } catch {}
   try { await getAgentPool().stopAll(); } catch {}
   try { await mobileAdapter?.stop?.(); } catch {}
   server.close(() => process.exit(0));

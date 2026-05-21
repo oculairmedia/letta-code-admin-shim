@@ -40,7 +40,7 @@ export interface MobileWsFrame {
 }
 
 export interface OpenMobileWsOptions {
-  token?: string;
+  token?: string | null;
   deviceId?: string;
   clientVersion?: string;
   path?: string;
@@ -148,13 +148,14 @@ export async function openMobileWs(httpUrl: string, {
   });
 
   if (!skipHello) {
-    handle.send({
+    const helloFrame: { type: "hello"; device_id: string; client_version: string; token?: string } & Record<string, unknown> = {
       type: "hello",
-      token,
       device_id: deviceId,
       client_version: clientVersion,
       ...helloExtras,
-    });
+    };
+    if (token !== null) helloFrame.token = token;
+    handle.send(helloFrame);
     await handle.waitFor("welcome", { timeoutMs });
   }
 

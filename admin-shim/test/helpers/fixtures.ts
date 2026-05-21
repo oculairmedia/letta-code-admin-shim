@@ -147,6 +147,12 @@ export interface SeedMessageInput {
   sourceMessageIndex?: number;
   created_at?: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Extra top-level fields to merge into the record — used to emit the
+   * letta-code 0.25.x toolResult shape, which carries top-level toolCallId
+   * / toolName / isError instead of stuffing them into parts.
+   */
+  extra?: Record<string, unknown>;
 }
 
 /**
@@ -174,6 +180,7 @@ export function seedMessage(
       created_at: msg.created_at ?? `2026-01-01T00:00:${String(sourceIdx + 1).padStart(2, "0")}.000Z`,
       ...(msg.metadata ?? {}),
     },
+    ...(msg.extra ?? {}),
   };
   appendFileSync(path, JSON.stringify(record) + "\n");
   return id;

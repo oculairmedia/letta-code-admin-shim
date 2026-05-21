@@ -237,6 +237,11 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
       completion_tokens: (f["completion_tokens"] ?? 0) as number,
       prompt_tokens: (f["prompt_tokens"] ?? 0) as number,
       total_tokens: (f["total_tokens"] ?? 0) as number,
+      // Per-step semantics: each upstream usage_statistics frame
+      // represents ONE step's worth of tokens. Cumulative counts are
+      // the consumer's job to sum (or read off the run-level
+      // aggregate). lcp-d9o fixes the non-streaming response where
+      // this was wrongly hardcoded for the WHOLE turn.
       step_count: 1,
       run_ids: runIds,
       cached_input_tokens: (f["cached_input_tokens"] ?? 0) as number,
@@ -658,6 +663,13 @@ export async function handleSendMessage(
       (f): f is UsageStatisticsMessage => f.message_type === "usage_statistics",
     );
 
+    // lcp-d9o: step_count reflects the actual number of agent steps in
+    // this turn. Each step emits its own `usage_statistics` frame from
+    // letta-code; counting them gives the right total. The coalesced
+    // `usageFrame` is a "first-wins" projection (lcp-c4d) for the token
+    // counters, but step_count is a CARDINALITY signal, so we read from
+    // the raw `frames` collection that retained every step's record.
+    const usageStepCount = frames.filter((f) => f.message_type === "usage_statistics").length;
     res.writeHead(exitCode === 0 ? 200 : 500, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
@@ -670,7 +682,7 @@ export async function handleSendMessage(
               completion_tokens: usageFrame.completion_tokens ?? 0,
               prompt_tokens: usageFrame.prompt_tokens ?? 0,
               total_tokens: usageFrame.total_tokens ?? 0,
-              step_count: 1,
+              step_count: usageStepCount,
             }
           : { completion_tokens: 0, prompt_tokens: 0, total_tokens: 0, step_count: 0 },
         agent_id: agentId,

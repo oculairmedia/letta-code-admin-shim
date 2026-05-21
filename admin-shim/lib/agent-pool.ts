@@ -25,7 +25,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { listMessages, stampNewMessages } from "./store.js";
-import { augmentUserInputForA2ui, type A2uiCapability } from "./a2ui-adapter.js";
+import { augmentUserInputForA2ui, ensureA2uiBlockAttached, type A2uiCapability } from "./a2ui-adapter.js";
 import {
   createRun,
   finalizeRun,
@@ -51,7 +51,10 @@ const LETTA_BIN = process.env["LETTA_BIN"] || "letta";
 const MAX_WORKERS = Number(process.env["SHIM_POOL_MAX"] ?? 10);
 const IDLE_EVICT_MS = Number(process.env["SHIM_POOL_IDLE_SEC"] ?? 300) * 1000;
 const SPAWN_TIMEOUT_MS = Number(process.env["SHIM_POOL_SPAWN_TIMEOUT"] ?? 15000);
-const HOUSEKEEP_INTERVAL_MS = 30_000;
+// Default 30s in prod. Tests override via SHIM_POOL_HOUSEKEEP_MS so they
+// can exercise the idle-evict path within the suite's wall-clock budget
+// rather than waiting half a minute per case.
+const HOUSEKEEP_INTERVAL_MS = Number(process.env["SHIM_POOL_HOUSEKEEP_MS"] ?? 30_000);
 
 /**
  * Synthetic frame the Worker injects into the active turn's frame handler
@@ -722,6 +725,10 @@ class Worker {
         // — MessageCreate.content is a union of string | ContentBlock[].
         // DEBUG (lcp-dlj follow-up): log userInput shape to diagnose
         // image strip happening between shim stdin write and disk write.
+        // lcp-crp: write the a2ui_protocol block to this agent's memfs if
+        // missing/stale before the turn. Idempotent + cached per process so
+        // it's effectively free after the first call per agent.
+        if (a2uiCapability) ensureA2uiBlockAttached(this.agentId);
         const effectiveUserInput = augmentUserInputForA2ui(userInput, a2uiCapability);
         const inputShape = Array.isArray(effectiveUserInput)
           ? `array[${effectiveUserInput.length}] types=${effectiveUserInput.map((p) => (p && typeof p === "object" && "type" in (p as Record<string, unknown>)) ? (p as Record<string, unknown>)["type"] : typeof p).join(",")}`

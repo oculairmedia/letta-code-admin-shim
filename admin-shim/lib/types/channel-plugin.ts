@@ -194,6 +194,8 @@ export interface A2uiUserAction {
   turn_id: string | null;
   /** A2UI surface this action originated from. */
   surface_id: string | null;
+  /** Optional component/widget id this action originated from. */
+  component_id?: string | null;
   /** Event name from `Action.event.name` (free-form, agent-defined). */
   name: string;
   /** Event context bag from `Action.event.context`. */
@@ -210,6 +212,32 @@ export interface A2uiUserActionAck {
   status: "accepted" | "rejected";
   /** Human-readable reason; populated when status === "rejected". */
   reason?: string;
+  /** Observability hint describing how the shim routed this action. */
+  routed_as?: "approval" | "synthetic_input" | "recorded_only";
+  /** Synthetic agent turn request for non-approval A2UI actions. */
+  synthetic_input?: {
+    agent_id: string;
+    conversation_id: string;
+    text: string;
+  };
+}
+
+/** UI-facing outcome emitted back to mobile for every accepted/rejected user_action. */
+export interface A2uiUserActionOutcome {
+  /** Originating WebSocket frame id, if the client supplied one. */
+  frame_id: string | null;
+  /** Server action id echoed from user_action_ack when available. */
+  action_id?: string;
+  outcome: "matched_approval" | "injected_as_input" | "recorded_only" | "rejected" | "error";
+  detail?: {
+    action_id?: string;
+    routed_as?: A2uiUserActionAck["routed_as"];
+    approval_scope?: "Once" | "Session" | "Forever" | "Deny";
+    synthetic_turn_id?: string;
+    run_id?: string | null;
+    reason?: string;
+    error_code?: string;
+  };
 }
 
 // ─── Mobile-channel-specific extras ────────────────────────────────────

@@ -1,3 +1,6 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { A2UI_V09_BASIC_PROMPT_TEMPLATE } from "./a2ui-v09-basic-prompt.js";
 
 // Handshake/capability frames use the shim-local version string ("0.9").
@@ -146,17 +149,133 @@ export function buildA2uiSystemPrompt(capability: A2uiCapability): string {
   ].join("\n\n");
 }
 
+// lcp-crp: per-turn injection retired. The 40KB A2UI prompt (97% inline
+// JSON Schema) used to be prepended to every user turn here, which
+// overflowed context on existing chats. The contract now lives in a
+// per-agent core-memory block written by ensureA2uiBlockAttached on first
+// A2UI-enabled turn (see below). Kept as a typed no-op for API stability;
+// remove in a follow-up after callsites are confirmed clean.
 export function augmentUserInputForA2ui(
   userInput: string | unknown[],
-  capability: A2uiCapability | null | undefined,
+  _capability: A2uiCapability | null | undefined,
 ): string | unknown[] {
-  if (!capability) return userInput;
-  const augmentation = buildA2uiSystemPrompt(capability);
-  if (Array.isArray(userInput)) {
-    return [
-      { type: "text", text: augmentation },
-      ...userInput,
-    ];
+  return userInput;
+}
+
+// Core-memory block label written into <storageDir>/memfs/<agent>/memory/system/.
+// Matches the existing snake_case convention (human, language, matrix_capabilities).
+export const A2UI_BLOCK_LABEL = "a2ui_protocol";
+
+function blockStorageDir(): string {
+  return (
+    process.env["LETTA_LOCAL_BACKEND_DIR"] ||
+    join(process.env["LETTA_HOME"] || join(process.env["HOME"] || "/root", ".letta"), "lc-local-backend")
+  );
+}
+
+// Slim ~2KB block content: rules + examples, NO embedded JSON Schema.
+// Letta-code's memfs reader includes every system/*.md file in the agent's
+// persistent context on every turn, so the contract is available without
+// being re-stuffed into the user message.
+export function buildA2uiBlockContent(): string {
+  const server = getA2uiServerCapabilities();
+  return [
+    "# A2UI Dynamic UI Protocol (v0.9, Basic Catalog)",
+    "",
+    server.roleDescription,
+    "",
+    "## Output format",
+    "- Wrap each A2UI message in `<a2ui-json>` and `</a2ui-json>` tags.",
+    "- Each block contains exactly one A2UI v0.9 message object. To send multiple messages, use multiple adjacent `<a2ui-json>` blocks; do NOT use a top-level array.",
+    "- Between or around blocks, you may write conversational text.",
+    "",
+    "## Component ordering",
+    "Within `components`:",
+    "- The `root` component MUST be the FIRST element.",
+    "- Parent components MUST appear before their child components.",
+    "This lets the streaming parser render the UI incrementally.",
+    "",
+    "## Profile rules",
+    "- Do NOT set `createSurface.sendDataModel: true` in this shim profile. User-action data-model delivery is deferred until the tool-dispatcher gate can consume it end-to-end.",
+    "- Only emit A2UI blocks when a rich UI helps the user; otherwise continue with normal conversational text.",
+    "",
+    `## Supported widgets (catalog: ${server.catalogId})`,
+    server.supportedWidgets.join(", "),
+    "",
+    "## Examples",
+    "",
+    "### createSurface — create a new UI surface",
+    "<a2ui-json>",
+    JSON.stringify(
+      {
+        version: "v0.9",
+        createSurface: {
+          surface: { id: "main", root: "rootCard" },
+          components: [
+            { id: "rootCard", Card: { child: "greeting" } },
+            { id: "greeting", Text: { value: "Hello!" } },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+    "</a2ui-json>",
+    "",
+    "### updateComponents — patch existing components",
+    "<a2ui-json>",
+    JSON.stringify(
+      {
+        version: "v0.9",
+        updateComponents: {
+          surface: "main",
+          components: [
+            { id: "greeting", Text: { value: "Updated!" } },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+    "</a2ui-json>",
+    "",
+    "### deleteSurface — close a surface",
+    "<a2ui-json>",
+    JSON.stringify(
+      {
+        version: "v0.9",
+        deleteSurface: { surface: "main" },
+      },
+      null,
+      2,
+    ),
+    "</a2ui-json>",
+  ].join("\n");
+}
+
+// Per-process cache so we touch disk once per agent, not every turn.
+const a2uiBlockAttachedAgents = new Set<string>();
+
+// Idempotent: writes <storageDir>/memfs/<agent>/memory/system/a2ui_protocol.md
+// to match the canonical block content. Safe to call repeatedly; the in-process
+// Set short-circuits subsequent calls for the same agent.
+export function ensureA2uiBlockAttached(agentId: string): void {
+  if (a2uiBlockAttachedAgents.has(agentId)) return;
+  const sysDir = join(blockStorageDir(), "memfs", agentId, "memory", "system");
+  const blockPath = join(sysDir, `${A2UI_BLOCK_LABEL}.md`);
+  const desired = buildA2uiBlockContent();
+  try {
+    if (!existsSync(sysDir)) mkdirSync(sysDir, { recursive: true });
+    const existing = existsSync(blockPath) ? readFileSync(blockPath, "utf8") : null;
+    if (existing !== desired) {
+      writeFileSync(blockPath, desired);
+    }
+    a2uiBlockAttachedAgents.add(agentId);
+  } catch (err) {
+    // Non-fatal: if attach fails the worst case is the agent loses the
+    // contract for one turn. Per-turn augment is already a no-op, so we'd
+    // rather miss the UI than break the turn with an unrelated FS error.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[a2ui] ensureA2uiBlockAttached failed for ${agentId}: ${msg}`);
   }
-  return `${augmentation}\n\nUser request:\n${userInput}`;
 }

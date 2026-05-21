@@ -73,6 +73,18 @@ function createMobileAdapter(account, host) {
         handleUserAction: host.handleUserAction
           ? (action) => host.handleUserAction(action)
           : undefined,
+        // lcp-p74.2: replay+live-tail subscription so disconnected clients
+        // can resume from a known cursor.
+        subscribeToRun: host.subscribeToRun
+          ? (runId, cursor, cbs) => host.subscribeToRun(runId, cursor, cbs)
+          : undefined,
+        // lcp-2gx: cron CRUD over WS + crons_updated push.
+        handleCronList: host.handleCronList,
+        handleCronAdd: host.handleCronAdd,
+        handleCronGet: host.handleCronGet,
+        handleCronDelete: host.handleCronDelete,
+        handleCronDeleteAll: host.handleCronDeleteAll,
+        subscribeCronEvents: host.subscribeCronEvents,
       });
     },
   };

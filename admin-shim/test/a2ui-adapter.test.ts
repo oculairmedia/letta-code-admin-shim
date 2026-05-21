@@ -52,15 +52,15 @@ test("a2ui: system prompt and user input augmentation include the v0.9 contract"
   assert.match(prompt, /`<a2ui-json>` and `<\/a2ui-json>` tags/);
   assert.match(prompt, /---BEGIN A2UI JSON SCHEMA---/);
 
+  // lcp-crp: per-turn injection retired (overflowed context on existing
+  // chats). The A2UI contract now lives in a per-agent core-memory block;
+  // augmentUserInputForA2ui is a no-op.
   const augmented = augmentUserInputForA2ui("show a booking form", capability);
-  assert.equal(typeof augmented, "string");
-  assert.ok(typeof augmented === "string");
-  assert.match(augmented, /A2UI dynamic UI mode is enabled/);
-  assert.match(augmented, /User request:\nshow a booking form/);
+  assert.equal(augmented, "show a booking form");
 
-  const contentParts = augmentUserInputForA2ui([{ type: "text", text: "hello" }], capability);
-  assert.ok(Array.isArray(contentParts));
-  assert.deepEqual(contentParts[1], { type: "text", text: "hello" });
+  const original = [{ type: "text", text: "hello" }];
+  const contentParts = augmentUserInputForA2ui(original, capability);
+  assert.equal(contentParts, original);
 });
 
 test("a2ui: system prompt includes sanitized client theme hints", () => {

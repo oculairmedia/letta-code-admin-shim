@@ -77,6 +77,10 @@ export interface RunHandle {
   record: RunRecord;
   hrStart: [number, number];
   firstTokenSet: boolean;
+  // lcp-p74.1: monotonic seq per run for frames.jsonl. Not persisted on the
+  // record — seq is implicit in file line position; this is just a writer-side
+  // counter to avoid re-stat'ing the file on every append.
+  frameCount: number;
 }
 
 /**
@@ -99,6 +103,13 @@ export interface CreateRunOptions {
   agentId?: string | null;
   conversationId?: string | null;
   onCancel?: (reason: string) => void;
+  /**
+   * lcp-4tv: when true, mark the run as "background" so list filters
+   * (`/v1/runs?background=true`) can distinguish operator-initiated /
+   * cron-driven turns from user-initiated ones. Defaults to false to
+   * match the prior hardcoded behavior.
+   */
+  background?: boolean;
 }
 
 /** Argument bag for finalizeRun. */
@@ -201,6 +212,10 @@ function stepsFile(runId: string): string {
   return join(runDir(runId), "steps.jsonl");
 }
 
+function framesFile(runId: string): string {
+  return join(runDir(runId), "frames.jsonl");
+}
+
 function userActionsFile(runId: string): string {
   return join(runDir(runId), "user-actions.jsonl");
 }
@@ -288,12 +303,12 @@ export function toWireRun(record: RunRecord): Run {
  * caller (agent-pool) registers it to SIGTERM the worker; we keep it out
  * of the persisted record because functions don't serialize.
  */
-export function createRun({ agentId, conversationId, onCancel }: CreateRunOptions = {}): RunHandle {
+export function createRun({ agentId, conversationId, onCancel, background }: CreateRunOptions = {}): RunHandle {
   const id = `run-${randomUUID()}`;
   const record: RunRecord = {
     id,
     agent_id: agentId ?? null,
-    background: false,
+    background: background ?? false,
     base_template_id: null,
     callback_error: null,
     callback_sent_at: null,
@@ -319,6 +334,7 @@ export function createRun({ agentId, conversationId, onCancel }: CreateRunOption
     record,
     hrStart,
     firstTokenSet: false,
+    frameCount: 0,
   };
   _activeRuns.set(id, handle);
   if (typeof onCancel === "function") {
@@ -386,9 +402,11 @@ export function recordA2uiUserAction(entry: {
   session_id: string;
   turn_id: string | null;
   surface_id: string | null;
+  component_id?: string | null;
   name: string;
   context: Record<string, unknown>;
   action_id: string;
+  routed_as?: "approval" | "synthetic_input" | "recorded_only";
 }): void {
   const bucket = entry.run_id ?? `unbound-${entry.session_id}`;
   try {
@@ -401,6 +419,41 @@ export function recordA2uiUserAction(entry: {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[runs] user-action append failed for ${bucket}: ${msg}`);
   }
+}
+
+/**
+ * lcp-p74.2: absolute path to a run's frames.jsonl. May not exist yet.
+ * Exported so the subscribe reader/tail (subscribeToRun) can resolve the
+ * file without duplicating the storageDir + runDir logic.
+ */
+export function getFramesFilePath(runId: string): string {
+  return framesFile(runId);
+}
+
+/**
+ * lcp-p74.1: append a single frame to <run-dir>/frames.jsonl with a
+ * monotonic seq. Each line: { seq, ts, frame }. Returns the seq assigned to
+ * this frame (or -1 if the run isn't tracked — caller can ignore for
+ * fire-and-forget cases).
+ *
+ * Atomicity: one appendFileSync per line. POSIX guarantees atomic appends
+ * for writes ≤ PIPE_BUF (4 KiB); single-writer-per-run holds for the agent
+ * pool's serialized turns, so larger frames are also safe in practice.
+ */
+export function appendRunFrame(runId: string, frame: unknown): { seq: number } {
+  const handle = _activeRuns.get(runId);
+  if (!handle) return { seq: -1 };
+  handle.frameCount += 1;
+  const seq = handle.frameCount;
+  const line = JSON.stringify({ seq, ts: nowIso(), frame }) + "\n";
+  try {
+    mkdirSync(runDir(runId), { recursive: true });
+    appendFileSync(framesFile(runId), line);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] frame append failed for ${runId}: ${msg}`);
+  }
+  return { seq };
 }
 
 /**
@@ -814,6 +867,55 @@ export function listActiveRunIds(): string[] {
 }
 
 /**
+ * lcp-r0m: return active (status="running") runs scoped to a conversation.
+ * Used by the REST /messages handler to filter out in-flight assistant
+ * messages so they don't race the WS delta stream on the same serverId.
+ *
+ * Why this exists: the WS path streams pure deltas under a stable
+ * cm-stream-<otid> id. If REST /messages returns the corresponding
+ * cumulative assistant_message mid-stream, the client's merge appends
+ * the snapshot onto the accumulated deltas and produces incoherent text
+ * (the 2026-05-19 "StandStanding by..." repro). Filtering here keeps the
+ * two transports from racing on the same serverId.
+ *
+ * On the next REST hydrate after turn_done, the run finalizes and drops
+ * out of _activeRuns, so the message naturally appears in subsequent
+ * /messages calls.
+ */
+export function listActiveRunsForConversation(
+  agentId: string,
+  conversationId: string,
+): RunHandle[] {
+  const out: RunHandle[] = [];
+  for (const handle of _activeRuns.values()) {
+    if (handle.record.status !== "running") continue;
+    if (handle.record.agent_id !== agentId) continue;
+    if (handle.record.conversation_id !== conversationId) continue;
+    out.push(handle);
+  }
+  return out;
+}
+
+/**
+ * lcp-r0m: collect the set of message_ids currently claimed by any
+ * active run for the given (agent, conversation) pair. The REST
+ * /messages handler uses this to drop in-flight assistant messages
+ * from the response.
+ */
+export function inFlightMessageIds(
+  agentId: string,
+  conversationId: string,
+): Set<string> {
+  const out = new Set<string>();
+  for (const handle of listActiveRunsForConversation(agentId, conversationId)) {
+    for (const mid of handle.record.message_ids) {
+      if (typeof mid === "string" && mid.length > 0) out.add(mid);
+    }
+  }
+  return out;
+}
+
+/**
  * lcp-nwd: build an inverse messageId -> runId index for a given scope.
  * Used by the message wire projection so each returned LettaMessage
  * carries the run_id that attributed it, enabling mobile's chat-UI
@@ -825,10 +927,22 @@ export function listActiveRunIds(): string[] {
  *
  * When the same messageId appears in multiple runs' message_ids
  * (rare — would imply two runs both claimed the same persisted
- * message), the LAST writer wins to match the "first run that
- * attributed it" semantics most callers want. listRuns returns
- * desc-by-created-at; we iterate accordingly so older wins overall.
+ * message), the OLDEST run wins. We iterate `listRuns(..., order:
+ * "asc")` — oldest-first — and use `if (!out[mid]) out[mid] = r.id`,
+ * so the oldest run that claimed a given messageId keeps the
+ * attribution. Once a run has attributed a persisted message, later
+ * runs cannot steal that attribution. This matches the "first run
+ * that attributed it" intuition most callers want.
  */
+/**
+ * lcp-cen: hard cap on `listRuns` for the attribution walk. Long-lived
+ * agents that exceed this start losing OLDEST runs from the lookup
+ * (because `order: "asc"` walks oldest-first but the result is capped
+ * at this size). The cap-hit warning below surfaces the problem so it
+ * doesn't fail silently as "old messages suddenly render ungrouped".
+ */
+const BUILD_MESSAGE_RUN_MAP_CAP = 10_000;
+
 export function buildMessageRunMap(
   { agentId, conversationId }: { agentId?: string | undefined; conversationId?: string | undefined } = {},
 ): Record<string, string> {
@@ -836,9 +950,28 @@ export function buildMessageRunMap(
   const runs = listRuns({
     ...(agentId !== undefined ? { agentId } : {}),
     ...(conversationId !== undefined ? { conversationId } : {}),
-    limit: 10_000,
+    limit: BUILD_MESSAGE_RUN_MAP_CAP,
     order: "asc",
   });
+  if (runs.length >= BUILD_MESSAGE_RUN_MAP_CAP) {
+    // lcp-cen: structured warning. Converts a silent-incorrectness bug
+    // (attribution-incomplete past the cap) into a loud-incorrectness
+    // bug so operators see it in logs / metrics scrape before users
+    // see ungrouped chat blocks. Logged once per call site invocation;
+    // dedup belongs in a memoization layer (separate concern).
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        module: "runs",
+        event: "buildMessageRunMap.cap_hit",
+        agent_id: agentId ?? null,
+        conversation_id: conversationId ?? null,
+        cap: BUILD_MESSAGE_RUN_MAP_CAP,
+        message:
+          "attribution-incomplete: increase cap or paginate; oldest runs past the cap will not be reflected in the run_id projection",
+      }),
+    );
+  }
   for (const r of runs) {
     for (const mid of r.message_ids ?? []) {
       if (typeof mid === "string" && !out[mid]) out[mid] = r.id;

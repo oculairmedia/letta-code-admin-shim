@@ -149,6 +149,59 @@ so cached mobile state doesn't 404 when the migrator changes id schemes.
 This is purely a transitional convenience and should be empty in a clean
 deployment.
 
+## Intentional divergence #5: WS-only cron mutations
+
+Scheduled prompts ("crons") are an end-to-end shim feature. The shim
+holds the scheduler lease, ticks every 60s, and routes due tasks
+through the agent pool (`admin-shim/lib/cron-scheduler.ts`). The wire
+protocol mirrors Letta Cloud's frame style — `cron_list` / `cron_add`
+/ `cron_get` / `cron_delete` / `cron_delete_all` request/response
+pairs plus a `crons_updated` push — but the **mutations live on the
+WebSocket only**.
+
+Vanilla Letta (when it adds cron) is expected to expose a full HTTP
+CRUD surface for parity with its other resources. We deliberately do
+not, for two reasons:
+
+1. Per the saved memory `shim-new-features-mutations-ws-reads-may-mirror-rest`,
+   any net-new feature in the shim funnels writes through
+   `/shim/v1/mobile` to keep the WS-first contract intact. Cron is
+   the first non-trivial feature added under that rule, and we'd
+   rather not split it.
+2. The mobile app is the only first-class write-side consumer today
+   and already holds a long-lived WS, so a parallel POST/DELETE
+   surface would add maintenance without a consumer.
+
+REST mirrors the **read** side only:
+
+| Route | Method | Returns |
+|-------|--------|---------|
+| `/v1/crons` | `GET` | `{ tasks: CronTask[] }` (filters: `?agent_id=` / `?conversation_id=`) |
+| `/v1/crons/{id}` | `GET` | `CronTask` (404 if missing) |
+| `/v1/crons/scheduler` | `GET` | `{ lease_held, owner_pid, started_at, tasks_active, … }` |
+
+Any non-`GET`/`OPTIONS` method on these paths returns **HTTP 405**
+with a body pointing at the WS protocol (`{ detail, ws_endpoint,
+ws_frames }`). Curl-from-the-terminal still works for inspection;
+write attempts get a precise pointer at the actual API.
+
+A second deliberate divergence: **the shim does not register with the
+Letta Cloud device service** for cron heartbeats. The bundled
+`letta-code` CLI normally expects to phone home to a Cloud-hosted cron
+listener; we keep all execution in-shim so the agent's state and
+schedule live entirely on the local disk. This is one of the design
+constraints behind the whole shim — see
+`/opt/stacks/letta-code-parallel/docs/MOBILE_CHANNEL_DESIGN.md`.
+
+Implementation:
+- Store: `admin-shim/lib/crons.ts` (lock-aware CRUD on
+  `$LETTA_HOME/crons.json` — same file the bundled `letta cron` CLI
+  reads/writes, so the agent's own self-schedule skill interoperates).
+- Scheduler: `admin-shim/lib/cron-scheduler.ts` (lease + 60s tick +
+  fs.watch mtime).
+- WS protocol: see `MOBILE_WS_PROTOCOL.md` §10 for the full frame
+  catalog and `CronTask` schema.
+
 ## What's NOT a divergence (and should stay that way)
 
 - **Conversation list and detail responses** — same shape as vanilla.

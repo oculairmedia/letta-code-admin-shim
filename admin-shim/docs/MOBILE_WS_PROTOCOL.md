@@ -330,15 +330,43 @@ handle them in the client without a WebSocket round-trip.
   present must be a JSON object (not array). Servers reject non-object
   values with `protocol_violation` and keep the socket open.
 - `run_id` / `turn_id` / `surface_id` — optional but recommended for
-  audit correlation. The shim records them verbatim alongside the action.
+  audit correlation. If `run_id` is omitted or `null`, the shim falls back
+  to the most recent Run created on the same WebSocket session so real
+  renderer actions from existing surfaces can still route back to the agent.
+- `component_id` — optional widget/component id. When omitted, agents may
+  still infer a component from `context.componentId`, `context.component_id`,
+  or `context.id` if the renderer supplied one.
 - `action_id` — optional client id for ack correlation. When omitted the
   shim mints `act-<ts>-<rand>` and echoes it in `user_action_ack`.
 
 Outcome: server appends an entry to
 `state/runs/<run_id>/user-actions.jsonl` (or `unbound-<session>/…` when
-run_id is null) and replies with `user_action_ack`. The shim does **not**
-yet inject the action into letta-code's tool dispatcher — a follow-up
-bead wires it once letta-code exposes a stable approval API.
+run_id is null) and replies with `user_action_ack`.
+
+Routing:
+
+1. `name: "tool_approval_choice"` first attempts to match a pending
+   dispatcher approval gate. When it matches, `user_action_ack.routed_as`
+   is `"approval"` and the gate receives the decision.
+2. Any other action with a resolvable `run_id` — explicit or inferred from
+   the session's most recent Run — is injected as a new agent turn on the
+   same agent/conversation. `user_action_ack.routed_as` is `"synthetic_input"`.
+3. Actions that cannot be routed remain audit-only with
+   `user_action_ack.routed_as: "recorded_only"`.
+
+The synthetic user message is plain text and intentionally machine-readable:
+
+```text
+[system: A2UI user action]
+actionId: act-…
+surfaceId: final-roundtrip-test-btn
+componentId: primary-submit
+event: a2ui.final.submit
+context: {"componentId":"primary-submit","value":"confirmed"}
+```
+
+Agents should treat this as an A2UI event signal, not literal prose typed by
+the user.
 
 Errors:
 
@@ -349,6 +377,169 @@ Errors:
   socket stays open.
 - Handler not wired (channel host built without `handleUserAction`) →
   `error{internal_error}`; socket stays open.
+
+#### `subscribe`
+
+Replay + live-tail a Run's frame log (lcp-p74.2). Used to *resume* a
+turn after a network drop or app restart, and to *observe* a run that
+was started by another client (e.g. cron-driven turns).
+
+```json
+{ "v": 1, "type": "subscribe", "id": "…", "ts": "…",
+  "run_id": "run-…",
+  "cursor": 0 }
+```
+
+- `run_id` — **required**, non-empty. Must reference a Run whose
+  `state/runs/<id>/frames.jsonl` has been written at least once.
+- `cursor` — optional. Number; the last `seq` the client has already
+  received. The server emits only frames with `seq > cursor`. Omit (or
+  send `0`) for a full replay from the start.
+
+Server response sequence:
+
+1. Replay phase. For each frame in `frames.jsonl` with `seq > cursor`,
+   the server emits a `subscribe_frame` envelope (§2.2). Frames arrive
+   in seq order; the client should treat each one as if it had just
+   streamed live (it carries the same `message_type` as the original
+   bridge frame).
+2. Live-tail phase. Once the replay catches up, the server watches the
+   frame log via `fs.watch` and forwards new appends as additional
+   `subscribe_frame` envelopes.
+3. Termination. When the Run reaches a terminal status
+   (`completed` / `failed` / `cancelled` / `expired`) **and** the tail
+   has caught up, the server emits a single `subscribe_done` envelope
+   and stops watching.
+
+Re-subscribing to a `run_id` you're already subscribed to *replaces*
+the prior subscription (the server cancels the earlier watcher to
+avoid double-emit on overlapping replays). Use a fresh `cursor` to
+re-replay.
+
+Errors:
+
+- Missing or empty `run_id` → `error{protocol_violation}`; socket
+  stays open.
+- Frame log doesn't exist (unknown run id) →
+  `error{run_not_found, message: "no frames recorded for run <id>"}`;
+  socket stays open.
+- File deleted/rotated mid-subscription → `error{internal_error}`,
+  watcher is closed; client may re-subscribe with the last seen seq.
+
+See §11 for the recommended reconnect-resume pattern.
+
+#### `cron_list`
+
+Request a snapshot of cron tasks. Optional `agent_id` / `conversation_id`
+filters mirror `listTasks()` in `lib/crons.ts`. See §10 for the full
+`CronTask` shape.
+
+```json
+{ "v": 1, "type": "cron_list", "id": "…", "ts": "…",
+  "request_id": "req-1",
+  "agent_id": "agent-597b…",
+  "conversation_id": "default" }
+```
+
+- `request_id` — optional, echoed verbatim on `cron_list_response` for
+  client-side correlation. The shim does not interpret it.
+- `agent_id` — optional. Resolved through `resolveAgentIdAlias` before
+  filtering (so legacy ids match the canonical row).
+- `conversation_id` — optional. Exact match against persisted rows.
+
+Reply: `cron_list_response`.
+
+#### `cron_add`
+
+Persist a new cron task. **Exactly one** of `cron` / `every` / `at` must
+be set; the shim resolves the others. Validation is server-side
+(`isValidCron` / `parseEvery` / `parseAt` from `lib/crons.ts`).
+
+```json
+{ "v": 1, "type": "cron_add", "id": "…", "ts": "…",
+  "request_id": "req-2",
+  "agent_id": "agent-597b…",
+  "conversation_id": "default",
+  "name": "morning-checkin",
+  "description": "summarize overnight signals",
+  "prompt": "What changed overnight in the inbox?",
+  "recurring": true,
+  "cron": "*/30 9-17 * * *",
+  "timezone": "America/Toronto" }
+```
+
+- `agent_id` — **required**, non-empty. Resolved through alias map.
+- `prompt` — **required**, non-empty. Wrapped in a `<system-reminder>`
+  envelope at fire-time so the agent reads it as a scheduled prompt, not
+  a user message (`wrapCronPrompt` in `lib/cron-scheduler.ts`).
+- `name` — optional; defaults to `task-<ts>` when omitted. Free-form
+  display label.
+- `description` — optional; empty string when omitted. Free-form
+  rendered alongside `name` in the agent's reminder envelope.
+- `recurring` — optional. When `every` is set, forced to `true`. When
+  `at` is set, forced to `false`. With raw `cron`, defaults to `true`
+  unless the client explicitly sends `false`.
+- `cron` — optional. Standard 5-field cron expression (minute, hour,
+  day-of-month, month, day-of-week). Accepts `*`, `*/N`, ranges
+  (`N-M`), and exact integers. See §10 for the validation grammar.
+- `every` — optional shorthand. Accepts `Ns` / `Nm` / `Nh` / `Nd`
+  (units accept long forms too: `seconds`/`minutes`/`hours`/`days`).
+  Sub-minute is rounded up to 1m (the cron-floor) with a `warning`
+  on the response. Non-divisor minute/hour intervals snap to the
+  nearest clean divisor of 60/24 — the response carries a `note` field
+  with the rounding rationale (e.g. `7h rounded to every 8h`).
+- `at` — optional shorthand. Accepts `in <N>m`, `in <N>h`, or
+  `H:MMam`/`H:MMpm`. Produces a one-shot with `scheduled_for` set.
+- `timezone` — optional IANA tz string. Defaults to the host's
+  `Intl.DateTimeFormat().resolvedOptions().timeZone`. Cron matching
+  uses this tz, so `0 8 * * *` fires at 08:00 in the task's tz.
+- `conversation_id` — optional. Defaults to `"default"`.
+
+Reply: `cron_add_response` (success with `task`, or failure with `error`).
+
+#### `cron_get`
+
+Fetch one task by id.
+
+```json
+{ "v": 1, "type": "cron_get", "id": "…", "ts": "…",
+  "request_id": "req-3",
+  "task_id": "deadbeef" }
+```
+
+- `task_id` — **required**. The 8-hex-char id from a prior `cron_add_response.task.id`.
+
+Reply: `cron_get_response` (success with `task`, or success=false with
+`error: "task <id> not found"`).
+
+#### `cron_delete`
+
+Remove one task by id.
+
+```json
+{ "v": 1, "type": "cron_delete", "id": "…", "ts": "…",
+  "request_id": "req-4",
+  "task_id": "deadbeef" }
+```
+
+Reply: `cron_delete_response`. Triggers a `crons_updated` push on every
+connected client (this socket included).
+
+#### `cron_delete_all`
+
+Remove every task belonging to one agent. Used by the "wipe schedules
+for this agent" affordance.
+
+```json
+{ "v": 1, "type": "cron_delete_all", "id": "…", "ts": "…",
+  "request_id": "req-5",
+  "agent_id": "agent-597b…" }
+```
+
+- `agent_id` — **required**. Resolved through the alias map.
+
+Reply: `cron_delete_all_response` with `count` (number of rows
+removed). Triggers `crons_updated` push only when `count > 0`.
 
 ### 2.2 Server → client frames
 
@@ -461,13 +652,15 @@ boundary clear when the v0.9 catalog evolves.
 
 #### `user_action_ack`
 
-Reply to a client `user_action` frame. Always lands; `status` carries
-the outcome.
+Immediate receipt ack for a client `user_action` frame. It says the shim
+accepted or rejected the frame for processing; the UI-facing result arrives in
+the follow-up `user_action_outcome` frame.
 
 ```json
 { "v": 1, "type": "user_action_ack", "id": "…", "ts": "…",
   "action_id": "act-…",
-  "status": "accepted" }
+  "status": "accepted",
+  "routed_as": "synthetic_input" }
 ```
 
 - `status` ∈ `"accepted" | "rejected"`. `"rejected"` adds a `reason`
@@ -475,6 +668,52 @@ the outcome.
   agent integration ships).
 - `action_id` echoes the client-supplied id, or carries the
   server-minted id when the client omitted one.
+- `routed_as` ∈ `"approval" | "synthetic_input" | "recorded_only"`
+  when accepted. It is an observability hint; use `user_action_outcome` for
+  user-visible state transitions.
+
+#### `user_action_outcome`
+
+UI-facing result for a client `user_action` frame. Emitted for every inbound
+`user_action`, including validation failures that also produce an `error`
+frame. Clients should log receipt as:
+`A2UI: user_action_outcome received frameId=<id> outcome=<enum>`.
+
+```json
+{ "v": 1, "type": "user_action_outcome", "id": "…", "ts": "…",
+  "frame_id": "client-frame-id",
+  "action_id": "act-…",
+  "outcome": "injected_as_input",
+  "detail": {
+    "action_id": "act-…",
+    "routed_as": "synthetic_input",
+    "synthetic_turn_id": "turn-…",
+    "run_id": "run-…"
+  } }
+```
+
+- `frame_id` correlates back to the originating `user_action` frame `id`.
+  It may be `null` only for malformed/legacy clients that omit `id`.
+- `action_id` echoes the action id when one exists.
+- `outcome` ∈ `"matched_approval" | "injected_as_input" | "recorded_only" |
+  "rejected" | "error"`.
+- `detail.reason` is human-readable and safe to show for `rejected`/`error`.
+  It must not contain stack traces.
+- `detail.synthetic_turn_id` is present for `injected_as_input` once the
+  synthetic agent turn has started.
+
+Minimum client UI behavior:
+
+- `matched_approval` — dismiss the surface or show a brief "decision recorded"
+  state with the selected scope/context.
+- `injected_as_input` — show a brief "sent"/spinner state and wait for the
+  next agent turn to land in chat.
+- `recorded_only` — show a subtle "recorded" caption; this is an audit-only
+  action.
+- `rejected` — show an error chip with `detail.reason` and keep the surface
+  interactive for retry.
+- `error` — show a generic error chip (using `detail.reason` if present) and
+  keep the surface interactive for retry.
 
 #### `error`
 
@@ -597,20 +836,38 @@ inner `tool_call` / `tool_calls` shape). Treat exactly like a
 ```json
 { "v": 1, "type": "assistant_message", "id": "cm-stream-letta-msg-3", "ts": "…",
   "agent_id": "agent-…", "conversation_id": "conv-default-…",
-  "turn_id": "turn-…", "run_id": "run-…",
+  "turn_id": "turn-…", "run_id": "run-…", "seq": 17, "seq_id": 17,
   "content": "pong",
   "otid": "cm-android-d6f0e2c1" }
 ```
 
-- Server-side coalesced: one `assistant_message` per `otid` per turn
-  (`mobile-channel-host.ts:141-197`). letta-code's underlying stream
-  emits many partial chunks; the host concatenates them by `otid`.
+- **Pure-delta stream** (post-`lcp-cv3`): the shim does NOT coalesce
+  server-side. Each frame's `content` carries only the newly-emitted
+  tokens since the previous chunk. Chunks of the same logical message
+  share the same envelope `id` (the `cm-stream-<otid>` prefix);
+  consumers merge by `id` and concatenate in `seq` order. letta-code's
+  underlying stream emits many partial chunks; the host stamps a stable
+  per-otid id but forwards the deltas verbatim.
 - `id` always carries the `cm-stream-` prefix — see §4.2.
+- `seq` — the per-run frame-log cursor (`lcp-p74.2`). Monotonic across
+  every WS frame for a given run; primary cursor for `subscribe(cursor)`
+  replay.
+- `seq_id` — alias of `seq` on `assistant_message` and `reasoning_message`
+  frames (`lcp-pro`). Exposed under this name so the mobile client's
+  existing `hasAlreadyIngestedStreamFrame` gate (which dedups by
+  `seqId: Int?`) fires on the WS path without a mobile-side change.
+  Strictly monotonic-increasing across the turn within one logical
+  message id. Without this alias the gate is dead code on WS — every
+  duplicate delta (reconnect replay, WS-vs-REST race) silently
+  double-appends, producing incoherent text (the 2026-05-19 repro).
+  Other frame types omit `seq_id`; the merge gate only applies to
+  delta-shaped assistant/reasoning frames.
 - `otid` is the **echo of the client's send_message.otid** (when
   present) so mobile can collapse stream-vs-disk twins via
   `dedupeOptimisticContentTwins`.
 
-Test: `ws: assistant_message carries non-empty content on a normal reply`.
+Test: `ws: assistant_message chunks concatenate to the full reply (lcp-cv3 streaming)`.
+Test: `ws: assistant_message chunks carry monotonic seq_id (lcp-pro dedup bridge)`.
 
 #### `stop_reason`
 
@@ -667,6 +924,172 @@ Test: `ws: stop_reason frame carries stop_reason field (\`end_turn\` on clean tu
 Tests:
 - `ws: turn_done follows stop_reason (post-stamp sentinel)`
 - `ws: every post-turn_started frame carries run_id`
+
+#### `subscribe_frame`
+
+A single replayed (or live-tailed) entry from a Run's `frames.jsonl`.
+Emitted in response to `subscribe`; one envelope per frame in seq order.
+
+```json
+{ "v": 1, "type": "subscribe_frame", "id": "…", "ts": "…",
+  "run_id": "run-…",
+  "seq": 17,
+  "frame": { "message_type": "assistant_message", "content": "…", "run_id": "run-…" } }
+```
+
+- `seq` — the cursor value to remember; on reconnect, pass `cursor: seq`
+  to resume after this frame.
+- `frame` — the original `BridgeFrame` shape the host emitted at write
+  time. The same `message_type` discriminator the client uses for live
+  frames applies here verbatim — the renderer should not need a
+  different code path for replayed vs live frames.
+
+Replayed frames carry the original `run_id` / `turn_id` and any
+type-specific fields (`content`, `tool_call`, `reasoning`, etc.).
+The wrapping envelope's `id` / `ts` are fresh for each subscribe
+emission; the inner `frame` payload is whatever was recorded.
+
+#### `subscribe_done`
+
+Terminal envelope for a subscription. Emitted once the Run reaches a
+terminal status (`completed` / `failed` / `cancelled` / `expired`) AND
+the live-tail has caught up to the final frame.
+
+```json
+{ "v": 1, "type": "subscribe_done", "id": "…", "ts": "…",
+  "run_id": "run-…",
+  "last_seq": 42,
+  "status": "completed" }
+```
+
+- `last_seq` — the largest `seq` the server emitted on this
+  subscription. Persist this if you plan to subscribe to the same Run
+  later (rare; usually a terminal subscription is the final word).
+- `status` — the Run's terminal status. Mirrors `run.status` from
+  `/v1/runs/{id}`.
+
+After `subscribe_done` the server stops watching the frame log. The
+client may still send a fresh `subscribe` for the same run if needed
+(e.g. to fetch the full transcript for a "view history" affordance).
+
+#### `cron_list_response`
+
+Reply to `cron_list`. See §10 for the `CronTask` shape.
+
+```json
+{ "v": 1, "type": "cron_list_response", "id": "…", "ts": "…",
+  "request_id": "req-1",
+  "success": true,
+  "tasks": [ /* CronTask[] */ ] }
+```
+
+- `request_id` — echoes the request's value (or `null` if the client omitted it).
+- `success` — always `true` on the read path. Failures surface as a
+  generic server-side internal error and the response carries
+  `success: false, error: <msg>`.
+- `tasks` — array; empty when the filters match nothing.
+
+#### `cron_add_response`
+
+Reply to `cron_add`.
+
+```json
+{ "v": 1, "type": "cron_add_response", "id": "…", "ts": "…",
+  "request_id": "req-2",
+  "success": true,
+  "task": { /* CronTask, see §10 */ },
+  "warning": "No letta server is currently running. This task will only execute when a WS listener is active." }
+```
+
+- `success: true` — `task` is the persisted row (use `task.id` for
+  subsequent `cron_get` / `cron_delete`). `warning` is present only
+  when the file was missing a live scheduler at write-time. With
+  `SHIM_CRON_ENABLED=1` (default) this warning is essentially never
+  observed in production — included for parity with the bundled letta
+  CLI when running outside the shim.
+- `success: false` — `error` carries the validation reason. Possible
+  values: `"agent_id is required"`, `"prompt is required"`, `"one of
+  \`cron\`, \`every\`, or \`at\` is required"`, `"exactly one of
+  \`cron\`, \`every\`, or \`at\` may be set"`, `"invalid cron
+  expression: <expr>"`, `"invalid every: <expr>"`, `"invalid at:
+  <expr>"`, `"Agent <id> has <N> active tasks (max <cap>)…"`.
+
+#### `cron_get_response`
+
+```json
+{ "v": 1, "type": "cron_get_response", "id": "…", "ts": "…",
+  "request_id": "req-3",
+  "success": true,
+  "task": { /* CronTask */ } }
+```
+
+- `success: false` with `error: "task <id> not found"` when the id
+  doesn't resolve. The 404 model carries through the WS envelope
+  rather than as a separate `error` frame — the socket stays open.
+
+#### `cron_delete_response`
+
+```json
+{ "v": 1, "type": "cron_delete_response", "id": "…", "ts": "…",
+  "request_id": "req-4",
+  "success": true }
+```
+
+- `success: false` with `error: "task <id> not found"` when the id is
+  unknown. No `task` is returned.
+
+#### `cron_delete_all_response`
+
+```json
+{ "v": 1, "type": "cron_delete_all_response", "id": "…", "ts": "…",
+  "request_id": "req-5",
+  "success": true,
+  "count": 3 }
+```
+
+- `count` — number of rows removed. `0` is a valid success (the agent
+  had no scheduled tasks). `crons_updated` is broadcast only when
+  `count > 0`.
+
+#### `crons_updated`
+
+Server push emitted whenever the underlying `crons.json` changes —
+mutations from this socket, mutations from a peer socket, scheduler
+ticks that fired a task, and external writes (e.g. the agent calls its
+own self-schedule skill via the bundled letta-code CLI).
+
+```json
+{ "v": 1, "type": "crons_updated", "id": "…", "ts": "…",
+  "reason": "client_mutation",
+  "tasks_active": 2,
+  "at": "2026-05-19T01:23:45.678Z" }
+```
+
+- `reason` ∈
+  - `"client_mutation"` — a WS client called `cron_add` / `cron_delete`
+    / `cron_delete_all` on this shim (broadcast immediately, no
+    fs.watch debounce);
+  - `"scheduler_write"` — the scheduler's tick fired a task and updated
+    its row (`fire_count`, `last_fired_at`, or terminal status);
+  - `"external_write"` — the file mtime changed and our scheduler
+    didn't cause it; almost always the bundled `letta cron`
+    CLI or the agent's self-schedule skill writing the file (≤200ms
+    after the write — fs.watch debounce window);
+  - `"scheduler_started"` / `"scheduler_stopped"` — emitted on the
+    socket immediately when this shim claims or releases the scheduler
+    lease. Useful for surfacing "scheduler offline" state if you have
+    multiple shim instances and only one holds the lease.
+- `tasks_active` — current count of rows with `status: "active"`, read
+  fresh at push time. Treat as an authoritative cap for any list
+  rendering — it can differ from the cached list you last fetched.
+- `at` — when the event was emitted, server-side ISO timestamp.
+
+This frame is broadcast to **every** authenticated socket. Filter
+client-side if your UI scopes by agent.
+
+Subscription is automatic at hello-accept time and lasts for the
+lifetime of the WS connection (`ws-handler.mjs` registers via
+`host.subscribeCronEvents`, unsubscribes in `stopAll`).
 
 #### Sealed-class strategy
 
@@ -1251,10 +1674,484 @@ ambiguous.
 | `CLIENT_FRAMES` / `SERVER_FRAMES` lists | `home/.letta/channels/mobile/lib/protocol.mjs` | 22-45 |
 | Backpressure (bufferedAmount drop) | `home/.letta/channels/mobile/lib/ws-handler.mjs` | 202-206 |
 | Device state sidecar (`devices/<id>.json`) | `home/.letta/channels/mobile/lib/state.mjs` | 17-59 |
+| Cron store (lock-aware CRUD on `crons.json`) | `admin-shim/lib/crons.ts` | full file |
+| Cron scheduler (lease + tick + mtime watcher) | `admin-shim/lib/cron-scheduler.ts` | full file |
+| Cron event bus (`crons_updated` pub/sub) | `admin-shim/lib/cron-events.ts` | full file |
+| Cron WS handlers (handleCron* + agent alias resolution) | `admin-shim/lib/mobile-channel-host.ts` | search for `handleCronList` |
+| Cron WS frame routing (`cron_*` cases + `crons_updated` push) | `home/.letta/channels/mobile/lib/ws-handler.mjs` | search for `case "cron_` |
+| Cron REST mirror (`/v1/crons*` + 405 on mutation) | `admin-shim/server.ts` | search for `handleCronsList` |
+| Frame log writer (`appendRunFrame` + monotonic seq) | `admin-shim/lib/runs.ts` | search for `appendRunFrame` |
+| Subscribe replay + live-tail (`subscribeToRun`) | `admin-shim/lib/mobile-channel-host.ts` | search for `subscribeToRun` |
+| Subscribe WS frame routing | `home/.letta/channels/mobile/lib/ws-handler.mjs` | search for `case "subscribe"` |
 
 For the wire types themselves, read
 `admin-shim/lib/types/wire.ts` — it documents every locked contract in
 the file banner and references the Kotlin counterparts in `Message.kt`.
+
+---
+
+## 10. Cron / Scheduled Prompts
+
+The cron protocol (frames defined in §2) is read-only via REST
+(`/v1/crons*`) and write+read via WS. Every WS mutation is mirrored to
+disk in `$LETTA_HOME/crons.json` so it interoperates byte-for-byte with
+the bundled `letta cron` CLI and the agent's own self-schedule skill.
+
+### 10.1 The `CronTask` shape
+
+```json
+{
+  "id": "deadbeef",
+  "agent_id": "agent-597b…",
+  "conversation_id": "default",
+  "name": "morning-checkin",
+  "description": "summarize overnight signals",
+  "cron": "*/30 9-17 * * *",
+  "timezone": "America/Toronto",
+  "recurring": true,
+  "prompt": "What changed overnight in the inbox?",
+  "status": "active",
+  "created_at": "2026-05-19T13:45:21.000Z",
+  "expires_at": null,
+  "last_fired_at": null,
+  "fire_count": 0,
+  "cancel_reason": null,
+  "jitter_offset_ms": 14823,
+  "scheduled_for": null,
+  "fired_at": null,
+  "missed_at": null
+}
+```
+
+All 19 fields are present on every row. Nullable timestamps are written
+as JSON `null`, not omitted. TypeScript source-of-truth:
+`admin-shim/lib/types/crons.ts` (`CronTask`).
+
+| Field | Type | Semantics |
+|-------|------|-----------|
+| `id` | `string` | 8-char hex, generated server-side at add time. Use this for `cron_get` / `cron_delete`. |
+| `agent_id` | `string` | Canonical agent id (post-alias-resolution). |
+| `conversation_id` | `string` | `"default"` or `"conv-…"`. Determines which thread the fired prompt lands in. |
+| `name` | `string` | Display label. Free-form. |
+| `description` | `string` | Description rendered alongside `name` inside the agent's `<system-reminder>` envelope at fire time. |
+| `cron` | `string` | 5-field cron expression. `"*/5 * * * *"` matches every five minutes; `"0 8 * * 1-5"` matches 08:00 on weekdays. |
+| `timezone` | `string` | IANA tz. Cron matching uses this tz, not the host clock. |
+| `recurring` | `boolean` | `true` for cron-driven recurring tasks; `false` for one-shots scheduled via `at`. |
+| `prompt` | `string` | The agent-facing prompt body. Wrapped in `<system-reminder>` at fire time. |
+| `status` | `CronTaskStatus` | See §10.2. |
+| `created_at` | `string` | ISO timestamp. |
+| `expires_at` | `string \| null` | Reserved for future use (no scheduler path produces it today). |
+| `last_fired_at` | `string \| null` | ISO timestamp of the most recent fire. Updated on every fire (recurring or one-shot). |
+| `fire_count` | `number` | Number of times the task has fired. `0` until the first fire. |
+| `cancel_reason` | `string \| null` | Non-null only when `status === "cancelled"` — reserved for user-initiated cancels. Missed one-shots use `status: "missed"`, NOT `cancel_reason: "missed"`. |
+| `jitter_offset_ms` | `number` | See §10.3. |
+| `scheduled_for` | `string \| null` | ISO timestamp. Set only for one-shots created via `at`. |
+| `fired_at` | `string \| null` | ISO timestamp. Set only for one-shots, identical to `last_fired_at` at terminal time. |
+| `missed_at` | `string \| null` | ISO timestamp. Set only when a one-shot transitions to `status: "missed"`. |
+
+### 10.2 Status vocabulary
+
+`CronTaskStatus` values, matched to bundled letta-code so the bundle's
+CLI and our REST mirror render the same string:
+
+| Value | Set by | Meaning |
+|-------|--------|---------|
+| `"active"` | `cron_add` | Scheduled and waiting to fire. The default on creation. |
+| `"fired"` | scheduler tick | One-shot completed its single fire. Terminal. |
+| `"missed"` | scheduler tick | One-shot's `scheduled_for` was more than `SHIM_CRON_MISSED_THRESHOLD_MS` (default 5 min) in the past when first observed. Never fired. Terminal. |
+| `"cancelled"` | (reserved) | User-initiated cancellation. `cancel_reason` carries detail. Not produced by current code; reserved for future "soft-delete" semantics. |
+| `"completed"` | (reserved) | Recurring task hit `expires_at`. Not produced today. |
+
+Recurring tasks stay `"active"` forever (no terminal state). To stop
+them, send `cron_delete`. Mobile UIs that filter by status should
+treat `"active"` as "show in the schedules tab" and the others as
+"history".
+
+### 10.3 Jitter
+
+`jitter_offset_ms` is the per-task offset (in ms) applied to the
+matched fire-time, so 100 tasks all set to `"*/5 * * * *"` don't
+all fire on the same tick.
+
+- For **recurring** tasks: a positive jitter capped at 10% of the
+  estimated period (or 59.999s, whichever is smaller). Deterministically
+  hashed from `id`, so the same row always picks the same jitter.
+- For **one-shot** tasks landing on `:00` / `:30` boundaries: a
+  *negative* jitter up to 90s before `scheduled_for`, to soften the
+  "everyone scheduled for 3pm fires at exactly 3pm" pile-up. Clamped to
+  not predate `created_at`.
+- For everything else: `0`.
+
+Mobile rendering tip: the user-visible "next fire" should be the
+**jittered** time, not the raw cron match. The scheduler waits
+`jitter_offset_ms` after the cron match before invoking the agent.
+
+### 10.4 Schedule shorthand parsing
+
+`cron_add` resolves `every` / `at` server-side. Edge cases:
+
+- `every "30s"` → cron `"*/1 * * * *"` with a note about the 1-minute
+  floor (cron's granularity).
+- `every "7h"` → cron `"0 */8 * * *"` with a `note` field explaining
+  the rounding to the nearest divisor of 24.
+- `at "in 30m"` → one-shot with `scheduled_for = now + 30min`.
+- `at "3:15pm"` → one-shot for today at 15:15, or tomorrow if that's
+  already past.
+
+The raw 5-field `cron` accepts `*`, `*/N`, `N-M` ranges, and exact
+integers per field. **No L / W / `#` / @-aliases** — keep it simple.
+
+### 10.5 Scheduler-lease semantics
+
+Exactly one process holds the cron scheduler lease at any time.
+Persisted in `crons.json.scheduler_owner` as `{pid, token,
+started_at, process_start_ticks, boot_id}`. The shim claims this on
+boot (`SHIM_CRON_ENABLED=1`, default on) and releases it on SIGTERM /
+SIGINT.
+
+- If another shim (or the bundled letta-code) holds the lease with a
+  live PID, the second claim is a no-op (logs and exits without
+  crashing).
+- After a host crash, the next shim startup sees a stale lease,
+  matches the dead `pid` + `boot_id`, and steals it within one tick.
+- The lease holder ticks every 60s (`TICK_INTERVAL_MS`). The mtime
+  watcher refreshes the cache out-of-band when the file changes,
+  with a 200ms debounce.
+
+Implementation: `admin-shim/lib/cron-scheduler.ts`.
+
+### 10.6 REST read mirror
+
+For dashboards / curl / ops scripts that don't want to hold a WS:
+
+| Route | Method | Returns |
+|-------|--------|---------|
+| `/v1/crons` | `GET` | `{ tasks: CronTask[] }` (filters: `?agent_id=` / `?conversation_id=`) |
+| `/v1/crons/{id}` | `GET` | `CronTask` (404 if missing) |
+| `/v1/crons/scheduler` | `GET` | `{ lease_held, owner_pid, token, started_at, tasks_active, last_tick_at, next_tick_at }` |
+
+Any non-`GET`/`OPTIONS` method on these paths returns **HTTP 405**
+with a body pointing at the WS protocol:
+
+```json
+{
+  "detail": "POST not allowed on cron REST endpoints — mutations are WS-only",
+  "ws_endpoint": "/shim/v1/mobile",
+  "ws_frames": ["cron_add", "cron_list", "cron_get", "cron_delete"]
+}
+```
+
+Per the shim's WS-first-for-mutations rule (see `DIVERGENCE.md` §5),
+the canonical write path is always the WS protocol. The REST mirror
+exists strictly so passive observers don't need a long-lived socket.
+
+### 10.7 Auth
+
+All cron frames require an authenticated socket. Auth is the same
+`MOBILE_CHANNEL_TOKEN` flow described in §1 — clients without a valid
+token at `hello` get `error{invalid_token}` and a WS close (code 4000)
+before any cron frame is dispatched. There is no per-frame re-check;
+the hello result gates the whole session.
+
+### 10.8 Error envelopes
+
+Cron responses use a unified shape:
+
+```json
+{ "v": 1, "type": "cron_add_response", "id": "…", "ts": "…",
+  "request_id": "req-2",
+  "success": false,
+  "error": "invalid cron expression: not a cron" }
+```
+
+This is intentionally different from the generic `error` frame
+(§7) — a failed `cron_add` is **not** a protocol violation, it's a
+data-validation rejection. The socket stays open, no error counter
+increments, and the client can retry with corrected input. Use the
+generic `error` frame's `code` for transport-level failures only.
+
+---
+
+## 11. Reconnect resume
+
+A mobile app that loses its WS connection mid-turn should not lose
+visible state. The shim persists every BridgeFrame to disk
+(`state/runs/<run_id>/frames.jsonl`) and exposes the `subscribe`
+protocol so the reconnecting client can resume from a known cursor
+without re-driving the turn.
+
+This section spells out the recommended client-side recipe end-to-end.
+For the durability model (what's persisted, what isn't, recovery
+non-goals) see `DURABLE_EXECUTION.md`.
+
+### 11.1 What the client tracks per active Run
+
+- `run_id` — captured from the first frame after `send_message`
+  (`turn_started.run_id` is non-null per lcp-99a).
+- `last_seq` — the largest `seq` observed on any frame for that Run.
+  Every server frame for an active turn carries a `seq` field (post
+  lcp-p74.2) — `assistant_message`, `reasoning_message`,
+  `tool_call_message`, `tool_return_message`, `stop_reason`,
+  `usage_statistics`, and `a2ui_frame` all include it. Treat
+  `seq: null` (older clients, frames emitted before run_id resolved)
+  as "no cursor yet" — start from `0` on resume.
+- Terminal flag — flips to `true` when `turn_done` arrives. After
+  that, no resume is needed.
+
+### 11.2 Reconnect recipe
+
+```text
+on network drop:
+  remember (run_id, last_seq) for every non-terminal Run
+  reopen WS, send hello
+  for each remembered Run:
+    send { type: "subscribe", run_id, cursor: last_seq }
+    consume subscribe_frame envelopes until subscribe_done
+      — each envelope's `frame.message_type` matches what the
+        live turn would emit; render it the same way
+      — track subscribe_frame.seq as the new last_seq
+    on subscribe_done: drop the Run from the active set
+```
+
+The replay arrives **before** the live tail catches up, so a partial
+replay followed by live appends is a normal sequence. Don't dedupe by
+`seq` on the client — the server already filters `seq > cursor` for
+you.
+
+### 11.3 Worked example
+
+Mobile is in a turn at `run-abc`. Frames seq 1–4 have arrived:
+`turn_started`, `assistant_message`, `assistant_message`,
+`reasoning_message`. The TCP connection drops at seq 4.
+
+```text
+Client state:  { activeRuns: { "run-abc": { last_seq: 4 } } }
+```
+
+Client reconnects, sends `hello`, then:
+
+```json
+{ "v": 1, "type": "subscribe", "id": "…", "ts": "…",
+  "run_id": "run-abc", "cursor": 4 }
+```
+
+Server replays seq 5+ from `frames.jsonl`:
+
+```json
+{ "v": 1, "type": "subscribe_frame", "seq": 5,
+  "run_id": "run-abc",
+  "frame": { "message_type": "tool_call_message", "tool_call": {…} } }
+{ "v": 1, "type": "subscribe_frame", "seq": 6,
+  "run_id": "run-abc",
+  "frame": { "message_type": "tool_return_message", "tool_return": {…} } }
+{ "v": 1, "type": "subscribe_frame", "seq": 7,
+  "run_id": "run-abc",
+  "frame": { "message_type": "assistant_message", "content": "…" } }
+```
+
+Then a live tail of new frames as they arrive:
+
+```json
+{ "v": 1, "type": "subscribe_frame", "seq": 8,
+  "run_id": "run-abc",
+  "frame": { "message_type": "stop_reason", "stop_reason": "end_turn" } }
+{ "v": 1, "type": "subscribe_frame", "seq": 9,
+  "run_id": "run-abc",
+  "frame": { "message_type": "usage_statistics", "prompt_tokens": 1024, … } }
+```
+
+Final terminal envelope (the Run was already `completed` on disk;
+once the tail catches up, the server stops watching):
+
+```json
+{ "v": 1, "type": "subscribe_done", "id": "…", "ts": "…",
+  "run_id": "run-abc",
+  "last_seq": 9,
+  "status": "completed" }
+```
+
+Client drops `run-abc` from its active set.
+
+### 11.4 Cursor caveats
+
+- Frames are written in seq order but seq values are **per-run**, not
+  global. Two different Runs each start at `seq: 1`.
+- A turn that's already terminal at the time of subscribe receives the
+  full replay then `subscribe_done` essentially back-to-back. Render
+  the frames as you go; the terminal flag arrives last.
+- The frame log is append-only — there's no rewrite. A `seq` you
+  remembered yesterday is still valid tomorrow as long as the Run's
+  directory hasn't been GC'd (Run TTL is currently infinite; see
+  `DURABLE_EXECUTION.md` for the non-goal of bounded retention).
+
+---
+
+## 12. WS-canonical conversation state (deconfliction)
+
+**Status:** draft. Tracks epic `letta-mobile-wq8v` ("Conversation state:
+single source of truth across REST + WS + SSE"). This section pins the
+contract; the implementation lands across phases P1–P5 of that epic.
+
+### 12.1 Why this section exists
+
+Through Phase-1 the shim accumulated several concurrent paths for
+conversation state that don't know about each other:
+
+1. `POST /v1/conversations/{id}/stream` — long-lived SSE-shaped agent
+   run output (observed durations ~30–48 min per stream).
+2. `/shim/v1/mobile` WebSocket — A2UI frames, message deltas, tool
+   approvals, cron, subscribe/resume.
+3. `GET /v1/conversations/{id}/messages` — REST history; called with
+   inconsistent shapes (`limit=200`/`250`, `order=asc`/`desc`) from
+   multiple consumers.
+4. `GET /v1/runs/{id}/steps` — REST polling for the live-run pane.
+5. Agent-pool stdin — the actual write path into the messages table.
+
+Storage is fine (single Letta messages table). The chaos is in
+**server→client delivery** and **client-side reconciliation**:
+multiple writers into the UI, no monotonic ordering across paths,
+no shared cursor on the wire. Observed symptoms include hydration
+misses on reopen, A2UI surface history flashing the whole timeline,
+silently-dropped actions on a stale WS, and `total_frames=0` in
+a2ui turn_metrics even when A2UI is clearly rendering.
+
+The fix is to pick a single canonical transport for conversation-state
+mutations and treat everything else as observers or cold-start replay.
+
+### 12.2 The canonical transport: WebSocket
+
+For each conversation:
+
+- **WS is the canonical mutator.** Every state-mutating frame
+  (`assistant_message`, `tool_call_message`, `tool_return_message`,
+  `reasoning_message`, `stop_reason`, `usage_statistics`, `turn_done`,
+  `a2ui_frame`, `user_action_outcome`) reaches the client over WS.
+- **REST is cold-start replay only.** `GET /v1/conversations/{id}/messages`
+  fires exactly once per cold-open of a conversation. It does **not**
+  poll while a WS session is active for that same conv.
+- **SSE `/stream` is deprecated.** Phase-1 clients may continue to read
+  it during transition (P3); P4-compliant clients MUST NOT open `/stream`
+  for any conv that has a live WS session.
+- **REST `/v1/runs/{id}/steps` is observability-only.** Live run-pane
+  state arrives via WS frames; REST step polling is for offline
+  dashboards (ops curl, cron-driven views).
+
+### 12.3 Per-conversation monotonic `seq`
+
+Every server→client WS frame for a conversation carries a per-conversation
+monotonic `seq` field in addition to the per-run `seq` already used for
+`subscribe`/`subscribe_done` (§11). The two cursors coexist:
+
+- `seq` (per-conv) — new field added by this section. Increments by 1
+  for every frame the shim emits for conversation `X` over WS,
+  regardless of which run produced it.
+- `frame.seq` inside `subscribe_frame` — unchanged. Per-run cursor for
+  replay-after-drop.
+
+Client semantics:
+
+- The single `ConversationStateHolder` (§12.4) records `last_conv_seq`
+  per conversation. On WS reconnect, it sends a future `resync_conversation`
+  frame (P1 deliverable) carrying `last_conv_seq` and receives a
+  backfill of any frames it missed during the disconnect window.
+- A frame with `seq <= last_conv_seq` is a duplicate; drop it.
+- A gap (`seq > last_conv_seq + 1`) triggers a single REST cold-start
+  refetch and resets `last_conv_seq` to the highest seq observed.
+
+`seq` is server-assigned. Clients MUST NOT mint or modify it. Persisted
+to disk alongside the conversation row so it survives shim restarts;
+the persistence model is owned by `lib/store.ts` (P1 deliverable).
+
+### 12.4 Client-side: one `ConversationStateHolder`
+
+On Android the contract is symmetrical:
+
+- **Exactly one writer per conversation.** The WS frame pump is the
+  sole writer into the per-conversation state holder. REST cold-start
+  hands its result to the holder via a single `seedFromCold` call and
+  then ceases to be a writer.
+- **All UI subscribes through the holder.** No view binds directly to a
+  raw network response. Chat list, message timeline, A2UI surface
+  registry, run-step pane — all derived from the holder's observable
+  state.
+- **No polling.** The only acceptable triggers for `seedFromCold` are
+  cold app start, explicit pull-to-refresh, or a per-conv seq gap
+  detected by the holder itself.
+
+Anti-patterns to remove (tracked under `letta-mobile-wq8v` children):
+
+- Multiple `/v1/conversations/{id}/messages` consumers with their own
+  paginators (`letta-mobile-16li`).
+- SSE `/stream` reads concurrent with WS sessions for the same conv
+  (`letta-mobile-c3h4`).
+- A2UI surface history replayed frame-by-frame on conversation reopen
+  (`letta-mobile-g2qg`) — the holder folds prior surfaces into final
+  state during `seedFromCold` and renders only the live snapshot.
+
+### 12.5 Frame metadata unification
+
+`a2ui_frame` MUST flow through the same `turn_metrics` pipeline that
+counts text/tool frames. Today the A2UI splitter operates inline on the
+WS-only path and bypasses the metrics emitter, producing the
+`total_frames: 0` observability blind-spot seen in `/tmp/admin-shim.log`.
+
+P5 deliverable: every WS frame carrying a `run_id` increments
+`turn_metrics.total_frames` regardless of which path inside the shim
+produced it. `widget_types_seen` populates for every successfully
+validated `a2ui_frame`.
+
+### 12.6 Migration phases (cross-ref to epic `letta-mobile-wq8v`)
+
+| Phase | Deliverable | Lands in |
+|-------|-------------|----------|
+| **P1** | Define WS-canonical contract: per-conv `seq` field on every server frame, `resync_conversation` frame shape, REST cold-start contract, SSE retirement plan. | `MOBILE_WS_PROTOCOL.md` (this section), `lib/types/wire.ts`, `lib/store.ts` (seq persistence). |
+| **P2** | Single `ConversationStateHolder` on Android. WS pump is sole writer; REST is `seedFromCold` only. | `letta-mobile/android-compose/core/...`. |
+| **P3** | Retire (or quarantine behind flag) `POST /v1/conversations/{id}/stream` for mobile clients. | `admin-shim/server.ts`, mobile transport layer. |
+| **P4** | Stop REST `/v1/conversations/{id}/messages` polling. Cold-start + pull-to-refresh only. | mobile data layer. |
+| **P5** | Unify A2UI metrics with the rest of the frame pipeline. `total_frames` reflects every emitted frame. | `lib/a2ui-adapter.ts`, `lib/a2ui-stream-splitter.ts`, `mobile-channel-host.ts`. |
+
+Acceptance lives in the epic. Each phase ships behind a feature flag
+where reversibility matters (P3 especially); P1/P2/P5 are
+forward-compatible by construction.
+
+### 12.7 In-flight messages MUST NOT appear in REST snapshots
+
+**Rule (lcp-r0m):** REST `GET /v1/conversations/{id}/messages` and `GET
+/v1/agents/{id}/messages` MUST NOT return content that is currently being
+streamed via WS for the same conversation. The two transports MUST NOT
+race on the same serverId.
+
+Why: the WS path streams pure deltas under a stable `cm-stream-<otid>`
+id. If REST returns the corresponding cumulative `assistant_message`
+mid-stream, the client's merge appends the snapshot onto the accumulated
+deltas and produces incoherent text (the 2026-05-19 "StandStanding
+by..." repro).
+
+Implementation: the shim tracks active runs via `_activeRuns` in
+`lib/runs.ts`. A run is "active" when it has been created and not yet
+finalized (`status === "running"`). Every message persisted during such
+a run is recorded in `RunRecord.message_ids` via `recordRunMessage`.
+The REST `/messages` handlers consult `inFlightMessageIds(agentId,
+conversationId)` and filter the response — any message whose id is in
+the in-flight set is dropped. On `finalizeRun` the handle leaves
+`_activeRuns` and the next REST hydrate naturally picks the message up.
+
+This is a narrow filter on top of the existing REST surface. It does
+not change the WS contract, does not change the disk projection, and
+does not change the response shape for any conversation that has no
+active run. Tests in `admin-shim/test/ws-protocol.test.ts`
+(`lcp-r0m REST /messages drops in-flight content`) defend the rule.
+
+### 12.8 What does NOT change
+
+- REST `/v1/agents/{agent_id}/messages` after `turn_done` (§6
+  reconciliation pattern) is unaffected — that GET is a cold-start /
+  post-turn reconciliation, not a poll. The new holder uses it.
+- `subscribe` / `subscribe_frame` / `subscribe_done` (§11) keep their
+  per-run `seq` semantics for mid-turn reconnect-resume. The new
+  per-conv `seq` is additive and orthogonal.
+- The locked behavioral contracts in §4 are preserved. Single-flight,
+  otid round-trip, cm-stream- prefix, per-type ms offsets — all stay.
 
 ---
 

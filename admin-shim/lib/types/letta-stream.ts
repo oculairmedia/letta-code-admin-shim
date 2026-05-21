@@ -391,6 +391,14 @@ export interface LettaToolReturn {
  * (`translate.mjs:localMessageToConversationMessages`) fans one of
  * these out into ONE OR MORE vanilla wire messages.
  *
+ * Post-pi-backup letta-code (0.25.x) writes a NEW shape for tool turns:
+ * each tool result is a TOP-LEVEL row with `role: "toolResult"` plus
+ * the top-level `toolCallId` / `toolName` / `isError` fields below
+ * (not a part inside an assistant message). The assistant message
+ * carrying the matching tool call uses `{type:"toolCall", id, name,
+ * arguments}` parts (camelCase, `id` instead of `toolCallId`, object
+ * args). The translator handles both old and new shapes.
+ *
  * @example fixtures see migrator/out/conversations/<key>/messages.jsonl
  */
 export interface LocalMessage {
@@ -398,9 +406,15 @@ export interface LocalMessage {
   role: LocalMessageRole;
   parts: LocalMessagePart[];
   metadata?: LocalMessageMetadata;
+  /** Top-level toolCallId — present iff role === "toolResult" (new shape). */
+  toolCallId?: string;
+  /** Top-level toolName — present iff role === "toolResult" (new shape). */
+  toolName?: string;
+  /** Top-level isError — present iff role === "toolResult" (new shape). */
+  isError?: boolean;
 }
 
-export type LocalMessageRole = "user" | "assistant" | "system" | "tool";
+export type LocalMessageRole = "user" | "assistant" | "system" | "tool" | "toolResult";
 
 export interface LocalMessageMetadata {
   /** Sentinel ISO when the agent wrote the row; real time lives in sidecar. */
@@ -422,7 +436,25 @@ export type LocalMessagePart =
   | { type: "step-start" }
   | LocalMessageToolCallPart
   | LocalMessageToolReturnPart
-  | LocalMessageNativeToolPart;
+  | LocalMessageNativeToolPart
+  | LocalMessageToolCallContentPart;
+
+/**
+ * New-shape assistant tool-call part written by letta-code 0.25.x
+ * (post-pi-backup migrate-transcripts). Replaces the old hyphenated
+ * `tool-call` variant for assistant rows: `{type:"toolCall", id, name,
+ * arguments}` where `id` carries the toolCallId and `arguments` is an
+ * object (not a JSON string).
+ *
+ * @example {"type":"toolCall","id":"toolu_abc","name":"Bash",
+ *           "arguments":{"command":"ls"}}
+ */
+export interface LocalMessageToolCallContentPart {
+  type: "toolCall";
+  id: string;
+  name?: string;
+  arguments?: string | Record<string, unknown>;
+}
 
 /** Bare tool-call part (rare — most go via `tool-${name}` native form). */
 export interface LocalMessageToolCallPart {

@@ -27,6 +27,7 @@
  *
  * Trace selection (first match wins):
  *   - LETTA_MOCK_FORCE_TRACE  → use exactly this fixture for every turn
+ *   - LETTA_MOCK_STOP_REASON  → rewrite stop_reason frames to this value
  *   - input.content contains "bash" / "shell" / "echo" → bash-tool
  *   - input.content contains "read" / "file" → read-tool
  *   - input.content contains "list" / "bullet" / "step" → multi-step
@@ -101,6 +102,14 @@ function rewrite(frame) {
   if (f.event && typeof f.event === "object") {
     if (f.event.agent_id) f.event.agent_id = agentId;
     if (f.event.conversation_id) f.event.conversation_id = conversationId;
+    const forcedStopReason = process.env["LETTA_MOCK_STOP_REASON"];
+    if (
+      typeof forcedStopReason === "string" &&
+      forcedStopReason.length > 0 &&
+      f.event.message_type === "stop_reason"
+    ) {
+      f.event.stop_reason = forcedStopReason;
+    }
   }
   return f;
 }

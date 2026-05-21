@@ -13,7 +13,7 @@
  * the only place the shim binds to it.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -21,6 +21,7 @@ import type { IncomingMessage } from "node:http";
 
 import { reshapeFrame } from "./chat.js";
 import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
+import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
 import {
   A2uiStreamSplitter,
@@ -28,9 +29,10 @@ import {
   type A2uiBlock,
   type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
-import { createRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
+import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
 import {
   findUnmappedTailUserMessageId,
+  getAgentRecord,
   resolveConversationId,
   writeOtidForLocalId,
 } from "./store.js";
@@ -126,6 +128,13 @@ interface BridgeSendMessageArgs {
   content_parts?: unknown[] | null;
   otid?: string | null;
   a2ui_capability?: A2uiCapability | null;
+  /**
+   * lcp-4tv: marks the resulting Run as background. Cron-driven and
+   * other operator-initiated turns set this true so list filters
+   * (`/v1/runs?background=true`) can pull them out. Defaults to false
+   * (foreground / user-initiated).
+   */
+  background?: boolean;
 }
 
 interface BridgeSendMessageHooks {
@@ -140,8 +149,8 @@ interface BridgeSendMessageHooks {
  * `onFrame(reshapedFrame)` fires for each vanilla-shaped frame coming
  * out of the worker. The WS handler wraps these into protocol envelopes.
  */
-async function bridgeSendMessage(
-  { agent_id, conversation_id, text, content_parts, otid, a2ui_capability }: BridgeSendMessageArgs,
+export async function bridgeSendMessage(
+  { agent_id, conversation_id, text, content_parts, otid, a2ui_capability, background }: BridgeSendMessageArgs,
   onFrame: (frame: BridgeFrame) => void,
   { onRunCreated }: BridgeSendMessageHooks = {},
 ): Promise<unknown> {
@@ -156,7 +165,8 @@ async function bridgeSendMessage(
   // bare literal "default" which the resolver refuses), fall back to
   // the client's pair so the worker pool can still target a fresh conv.
   const resolved = await resolveConversationId(conversation_id);
-  const effectiveAgentId = resolved?.agentId ?? agent_id;
+  const requestedAgentId = resolved?.agentId ?? agent_id;
+  const effectiveAgentId = resolveAgentIdAlias(requestedAgentId, (id) => getAgentRecord(id) != null);
   const effectiveConvId = resolved?.conversationId ?? conversation_id;
 
   // lcp-99a: create the Run record BEFORE awaiting pool.get() so the ws
@@ -168,6 +178,7 @@ async function bridgeSendMessage(
   const runHandle = createRun({
     agentId: effectiveAgentId,
     conversationId: effectiveConvId,
+    background: background ?? false,
     onCancel: () => {
       // Replaced by runTurn(). If a cancel lands before runTurn() patches
       // this in, it's a no-op — the worker doesn't exist yet so there's
@@ -178,6 +189,20 @@ async function bridgeSendMessage(
   if (typeof onRunCreated === "function") {
     try { onRunCreated(runHandle.id); } catch {}
   }
+
+  // lcp-p74.1: every frame the host emits also lands in state/runs/<id>/frames.jsonl
+  // so a disconnected mobile client can later subscribe(run_id, cursor) (lcp-p74.2)
+  // and replay. Wrapping at the consumer-emit boundary captures the post-reshape
+  // shape — i.e. exactly what the WS would see, not the raw upstream frame.
+  // lcp-p74.2: stamp the assigned seq onto the frame so live consumers track
+  // their cursor in lockstep with what subscribe(run_id, cursor) would replay.
+  const emit = (frame: BridgeFrame): void => {
+    const { seq } = appendRunFrame(runHandle.id, frame);
+    if (seq > 0) {
+      (frame as unknown as Record<string, unknown>)["seq"] = seq;
+    }
+    onFrame(frame);
+  };
 
   const pool = getAgentPool();
   const worker = await pool.get(effectiveConvId, effectiveAgentId);
@@ -322,12 +347,12 @@ async function bridgeSendMessage(
           // empty bubbles down the wire.
           if (split.text.length > 0) {
             (reshaped as unknown as Record<string, unknown>)["content"] = split.text;
-            onFrame(reshaped);
+            emit(reshaped);
           }
           // Forward each completed A2UI block as a host-synthesized frame.
           const runId = (reshaped as { run_id?: string | null }).run_id ?? null;
           for (const block of split.frames) {
-            onFrame(buildA2uiFrame(block, otid ?? null, runId));
+            emit(buildA2uiFrame(block, otid ?? null, runId));
           }
           return;
         }
@@ -337,7 +362,7 @@ async function bridgeSendMessage(
           (reshaped as unknown as Record<string, unknown>)["id"] = `cm-reason-${otid}`;
         }
       }
-      onFrame(reshaped);
+      emit(reshaped);
     },
   });
 
@@ -350,7 +375,7 @@ async function bridgeSendMessage(
       const flush = splitter.flush();
       if (flush.text.length > 0) {
         const fakeOtid = otidKey === "__no-otid__" ? null : otidKey;
-        onFrame({
+        emit({
           id: fakeOtid ? `cm-stream-${fakeOtid}` : `cm-stream-flush-${Date.now()}`,
           date: new Date().toISOString(),
           name: null,
@@ -388,8 +413,8 @@ async function bridgeSendMessage(
 
   // End-of-turn tail: stop_reason → usage_statistics. Assistant chunks
   // were already forwarded inline above.
-  if (pendingStop) onFrame(pendingStop);
-  if (pendingUsage) onFrame(pendingUsage);
+  if (pendingStop) emit(pendingStop);
+  if (pendingUsage) emit(pendingUsage);
 
   // Bind mobile's otid to the user message letta-code persisted — same
   // path the SSE handler runs so the disk projection echoes the otid back
@@ -428,11 +453,9 @@ interface GetMobileChannelAdapterOptions {
 }
 
 /**
- * Phase 5: handle an inbound A2UI user_action frame. Records the action
- * to the run sidecar and returns a synchronous ack. The actual
- * tool-dispatcher gate integration ships in a follow-up bead once
- * letta-code exposes a stable approval API; for now the recorded
- * action is the canonical source of truth for downstream consumers.
+ * Phase 5: handle an inbound A2UI user_action frame. Approval actions resolve
+ * pending dispatcher gates; non-approval actions with a resolvable run become
+ * synthetic agent input; every action is recorded to the run sidecar.
  */
 function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
   const actionId =
@@ -442,21 +465,88 @@ function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
   if (typeof action.name !== "string" || action.name.length === 0) {
     return { action_id: actionId, status: "rejected", reason: "missing event name" };
   }
+  const approvalDecision = approvalDecisionFromAction(action, actionId);
+  const matchedApproval = Boolean(approvalDecision && action.run_id && resolveApprovalGate(action.run_id, approvalDecision));
+  const syntheticInput = !approvalDecision ? syntheticInputFromAction(action, actionId) : null;
+  const routedAs = matchedApproval
+    ? "approval"
+    : syntheticInput
+      ? "synthetic_input"
+      : "recorded_only";
   recordA2uiUserAction({
     run_id: action.run_id,
     session_id: action.session_id,
     turn_id: action.turn_id,
     surface_id: action.surface_id,
+    component_id: action.component_id ?? null,
     name: action.name,
     context: action.context ?? {},
     action_id: actionId,
+    routed_as: routedAs,
   });
-
-  const approvalDecision = approvalDecisionFromAction(action, actionId);
-  if (approvalDecision && action.run_id) {
-    resolveApprovalGate(action.run_id, approvalDecision);
+  console.log(JSON.stringify({
+    level: "info",
+    module: "a2ui",
+    event: "user_action_routed",
+    run_id: action.run_id,
+    surface_id: action.surface_id,
+    component_id: action.component_id ?? null,
+    action_name: action.name,
+    action_id: actionId,
+    routed_as: routedAs,
+  }));
+  if (syntheticInput) {
+    return { action_id: actionId, status: "accepted", routed_as: routedAs, synthetic_input: syntheticInput };
   }
-  return { action_id: actionId, status: "accepted" };
+  return { action_id: actionId, status: "accepted", routed_as: routedAs };
+}
+
+function syntheticInputFromAction(
+  action: A2uiUserAction,
+  actionId: string,
+): { agent_id: string; conversation_id: string; text: string } | null {
+  if (!action.run_id) return null;
+  const run = getRun(action.run_id);
+  if (!run?.agent_id || !run.conversation_id) return null;
+  return {
+    agent_id: run.agent_id,
+    conversation_id: run.conversation_id,
+    text: formatSyntheticA2uiAction(action, actionId),
+  };
+}
+
+function formatSyntheticA2uiAction(action: A2uiUserAction, actionId: string): string {
+  // lcp-crp follow-up: previous format read like a system log ("[system: A2UI
+  // user action] event: demo.send context: {...}") so the LLM treated it as a
+  // notification and responded in 7 tokens. Rephrase as a clear user-input
+  // signal with the full context body inline so any data the mobile client
+  // captures (TextField values, picker choices, form snapshots) is visible
+  // to the agent without it having to parse "context: <json>" out of band.
+  const componentId = action.component_id ?? componentIdFromContext(action.context) ?? null;
+  const componentClause = componentId !== null ? ` (component "${componentId}")` : "";
+  const ctx = action.context ?? {};
+  const ctxHasData = Object.keys(ctx).length > 0;
+  const ctxBody = ctxHasData ? JSON.stringify(ctx, null, 2) : "(no additional data)";
+  return [
+    "[User UI interaction via A2UI]",
+    "",
+    `The user performed the action "${action.name}" on surface "${action.surface_id ?? "(unspecified)"}"${componentClause}.`,
+    "",
+    "Data the user submitted with this interaction:",
+    ctxBody,
+    "",
+    "Respond as you would to a normal user message based on this interaction. Treat the data above as the user's input.",
+    `(traceId: ${actionId})`,
+  ].join("\n");
+}
+
+function componentIdFromContext(context: Record<string, unknown>): string | null {
+  const camel = context["componentId"];
+  if (typeof camel === "string" && camel.length > 0) return camel;
+  const snake = context["component_id"];
+  if (typeof snake === "string" && snake.length > 0) return snake;
+  const id = context["id"];
+  return typeof id === "string" && id.length > 0 ? id : null;
 }
 
 function approvalDecisionFromAction(
@@ -505,6 +595,302 @@ function normalizeApprovalScope(value: string): ApprovalScope | null {
 }
 
 /**
+ * lcp-p74.2: subscribe to a run's frame log. Replays every frame with
+ * seq > cursor in original order, then live-tails new appends as the
+ * worker continues to emit. Calls `onDone` once the run reaches a
+ * terminal state AND the tail has caught up. Returns an `unsubscribe`
+ * function the caller binds to its WS close handler.
+ *
+ * Errors via `onError` and stops: unknown runId (no frames.jsonl on
+ * disk), file read failure. The function does NOT throw — callers
+ * propagate via the error callback so the WS layer can map to a
+ * protocol frame uniformly.
+ */
+export interface SubscribeToRunCallbacks {
+  onFrame: (frame: unknown, seq: number) => void;
+  onDone: (info: { last_seq: number; status: string }) => void;
+  onError: (info: { code: string; message: string }) => void;
+}
+
+export function subscribeToRun(
+  runId: string,
+  cursor: number,
+  cbs: SubscribeToRunCallbacks,
+): { unsubscribe: () => void } {
+  const path = getFramesFilePath(runId);
+  if (!existsSync(path)) {
+    cbs.onError({ code: "run_not_found", message: `no frames recorded for run ${runId}` });
+    return { unsubscribe: () => {} };
+  }
+
+  let lastSeqSent = Math.max(0, Number.isFinite(cursor) ? cursor : 0);
+  let stopped = false;
+  let watcher: FSWatcher | null = null;
+  let polling = false;
+
+  // Replay (and live-tail) is "read whole file, filter by seq > lastSeqSent,
+  // emit, advance lastSeqSent". Re-reading on every change is O(n) per
+  // append; fine for v1 since runs rarely exceed thousands of frames and
+  // appendFileSync guarantees lines are ordered + complete.
+  const readAndEmit = (): void => {
+    if (stopped) return;
+    let body: string;
+    try {
+      body = readFileSync(path, "utf8");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      cbs.onError({ code: "internal_error", message: `frames.jsonl read failed: ${msg}` });
+      stop();
+      return;
+    }
+    for (const line of body.split("\n")) {
+      if (stopped) return;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let obj: { seq?: number; frame?: unknown };
+      try {
+        obj = JSON.parse(trimmed);
+      } catch {
+        continue; // skip malformed (partial trailing line during a write race, etc.)
+      }
+      if (typeof obj.seq !== "number" || obj.seq <= lastSeqSent) continue;
+      cbs.onFrame(obj.frame, obj.seq);
+      lastSeqSent = obj.seq;
+    }
+  };
+
+  const checkTerminalAndMaybeFinish = (): boolean => {
+    if (stopped) return true;
+    const run = getRun(runId);
+    if (!run) return false;
+    const terminal = run.status === "completed" || run.status === "failed" || run.status === "cancelled" || run.status === "expired";
+    if (!terminal) return false;
+    // Final tail to make sure we got everything written after the status
+    // flip — finalizeRun writes run.json before any final flush of frames
+    // in practice, but a defensive re-read closes the race.
+    readAndEmit();
+    if (!stopped) {
+      cbs.onDone({ last_seq: lastSeqSent, status: run.status ?? "unknown" });
+      stop();
+    }
+    return true;
+  };
+
+  function stop(): void {
+    stopped = true;
+    if (watcher) {
+      try { watcher.close(); } catch {}
+      watcher = null;
+    }
+  }
+
+  // Initial replay + immediate terminal check (handles already-completed runs).
+  readAndEmit();
+  if (checkTerminalAndMaybeFinish()) return { unsubscribe: stop };
+
+  // Live-tail. fs.watch can fire multiple times per append on some FSes;
+  // dedup via the polling guard. We use 'change' events; 'rename' would
+  // mean the file was rotated/deleted — treat as terminal-ish error.
+  try {
+    watcher = fsWatch(path, (eventType) => {
+      if (stopped || polling) return;
+      polling = true;
+      try {
+        if (eventType === "change") {
+          readAndEmit();
+          checkTerminalAndMaybeFinish();
+        } else if (eventType === "rename") {
+          cbs.onError({ code: "internal_error", message: "frames.jsonl was rotated or deleted during subscription" });
+          stop();
+        }
+      } finally {
+        polling = false;
+      }
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    cbs.onError({ code: "internal_error", message: `fs.watch failed: ${msg}` });
+    stop();
+  }
+
+  return { unsubscribe: stop };
+}
+
+// ── Cron WS handlers (lcp-2gx) ──────────────────────────────────
+//
+// Backed by lib/crons.ts. The same store the bundled letta-code self-schedule
+// skill writes to, so frames here interoperate with that.
+//
+// After each successful mutation we broadcast a `client_mutation` cron event
+// so peer WS clients receive a `crons_updated` push within a few hundred μs
+// — the fs.watch path in cron-scheduler would also catch the write, but its
+// 200ms debounce is slower than direct broadcast.
+
+import {
+  addTask as cronAddTask,
+  deleteAllTasks as cronDeleteAllTasks,
+  deleteTask as cronDeleteTask,
+  getTask as cronGetTask,
+  isValidCron,
+  listTasks as cronListTasks,
+  parseAt,
+  parseEvery,
+  getActiveTasks as cronGetActiveTasks,
+} from "./crons.js";
+import { broadcastCronEvent, subscribeCronEvents } from "./cron-events.js";
+import type {
+  AddTaskInput,
+  AddTaskResult,
+  CronTask,
+  ListTaskFilters,
+} from "./types/crons.js";
+
+export interface CronAddRequest {
+  agent_id: string;
+  conversation_id?: string;
+  name?: string;
+  description?: string;
+  prompt: string;
+  recurring?: boolean;
+  cron?: string;
+  every?: string;
+  at?: string;
+  timezone?: string;
+}
+
+export interface CronAddResponse {
+  success: true;
+  task: CronTask;
+  warning?: string;
+}
+
+export interface CronErrorResponse {
+  success: false;
+  error: string;
+}
+
+/** Read a snapshot of crons. Agent_id alias is resolved before listing. */
+export function handleCronList(filters: ListTaskFilters = {}): { tasks: CronTask[] } {
+  const effective: ListTaskFilters = {};
+  if (filters.agent_id) {
+    effective.agent_id = resolveAgentIdAlias(filters.agent_id, (id) => getAgentRecord(id) != null);
+  }
+  if (filters.conversation_id) effective.conversation_id = filters.conversation_id;
+  return { tasks: cronListTasks(effective) };
+}
+
+export function handleCronGet(taskId: string): CronTask | null {
+  return cronGetTask(taskId);
+}
+
+/**
+ * Validate + add a cron task. Supports raw `cron` expression or shortcuts
+ * via `every` / `at`. Resolves agent_id alias before persistence.
+ */
+export function handleCronAdd(req: CronAddRequest): CronAddResponse | CronErrorResponse {
+  if (!req.agent_id || typeof req.agent_id !== "string") {
+    return { success: false, error: "agent_id is required" };
+  }
+  if (typeof req.prompt !== "string" || req.prompt.length === 0) {
+    return { success: false, error: "prompt is required" };
+  }
+
+  const effectiveAgent = resolveAgentIdAlias(req.agent_id, (id) => getAgentRecord(id) != null);
+
+  // Resolve schedule: exactly one of cron / every / at.
+  let cronExpr: string | null = null;
+  let scheduledFor: Date | undefined;
+  let recurring = req.recurring ?? true;
+  const provided = [req.cron, req.every, req.at].filter((v) => typeof v === "string" && v.length > 0).length;
+  if (provided === 0) {
+    return { success: false, error: "one of `cron`, `every`, or `at` is required" };
+  }
+  if (provided > 1) {
+    return { success: false, error: "exactly one of `cron`, `every`, or `at` may be set" };
+  }
+  if (req.cron) {
+    if (!isValidCron(req.cron)) {
+      return { success: false, error: `invalid cron expression: ${req.cron}` };
+    }
+    cronExpr = req.cron;
+  } else if (req.every) {
+    const parsed = parseEvery(req.every);
+    if (!parsed) return { success: false, error: `invalid every: ${req.every}` };
+    cronExpr = parsed.cron;
+    recurring = true;
+  } else if (req.at) {
+    const parsed = parseAt(req.at);
+    if (!parsed) return { success: false, error: `invalid at: ${req.at}` };
+    cronExpr = parsed.cron;
+    scheduledFor = parsed.scheduledFor;
+    recurring = false;
+  }
+  if (!cronExpr) {
+    return { success: false, error: "could not resolve cron expression" };
+  }
+
+  const input: AddTaskInput = {
+    agent_id: effectiveAgent,
+    name: req.name ?? `task-${Date.now()}`,
+    description: req.description ?? "",
+    cron: cronExpr,
+    recurring,
+    prompt: req.prompt,
+  };
+  if (req.conversation_id) input.conversation_id = req.conversation_id;
+  if (req.timezone) input.timezone = req.timezone;
+  if (scheduledFor !== undefined) input.scheduled_for = scheduledFor;
+
+  let result: AddTaskResult;
+  try {
+    result = cronAddTask(input);
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  broadcastCronEvent({
+    reason: "client_mutation",
+    tasks_active: cronGetActiveTasks().length,
+    at: new Date().toISOString(),
+  });
+
+  const response: CronAddResponse = { success: true, task: result.task };
+  if (result.warning) response.warning = result.warning;
+  return response;
+}
+
+export function handleCronDelete(taskId: string): { success: boolean; error?: string } {
+  if (typeof taskId !== "string" || taskId.length === 0) {
+    return { success: false, error: "task_id is required" };
+  }
+  const removed = cronDeleteTask(taskId);
+  if (!removed) return { success: false, error: `task ${taskId} not found` };
+
+  broadcastCronEvent({
+    reason: "client_mutation",
+    tasks_active: cronGetActiveTasks().length,
+    at: new Date().toISOString(),
+  });
+  return { success: true };
+}
+
+export function handleCronDeleteAll(agentId: string): { success: boolean; count: number; error?: string } {
+  if (typeof agentId !== "string" || agentId.length === 0) {
+    return { success: false, count: 0, error: "agent_id is required" };
+  }
+  const effective = resolveAgentIdAlias(agentId, (id) => getAgentRecord(id) != null);
+  const count = cronDeleteAllTasks(effective);
+  if (count > 0) {
+    broadcastCronEvent({
+      reason: "client_mutation",
+      tasks_active: cronGetActiveTasks().length,
+      at: new Date().toISOString(),
+    });
+  }
+  return { success: true, count };
+}
+
+/**
  * The `host` object the shim hands the channel plugin. Mirrors the
  * informal contract the plugin reads in `acceptConnection` (see
  * home/.letta/channels/mobile/plugin.mjs):
@@ -513,6 +899,9 @@ function normalizeApprovalScope(value: string): ApprovalScope | null {
  *  - `bridgeSendMessage(args, onFrame, hooks)` — turn driver
  *  - `cancelRun(runId)` — cancel hook from the worker pool
  *  - `handleUserAction(action)` — A2UI user_action ingestion
+ *  - `subscribeToRun(runId, cursor, cbs)` — lcp-p74.2 replay + live-tail
+ *  - `handleCron*` — lcp-2gx WS-side CRUD for crons.json
+ *  - `subscribeCronEvents(listener)` — register for crons_updated push
  */
 interface MobileChannelHost {
   log: (msg: string) => void;
@@ -521,6 +910,13 @@ interface MobileChannelHost {
   bridgeSendMessage: typeof bridgeSendMessage;
   cancelRun: (runId: string) => boolean;
   handleUserAction: typeof handleUserAction;
+  subscribeToRun: typeof subscribeToRun;
+  handleCronList: typeof handleCronList;
+  handleCronAdd: typeof handleCronAdd;
+  handleCronGet: typeof handleCronGet;
+  handleCronDelete: typeof handleCronDelete;
+  handleCronDeleteAll: typeof handleCronDeleteAll;
+  subscribeCronEvents: typeof subscribeCronEvents;
 }
 
 /**
@@ -618,6 +1014,13 @@ async function createMobileChannelAdapter(
     bridgeSendMessage,
     cancelRun: (runId: string) => cancelRun(runId),
     handleUserAction,
+    subscribeToRun,
+    handleCronList,
+    handleCronAdd,
+    handleCronGet,
+    handleCronDelete,
+    handleCronDeleteAll,
+    subscribeCronEvents,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();
