@@ -36,13 +36,24 @@ import type {
   LettaInnerEvent,
 } from "./types/letta-stream.js";
 
-import type {
-  AdapterRunTurnResult,
-  LettaSessionAdapter,
-  LettaSessionAdapterOptions,
-  LettaSessionInit,
-  RunTurnOptions,
+import {
+  applyFrameRunSideEffects,
+  finalizeTurnLifecycle,
+  type AdapterRunTurnResult,
+  type LettaSessionAdapter,
+  type LettaSessionAdapterOptions,
+  type LettaSessionInit,
+  type RunTurnOptions,
 } from "./agent-pool.js";
+
+import {
+  createRun,
+  setRunCancelHandler,
+  type RunHandle,
+  type UsageInput,
+} from "./runs.js";
+
+import { listMessages } from "./store.js";
 
 function logLine(msg: string): void {
   console.log(`[sdk-adapter] ${msg}`);
@@ -117,41 +128,82 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     if (!this.session) throw new Error("SDK adapter: runTurn before start()");
     if (this.dead) throw new Error("SDK adapter: runTurn on dead adapter");
     const session = this.session;
-    const runId = opts.runHandle?.id ?? "";
+
+    // lcp-sdk.4: same runHandle resolution as the direct adapter. Mobile
+    // WS callers pre-create the handle so turn_started can carry run_id
+    // before the first content frame (lcp-99a); REST/SSE callers don't.
+    // Cancellation: setRunCancelHandler binds a hook keyed by run id; for
+    // the SDK path the hook calls session.abort() (the SDK's `interrupt`
+    // control request), matching the direct adapter's SIGTERM semantics
+    // as closely as the SDK allows. SDK-level cancellation surface
+    // limitations are flagged in lcp-sdk.5 — for now best-effort.
+    let cancelled = false;
+    const cancelSession = (): void => {
+      cancelled = true;
+      void session.abort().catch(() => {});
+    };
+    let runHandle: RunHandle;
+    if (opts.runHandle) {
+      runHandle = opts.runHandle;
+      setRunCancelHandler(runHandle.id, cancelSession);
+    } else {
+      runHandle = createRun({
+        agentId: this.agentId,
+        conversationId: this.conversationId,
+        onCancel: cancelSession,
+      });
+      if (typeof opts.onRunCreated === "function") {
+        try { opts.onRunCreated(runHandle.id); } catch {}
+      }
+    }
+
+    // Snapshot pre-turn message ids so we can attribute new ids after
+    // the turn settles. listMessages reads messages.jsonl which the CLI
+    // (through the SDK pump) appends to during the turn.
+    const messageIdsBefore = new Set<string>(
+      (await listMessages(this.conversationId, this.agentId))
+        .map((m) => m?.id)
+        .filter((id): id is string => Boolean(id)),
+    );
+
+    // Anchor stamp time: caller may supply a turn-start time captured
+    // before this method ran (mobile WS uses this so disk-stamped and
+    // stream-emitted timestamps share a base). Fall back to `now`.
+    const passedStart = opts.turnStartedAt;
+    const turnStartedAt = passedStart instanceof Date
+      ? passedStart
+      : (typeof passedStart === "number" ? new Date(passedStart) : new Date());
 
     const frames: LettaStreamFrame[] = [];
+    let pendingStepUsage: UsageInput | null = null;
     let result: SDKResultMessage | null = null;
     let timedOut = false;
-    let aborted = false;
 
-    // SendMessage is `string | MessageContentItem[]`. Our adapter contract
-    // accepts the same union (string for plain text, content-parts array for
-    // multimodal). Cast through unknown[] → SendMessage's array branch; the
-    // SDK validates shape internally.
     const sendInput = (typeof input === "string" ? input : input) as Parameters<Session["send"]>[0];
 
-    // Watchdog: same envelope the direct adapter uses. Race the stream loop
-    // against a timer; on timeout we flag and let the loop break itself by
-    // checking `timedOut` after the next yielded message (or via abort).
+    // Watchdog: same envelope the direct adapter uses. On timeout, flag
+    // and signal abort; the stream loop breaks at the next yield.
     let watchdog: NodeJS.Timeout | null = setTimeout(() => {
       timedOut = true;
-      // Best-effort interrupt; the CLI may or may not respond before the
-      // session pump terminates. If it doesn't, close() in the finally
-      // path tears the subprocess down.
-      session.abort().catch(() => {});
+      void session.abort().catch(() => {});
     }, TURN_TIMEOUT_MS);
 
     try {
       await session.send(sendInput);
 
       for await (const msg of session.stream()) {
-        if (aborted) break;
+        if (cancelled) break;
         const frame = sdkMessageToLettaFrame(msg, this.sessionId, this.agentId, this.conversationId);
         if (frame) {
           frames.push(frame);
+          // lcp-sdk.4: same per-frame run-bookkeeping as the direct
+          // adapter (markRunFirstToken / recordRunTool / recordRunStep,
+          // pendingStepUsage tracking). Behavior-identical via the
+          // shared helper.
+          pendingStepUsage = applyFrameRunSideEffects(frame, runHandle, pendingStepUsage);
           if (opts.onFrame) {
             try {
-              opts.onFrame(frame, { runId });
+              opts.onFrame(frame, { runId: runHandle.id });
             } catch (err) {
               const m = err instanceof Error ? err.message : String(err);
               logLine(`onFrame error: ${m}`);
@@ -172,15 +224,35 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       this.lastUsedAt = Date.now();
     }
 
+    // lcp-sdk.4: shared post-turn finalization — stampNewMessages,
+    // recordRunMessage attribution, finalizeRun. Mirror the direct
+    // adapter's call so /v1/runs/{id}, /messages, /usage, /metrics, and
+    // /steps surfaces look identical regardless of transport.
+    const finishedExit = false; // no subprocess to crash
+    const finishedTimeout = timedOut;
+    const { newUserMessageId } = await finalizeTurnLifecycle({
+      runHandle,
+      frames,
+      conversationId: this.conversationId,
+      agentId: this.agentId,
+      messageIdsBefore,
+      turnStartedAt,
+      cancelled,
+      finishedExit,
+      finishedTimeout,
+    });
+
     if (timedOut) {
-      return { frames, stderr: "", run_id: runId, timeout: true };
+      return { frames, stderr: "", run_id: runHandle.id, timeout: true, cancelled, newUserMessageId };
     }
     if (result) {
       return {
         frames,
         stderr: "",
-        run_id: runId,
+        run_id: runHandle.id,
         done: result.success,
+        cancelled,
+        newUserMessageId,
         // SDK surfaces upstream Letta run ids as `result.runIds`. We do NOT
         // expose them as the mobile-facing run id — the shim continues to
         // own /v1/runs/* (see lcp-sdk-decide-runid). Caller correlates via
@@ -188,7 +260,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       };
     }
     // Stream ended without a result frame (e.g. session closed mid-turn).
-    return { frames, stderr: "", run_id: runId, dead: true, error: "stream ended without result" };
+    return { frames, stderr: "", run_id: runHandle.id, dead: true, cancelled, newUserMessageId, error: "stream ended without result" };
   }
 
   async abort(reason?: string): Promise<void> {

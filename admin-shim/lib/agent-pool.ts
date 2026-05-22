@@ -349,6 +349,167 @@ function frameEvent(frame: LettaStreamFrame): LettaInnerEvent | LettaStreamFrame
   return frame;
 }
 
+// ── lcp-sdk.4: shared run-lifecycle helpers ───────────────────────────
+//
+// Both adapters (DirectSubprocess and Sdk-backed) need identical
+// run-record bookkeeping so /v1/runs/* observability stays the same
+// regardless of transport. The pure-bookkeeping bits below (per-frame
+// markRunFirstToken / recordRunTool / recordRunStep + post-turn
+// stampNewMessages + recordRunMessage + finalizeRun) have NO
+// subprocess coupling, so we lift them to module scope and call them
+// from both adapters. Approval-related side effects stay adapter-local
+// (lcp-sdk.5 will give the SDK path its own approval implementation).
+
+/**
+ * Apply per-frame run-bookkeeping side effects. Called once for each
+ * collected frame during a turn. Returns the (possibly mutated) pending
+ * usage buffer — usage_statistics frames stash here, stop_reason frames
+ * drain it into a step record.
+ *
+ * Behavior MUST match the DirectSubprocess collector pre-extraction
+ * (lines 594–669). Closely mirror those reads (including the
+ * `usage: pendingStepUsage` not-coerced-to-undefined contract for steps).
+ */
+export function applyFrameRunSideEffects(
+  frame: LettaStreamFrame,
+  runHandle: RunHandle,
+  pendingStepUsage: UsageInput | null,
+): UsageInput | null {
+  try {
+    const ev = frameEvent(frame);
+    const mt: string | undefined =
+      "message_type" in ev && typeof ev.message_type === "string"
+        ? ev.message_type
+        : undefined;
+    if (mt === "assistant_message" || mt === "tool_call_message" || mt === "approval_request_message") {
+      markRunFirstToken(runHandle);
+    }
+    const evToolCall =
+      "tool_call" in ev && ev.tool_call && typeof ev.tool_call === "object"
+        ? (ev.tool_call as { name?: unknown })
+        : undefined;
+    const frameToolCall =
+      frame.type === "auto_approval" ? frame.tool_call : undefined;
+    const toolName =
+      (typeof evToolCall?.name === "string" ? evToolCall.name : undefined)
+      ?? (typeof frameToolCall?.name === "string" ? frameToolCall.name : undefined);
+    if (toolName) recordRunTool(runHandle, toolName);
+    if (mt === "usage_statistics") {
+      const u = ev as UsageStatisticsEvent;
+      pendingStepUsage = {
+        prompt_tokens: u.prompt_tokens ?? 0,
+        completion_tokens: u.completion_tokens ?? 0,
+        total_tokens: u.total_tokens ?? 0,
+        cached_input_tokens: u.cached_input_tokens ?? 0,
+        cache_write_tokens: u.cache_write_tokens ?? 0,
+        reasoning_tokens: u.reasoning_tokens ?? 0,
+      };
+    }
+    if (mt === "stop_reason") {
+      const stopReasonRaw =
+        "stop_reason" in ev && typeof ev.stop_reason === "string"
+          ? ev.stop_reason
+          : undefined;
+      const evAsRec = ev as unknown as Record<string, unknown>;
+      const frameAsRec = frame as unknown as Record<string, unknown>;
+      const evModel =
+        "model" in ev && typeof evAsRec["model"] === "string"
+          ? (evAsRec["model"] as string)
+          : undefined;
+      const frameModel =
+        "model" in frame && typeof frameAsRec["model"] === "string"
+          ? (frameAsRec["model"] as string)
+          : undefined;
+      recordRunStep(runHandle, {
+        stop_reason: stopReasonRaw,
+        usage: pendingStepUsage,
+        model: evModel ?? frameModel ?? null,
+      });
+      pendingStepUsage = null;
+    }
+  } catch {}
+  return pendingStepUsage;
+}
+
+/**
+ * Post-turn run-lifecycle finalization. Both adapters call this AFTER
+ * their stream loop ends and BEFORE returning from runTurn.
+ *
+ *   1. Stamp the real wallclock time on newly-persisted messages
+ *      (lcp-dfz path).
+ *   2. Attribute any new message ids to this turn's shim run.
+ *   3. Find the FIRST stop_reason + FIRST usage_statistics frames
+ *      across the turn — LOCKED CONTRACTS #4 + #5, do not switch to
+ *      .findLast or summing.
+ *   4. Call finalizeRun unless the turn was already cancelled
+ *      (cancelRun's path already wrote its terminal record; calling
+ *      finalizeRun would be a no-op but skipping is cheaper).
+ *
+ * Returns the partial RunTurnResult fields that depend on the run state
+ * — caller spreads these into the resolved result.
+ */
+export async function finalizeTurnLifecycle(args: {
+  runHandle: RunHandle;
+  frames: LettaStreamFrame[];
+  conversationId: string;
+  agentId: string;
+  messageIdsBefore: Set<string>;
+  turnStartedAt: Date;
+  cancelled: boolean;
+  finishedExit: boolean;
+  finishedTimeout: boolean;
+}): Promise<{ newUserMessageId: string | null }> {
+  const { runHandle, frames, conversationId, agentId, messageIdsBefore, turnStartedAt, cancelled, finishedExit, finishedTimeout } = args;
+  try {
+    await stampNewMessages(conversationId, agentId, turnStartedAt);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logLine(`stampNewMessages failed conv=${conversationId}: ${msg}`);
+  }
+  let newUserMessageId: string | null = null;
+  try {
+    const after = await listMessages(conversationId, agentId);
+    for (const m of after) {
+      if (m?.id && !messageIdsBefore.has(m.id)) {
+        recordRunMessage(runHandle, m.id);
+        if (m.role === "user") newUserMessageId = m.id;
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logLine(`run message attribution failed for ${runHandle.id}: ${msg}`);
+  }
+  const stopFrame = frames.find((f) => {
+    const ev = frameEvent(f);
+    const mt = "message_type" in ev ? ev.message_type : undefined;
+    return mt === "stop_reason";
+  });
+  const usageFrame = frames.find((f) => {
+    const ev = frameEvent(f);
+    const mt = "message_type" in ev ? ev.message_type : undefined;
+    return mt === "usage_statistics";
+  });
+  const stopReason: string | null = (() => {
+    if (!stopFrame) return null;
+    const ev = frameEvent(stopFrame);
+    if ("stop_reason" in ev && typeof ev.stop_reason === "string") return ev.stop_reason;
+    return null;
+  })();
+  const usage: UsageStatisticsEvent | LettaStreamFrame | null = usageFrame
+    ? (usageFrame.type === "stream_event"
+        ? (usageFrame.event as UsageStatisticsEvent)
+        : usageFrame)
+    : null;
+  if (!cancelled) {
+    finalizeRun(runHandle, {
+      status: finishedExit ? "failed" : (finishedTimeout ? "failed" : "completed"),
+      stopReason: finishedTimeout ? "timeout" : (finishedExit ? "child_exit" : stopReason),
+      usage: usage as UsageStatisticsEvent | null,
+    });
+  }
+  return { newUserMessageId };
+}
+
 class DirectSubprocessLettaSessionAdapter implements LettaSessionAdapter {
   conversationId: string;
   agentId: string;
@@ -591,82 +752,11 @@ class DirectSubprocessLettaSessionAdapter implements LettaSessionAdapter {
           return;
         }
         frames.push(frame);
-        // Run-tracking side effects. Best-effort — failures shouldn't
-        // hose the turn.
-        try {
-          const ev = frameEvent(frame);
-          // `message_type` only lives on inner stream events + the
-          // `stream_event` variant lifts it via `frameEvent`. Top-level
-          // frames (queue_*, auto_approval, result, system) have no
-          // `message_type` and fall through every branch below.
-          const mt: string | undefined =
-            "message_type" in ev && typeof ev.message_type === "string"
-              ? ev.message_type
-              : undefined;
-          if (mt === "assistant_message" || mt === "tool_call_message" || mt === "approval_request_message") {
-            markRunFirstToken(runHandle);
-          }
-          // Tool call name lives on the inner event's `tool_call` only
-          // (approval_request_message / tool_call_message). Top-level
-          // `auto_approval` ALSO carries `tool_call` but is not a
-          // discriminator path the mjs read — preserve that by reading
-          // the inner-event path first, then falling back to a raw
-          // `tool_call` on the frame itself (covers `auto_approval`).
-          const evToolCall =
-            "tool_call" in ev && ev.tool_call && typeof ev.tool_call === "object"
-              ? (ev.tool_call as { name?: unknown })
-              : undefined;
-          const frameToolCall =
-            frame.type === "auto_approval" ? frame.tool_call : undefined;
-          const toolName =
-            (typeof evToolCall?.name === "string" ? evToolCall.name : undefined)
-            ?? (typeof frameToolCall?.name === "string" ? frameToolCall.name : undefined);
-          if (toolName) recordRunTool(runHandle, toolName);
-          if (mt === "usage_statistics") {
-            const u = ev as UsageStatisticsEvent;
-            pendingStepUsage = {
-              prompt_tokens: u.prompt_tokens ?? 0,
-              completion_tokens: u.completion_tokens ?? 0,
-              total_tokens: u.total_tokens ?? 0,
-              cached_input_tokens: u.cached_input_tokens ?? 0,
-              cache_write_tokens: u.cache_write_tokens ?? 0,
-              reasoning_tokens: u.reasoning_tokens ?? 0,
-            };
-          }
-          if (mt === "stop_reason") {
-            // letta-code sends one stop_reason per model step. Use it as a
-            // step boundary marker so num_steps reflects actual model turns.
-            // `stop_reason`/`model` are read off `ev` and `frame` exactly
-            // as the .mjs did — keep the `ev.stop_reason ?? null`,
-            // `ev.model ?? frame?.model ?? null` precedence.
-            //
-            // `usage: pendingStepUsage` (NOT `?? undefined`) is intentional:
-            // when no usage_statistics fired between this stop_reason and
-            // the previous one, the .mjs wrote "usage":null to steps.jsonl
-            // explicitly. Coercing null→undefined would let JSON.stringify
-            // omit the field — a disk-bytes change.
-            const stopReasonRaw =
-              "stop_reason" in ev && typeof ev.stop_reason === "string"
-                ? ev.stop_reason
-                : undefined;
-            const evAsRec = ev as unknown as Record<string, unknown>;
-            const frameAsRec = frame as unknown as Record<string, unknown>;
-            const evModel =
-              "model" in ev && typeof evAsRec["model"] === "string"
-                ? (evAsRec["model"] as string)
-                : undefined;
-            const frameModel =
-              "model" in frame && typeof frameAsRec["model"] === "string"
-                ? (frameAsRec["model"] as string)
-                : undefined;
-            recordRunStep(runHandle, {
-              stop_reason: stopReasonRaw,
-              usage: pendingStepUsage,
-              model: evModel ?? frameModel ?? null,
-            });
-            pendingStepUsage = null;
-          }
-        } catch {}
+        // lcp-sdk.4: pure run-bookkeeping side effects extracted to
+        // module scope so the SDK-backed adapter calls the same logic.
+        // Behavior identical to the pre-extraction inline block —
+        // see `applyFrameRunSideEffects` doc comment for the contract.
+        pendingStepUsage = applyFrameRunSideEffects(frame, runHandle, pendingStepUsage);
         const approvalRequest = a2uiCapability ? approvalRequestToolCall(frame) : null;
         if (approvalRequest) {
           if (onFrame) {
@@ -802,87 +892,26 @@ class DirectSubprocessLettaSessionAdapter implements LettaSessionAdapter {
       });
       this.frameHandler = null;
       this.lastUsedAt = Date.now();
-      // Stamp any new messages with their real timestamp. Sentinel dates
-      // on disk encode order, not time; the sidecar substitutes the real
-      // wall-clock at projection time. Anchor at turnStartedAt so the
-      // user's prompt timestamps land before letta-code's stream frame
-      // times (which fire later in the turn). Failure is non-fatal.
-      try {
-        await stampNewMessages(this.conversationId, this.agentId, turnStartedAt);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logLine(`stampNewMessages failed conv=${this.conversationId}: ${msg}`);
-      }
-      // Attribute newly-persisted messages to this run, then finalize.
-      // `cancelled` short-circuits because cancelRun already wrote the
-      // record; calling finalizeRun would no-op (handle removed from
-      // active map) but we still attribute messages first.
-      // Track the newest user_message id while we already have messages.jsonl
-      // open for the run-attribution loop. mobile-channel-host uses this to
-      // bind the mobile-supplied otid without re-scanning. (lcp-y88)
-      let newUserMessageId: string | null = null;
-      try {
-        const after = await listMessages(this.conversationId, this.agentId);
-        for (const m of after) {
-          if (m?.id && !messageIdsBefore.has(m.id)) {
-            recordRunMessage(runHandle, m.id);
-            if (m.role === "user") newUserMessageId = m.id;
-          }
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logLine(`run message attribution failed for ${runHandle.id}: ${msg}`);
-      }
-      // Find the first stop_reason / usage_statistics frame across the
-      // turn. LOCKED CONTRACTS #4 + #5 — these are the FIRST occurrences,
-      // not aggregates. Do NOT switch to .findLast or to summing.
-      const stopFrame = frames.find((f) => {
-        const ev = frameEvent(f);
-        const mt = "message_type" in ev ? ev.message_type : undefined;
-        return mt === "stop_reason";
+      // lcp-sdk.4: stampNewMessages + message attribution + finalizeRun
+      // extracted so the SDK adapter shares the same lifecycle. Closure-
+      // narrowing escape hatch (`finished as unknown as ...`) is preserved
+      // here — TS still can't see the writes in collector / child-exit
+      // callbacks, so the cast is load-bearing.
+      const finishedRead = finished as unknown as FinishedState | null;
+      const finishedExit = finishedRead?.exit === true;
+      const finishedTimeout = finishedRead?.timeout === true;
+      const { newUserMessageId } = await finalizeTurnLifecycle({
+        runHandle,
+        frames,
+        conversationId: this.conversationId,
+        agentId: this.agentId,
+        messageIdsBefore,
+        turnStartedAt,
+        cancelled,
+        finishedExit,
+        finishedTimeout,
       });
-      const usageFrame = frames.find((f) => {
-        const ev = frameEvent(f);
-        const mt = "message_type" in ev ? ev.message_type : undefined;
-        return mt === "usage_statistics";
-      });
-      const stopReason: string | null = (() => {
-        if (!stopFrame) return null;
-        const ev = frameEvent(stopFrame);
-        if ("stop_reason" in ev && typeof ev.stop_reason === "string") return ev.stop_reason;
-        return null;
-      })();
-      // Match the .mjs precedence exactly: `usageFrame?.event ?? usageFrame ?? null`.
-      // For top-level frames there's no `.event`; for stream_event we want
-      // the inner event. Either way it's passed straight to finalizeRun.
-      const usage: UsageStatisticsEvent | LettaStreamFrame | null = usageFrame
-        ? (usageFrame.type === "stream_event"
-            ? (usageFrame.event as UsageStatisticsEvent)
-            : usageFrame)
-        : null;
-      if (!cancelled) {
-        // Cast through unknown: the closure-write narrowing TS does for
-        // captured `let` collapses `finished` to `never` here even with
-        // an explicit FinishedState | null annotation — the writes live
-        // in callbacks (`collector`, child-exit handler) TS can't see.
-        // Behavior is byte-identical to the .mjs reads at this point.
-        const finishedRead = finished as unknown as FinishedState | null;
-        const finishedExit = finishedRead?.exit === true;
-        const finishedTimeout = finishedRead?.timeout === true;
-        finalizeRun(runHandle, {
-          status: finishedExit ? "failed" : (finishedTimeout ? "failed" : "completed"),
-          stopReason: finishedTimeout ? "timeout" : (finishedExit ? "child_exit" : stopReason),
-          // finalizeRun reads UsageInput-shaped fields; UsageStatisticsEvent
-          // is a structural superset (carries the same `*_tokens` numerics).
-          usage: usage as UsageStatisticsEvent | null,
-        });
-      }
-      // Spread `finished` into the result the same way the .mjs did
-      // (`...(finished ?? {})`). Each branch contributes a different set
-      // of flags; merging them keeps the public result shape stable.
-      // Same closure-narrowing escape hatch as above — see comment.
-      const finishedSpread: Partial<RunTurnResult> =
-        (finished as unknown as FinishedState | null) ?? {};
+      const finishedSpread: Partial<RunTurnResult> = finishedRead ?? {};
       resolveTurn({
         frames,
         ...finishedSpread,
