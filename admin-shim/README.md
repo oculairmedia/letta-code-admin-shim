@@ -168,6 +168,18 @@ Concrete invariants enforced in code:
 Revisit if the Letta Code SDK exposes a full `/v1/runs/*` equivalent
 with stable run lookup. Until then: shim ID is authoritative.
 
+### History endpoints stay on disk reads (decision: lcp-sdk.7)
+
+The SDK exposes `Session.listMessages()` / `Session.bootstrapState()`
+over a CLI control protocol. After evaluation
+([`docs/SDK_HISTORY_EVAL.md`](docs/SDK_HISTORY_EVAL.md)) the shim
+continues to read `messages.jsonl` + sidecars directly: the projection
+layer (tool fan-out, in-flight filter, real-time + otid sidecars, shim
+run-id attribution) is shim-specific and can't be sourced from upstream
+without re-implementing it on top of the SDK output. Revisit if the
+SDK adds a vanilla-Letta-shaped projection, or when the remote-Letta
+proxy mode (lcp-9he) ships.
+
 ### Smoke + rollback
 
 Promotion checklist, scenario-by-scenario smoke (REST/SSE, mobile WS,
