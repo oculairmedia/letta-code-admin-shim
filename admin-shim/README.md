@@ -168,6 +168,21 @@ Concrete invariants enforced in code:
 Revisit if the Letta Code SDK exposes a full `/v1/runs/*` equivalent
 with stable run lookup. Until then: shim ID is authoritative.
 
+### Smoke + rollback
+
+Promotion checklist, scenario-by-scenario smoke (REST/SSE, mobile WS,
+tool turns, approval, A2UI, cancel, disconnect/replay, conv stability),
+and the one-line rollback live in
+[`docs/SDK_TRANSPORT_SMOKE.md`](docs/SDK_TRANSPORT_SMOKE.md). Automated
+subset (scenarios 1–3) runs via:
+
+```bash
+SHIM_URL=http://localhost:8291 \
+AGENT_ID=agent-... \
+MOBILE_TOKEN=... \
+  node admin-shim/scripts/smoke-sdk-transport.mjs
+```
+
 ## Known caveats
 
 - letta-code splits long assistant outputs into multiple `assistant_message`
