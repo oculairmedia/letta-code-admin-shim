@@ -15,6 +15,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@letta-ai/letta-code-sdk": "0.1.14",
     "ws": "8.18.0"
   },
   "devDependencies": {

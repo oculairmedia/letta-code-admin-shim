@@ -106,6 +106,35 @@ Full wire contract + 19-field `CronTask` schema:
 Mutation routing rationale (and why there's no `POST /v1/crons`):
 [`docs/DIVERGENCE.md` §5](docs/DIVERGENCE.md).
 
+## SDK migration (lcp-sdk epic)
+
+The hand-rolled `lib/agent-pool.ts` subprocess layer is being replaced with
+`@letta-ai/letta-code-sdk`. The dependency is installed (pinned to `0.1.14`)
+and the SDK path is proven to work against the shim's local backend without
+any production code change yet — see beads `lcp-sdk.1` through `lcp-sdk.10`
+for the staged plan.
+
+Compatibility findings from `lcp-sdk.1`:
+
+- The SDK's `SubprocessTransport` does **not** pass `--backend local`. Our
+  hand-rolled pool does. The SDK works anyway because the CLI honors
+  `LETTA_LOCAL_BACKEND_EXPERIMENTAL=1`; the existing systemd env contract is
+  sufficient (no migration-time env change required for backend selection).
+- The SDK resolves the CLI binary via `LETTA_CLI_PATH`, then
+  `require.resolve("@letta-ai/letta-code")`, then a few hard-coded fallbacks.
+  Today the shim spawns whatever `letta` is on `PATH` (via `LETTA_BIN`). To
+  keep both paths pinned to the same binary during the migration, set
+  `LETTA_CLI_PATH=/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js`
+  (or wherever your install lives).
+- `includePartialMessages: true` in `CreateSessionOptions` maps to the same
+  `--include-partial-messages` CLI flag the pool already passes. The option
+  is still present in `0.1.14`'s type surface (test `sdk-compat: ...
+  includePartialMessages` asserts this).
+- Pre-existing benign noise: the CLI logs
+  `Failed to call /v1/tools/add-base-tools: fetch failed` on startup because
+  `LETTA_BASE_URL=http://127.0.0.1:0` is a deliberate dead URL. Same line
+  appears on the current direct-spawn path — not a SDK regression.
+
 ## Known caveats
 
 - letta-code splits long assistant outputs into multiple `assistant_message`

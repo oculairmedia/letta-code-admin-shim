@@ -41,6 +41,16 @@ export SHIM_HOST="${SHIM_HOST:-0.0.0.0}"
 # export SHIM_POOL_IDLE_SEC=300
 # export SHIM_POOL_TURN_TIMEOUT=180000
 
+# Letta Code CLI binary the agent-pool spawns.
+#
+# Today the hand-rolled pool reads LETTA_BIN (default: `letta` on PATH) and
+# invokes it as a wrapper script. The lcp-sdk migration (see beads lcp-sdk.*)
+# replaces that with @letta-ai/letta-code-sdk, which spawns `node <cliPath>`
+# and resolves cliPath via LETTA_CLI_PATH first, then require.resolve(
+# "@letta-ai/letta-code"). Set LETTA_CLI_PATH explicitly to pin both paths to
+# the same binary during the migration:
+# export LETTA_CLI_PATH=/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js
+
 # A2UI dynamic UI support. The shim injects the v0.9 Basic Catalog grammar
 # into the upstream model's system prompt when a WS client opts in via
 # its `hello` frame (a2ui_version + supported_catalogs + supported_widgets)
