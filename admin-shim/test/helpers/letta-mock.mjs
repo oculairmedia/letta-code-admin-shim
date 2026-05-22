@@ -90,6 +90,14 @@ function pickTrace(content) {
   return "plain";
 }
 
+// Monotonic per-turn run id. Captured traces all carry the same
+// `local-run-1`, but real letta-code generates a fresh run id per turn —
+// and the SDK Session filters out frames whose run_id appears in the
+// previous turn's `lastCompletedRunIds`, so reusing the same id silently
+// drops every frame on turn 2+ of an SDK-transport session. Bumping per
+// turn matches the real CLI and keeps multi-turn SDK tests viable.
+let currentTurnRunId = "local-run-1";
+
 /** @param {any} frame */
 function rewrite(frame) {
   // Stamp the active agent/conv/session onto every frame so consumers
@@ -102,6 +110,9 @@ function rewrite(frame) {
   if (f.event && typeof f.event === "object") {
     if (f.event.agent_id) f.event.agent_id = agentId;
     if (f.event.conversation_id) f.event.conversation_id = conversationId;
+    if (typeof f.event.run_id === "string" && f.event.run_id.startsWith("local-run-")) {
+      f.event.run_id = currentTurnRunId;
+    }
     const forcedStopReason = process.env["LETTA_MOCK_STOP_REASON"];
     if (
       typeof forcedStopReason === "string" &&
@@ -134,8 +145,12 @@ emit(initFrame);
 /** @type {any[] | null} */
 let pendingApprovalFrames = null;
 
+let turnCounter = 0;
+
 /** @param {string} content */
 function emitTurn(content) {
+  turnCounter += 1;
+  currentTurnRunId = `local-run-${turnCounter}`;
   const traceName = pickTrace(content);
   const frames = loadTrace(traceName);
   // Skip the init frame from the trace (we already emitted one). All other
