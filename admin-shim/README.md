@@ -135,6 +135,39 @@ Compatibility findings from `lcp-sdk.1`:
   `LETTA_BASE_URL=http://127.0.0.1:0` is a deliberate dead URL. Same line
   appears on the current direct-spawn path — not a SDK regression.
 
+### Run-ID ownership (decision: `lcp-sdk-decide-runid`)
+
+The shim owns mobile-facing run IDs. The SDK's `SDKResultMessage.runIds`
+(and the upstream Letta `run_id` fields on stream events) are NOT
+surfaced to mobile and are NOT accepted by `/v1/runs/{id}` — the shim's
+`createRun()` allocates a `run-<uuid>`, that ID is what flows through
+WS frames, frame replay, `/v1/runs/*` records, and message attribution.
+
+Why this split:
+
+- The shim's `/v1/runs/*` store is a local compatibility surface mobile
+  has historically relied on. Letta Cloud / self-hosted may also expose
+  `/v1/runs/{id}` against upstream run IDs. Mixing the two caused earlier
+  diagnostic confusion where a shim ID was queried against the real API.
+- The SDK `Session` doesn't yet offer a stable lookup for upstream runs
+  in a way that would make round-tripping safe.
+- Mobile's existing UX is keyed on the shim ID — re-keying mid-migration
+  would be a separate disruption with no current upside.
+
+Concrete invariants enforced in code:
+
+- `SdkBackedLettaSessionAdapter.runTurn` returns `run_id: runHandle.id`
+  — never the SDK's `result.runIds`.
+- The SDK's per-event `runId` on stream events flows through unchanged
+  on the stream_event payload (downstream may use it for upstream stale-
+  run detection inside one turn) but never replaces the shim ID on the
+  outer wire envelope.
+- Test `sdk-adapter (lcp-sdk-decide-runid): adapter never leaks SDK
+  result.runIds as the wire run_id` pins this boundary.
+
+Revisit if the Letta Code SDK exposes a full `/v1/runs/*` equivalent
+with stable run lookup. Until then: shim ID is authoritative.
+
 ## Known caveats
 
 - letta-code splits long assistant outputs into multiple `assistant_message`

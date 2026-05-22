@@ -317,6 +317,41 @@ test("sdk-adapter (lcp-sdk.4): runTurn creates a shim run with correct stop_reas
   assert.equal(steps[0]?.model, "claude-sonnet-x");
 });
 
+test("sdk-adapter (lcp-sdk-decide-runid): adapter never leaks SDK result.runIds as the wire run_id", async (t) => {
+  // Run-id boundary: mobile-facing run_id MUST be the shim's runHandle.id,
+  // not anything the SDK surfaces. Pins the decision documented in
+  // admin-shim/README "Run-ID ownership". See lcp-sdk-decide-runid.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-runid-"));
+  const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  t.after(() => {
+    if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-runid-1" });
+  // Stub a turn where the SDK's result.runIds contains values that are
+  // VISIBLY DIFFERENT from any shim run id — if the adapter ever swapped
+  // its return field to result.runIds[0], this assertion catches it.
+  const SDK_UPSTREAM_RUN_IDS = ["sdk-upstream-run-A", "sdk-upstream-run-B"];
+  const { session } = makeStubSession([
+    { type: "result", success: true, result: "", durationMs: 1, conversationId: "default", runIds: SDK_UPSTREAM_RUN_IDS } as SDKResultMessage,
+  ]);
+  (adapter as unknown as { session: unknown }).session = session;
+  (adapter as unknown as { ready: boolean }).ready = true;
+
+  const out = await adapter.runTurn("ping");
+  assert.ok(out.run_id, "wire result must carry a run_id");
+  assert.match(out.run_id!, /^run-/, `wire run_id must be a shim-allocated 'run-<uuid>', got ${out.run_id}`);
+  for (const upstream of SDK_UPSTREAM_RUN_IDS) {
+    assert.notStrictEqual(out.run_id, upstream, `wire run_id must NEVER equal an SDK upstream runId; leaked ${upstream}`);
+  }
+});
+
 test("sdk-adapter (lcp-sdk.4): runTurn reuses a pre-supplied runHandle (lcp-99a pattern)", async (t) => {
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
