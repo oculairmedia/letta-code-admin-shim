@@ -1038,10 +1038,19 @@ const server = createServer((req, res) => {
     return res.end();
   }
 
+  // Shim-native mobile hydrate endpoint. This must sit before the broad
+  // /api/* VibeSync proxy: shim-aware mobile clients use /api for local
+  // admin-shim reads, while unknown /api paths still belong to VibeSync.
+  const apiConvMessages = pathname.match(/^\/api\/conversations\/([^/]+)\/messages\/?$/);
+  if (apiConvMessages && req.method === "GET") {
+    return handleConversationMessagesList(req, res, url, apiConvMessages[1]!);
+  }
+
   // Reverse-proxy vibesync's /api/* surface through the same base URL so
   // the Android client can drive both letta (/v1/*) and vibesync (/api/*)
   // from one configured endpoint. Routed before any /v1 dispatch so the
-  // prefix match wins immediately.
+  // prefix match wins immediately, except for explicit shim-native /api
+  // routes above.
   if (pathname.startsWith(VIBESYNC_PROXY_PREFIX)) {
     return proxyToVibesync(req, res);
   }
@@ -1291,11 +1300,29 @@ server.on("upgrade", async (req: IncomingMessage, socket: Duplex, head: Buffer) 
   });
 });
 
-async function gracefulShutdown(): Promise<void> {
+let shutdownInProgress = false;
+async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  console.log(`[shim] received ${signal}, shutting down`);
+  // Hard deadline: if anything below hangs, exit anyway so systemd doesn't
+  // sit in stop-sigterm until TimeoutStopSec fires.
+  const forceExit = setTimeout(() => {
+    console.warn("[shim] graceful shutdown exceeded 4s, forcing exit");
+    process.exit(0);
+  }, 4000);
+  forceExit.unref();
   try { stopCronScheduler(); } catch {}
   try { await getAgentPool().stopAll(); } catch {}
   try { await mobileAdapter?.stop?.(); } catch {}
+  // Terminate live WS clients so server.close() can resolve.
+  try {
+    for (const client of wss.clients) {
+      try { client.terminate(); } catch {}
+    }
+    wss.close();
+  } catch {}
   server.close(() => process.exit(0));
 }
-process.on("SIGINT", gracefulShutdown);
-process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", (sig) => { void gracefulShutdown(sig); });
+process.on("SIGTERM", (sig) => { void gracefulShutdown(sig); });

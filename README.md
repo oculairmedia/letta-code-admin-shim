@@ -162,6 +162,13 @@ All knobs are env vars (see `env.example.sh`):
 - `WS /shim/v1/mobile` — Mobile channel transport (see `docs/MOBILE_CHANNEL_DESIGN.md`).
 - `GET /shim/pool` — agent worker pool stats.
 
+### Shim-native mobile reads (`/api/*`)
+
+- `GET /api/conversations/{id}/messages` — Local-store conversation hydrate for
+  shim-aware mobile clients. This route is handled by the shim before the broad
+  `/api/*` VibeSync proxy and uses the same projection as
+  `/v1/conversations/{id}/messages`.
+
 See `admin-shim/docs/DIVERGENCE.md` for the full list of intentional differences
 from vanilla Letta.
 
