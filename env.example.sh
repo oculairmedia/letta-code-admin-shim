@@ -51,6 +51,17 @@ export SHIM_HOST="${SHIM_HOST:-0.0.0.0}"
 # the same binary during the migration:
 # export LETTA_CLI_PATH=/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js
 
+# Adapter transport selector (lcp-sdk.3 / lcp-sdk.6). `direct` (default) uses
+# the hand-rolled subprocess pool; `sdk` routes through
+# @letta-ai/letta-code-sdk's Session. The SDK path preserves the same
+# /v1/runs/* + WS/SSE contracts (lcp-sdk.4 wired run lifecycle through both
+# transports). Approvals are NOT yet ported to the SDK path — leave at
+# `direct` if your traffic uses A2UI approval cards (tracked: lcp-sdk.5).
+#
+# Has no effect when SHIM_POOL_DISABLE=1 (the legacy per-request spawn in
+# lib/chat.ts bypasses the adapter seam; a startup warning is logged).
+# export SHIM_LETTA_TRANSPORT=direct
+
 # A2UI dynamic UI support. The shim injects the v0.9 Basic Catalog grammar
 # into the upstream model's system prompt when a WS client opts in via
 # its `hello` frame (a2ui_version + supported_catalogs + supported_widgets)

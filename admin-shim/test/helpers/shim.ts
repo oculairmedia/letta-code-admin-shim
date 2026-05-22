@@ -32,6 +32,10 @@ const ADMIN_SHIM_ROOT = join(__dirname, "..", "..");
 const REPO_ROOT = join(ADMIN_SHIM_ROOT, "..");
 const FIXTURES_STATE = join(__dirname, "..", "fixtures", "state");
 const MOCK_LETTA = join(__dirname, "letta-mock.mjs");
+// lcp-sdk.6: SDK path resolves the CLI via LETTA_CLI_PATH, not LETTA_BIN.
+// Exposed so integration tests can pin the SDK at the same mock binary
+// the direct path already uses.
+export const MOCK_LETTA_PATH = MOCK_LETTA;
 
 // Use OS-assigned ports (SHIM_PORT=0). The shim logs the actual port after
 // bind; the helper parses it from the log line. This avoids the port-cursor

@@ -960,8 +960,25 @@ class DirectSubprocessLettaSessionAdapter implements LettaSessionAdapter {
  */
 type Transport = "direct" | "sdk";
 function resolveTransport(): Transport {
-  return process.env["SHIM_LETTA_TRANSPORT"] === "sdk" ? "sdk" : "direct";
+  const requested = process.env["SHIM_LETTA_TRANSPORT"] === "sdk" ? "sdk" : "direct";
+  // lcp-sdk.6: the legacy per-request spawn path (SHIM_POOL_DISABLE=1 in
+  // chat.ts) bypasses AgentPool entirely — it calls spawn(LETTA_BIN, ...)
+  // directly with no adapter seam. If an operator sets both flags we
+  // can't honor SDK transport, so log a one-time warning and fall back
+  // to direct (the legacy path is direct anyway, so this matches the
+  // path actually in use).
+  if (requested === "sdk" && process.env["SHIM_POOL_DISABLE"] === "1" && !transportWarningEmitted) {
+    transportWarningEmitted = true;
+    logLine(
+      "WARN: SHIM_LETTA_TRANSPORT=sdk has no effect while SHIM_POOL_DISABLE=1 — " +
+      "the legacy per-request spawn path bypasses the adapter seam. " +
+      "Unset SHIM_POOL_DISABLE to enable SDK transport.",
+    );
+    return "direct";
+  }
+  return requested;
 }
+let transportWarningEmitted = false;
 
 async function createAdapter(
   transport: Transport,
