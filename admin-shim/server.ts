@@ -509,7 +509,7 @@ async function sendMessage(
 async function handleConversationsList(_req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const { limit, offset } = parsePagination(url.searchParams);
   const agentId = url.searchParams.get("agent_id") ?? undefined;
-  const items = agentId ? listConversationsForAgent(agentId) : await listAllConversations();
+  const items = await (agentId ? listConversationsForAgent(agentId) : listAllConversations());
   items.sort((a, b) => (b.last_message_at ?? "").localeCompare(a.last_message_at ?? ""));
   json(res, 200, items.slice(offset, offset + limit).map(conversationToLetta));
 }

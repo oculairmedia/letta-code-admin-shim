@@ -301,7 +301,7 @@ function conversationKey(conversationId: string, agentId: string): string {
     : `conversation:${conversationId}`;
 }
 
-export function listConversationsForAgent(agentId: string): OnDiskConversation[] {
+export async function listConversationsForAgent(agentId: string): Promise<OnDiskConversation[]> {
   const root = join(storageDir(), "conversations");
   if (!existsSync(root)) return [];
   const out: OnDiskConversation[] = [];
@@ -319,7 +319,7 @@ export function listConversationsForAgent(agentId: string): OnDiskConversation[]
       continue;
     const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
     if (!isConversationOnDisk(conv) || conv.agent_id !== agentId) continue;
-    out.push(conv);
+    out.push(await withRealTimes(conv));
   }
   return out;
 }
@@ -340,7 +340,7 @@ const _listAllConversationsCached = makeDirMtimeCache(
     for (const dirName of await fsReaddir(root)) {
       const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
       if (!isConversationOnDisk(conv)) continue;
-      out.push(conv);
+      out.push(await withRealTimes(conv));
     }
     return out;
   },
@@ -455,7 +455,7 @@ export async function getConversation(externalId: string, agentIdHint?: string |
     const key = conversationKey(externalId, agentIdHint);
     const dir = join(storageDir(), "conversations", b64url(key));
     const conv = await readJsonOrNullAsync(join(dir, "conversation.json"));
-    if (isConversationOnDisk(conv)) return conv;
+    if (isConversationOnDisk(conv)) return withRealTimes(conv);
   }
   // Mobile's external id may be `conv-default-{agentId}` → translate.
   const resolved = await resolveConversationId(externalId);
@@ -463,7 +463,7 @@ export async function getConversation(externalId: string, agentIdHint?: string |
   const key = conversationKey(resolved.conversationId, resolved.agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
   const conv = await readJsonOrNullAsync(join(dir, "conversation.json"));
-  return isConversationOnDisk(conv) ? conv : null;
+  return isConversationOnDisk(conv) ? withRealTimes(conv) : null;
 }
 
 export async function getAgentIdForConversation(externalId: string): Promise<string | null> {
@@ -522,6 +522,40 @@ export async function readMessageTimestamps(conversationId: string, agentId: str
   const path = timestampSidecarPath(conversationId, agentId);
   const raw = await readJsonOrNullAsync(path);
   return isStringRecord(raw) ? raw : {};
+}
+
+// lcp-dfz: derive the effective last_message_at from the sidecar. letta-code's
+// in-process LocalStore rewrites conversation.json at end-of-turn with sentinel
+// dates (2026-01-01T00:00:<seqIndex+1>.000Z), clobbering whatever
+// bumpConversationLastMessageAt wrote ~seconds earlier. The sidecar is the only
+// file letta-code never touches, so it's the race-free source of truth.
+async function maxRealMessageTime(conversationId: string, agentId: string): Promise<string> {
+  const map = await readMessageTimestamps(conversationId, agentId);
+  let max = "";
+  for (const iso of Object.values(map)) {
+    if (typeof iso === "string" && iso > max) max = iso;
+  }
+  return max;
+}
+
+/**
+ * Return a conv record whose last_message_at / updated_at reflect the
+ * sidecar's max real timestamp if it's newer than what's on disk.
+ *
+ * Pure substitution — never writes. Run on every read path that projects to
+ * the wire so the conversations list sorts by real recent activity.
+ */
+async function withRealTimes(conv: OnDiskConversation): Promise<OnDiskConversation> {
+  const max = await maxRealMessageTime(conv.id, conv.agent_id);
+  if (!max) return conv;
+  const currentLast = typeof conv.last_message_at === "string" ? conv.last_message_at : "";
+  const currentUpdated = typeof conv.updated_at === "string" ? conv.updated_at : "";
+  if (max <= currentLast && max <= currentUpdated) return conv;
+  return {
+    ...conv,
+    last_message_at: max > currentLast ? max : conv.last_message_at,
+    updated_at: max > currentUpdated ? max : conv.updated_at,
+  };
 }
 
 // Mobile reconciles its optimistic Local user bubble against the server-issued
@@ -642,10 +676,17 @@ export async function stampNewMessages(
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[store] stamp sidecar write failed for ${conversationId}: ${msg}`);
     }
-    // lcp-pwz: bump conversation.json's last_message_at / updated_at so the
-    // mobile conversations list (sorted by last_message_at) reflects real
-    // recent activity. Without this, both fields stay frozen at conv-create
-    // time and the list order is wrong forever.
+    // lcp-dfz: invalidate the list cache as soon as the sidecar is on disk.
+    // Read paths derive last_message_at from this sidecar (see withRealTimes)
+    // so the next GET /v1/conversations rebuilds with the fresh max time —
+    // even if bumpConversationLastMessageAt below loses its race with
+    // letta-code's end-of-turn conversation.json rewrite.
+    _listAllConversationsCached.invalidate();
+    // lcp-pwz: also try to persist the bump to conversation.json. Best-effort
+    // — letta-code's LocalStore commonly rewrites conversation.json a few
+    // seconds later with sentinel dates, clobbering this. The read-time
+    // substitution above is the load-bearing fix; this write just keeps
+    // disk-state consistent for external readers when no race occurs.
     await bumpConversationLastMessageAt(conversationId, agentId, maxStampedIso);
   }
 }
@@ -671,13 +712,10 @@ async function bumpConversationLastMessageAt(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[store] conversation.json bump failed for ${conversationId}: ${msg}`);
-    return;
   }
-  // lcp-5ky: drop the listAllConversations cache so the next GET
-  // /v1/conversations sees the fresh last_message_at. The dir-mtime cache
-  // key only catches conv-add / conv-remove, not in-place writes — without
-  // this the mobile list shows stale recent-activity ordering forever.
-  _listAllConversationsCached.invalidate();
+  // Cache invalidation lives in the caller (stampNewMessages) so it fires
+  // regardless of whether this best-effort persistent write wins or loses
+  // the race with letta-code's end-of-turn conversation.json rewrite.
 }
 
 export function readBlocksForAgent(agentId: string): Block[] {

@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -650,6 +650,61 @@ test("GET /v1/conversations reflects last_message_at bumps after a turn (lcp-5ky
   );
 });
 
+test("GET /v1/conversations substitutes last_message_at from _real-times sidecar (lcp-dfz)", async (t) => {
+  // Regression for lcp-dfz: even when conversation.json's last_message_at is
+  // frozen at letta-code's Jan-1-2026 sentinel (because the worker's
+  // LocalStore rewrote conv.json after the shim's bumpConversationLastMessageAt
+  // wrote a real timestamp), the API must serve the sidecar-derived value so
+  // the mobile list sorts by real activity. The previous fix (lcp-pwz) was
+  // write-time only and lost a ~4s race to letta-code's post-turn persistence.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-realtimes-1" });
+  const seeded = seedConversation(shim.stateDir, agentId, { id: "conv-realtimes-1" });
+
+  // Simulate the post-race on-disk state: conversation.json carries the
+  // sentinel (what letta-code writes after the shim bumps), and the
+  // _real-times.json sidecar carries the true wallclock max (what
+  // stampNewMessages wrote before letta-code clobbered conv.json).
+  const sentinelIso = "2026-01-01T01:13:27.000Z";
+  const realIso = "2026-05-22T13:20:52.607Z";
+  writeFileSync(
+    `${seeded.dir}/conversation.json`,
+    JSON.stringify(
+      {
+        id: "conv-realtimes-1",
+        agent_id: agentId,
+        created_at: sentinelIso,
+        updated_at: sentinelIso,
+        last_message_at: sentinelIso,
+        summary: null,
+        in_context_message_ids: [],
+      },
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    `${seeded.dir}/_real-times.json`,
+    JSON.stringify({ "ui-msg-1": "2026-05-22T13:20:50.000Z", "ui-msg-2": realIso }, null, 2),
+  );
+
+  const { res, body } = await getJson(`${shim.url}/v1/conversations`);
+  assert.equal(res.status, 200);
+  const row = (body as Array<{ id: string; last_message_at: string | null; updated_at: string | null }>)
+    .find((c) => c.id === "conv-realtimes-1");
+  assert.ok(row, "seeded conv must appear in the list");
+  assert.equal(row.last_message_at, realIso, "last_message_at must be derived from sidecar, not conv.json sentinel");
+  assert.equal(row.updated_at, realIso, "updated_at must be derived from sidecar, not conv.json sentinel");
+
+  // Single-conv GET path uses the same substitution.
+  const detail = await getJson(`${shim.url}/v1/conversations/conv-realtimes-1`);
+  const detailBody = detail.body as { last_message_at: string | null; updated_at: string | null };
+  assert.equal(detailBody.last_message_at, realIso);
+  assert.equal(detailBody.updated_at, realIso);
+});
+
 test("GET /v1/conversations/{external-default-id} resolves to the agent's default conv", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
@@ -736,6 +791,29 @@ test("GET /v1/conversations/{ext}/messages projects user message with otid=local
   // Other vanilla fields
   assert.equal(m.name, null);
   assert.equal(m.is_err, null);
+});
+
+test("GET /api/conversations/{ext}/messages is shim-native local-store hydrate", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const aid = seedAgent(shim.stateDir, { id: "agent-api-conv-hydrate" });
+  seedConversation(shim.stateDir, aid);
+  seedMessage(shim.stateDir, aid, "default", {
+    id: "ui-msg-api-hydrate",
+    role: "user",
+    content: "hydrate me locally",
+    sourceMessageIndex: 0,
+  });
+
+  const ext = externalConvId(aid);
+  const { res, body } = await getJson(`${shim.url}/api/conversations/${ext}/messages`);
+  const arr = body as Array<{ id: string; message_type: string; content: string }>;
+  assert.equal(res.status, 200);
+  assert.equal(arr.length, 1);
+  assert.equal(arr[0]!.id, "ui-msg-api-hydrate");
+  assert.equal(arr[0]!.message_type, "user_message");
+  assert.equal(arr[0]!.content, "hydrate me locally");
 });
 
 test("GET /v1/conversations/{ext}/messages strips <system-reminder> envelopes from user content", async (t) => {
