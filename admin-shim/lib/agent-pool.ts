@@ -57,9 +57,10 @@ const SPAWN_TIMEOUT_MS = Number(process.env["SHIM_POOL_SPAWN_TIMEOUT"] ?? 15000)
 const HOUSEKEEP_INTERVAL_MS = Number(process.env["SHIM_POOL_HOUSEKEEP_MS"] ?? 30_000);
 
 /**
- * Synthetic frame the Worker injects into the active turn's frame handler
- * when the child process exits mid-turn. Not part of the upstream
- * LettaStreamFrame discriminated union — see the WorkerFrame alias below.
+ * Synthetic frame the direct subprocess adapter injects into the active
+ * turn's frame handler when the child process exits mid-turn. Not part of the
+ * upstream LettaStreamFrame discriminated union — see the AdapterFrame alias
+ * below.
  */
 interface ExitFrame {
   type: "__exit__";
@@ -68,10 +69,10 @@ interface ExitFrame {
 }
 
 /**
- * What the per-turn frame handler ("collector") receives: either an
- * upstream letta-code frame or the synthetic __exit__ injected on child
- * death. The collector branches on `type === "__exit__"` and never
- * forwards that branch to the caller-supplied onFrame.
+ * What the per-turn frame handler ("collector") receives: either an upstream
+ * letta-code frame or the synthetic __exit__ injected on child/session death.
+ * The collector branches on `type === "__exit__"` and never forwards that
+ * branch to the caller-supplied onFrame.
  */
 
 /**
@@ -203,9 +204,9 @@ function writeApprovalResponse(
   }) + "\n");
 }
 
-type WorkerFrame = LettaStreamFrame | ExitFrame;
+type AdapterFrame = LettaStreamFrame | ExitFrame;
 
-/** Options accepted by `Worker#runTurn`. */
+/** Options accepted by `LettaSessionAdapter#runTurn`. */
 export interface RunTurnOptions {
   onFrame?: (frame: LettaStreamFrame, meta: { runId: string }) => void;
   /**
@@ -262,10 +263,47 @@ export interface RunTurnResult {
   newUserMessageId?: string | null;
 }
 
-/** Constructor args for the Worker class. */
-interface WorkerOptions {
+/** Internal adapter start metadata, normalized across direct CLI and SDK transports. */
+export interface LettaSessionInit {
+  agentId: string;
+  conversationId: string;
+}
+
+/** Constructor args for Letta session adapters. */
+export interface LettaSessionAdapterOptions {
   conversationId: string;
   agentId: string;
+}
+
+/** Adapter-owned turn result. Public callers still see RunTurnResult via AgentPool#get(). */
+export type AdapterRunTurnResult = RunTurnResult;
+
+/**
+ * Private transport seam for the lcp-sdk migration.
+ *
+ * Ownership boundary:
+ * - Adapter owns the concrete letta-code session transport, warm-session
+ *   lifecycle, stdout/stderr parsing, turn serialization, and hard abort/close.
+ * - AgentPool owns pooling, LRU/idle eviction, and public stats.
+ * - The current direct adapter still performs the existing run-recording and
+ *   approval side effects so this bead is behavior-preserving. Follow-up SDK
+ *   beads can move those concerns upward once both adapters emit the same
+ *   AdapterRunTurnResult shape.
+ *
+ * Keep this interface private to admin-shim/lib until the SDK-backed adapter
+ * ships and the stable contract is proven by tests.
+ */
+export interface LettaSessionAdapter {
+  readonly agentId: string;
+  readonly conversationId: string;
+  readonly ready: boolean;
+  readonly dead: boolean;
+  readonly lastUsedAt: number;
+  readonly spawnedAt: number;
+  start(): Promise<LettaSessionInit>;
+  runTurn(input: string | unknown[], opts?: RunTurnOptions): Promise<AdapterRunTurnResult>;
+  abort(reason?: string): Promise<void> | void;
+  close(): Promise<void> | void;
 }
 
 /** One snapshot row in `AgentPool#stats`. */
@@ -311,7 +349,7 @@ function frameEvent(frame: LettaStreamFrame): LettaInnerEvent | LettaStreamFrame
   return frame;
 }
 
-class Worker {
+class DirectSubprocessLettaSessionAdapter implements LettaSessionAdapter {
   conversationId: string;
   agentId: string;
   child: ChildProcessWithoutNullStreams | null;
@@ -322,10 +360,10 @@ class Worker {
   lastUsedAt: number;
   spawnedAt: number;
   chain: Promise<unknown>;
-  frameHandler: ((frame: WorkerFrame) => void | Promise<void>) | null;
+  frameHandler: ((frame: AdapterFrame) => void | Promise<void>) | null;
   private _onReady: (() => void) | null = null;
 
-  constructor({ conversationId, agentId }: WorkerOptions) {
+  constructor({ conversationId, agentId }: LettaSessionAdapterOptions) {
     this.conversationId = conversationId;
     this.agentId = agentId;
     this.child = null;
@@ -339,7 +377,7 @@ class Worker {
     this.frameHandler = null; // (frame) => void during a turn
   }
 
-  async spawn(): Promise<void> {
+  async start(): Promise<LettaSessionInit> {
     // letta-code's CLI: --conversation "default" REQUIRES --agent. Other
     // conversation ids REJECT --agent.
     const scope =
@@ -410,6 +448,7 @@ class Worker {
       };
       this._onReady = onReady;
     });
+    return { agentId: this.agentId, conversationId: this.conversationId };
   }
 
   _ingestStdout(chunk: Buffer | string): void {
@@ -546,7 +585,7 @@ class Worker {
       // to the step record. This is what makes per-step token tracking
       // possible (without it we'd only have the run-level aggregate).
       let pendingStepUsage: UsageInput | null = null;
-      const collector = async (frame: WorkerFrame): Promise<void> => {
+      const collector = async (frame: AdapterFrame): Promise<void> => {
         if (frame.type === "__exit__") {
           finished = { exit: true, code: frame.exit_code, stderr: frame.stderr };
           return;
@@ -856,7 +895,12 @@ class Worker {
     return turnPromise;
   }
 
-  async stop(): Promise<void> {
+  async abort(reason?: string): Promise<void> {
+    if (reason) logLine(`aborting key=${this.agentId}::${this.conversationId} reason=${reason}`);
+    await this.close();
+  }
+
+  async close(): Promise<void> {
     this.dead = true;
     this.ready = false;
     try {
@@ -874,14 +918,41 @@ class Worker {
   }
 }
 
+/**
+ * lcp-sdk.3: pick the adapter implementation per `SHIM_LETTA_TRANSPORT`.
+ * `direct` (default) is the production-tested hand-rolled subprocess path.
+ * `sdk` routes through `@letta-ai/letta-code-sdk` (Session). The flag is
+ * read at adapter-construction time so an operator can flip transports
+ * with a process restart, no recompile needed.
+ *
+ * The SDK adapter is dynamic-imported to keep its module out of the cold
+ * load path for the default transport (avoids paying SDK init cost on every
+ * shim boot when the feature is off).
+ */
+type Transport = "direct" | "sdk";
+function resolveTransport(): Transport {
+  return process.env["SHIM_LETTA_TRANSPORT"] === "sdk" ? "sdk" : "direct";
+}
+
+async function createAdapter(
+  transport: Transport,
+  opts: LettaSessionAdapterOptions,
+): Promise<LettaSessionAdapter> {
+  if (transport === "sdk") {
+    const { SdkBackedLettaSessionAdapter } = await import("./letta-sdk-adapter.js");
+    return new SdkBackedLettaSessionAdapter(opts);
+  }
+  return new DirectSubprocessLettaSessionAdapter(opts);
+}
+
 class AgentPool {
-  workers: Map<string, Worker>;
-  spawning: Map<string, Promise<Worker>>;
+  workers: Map<string, LettaSessionAdapter>;
+  spawning: Map<string, Promise<LettaSessionAdapter>>;
   housekeepTimer: NodeJS.Timeout;
 
   constructor() {
-    this.workers = new Map(); // key: conversationId → Worker
-    this.spawning = new Map(); // key: conversationId → Promise<Worker>
+    this.workers = new Map(); // key: conversationId → LettaSessionAdapter
+    this.spawning = new Map(); // key: conversationId → Promise<LettaSessionAdapter>
     this.housekeepTimer = setInterval(() => this.housekeep(), HOUSEKEEP_INTERVAL_MS);
     this.housekeepTimer.unref?.();
   }
@@ -906,7 +977,7 @@ class AgentPool {
    * spawns + waits for init if cold. Concurrent callers for the same
    * (agent, conv) coalesce on a single spawn.
    */
-  async get(conversationId: string, agentId: string): Promise<Worker> {
+  async get(conversationId: string, agentId: string): Promise<LettaSessionAdapter> {
     const key = this._key(conversationId, agentId);
     let worker = this.workers.get(key);
     if (worker && !worker.dead) return worker;
@@ -915,7 +986,7 @@ class AgentPool {
     const inFlight = this.spawning.get(key);
     if (inFlight) return inFlight;
 
-    const p = (async (): Promise<Worker> => {
+    const p = (async (): Promise<LettaSessionAdapter> => {
       // Evict if over cap (LRU).
       while (this.workers.size >= MAX_WORKERS) {
         const entries = [...this.workers.entries()].sort(
@@ -928,20 +999,24 @@ class AgentPool {
         const victim = this.workers.get(oldestKey);
         logLine(`evicting (cap) conv=${oldestKey}`);
         this.workers.delete(oldestKey);
-        victim?.stop();
+        victim?.close();
       }
 
-      const w = new Worker({ conversationId, agentId });
+      const transport = resolveTransport();
+      const w = await createAdapter(transport, { conversationId, agentId });
       try {
-        await w.spawn();
+        await w.start();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logLine(`spawn failed key=${key}: ${msg}`);
-        w.dead = true;
+        logLine(`spawn failed transport=${transport} key=${key}: ${msg}`);
+        // LettaSessionAdapter#dead is readonly on the interface; both
+        // concrete classes own a mutable backing field. Casting through
+        // unknown avoids leaking that mutability into the public seam.
+        (w as unknown as { dead: boolean }).dead = true;
         throw err;
       }
       this.workers.set(key, w);
-      logLine(`spawned key=${key} size=${this.workers.size}`);
+      logLine(`spawned transport=${transport} key=${key} size=${this.workers.size}`);
       return w;
     })();
 
@@ -964,7 +1039,7 @@ class AgentPool {
       if (now - w.lastUsedAt > IDLE_EVICT_MS) {
         logLine(`evicting (idle) conv=${key} idle=${(now - w.lastUsedAt) / 1000}s`);
         this.workers.delete(key);
-        w.stop();
+        w.close();
       }
     }
   }
@@ -973,7 +1048,7 @@ class AgentPool {
     if (this.housekeepTimer) clearInterval(this.housekeepTimer);
     const all = [...this.workers.values()];
     this.workers.clear();
-    await Promise.allSettled(all.map((w) => w.stop()));
+    await Promise.allSettled(all.map((w) => w.close()));
   }
 
   stats(): PoolStats {

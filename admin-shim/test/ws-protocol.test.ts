@@ -347,7 +347,9 @@ test("ws: cached legacy agent id aliases to active local backend agent", async (
     .map((f) => typeof f["content"] === "string" ? f["content"] : "")
     .join("");
   assert.match(assistantText, /pong/i, "aliased stale id must still produce assistant output");
-  assert.match(shim.readLog(), new RegExp(`spawned key=${canonicalAgentId}::default`));
+  // lcp-sdk.3: the spawn log line now carries `transport=<direct|sdk>`
+  // before `key=`. Match either layout — load-bearing part is the key.
+  assert.match(shim.readLog(), new RegExp(`spawned[^\\n]*key=${canonicalAgentId}::default`));
   assert.doesNotMatch(shim.readLog(), /Agent agent-597b5756-2915-4560-ba6b-91005f085166 not found|pool spawn timeout/);
 });
 
