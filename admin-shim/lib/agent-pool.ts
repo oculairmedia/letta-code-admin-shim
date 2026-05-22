@@ -90,7 +90,7 @@ interface ApprovalGateState {
 /**
  * User approval decision routed from mobile WS channel.
  */
-interface ApprovalDecision {
+export interface ApprovalDecision {
   decision: "approve" | "deny";
   scope: ApprovalScope;
   reason: string;
@@ -144,7 +144,7 @@ export function rejectApprovalGate(runId: string, error: Error): boolean {
  * 
  * Timeout is 30s per approval request (separate from turn timeout).
  */
-function waitForApprovalDecision(
+export function waitForApprovalDecision(
   runId: string,
   toolName: string,
   toolCallId: string,

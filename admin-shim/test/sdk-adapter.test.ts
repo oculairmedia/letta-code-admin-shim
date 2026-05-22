@@ -352,6 +352,162 @@ test("sdk-adapter (lcp-sdk-decide-runid): adapter never leaks SDK result.runIds 
   }
 });
 
+// ── lcp-sdk.5: approval flow via canUseTool ─────────────────────────────
+
+test("sdk-adapter (lcp-sdk.5): canUseTool emits approval_request_message + resolves via approval gate", async (t) => {
+  // The SDK invokes canUseTool from its background pump when the CLI hits
+  // an approval-required tool. We assert the adapter's callback:
+  //   (a) synthesizes a wire approval_request_message and calls onFrame,
+  //   (b) blocks on the existing approval gate (same machinery mobile uses),
+  //   (c) returns CanUseToolResponse{ behavior } honoring the decision,
+  //   (d) records the decision in the run sidecar.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-approval-"));
+  const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  t.after(() => {
+    if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const { createRun, loadApprovalScopeCache } = await import("../lib/runs.js");
+  const { resolveApprovalGate } = await import("../lib/agent-pool.js");
+
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-approve-1" });
+  // Stand the adapter up without a real Session — we don't need the SDK
+  // to fire canUseTool, we'll invoke the private method directly to test
+  // the approval glue. Set adapter state to match what _runTurnInner
+  // would set at the start of a turn.
+  (adapter as unknown as { ready: boolean }).ready = true;
+  const runHandle = createRun({ agentId: "agent-approve-1", conversationId: "default" });
+  const emittedFrames: LettaStreamFrame[] = [];
+  const a2ui = { version: "0.9", catalogId: "basic" } as unknown;
+  (adapter as unknown as {
+    currentRunHandle: typeof runHandle;
+    currentOnFrame: (f: LettaStreamFrame, m: { runId: string }) => void;
+    currentApprovalScopeCache: Map<string, unknown>;
+    currentA2uiCapability: unknown;
+  }).currentRunHandle = runHandle;
+  (adapter as unknown as { currentOnFrame: (f: LettaStreamFrame, m: { runId: string }) => void }).currentOnFrame = (f) => emittedFrames.push(f);
+  (adapter as unknown as { currentApprovalScopeCache: Map<string, unknown> }).currentApprovalScopeCache = loadApprovalScopeCache(runHandle.id, "default");
+  (adapter as unknown as { currentA2uiCapability: unknown }).currentA2uiCapability = a2ui;
+
+  // Fire the can_use_tool callback in the background; resolve the gate
+  // mid-flight to simulate mobile sending user_action.
+  const canUseToolPromise = (adapter as unknown as {
+    _handleCanUseTool: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string; message?: string }>;
+  })._handleCanUseTool("Bash", { command: "echo hi", description: "test" });
+
+  // Microtask break so the synthetic frame has been emitted + the gate
+  // registered before we try to resolve it.
+  await new Promise((r) => setTimeout(r, 10));
+
+  // (a) Synthetic approval_request_message frame was emitted via onFrame.
+  assert.equal(emittedFrames.length, 1, "must emit exactly one approval frame");
+  const af = emittedFrames[0]!;
+  assert.equal(af.type, "stream_event");
+  if (af.type !== "stream_event") return;
+  const ev = af.event as unknown as Record<string, unknown>;
+  assert.equal(ev["message_type"], "approval_request_message");
+  assert.equal(ev["agent_id"], "agent-approve-1");
+  assert.equal(ev["conversation_id"], "default");
+  assert.equal(ev["run_id"], runHandle.id);
+  const tc = ev["tool_call"] as Record<string, unknown>;
+  assert.equal(tc["name"], "Bash");
+  assert.match(tc["tool_call_id"] as string, /^synthetic-/);
+  assert.equal(tc["arguments"], JSON.stringify({ command: "echo hi", description: "test" }));
+
+  // (b) The approval gate is now registered keyed on runHandle.id —
+  // resolveApprovalGate routes the decision into the waiter.
+  const resolved = resolveApprovalGate(runHandle.id, {
+    decision: "approve",
+    scope: "Once",
+    reason: "user clicked approve",
+    actionId: "act-test-1",
+  });
+  assert.equal(resolved, true, "approval gate must be open with runHandle.id");
+
+  // (c) Resolution propagates to CanUseToolResponse{ behavior: "allow" }.
+  const result = await canUseToolPromise;
+  assert.equal(result.behavior, "allow");
+  assert.equal(result.message, "user clicked approve");
+});
+
+test("sdk-adapter (lcp-sdk.5): Session-scope decision caches and short-circuits the next call", async (t) => {
+  // After a Session-scope approval, the SAME tool on the same conv should
+  // auto-approve without another mobile round-trip — no frame to mobile,
+  // no gate to wait on.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-approval-cache-"));
+  const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  t.after(() => {
+    if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const { createRun, loadApprovalScopeCache } = await import("../lib/runs.js");
+  const { resolveApprovalGate } = await import("../lib/agent-pool.js");
+
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-cache-1" });
+  (adapter as unknown as { ready: boolean }).ready = true;
+  const runHandle = createRun({ agentId: "agent-cache-1", conversationId: "default" });
+  const emitted: LettaStreamFrame[] = [];
+  (adapter as unknown as { currentRunHandle: typeof runHandle }).currentRunHandle = runHandle;
+  (adapter as unknown as { currentOnFrame: (f: LettaStreamFrame) => void }).currentOnFrame = (f) => emitted.push(f);
+  (adapter as unknown as { currentApprovalScopeCache: Map<string, unknown> }).currentApprovalScopeCache = loadApprovalScopeCache(runHandle.id, "default");
+  (adapter as unknown as { currentA2uiCapability: unknown }).currentA2uiCapability = { version: "0.9" };
+
+  const cb = (adapter as unknown as {
+    _handleCanUseTool: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string; message?: string }>;
+  })._handleCanUseTool.bind(adapter);
+
+  // First call: Session-scope approval. Gate resolves manually.
+  const first = cb("Bash", { command: "ls" });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(emitted.length, 1, "first call emits approval frame");
+  resolveApprovalGate(runHandle.id, {
+    decision: "approve",
+    scope: "Session",
+    reason: "ok for this conv",
+    actionId: "act-cache-1",
+  });
+  assert.equal((await first).behavior, "allow");
+
+  // Second call: SAME tool. Cached Session policy → no frame, no gate.
+  const second = await cb("Bash", { command: "pwd" });
+  assert.equal(emitted.length, 1, "second (cached) call must NOT emit a frame");
+  assert.equal(second.behavior, "allow");
+  assert.equal(second.message, "cached_approval");
+});
+
+test("sdk-adapter (lcp-sdk.5): no A2UI client → default-allow without emitting a frame", async () => {
+  // The direct adapter only synthesizes approval cards when a2uiCapability
+  // is negotiated. Without A2UI, the upstream approval flow has no UI to
+  // drive it, so default-allow keeps the turn moving (matches direct's
+  // `a2uiCapability ? ... : null` short-circuit). On SDK path we mirror.
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-noa2ui-1" });
+  (adapter as unknown as { ready: boolean }).ready = true;
+  const emitted: LettaStreamFrame[] = [];
+  // Set run handle + onFrame but leave a2ui null.
+  (adapter as unknown as { currentRunHandle: { id: string } }).currentRunHandle = { id: "run-noop" };
+  (adapter as unknown as { currentOnFrame: (f: LettaStreamFrame) => void }).currentOnFrame = (f) => emitted.push(f);
+  (adapter as unknown as { currentApprovalScopeCache: Map<string, unknown> }).currentApprovalScopeCache = new Map();
+  (adapter as unknown as { currentA2uiCapability: null }).currentA2uiCapability = null;
+
+  const result = await (adapter as unknown as {
+    _handleCanUseTool: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string }>;
+  })._handleCanUseTool("Bash", { command: "echo" });
+  assert.equal(result.behavior, "allow");
+  assert.equal(emitted.length, 0, "no A2UI must mean no approval card emitted");
+});
+
 test("sdk-adapter (lcp-sdk.4): runTurn reuses a pre-supplied runHandle (lcp-99a pattern)", async (t) => {
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

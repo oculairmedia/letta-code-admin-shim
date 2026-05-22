@@ -24,12 +24,19 @@
  *     a clean text-only turn (init + send + stream + result).
  */
 
+import { randomUUID } from "node:crypto";
+
 import {
   resumeSession,
   type Session,
   type SDKMessage,
   type SDKResultMessage,
 } from "@letta-ai/letta-code-sdk";
+// CanUseToolResponse is part of letta-code's protocol package, re-exported via
+// the SDK index but not in the explicit type-export list — import directly.
+import type {
+  CanUseToolResponse,
+} from "@letta-ai/letta-code/protocol";
 
 import type {
   LettaStreamFrame,
@@ -39,7 +46,9 @@ import type {
 import {
   applyFrameRunSideEffects,
   finalizeTurnLifecycle,
+  waitForApprovalDecision,
   type AdapterRunTurnResult,
+  type ApprovalDecision,
   type LettaSessionAdapter,
   type LettaSessionAdapterOptions,
   type LettaSessionInit,
@@ -48,10 +57,17 @@ import {
 
 import {
   createRun,
+  loadApprovalScopeCache,
+  recordApprovalDecision,
+  recordApprovalPolicy,
   setRunCancelHandler,
+  type ApprovalScope,
+  type ApprovalScopeCacheEntry,
   type RunHandle,
   type UsageInput,
 } from "./runs.js";
+
+import type { A2uiCapability } from "./a2ui-adapter.js";
 
 import { listMessages } from "./store.js";
 
@@ -81,6 +97,21 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   // matching the direct adapter's per-worker chain semantics.
   private chain: Promise<unknown>;
 
+  // lcp-sdk.5: per-turn approval state. The SDK's canUseTool callback fires
+  // from the session's background pump (not from inside _runTurnInner), so
+  // we need closure access to "the currently active turn." Turns are
+  // serialized by `chain`, so at most one runTurn is in flight; these are
+  // set at the top of _runTurnInner and cleared in its finally block.
+  private currentRunHandle: RunHandle | null = null;
+  private currentOnFrame: ((frame: LettaStreamFrame, meta: { runId: string }) => void) | null = null;
+  private currentApprovalScopeCache: Map<string, ApprovalScopeCacheEntry> | null = null;
+  private currentA2uiCapability: A2uiCapability | null = null;
+  // Monotonic seq counter for synthesized approval frames within the
+  // current turn. Real upstream frames carry seq_id from letta-code; the
+  // SDK-side synthetic ones start at a high offset so they don't collide
+  // with any upstream-allocated ids in the same turn.
+  private syntheticSeqId = 1_000_000;
+
   constructor({ conversationId, agentId }: LettaSessionAdapterOptions) {
     this.conversationId = conversationId;
     this.agentId = agentId;
@@ -101,6 +132,16 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const target = this.conversationId === "default" ? this.agentId : this.conversationId;
     const session = resumeSession(target, {
       includePartialMessages: true,
+      // lcp-sdk.5: interactive approval gate. letta-code is approval-by-default
+      // for tool calls (the CLI emits approval_request_message frames and
+      // halts on requires_approval stop_reason on the direct path). On the
+      // SDK path, the CLI sends `can_use_tool` control_requests to the SDK
+      // pump and the SDK invokes this callback instead — so the wire-level
+      // approval_request_message never reaches us. Synthesize it here so
+      // mobile A2UI still gets its approval card, and reuse the existing
+      // approvalGates machinery so mobile user_action resolves it the same
+      // way it does on the direct path.
+      canUseTool: (toolName, toolInput) => this._handleCanUseTool(toolName, toolInput),
     });
     this.session = session;
     const init = await session.initialize();
@@ -181,6 +222,18 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
 
     const sendInput = (typeof input === "string" ? input : input) as Parameters<Session["send"]>[0];
 
+    // lcp-sdk.5: hand the canUseTool callback its turn context. The SDK's
+    // background pump invokes the callback OUT-of-band from this stream
+    // loop, so the callback reads these adapter fields via closure rather
+    // than receiving them as args. Turn serialization (`this.chain`) means
+    // at most one _runTurnInner is alive at a time, so a single set of
+    // fields is enough — no per-turn map needed.
+    this.currentRunHandle = runHandle;
+    this.currentOnFrame = opts.onFrame ?? null;
+    this.currentA2uiCapability = opts.a2uiCapability ?? null;
+    this.currentApprovalScopeCache = loadApprovalScopeCache(runHandle.id, this.conversationId);
+    this.syntheticSeqId = 1_000_000;
+
     // Watchdog: same envelope the direct adapter uses. On timeout, flag
     // and signal abort; the stream loop breaks at the next yield.
     let watchdog: NodeJS.Timeout | null = setTimeout(() => {
@@ -222,6 +275,13 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         watchdog = null;
       }
       this.lastUsedAt = Date.now();
+      // lcp-sdk.5: clear per-turn approval context. Any canUseTool that
+      // fires AFTER this (it shouldn't, since the stream ended) gets a
+      // safe default-allow path in _handleCanUseTool.
+      this.currentRunHandle = null;
+      this.currentOnFrame = null;
+      this.currentApprovalScopeCache = null;
+      this.currentA2uiCapability = null;
     }
 
     // lcp-sdk.4: shared post-turn finalization — stampNewMessages,
@@ -261,6 +321,160 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     }
     // Stream ended without a result frame (e.g. session closed mid-turn).
     return { frames, stderr: "", run_id: runHandle.id, dead: true, cancelled, newUserMessageId, error: "stream ended without result" };
+  }
+
+  /**
+   * lcp-sdk.5: the SDK invokes this for every tool the CLI wants to use
+   * while permissionMode is "default" (and letta-code is approval-by-default,
+   * so this fires for every tool call). Responsibilities:
+   *
+   *   1. Synthesize an approval_request_message wire frame matching the
+   *      shape the direct adapter would emit naturally, and feed it to
+   *      mobile via the active turn's onFrame so A2UI renders the
+   *      approval card.
+   *   2. Honor the per-conversation approval scope cache —
+   *      Session/Forever decisions auto-approve without a round-trip.
+   *   3. Block on waitForApprovalDecision (the SAME gate the direct
+   *      adapter uses; mobile-channel-host.handleUserAction resolves it
+   *      via resolveApprovalGate). Decision becomes a CanUseToolResponse.
+   *   4. Record the decision and (if Session/Forever) the policy to the
+   *      run sidecar via runs.ts — same audit trail as direct.
+   *
+   * Known limitations (worth a follow-up):
+   *
+   *   - The SDK doesn't expose the CLI-side tool_call_id to canUseTool,
+   *     only (toolName, toolInput). We generate a synthetic id here so
+   *     the approval frame has SOMETHING; mobile uses it to send
+   *     user_action back. The eventual tool_return_message from the CLI
+   *     will carry the REAL tool_call_id, which won't match ours —
+   *     mobile UI correlation by tool_call_id will see two unconnected
+   *     items. The approval gate itself is keyed by run_id, so the gate
+   *     resolution works correctly; only the visual correlation is off.
+   *   - When no A2UI client is connected (a2uiCapability == null) we
+   *     default-allow, matching the direct adapter's behavior (the
+   *     direct path only synthesizes A2UI approval cards when a2ui is
+   *     negotiated; without a2ui the upstream approval_request_message
+   *     passes through and the turn naturally halts at requires_approval,
+   *     but that's not a path mobile can drive without A2UI anyway).
+   */
+  private async _handleCanUseTool(toolName: string, toolInput: Record<string, unknown>): Promise<CanUseToolResponse> {
+    const runHandle = this.currentRunHandle;
+    const onFrame = this.currentOnFrame;
+    const cache = this.currentApprovalScopeCache;
+    const a2ui = this.currentA2uiCapability;
+
+    if (!runHandle || !cache) {
+      // canUseTool fired outside of an active turn. Shouldn't happen in
+      // normal flow — log and default-allow rather than block forever.
+      logLine(`canUseTool fired with no active turn (tool=${toolName}) — defaulting allow`);
+      return { behavior: "allow" };
+    }
+
+    // No A2UI client connected → default-allow. Matches the direct adapter's
+    // `a2uiCapability ? approvalRequestToolCall(frame) : null` short-circuit.
+    if (!a2ui) {
+      return { behavior: "allow" };
+    }
+
+    const toolCallId = `synthetic-${randomUUID()}`;
+    const timestamp = new Date().toISOString();
+
+    // 1. Scope cache: Session/Forever pre-approval → auto-allow without
+    //    showing the approval card. This diverges (intentionally) from
+    //    the direct adapter, which emits the upstream
+    //    approval_request_message frame unconditionally and only avoids
+    //    the BLOCKING wait. On the SDK path we have explicit control
+    //    over what gets emitted, so we skip the frame entirely for
+    //    cached approvals — no transient card flicker on mobile.
+    //    (loadApprovalScopeCache only caches APPROVE decisions per the
+    //    recordApprovalPolicy contract.)
+    const cached = cache.get(toolName);
+    if (cached) {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `cached-${toolCallId}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: cached.scope,
+        reason: "cached_approval",
+        timestamp,
+      });
+      return { behavior: "allow", message: "cached_approval" };
+    }
+
+    // 2. No cache hit → synthesize the approval_request_message wire
+    //    frame and emit via onFrame. Field shape matches the upstream
+    //    ApprovalRequestMessageEvent in lib/types/letta-stream.ts — the
+    //    synthetic toolCallId leaks into mobile's UI but the SDK won't
+    //    surface a CLI-side correlation until upstream changes.
+    const seqId = ++this.syntheticSeqId;
+    const frame: LettaStreamFrame = {
+      type: "stream_event",
+      session_id: this.sessionId,
+      uuid: `synthetic-${randomUUID()}`,
+      timestamp,
+      event: {
+        message_type: "approval_request_message",
+        id: `synthetic-msg-${seqId}`,
+        date: new Date().toISOString(),
+        agent_id: this.agentId,
+        conversation_id: this.conversationId,
+        run_id: runHandle.id,
+        seq_id: seqId,
+        tool_call: {
+          tool_call_id: toolCallId,
+          name: toolName,
+          arguments: JSON.stringify(toolInput),
+        },
+      } as unknown as LettaInnerEvent,
+    };
+    try { onFrame?.(frame, { runId: runHandle.id }); } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      logLine(`onFrame error during approval emit: ${m}`);
+    }
+
+    // 3. Block on the same approval gate the direct adapter uses. Mobile
+    //    user_action arrives via mobile-channel-host.handleUserAction →
+    //    resolveApprovalGate(runHandle.id, decision).
+    let decision: ApprovalDecision;
+    try {
+      decision = await waitForApprovalDecision(runHandle.id, toolName, toolCallId);
+    } catch (err) {
+      // 4a. Timeout / disconnect path. Record an audit entry and deny.
+      const reason = err instanceof Error ? err.message : String(err);
+      recordApprovalDecision(runHandle.id, {
+        action_id: `timeout-${toolCallId}`,
+        tool_name: toolName,
+        decision: reason.startsWith("approval_timeout") ? "timeout" : "deny",
+        scope: "Deny",
+        reason,
+        timestamp,
+      });
+      return { behavior: "deny", message: reason };
+    }
+
+    // 4b. Decision received. Audit + (if Session/Forever) persist policy.
+    recordApprovalDecision(runHandle.id, {
+      action_id: decision.actionId,
+      tool_name: toolName,
+      decision: decision.decision,
+      scope: decision.scope,
+      reason: decision.reason,
+      timestamp,
+      ...(decision.userId ? { user_id: decision.userId } : {}),
+    });
+    if (decision.decision === "approve" && (decision.scope === "Session" || decision.scope === "Forever")) {
+      recordApprovalPolicy(runHandle.id, this.conversationId, {
+        action_id: decision.actionId,
+        tool_name: toolName,
+        scope: decision.scope as Extract<ApprovalScope, "Session" | "Forever">,
+        timestamp,
+        ...(decision.userId ? { user_id: decision.userId } : {}),
+      });
+      cache.set(toolName, { scope: decision.scope as Extract<ApprovalScope, "Session" | "Forever">, timestamp });
+    }
+    return decision.decision === "approve"
+      ? { behavior: "allow", message: decision.reason }
+      : { behavior: "deny", message: decision.reason };
   }
 
   async abort(reason?: string): Promise<void> {
