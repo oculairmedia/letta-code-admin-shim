@@ -1,11 +1,9 @@
 /**
- * lcp-sdk.3 — SDK-backed Letta session adapter.
+ * SDK-backed Letta session adapter (sole implementation since lcp-sdk.10).
  *
- * Alternate `LettaSessionAdapter` implementation that drives the letta-code
- * CLI through `@letta-ai/letta-code-sdk` instead of hand-rolled subprocess
- * spawning + stdout parsing. Gated by `SHIM_LETTA_TRANSPORT=sdk`; the
- * `DirectSubprocessLettaSessionAdapter` in agent-pool.ts remains the
- * production default until parity is proven (lcp-sdk.4 → .9).
+ * Drives the letta-code CLI through `@letta-ai/letta-code-sdk`'s `Session`.
+ * Replaces the hand-rolled subprocess adapter that lived in agent-pool.ts
+ * through the lcp-sdk.* migration (1 → 10).
  *
  * Design boundary:
  *   - The SDK consumes the same wire frames the direct adapter does (both
@@ -248,6 +246,9 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         if (cancelled) break;
         const frame = sdkMessageToLettaFrame(msg, this.sessionId, this.agentId, this.conversationId);
         if (frame) {
+          // Mirror the direct adapter: heartbeat lastUsedAt on every frame
+          // so housekeep() doesn't idle-evict an in-flight long turn.
+          this.lastUsedAt = Date.now();
           frames.push(frame);
           // lcp-sdk.4: same per-frame run-bookkeeping as the direct
           // adapter (markRunFirstToken / recordRunTool / recordRunStep,

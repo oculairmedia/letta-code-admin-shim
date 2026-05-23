@@ -12,7 +12,7 @@
  * This test asserts the shim-side invariants under the SDK transport:
  *
  *   1. Three consecutive WS turns to the same conversation_id reuse a
- *      SINGLE pool entry (one `spawned transport=sdk` line in the log).
+ *      SINGLE pool entry (one `[pool] spawned key=...` line in the log).
  *   2. The on-disk `state/conversations/` directory does not grow
  *      between turns — i.e. the shim itself doesn't fragment.
  *   3. GET /v1/conversations returns exactly one entry for the agent,
@@ -83,7 +83,7 @@ function countConvDirs(stateDir: string): number {
 
 function countSpawnLines(log: string, key: string): number {
   const re = new RegExp(
-    `\\[pool\\] spawned transport=sdk key=${key.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`,
+    `\\[pool\\] spawned key=${key.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}`,
     "g",
   );
   return (log.match(re) ?? []).length;
@@ -92,7 +92,6 @@ function countSpawnLines(log: string, key: string): number {
 test("sdk-conversation-stability (lcp-sdk.8): three turns to default conv reuse one adapter", async (t) => {
   const shim = await startShim({
     env: {
-      SHIM_LETTA_TRANSPORT: "sdk",
       LETTA_CLI_PATH: MOCK_LETTA_PATH,
     },
   });
@@ -150,7 +149,6 @@ test("sdk-conversation-stability (lcp-sdk.8): three turns to default conv reuse 
 test("sdk-conversation-stability (lcp-sdk.8): three turns to a real conv-<uuid> reuse one adapter", async (t) => {
   const shim = await startShim({
     env: {
-      SHIM_LETTA_TRANSPORT: "sdk",
       LETTA_CLI_PATH: MOCK_LETTA_PATH,
     },
   });
@@ -214,7 +212,6 @@ test("sdk-conversation-stability (lcp-sdk.8): pool LRU eviction → new adapter 
   // (no fragmentation).
   const shim = await startShim({
     env: {
-      SHIM_LETTA_TRANSPORT: "sdk",
       LETTA_CLI_PATH: MOCK_LETTA_PATH,
       SHIM_POOL_MAX: "1",
     },

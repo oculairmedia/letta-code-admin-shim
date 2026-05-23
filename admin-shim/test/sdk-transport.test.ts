@@ -28,13 +28,12 @@ import { MOCK_LETTA_PATH } from "./helpers/shim.js";
 
 const WS_TIMEOUT_MS = 8000;
 
-test("sdk-transport (lcp-sdk.6): SHIM_LETTA_TRANSPORT=sdk drives a mobile WS turn end-to-end", async (t) => {
-  // The SDK resolves the CLI via LETTA_CLI_PATH — point it at the same
-  // letta-mock the direct path uses so we're testing transport selection,
-  // not different CLI behavior.
+test("sdk-transport (lcp-sdk.6): SDK adapter drives a mobile WS turn end-to-end", async (t) => {
+  // The SDK resolves the CLI via LETTA_CLI_PATH — point it at the letta-mock
+  // so we're exercising the adapter integration without spinning up a real
+  // model.
   const shim = await startShim({
     env: {
-      SHIM_LETTA_TRANSPORT: "sdk",
       LETTA_CLI_PATH: MOCK_LETTA_PATH,
     },
   });
@@ -58,8 +57,13 @@ test("sdk-transport (lcp-sdk.6): SHIM_LETTA_TRANSPORT=sdk drives a mobile WS tur
   // ran — pool.get() picked the SDK adapter, not the direct subprocess.
   assert.match(
     shim.readLog(),
-    /\[pool\] spawned transport=sdk key=agent-sdk-xport-1::default/,
-    "agent-pool must spawn the SDK-backed adapter when SHIM_LETTA_TRANSPORT=sdk",
+    /\[pool\] spawned key=agent-sdk-xport-1::default/,
+    "agent-pool must spawn the SDK-backed adapter",
+  );
+  assert.match(
+    shim.readLog(),
+    /\[sdk-adapter\] started agent=agent-sdk-xport-1/,
+    "SDK adapter must report init",
   );
 
   // Same WS envelope contract as the direct path. The mock's `plain` trace
@@ -79,72 +83,8 @@ test("sdk-transport (lcp-sdk.6): SHIM_LETTA_TRANSPORT=sdk drives a mobile WS tur
   assert.ok(assistantText.length > 0, "SDK path must produce assistant text");
 });
 
-test("sdk-transport (lcp-sdk.6): SHIM_LETTA_TRANSPORT=direct keeps the direct adapter (rollback path)", async (t) => {
-  const shim = await startShim({
-    env: { SHIM_LETTA_TRANSPORT: "direct" },
-  });
-  t.after(() => shim.stop());
-
-  const agentId = seedAgent(shim.stateDir, { id: "agent-sdk-xport-rollback" });
-  seedConversation(shim.stateDir, agentId);
-
-  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
-  t.after(() => conn.close());
-  conn.send({
-    type: "send_message",
-    agent_id: agentId,
-    conversation_id: externalConvId(agentId),
-    text: "hello direct",
-    otid: "ot-direct-1",
-  });
-  await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
-
-  assert.match(
-    shim.readLog(),
-    /\[pool\] spawned transport=direct key=agent-sdk-xport-rollback::default/,
-    "SHIM_LETTA_TRANSPORT=direct must keep the hand-rolled subprocess adapter",
-  );
-});
-
-test("sdk-transport (lcp-sdk.6): SHIM_LETTA_TRANSPORT=sdk + SHIM_POOL_DISABLE=1 logs a warning and falls back", async (t) => {
-  // The legacy per-request spawn (SHIM_POOL_DISABLE=1 in chat.ts) bypasses
-  // AgentPool entirely, so SDK transport can't apply. The agent-pool guard
-  // logs a one-time warning instead of silently dropping the flag.
-  const shim = await startShim({
-    env: {
-      SHIM_LETTA_TRANSPORT: "sdk",
-      SHIM_POOL_DISABLE: "1",
-      LETTA_CLI_PATH: MOCK_LETTA_PATH,
-    },
-  });
-  t.after(() => shim.stop());
-
-  const agentId = seedAgent(shim.stateDir, { id: "agent-sdk-conflict-1" });
-  seedConversation(shim.stateDir, agentId);
-
-  // Trigger pool.get() so resolveTransport() runs. With SHIM_POOL_DISABLE=1
-  // chat.ts takes the legacy path, but mobile WS still goes through the
-  // pool — and that's where the conflict guard fires.
-  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
-  t.after(() => conn.close());
-  conn.send({
-    type: "send_message",
-    agent_id: agentId,
-    conversation_id: externalConvId(agentId),
-    text: "hello conflict",
-    otid: "ot-conflict-1",
-  });
-  await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
-
-  assert.match(
-    shim.readLog(),
-    /WARN: SHIM_LETTA_TRANSPORT=sdk has no effect while SHIM_POOL_DISABLE=1/,
-    "operator must see a clear warning when both flags conflict",
-  );
-  // After the warning, the resolved transport falls back to direct.
-  assert.match(
-    shim.readLog(),
-    /\[pool\] spawned transport=direct key=agent-sdk-conflict-1::default/,
-    "fallback transport when flags conflict must be direct",
-  );
-});
+// lcp-sdk.10: the direct subprocess transport was removed; SHIM_LETTA_TRANSPORT
+// and SHIM_POOL_DISABLE are no longer honored. The corresponding tests
+// (rollback path + flag-conflict warning) were retired with the direct
+// adapter. The SDK adapter is the only implementation; the spawn log no
+// longer carries a transport tag.

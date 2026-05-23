@@ -137,7 +137,8 @@ All knobs are env vars (see `env.example.sh`):
 | `SHIM_POOL_MAX` | `10` | warm letta worker cap |
 | `SHIM_POOL_IDLE_SEC` | `300` | evict workers idle this long |
 | `SHIM_POOL_TURN_TIMEOUT` | `180000` ms | safety timeout per turn |
-| `SHIM_POOL_DISABLE` | _(unset)_ | set `1` to spawn `letta` per request (no pooling) |
+| `LETTA_CLI_PATH` | _(auto-wired)_ | path the SDK spawns; defaults to the in-tree `letta-cli-sdk-wrapper.mjs` |
+| `LETTA_CLI_PATH_REAL` | _(auto-wired)_ | real `@letta-ai/letta-code` binary the wrapper execs |
 
 ---
 

@@ -1,42 +1,43 @@
 /**
- * Per-conversation pool of long-running `letta` subprocesses.
+ * Per-conversation pool of `@letta-ai/letta-code-sdk` Sessions.
  *
- * Each worker is a single `letta --conversation X [--agent Y] --input-format
- * stream-json --output-format stream-json` child process, pinned to one
- * conversation. We send user messages on stdin (`{"type":"user","message":{"content":"..."}}`)
- * and read reply frames off stdout, one per line. End-of-turn is the
- * `{"type":"result",...}` frame.
+ * Each pool entry is one SDK Session pinned to one (agent, conversation)
+ * pair. The Session owns the underlying letta-code CLI subprocess; this
+ * file owns the keying, single-flight, LRU eviction, and shared
+ * turn-lifecycle helpers that the SDK adapter reuses.
  *
- * Design constraints (plugin-style principles):
- *   - No external deps; just `child_process`.
- *   - Single-writer per worker: each worker's stdin is owned by a per-room
- *     Promise chain so two turns can never overlap. The same chain pattern
- *     we used in the Matrix typing manager.
+ * Design constraints:
+ *   - Single-writer per session: each adapter's `runTurn` calls are
+ *     serialized through an internal Promise chain so two turns can never
+ *     overlap on the same Session.
  *   - State is in-process Map; no DB. Idle eviction + hard cap = bounded.
- *   - Cold-start fallback is automatic: pool miss → spawn → first frame.
- *   - Process death is graceful: worker is dropped, next request cold-starts.
+ *   - Cold-start fallback is automatic: pool miss → resumeSession → first
+ *     frame.
+ *   - Session death is graceful: adapter is dropped, next request
+ *     cold-starts.
  *
  * Tuneables (env):
- *   SHIM_POOL_MAX           default 10   hard cap on warm workers
- *   SHIM_POOL_IDLE_SEC      default 300  evict workers idle this long
- *   SHIM_POOL_SPAWN_TIMEOUT default 15000 ms to wait for the init frame
+ *   SHIM_POOL_MAX           default 10   hard cap on warm sessions
+ *   SHIM_POOL_IDLE_SEC      default 300  evict sessions idle this long
+ *   SHIM_POOL_SPAWN_TIMEOUT default 15000 ms to wait for the init message
+ *   SHIM_POOL_TURN_TIMEOUT  default 180_000 ms watchdog per turn
+ *
+ * Note (lcp-sdk.10, 2026-05-22): the hand-rolled subprocess transport
+ * was retired in favor of the SDK transport. The Session adapter is the
+ * only implementation. Operators no longer pick a transport — there's
+ * no flag, and there's no rollback path inside this codebase. The
+ * release before this one shipped both behind `SHIM_LETTA_TRANSPORT=sdk`
+ * if you need to revert to that codepath.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-
 import { listMessages, stampNewMessages } from "./store.js";
-import { augmentUserInputForA2ui, ensureA2uiBlockAttached, type A2uiCapability } from "./a2ui-adapter.js";
+import { type A2uiCapability } from "./a2ui-adapter.js";
 import {
-  createRun,
   finalizeRun,
   markRunFirstToken,
   recordRunMessage,
   recordRunStep,
   recordRunTool,
-  recordApprovalDecision,
-  recordApprovalPolicy,
-  loadApprovalScopeCache,
-  setRunCancelHandler,
   type RunHandle,
   type UsageInput,
   type ApprovalScope,
@@ -47,33 +48,12 @@ import type {
   UsageStatisticsEvent,
 } from "./types/letta-stream.js";
 
-const LETTA_BIN = process.env["LETTA_BIN"] || "letta";
 const MAX_WORKERS = Number(process.env["SHIM_POOL_MAX"] ?? 10);
 const IDLE_EVICT_MS = Number(process.env["SHIM_POOL_IDLE_SEC"] ?? 300) * 1000;
-const SPAWN_TIMEOUT_MS = Number(process.env["SHIM_POOL_SPAWN_TIMEOUT"] ?? 15000);
 // Default 30s in prod. Tests override via SHIM_POOL_HOUSEKEEP_MS so they
 // can exercise the idle-evict path within the suite's wall-clock budget
 // rather than waiting half a minute per case.
 const HOUSEKEEP_INTERVAL_MS = Number(process.env["SHIM_POOL_HOUSEKEEP_MS"] ?? 30_000);
-
-/**
- * Synthetic frame the direct subprocess adapter injects into the active
- * turn's frame handler when the child process exits mid-turn. Not part of the
- * upstream LettaStreamFrame discriminated union — see the AdapterFrame alias
- * below.
- */
-interface ExitFrame {
-  type: "__exit__";
-  exit_code: number | null;
-  stderr: string;
-}
-
-/**
- * What the per-turn frame handler ("collector") receives: either an upstream
- * letta-code frame or the synthetic __exit__ injected on child/session death.
- * The collector branches on `type === "__exit__"` and never forwards that
- * branch to the caller-supplied onFrame.
- */
 
 /**
  * Approval gate state for a single approval_request_message.
@@ -168,43 +148,6 @@ export function waitForApprovalDecision(
     approvalGates.set(runId, gate);
   });
 }
-
-function approvalRequestToolCall(frame: LettaStreamFrame): { toolName: string; toolCallId: string } | null {
-  const ev = frameEvent(frame);
-  if (!("message_type" in ev) || ev.message_type !== "approval_request_message") return null;
-  if (!("tool_call" in ev) || !ev.tool_call || typeof ev.tool_call !== "object") return null;
-  const toolCall = ev.tool_call as { name?: unknown; tool_call_id?: unknown };
-  if (typeof toolCall.name !== "string" || typeof toolCall.tool_call_id !== "string") return null;
-  return { toolName: toolCall.name, toolCallId: toolCall.tool_call_id };
-}
-
-function writeApprovalResponse(
-  child: ChildProcessWithoutNullStreams | null,
-  toolCallId: string,
-  approved: boolean,
-  reason: string,
-): void {
-  if (!child || child.killed || !child.stdin.writable) return;
-  child.stdin.write(JSON.stringify({
-    type: "approval",
-    approvals: approved
-      ? [{
-          type: "tool",
-          tool_call_id: toolCallId,
-          tool_return: "approved",
-          status: "success",
-          reason,
-        }]
-      : [{
-          type: "approval",
-          tool_call_id: toolCallId,
-          approve: false,
-          reason,
-        }],
-  }) + "\n");
-}
-
-type AdapterFrame = LettaStreamFrame | ExitFrame;
 
 /** Options accepted by `LettaSessionAdapter#runTurn`. */
 export interface RunTurnOptions {
@@ -327,20 +270,6 @@ export interface PoolStats {
 
 function logLine(msg: string): void {
   console.log(`[pool] ${msg}`);
-}
-
-/**
- * Best-effort discriminator for an upstream letta-code stream frame.
- * Subprocess stdout lines are JSON.parse'd into `unknown`; we narrow to
- * `LettaStreamFrame` only after this guard fires. Init/system frames
- * are still detected by the readiness path (which looks at the raw
- * parsed object) — this guard intentionally accepts the full top-level
- * union so the per-turn collector can branch on it.
- */
-function isLettaStreamFrame(value: unknown): value is LettaStreamFrame {
-  if (typeof value !== "object" || value === null) return false;
-  const v = value as Record<string, unknown>;
-  return typeof v["type"] === "string";
 }
 
 /** Pull the inner event when present, else fall back to the frame itself. */
@@ -510,485 +439,15 @@ export async function finalizeTurnLifecycle(args: {
   return { newUserMessageId };
 }
 
-class DirectSubprocessLettaSessionAdapter implements LettaSessionAdapter {
-  conversationId: string;
-  agentId: string;
-  child: ChildProcessWithoutNullStreams | null;
-  stdoutBuf: string;
-  stderrBuf: string;
-  ready: boolean;
-  dead: boolean;
-  lastUsedAt: number;
-  spawnedAt: number;
-  chain: Promise<unknown>;
-  frameHandler: ((frame: AdapterFrame) => void | Promise<void>) | null;
-  private _onReady: (() => void) | null = null;
-
-  constructor({ conversationId, agentId }: LettaSessionAdapterOptions) {
-    this.conversationId = conversationId;
-    this.agentId = agentId;
-    this.child = null;
-    this.stdoutBuf = "";
-    this.stderrBuf = "";
-    this.ready = false;
-    this.dead = false;
-    this.lastUsedAt = Date.now();
-    this.spawnedAt = Date.now();
-    this.chain = Promise.resolve(); // serializes turns per worker
-    this.frameHandler = null; // (frame) => void during a turn
-  }
-
-  async start(): Promise<LettaSessionInit> {
-    // letta-code's CLI: --conversation "default" REQUIRES --agent. Other
-    // conversation ids REJECT --agent.
-    const scope =
-      this.conversationId === "default" && this.agentId
-        ? ["--agent", this.agentId, "--conversation", "default"]
-        : this.conversationId
-          ? ["--conversation", this.conversationId]
-          : this.agentId
-            ? ["--agent", this.agentId]
-            : [];
-
-    const args = [
-      "--backend",
-      "local",
-      ...scope,
-      "--input-format",
-      "stream-json",
-      "--output-format",
-      "stream-json",
-      "--include-partial-messages",
-    ];
-
-    this.child = spawn(LETTA_BIN, args, {
-      env: process.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    this.child.stdout.on("data", (chunk: Buffer | string) => this._ingestStdout(chunk));
-    this.child.stderr.on("data", (chunk: Buffer | string) => {
-      this.stderrBuf += chunk.toString("utf8");
-      if (this.stderrBuf.length > 8192) {
-        this.stderrBuf = this.stderrBuf.slice(-8192);
-      }
-    });
-    this.child.on("exit", (code: number | null) => {
-      this.dead = true;
-      this.ready = false;
-      if (this.frameHandler) {
-        const handler = this.frameHandler;
-        this.frameHandler = null;
-        handler({ type: "__exit__", exit_code: code, stderr: this.stderrBuf });
-      }
-      // lcp-gs2 follow-up: dump the worker's stderr tail on a non-zero
-      // exit so spawn failures surface in the shim log instead of
-      // requiring us to manually re-run letta to learn what went
-      // wrong. Clamp to 1KB so a long traceback doesn't flood.
-      if (code !== 0 && this.stderrBuf) {
-        const tail = this.stderrBuf.slice(-1024).replace(/\n/g, " | ");
-        logLine(`worker conv=${this.conversationId} exited code=${code} stderr="${tail}"`);
-      } else {
-        logLine(`worker conv=${this.conversationId} exited code=${code}`);
-      }
-    });
-    this.child.on("error", (err: Error) => {
-      this.dead = true;
-      this.ready = false;
-      logLine(`worker conv=${this.conversationId} error: ${err.message}`);
-    });
-
-    // Wait for the init frame
-    await new Promise<void>((resolve, reject) => {
-      const timer: NodeJS.Timeout = setTimeout(() => {
-        reject(new Error(`pool spawn timeout for conv=${this.conversationId}`));
-      }, SPAWN_TIMEOUT_MS);
-      const onReady = (): void => {
-        clearTimeout(timer);
-        resolve();
-      };
-      this._onReady = onReady;
-    });
-    return { agentId: this.agentId, conversationId: this.conversationId };
-  }
-
-  _ingestStdout(chunk: Buffer | string): void {
-    this.stdoutBuf += chunk.toString("utf8");
-    for (;;) {
-      const idx = this.stdoutBuf.indexOf("\n");
-      if (idx < 0) break;
-      const line = this.stdoutBuf.slice(0, idx).trim();
-      this.stdoutBuf = this.stdoutBuf.slice(idx + 1);
-      if (!line) continue;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue;
-      }
-
-      if (!isLettaStreamFrame(parsed)) continue;
-      const frame: LettaStreamFrame = parsed;
-
-      // Init frame readies the worker.
-      if (
-        frame.type === "system" &&
-        frame.subtype === "init" &&
-        !this.ready
-      ) {
-        this.ready = true;
-        if (this._onReady) {
-          const fn = this._onReady;
-          this._onReady = null;
-          fn();
-        }
-        continue; // do NOT forward the init frame to per-turn handlers
-      }
-
-      // Skip system init frames for subsequent turns (none expected) and
-      // route everything else to the active turn handler.
-      if (this.frameHandler) void this.frameHandler(frame);
-    }
-  }
-
-  /**
-   * Run a single turn: write the user message to stdin, collect frames
-   * until the `result` frame fires, return { frames, exitDuringTurn }.
-   *
-   * Turns are queued on the per-worker chain so two simultaneous callers
-   * can't interleave.
-   */
-  runTurn(userInput: string | unknown[], { onFrame, turnStartedAt: passedStart, onRunCreated, runHandle: providedRunHandle, a2uiCapability }: RunTurnOptions = {}): Promise<RunTurnResult> {
-    const previous = this.chain;
-    let resolveTurn!: (value: RunTurnResult) => void;
-    const turnPromise = new Promise<RunTurnResult>((r) => (resolveTurn = r));
-    this.chain = previous.then(async () => {
-      if (this.dead) {
-        resolveTurn({ frames: [], dead: true, stderr: this.stderrBuf });
-        return;
-      }
-      this.lastUsedAt = Date.now();
-      // Caller (chat.mjs) can supply a turn-start anchor it captured before
-      // calling pool.get(). Unifying anchors keeps stream frame timestamps
-      // and disk-stamped timestamps consistent — without that, stream frames
-      // can carry an EARLIER turnStart than the disk's (when the worker was
-      // already warm) or LATER (when spawning was slow), and a sort-by-date
-      // merge produces nonsensical order. Fall back to `now` if not supplied.
-      const turnStartedAt = passedStart instanceof Date
-        ? passedStart
-        : (typeof passedStart === "number" ? new Date(passedStart) : new Date());
-
-      // Create a Run record for this turn. Vanilla Letta exposes Runs at
-      // /v1/runs/*; mobile polls/cancels by run_id. The Run is the
-      // turn-scoped state record; finalize at end-of-turn (or on cancel).
-      // We register an onCancel hook that signals the child so an in-flight
-      // turn can be aborted from the cancel API.
-      //
-      // lcp-99a: callers that need run_id BEFORE the turn streams (mobile
-      // WS) can pre-create the handle and pass it in. In that case we
-      // reuse their handle and skip the onRunCreated callback (they
-      // already know the id). The cancel hook still needs to wire into
-      // *this* turn's state — we patch it onto the supplied handle so
-      // the cancel signal kills the right child.
-      let cancelled = false;
-      const cancelChild = (): void => {
-        cancelled = true;
-        try { this.child?.kill?.("SIGTERM"); } catch {}
-      };
-      let runHandle: RunHandle;
-      if (providedRunHandle) {
-        runHandle = providedRunHandle;
-        // Late-bind the cancel hook to this turn's worker. The provided
-        // handle was created before the worker existed; now that we own
-        // the child process, patch the SIGTERM dispatcher into the
-        // cancel-handler map keyed by the existing run id.
-        setRunCancelHandler(runHandle.id, cancelChild);
-      } else {
-        runHandle = createRun({
-          agentId: this.agentId,
-          conversationId: this.conversationId,
-          onCancel: cancelChild,
-        });
-        if (typeof onRunCreated === "function") {
-          try { onRunCreated(runHandle.id); } catch {}
-        }
-      }
-
-      // Load approval scope cache from sidecar. Session/Forever decisions
-
-
-      // auto-approve without user round-trip; Once/Deny require user action.
-
-
-      const approvalScopeCache = loadApprovalScopeCache(runHandle.id, this.conversationId);
-
-
-
-      const frames: LettaStreamFrame[] = [];
-      // `finished` is the lifecycle latch the turn-wait loop polls. Each
-      // shape captures one of: clean end-of-turn (`done`), child exit
-      // (`exit` + `code` + `stderr`), or the safety-timeout
-      // (`timeout`). At most one is set during a turn. `done`/`exit`/
-      // `timeout` are optional flags because the .mjs spreads `finished`
-      // into the result and downstream callsites (chat.mjs:565) check
-      // `turn?.dead || turn?.exit` — preserve those property names.
-      type FinishedState = {
-        done?: true;
-        exit?: true;
-        timeout?: true;
-        code?: number | null;
-        stderr?: string;
-      };
-      let finished: FinishedState | null = null;
-      // Buffer the most-recent usage_statistics frame seen in the current
-      // step. letta-code emits one usage_statistics + one stop_reason per
-      // model step; when stop_reason fires we attribute the buffered usage
-      // to the step record. This is what makes per-step token tracking
-      // possible (without it we'd only have the run-level aggregate).
-      let pendingStepUsage: UsageInput | null = null;
-      const collector = async (frame: AdapterFrame): Promise<void> => {
-        if (frame.type === "__exit__") {
-          finished = { exit: true, code: frame.exit_code, stderr: frame.stderr };
-          return;
-        }
-        frames.push(frame);
-        // lcp-sdk.4: pure run-bookkeeping side effects extracted to
-        // module scope so the SDK-backed adapter calls the same logic.
-        // Behavior identical to the pre-extraction inline block —
-        // see `applyFrameRunSideEffects` doc comment for the contract.
-        pendingStepUsage = applyFrameRunSideEffects(frame, runHandle, pendingStepUsage);
-        const approvalRequest = a2uiCapability ? approvalRequestToolCall(frame) : null;
-        if (approvalRequest) {
-          if (onFrame) {
-            try { onFrame(frame, { runId: runHandle.id }); } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              logLine(`onFrame error: ${msg}`);
-            }
-          }
-          const cached = approvalScopeCache.get(approvalRequest.toolName);
-          const timestamp = new Date().toISOString();
-          if (cached) {
-            recordApprovalDecision(runHandle.id, {
-              action_id: `cached-${approvalRequest.toolCallId}`,
-              tool_name: approvalRequest.toolName,
-              decision: "approve",
-              scope: cached.scope,
-              reason: "cached_approval",
-              timestamp,
-            });
-            writeApprovalResponse(this.child, approvalRequest.toolCallId, true, "cached_approval");
-          } else {
-            try {
-              const decision = await waitForApprovalDecision(
-                runHandle.id,
-                approvalRequest.toolName,
-                approvalRequest.toolCallId,
-              );
-              recordApprovalDecision(runHandle.id, {
-                action_id: decision.actionId,
-                tool_name: approvalRequest.toolName,
-                decision: decision.decision,
-                scope: decision.scope,
-                reason: decision.reason,
-                timestamp,
-                ...(decision.userId ? { user_id: decision.userId } : {}),
-              });
-              if (decision.decision === "approve" && (decision.scope === "Session" || decision.scope === "Forever")) {
-                recordApprovalPolicy(runHandle.id, this.conversationId, {
-                  action_id: decision.actionId,
-                  tool_name: approvalRequest.toolName,
-                  scope: decision.scope,
-                  timestamp,
-                  ...(decision.userId ? { user_id: decision.userId } : {}),
-                });
-                approvalScopeCache.set(approvalRequest.toolName, { scope: decision.scope, timestamp });
-              }
-              writeApprovalResponse(
-                this.child,
-                approvalRequest.toolCallId,
-                decision.decision === "approve",
-                decision.reason,
-              );
-            } catch (err) {
-              const reason = err instanceof Error ? err.message : String(err);
-              recordApprovalDecision(runHandle.id, {
-                action_id: `timeout-${approvalRequest.toolCallId}`,
-                tool_name: approvalRequest.toolName,
-                decision: reason.startsWith("approval_timeout") ? "timeout" : "deny",
-                scope: "Deny",
-                reason,
-                timestamp,
-              });
-              writeApprovalResponse(this.child, approvalRequest.toolCallId, false, reason);
-            }
-          }
-          if (frame.type === "result") {
-            finished = { done: true };
-          }
-          return;
-        }
-        if (onFrame) {
-          try { onFrame(frame, { runId: runHandle.id }); } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            logLine(`onFrame error: ${msg}`);
-          }
-        }
-        if (frame.type === "result") {
-          finished = { done: true };
-        }
-      };
-      this.frameHandler = collector;
-      // Snapshot existing message ids so we can attribute newly-persisted
-      // messages to this run after the turn settles. listMessages reads
-      // messages.jsonl which letta-code appends to during the turn.
-      const messageIdsBefore = new Set<string>(
-        (await listMessages(this.conversationId, this.agentId))
-          .map((m) => m?.id)
-          .filter((id): id is string => Boolean(id)),
-      );
-      try {
-        // lcp-dlj: `userInput` is either a plain string (text-only turn —
-        // legacy shape and current SSE path) OR an Anthropic-style content
-        // parts array carrying inline text + image blocks. letta-code's
-        // headless mode (headless.ts ~L1770) accepts both shapes directly
-        // — MessageCreate.content is a union of string | ContentBlock[].
-        // DEBUG (lcp-dlj follow-up): log userInput shape to diagnose
-        // image strip happening between shim stdin write and disk write.
-        // lcp-crp: write the a2ui_protocol block to this agent's memfs if
-        // missing/stale before the turn. Idempotent + cached per process so
-        // it's effectively free after the first call per agent.
-        if (a2uiCapability) ensureA2uiBlockAttached(this.agentId);
-        const effectiveUserInput = augmentUserInputForA2ui(userInput, a2uiCapability);
-        const inputShape = Array.isArray(effectiveUserInput)
-          ? `array[${effectiveUserInput.length}] types=${effectiveUserInput.map((p) => (p && typeof p === "object" && "type" in (p as Record<string, unknown>)) ? (p as Record<string, unknown>)["type"] : typeof p).join(",")}`
-          : `string(${effectiveUserInput.length}ch)`;
-        logLine(`stdin.write conv=${this.conversationId} shape=${inputShape}`);
-        this.child!.stdin.write(
-          JSON.stringify({ type: "user", message: { content: effectiveUserInput } }) + "\n",
-        );
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        this.frameHandler = null;
-        this.dead = true;
-        finalizeRun(runHandle, { status: "failed", stopReason: `stdin_write_error: ${errMsg}` });
-        resolveTurn({ frames: [], dead: true, error: errMsg, run_id: runHandle.id, stderr: this.stderrBuf });
-        return;
-      }
-      // Wait for the result frame OR child exit. Add a generous safety
-      // timeout so a stuck worker doesn't block the chain forever.
-      const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 180_000);
-      await new Promise<void>((r) => {
-        const start = Date.now();
-        const poll = setInterval(() => {
-          if (finished) {
-            clearInterval(poll);
-            r();
-          } else if (Date.now() - start > TURN_TIMEOUT_MS) {
-            clearInterval(poll);
-            finished = { timeout: true };
-            r();
-          }
-        }, 50);
-      });
-      this.frameHandler = null;
-      this.lastUsedAt = Date.now();
-      // lcp-sdk.4: stampNewMessages + message attribution + finalizeRun
-      // extracted so the SDK adapter shares the same lifecycle. Closure-
-      // narrowing escape hatch (`finished as unknown as ...`) is preserved
-      // here — TS still can't see the writes in collector / child-exit
-      // callbacks, so the cast is load-bearing.
-      const finishedRead = finished as unknown as FinishedState | null;
-      const finishedExit = finishedRead?.exit === true;
-      const finishedTimeout = finishedRead?.timeout === true;
-      const { newUserMessageId } = await finalizeTurnLifecycle({
-        runHandle,
-        frames,
-        conversationId: this.conversationId,
-        agentId: this.agentId,
-        messageIdsBefore,
-        turnStartedAt,
-        cancelled,
-        finishedExit,
-        finishedTimeout,
-      });
-      const finishedSpread: Partial<RunTurnResult> = finishedRead ?? {};
-      resolveTurn({
-        frames,
-        ...finishedSpread,
-        stderr: this.stderrBuf,
-        run_id: runHandle.id,
-        cancelled,
-        newUserMessageId,
-      });
-    });
-    return turnPromise;
-  }
-
-  async abort(reason?: string): Promise<void> {
-    if (reason) logLine(`aborting key=${this.agentId}::${this.conversationId} reason=${reason}`);
-    await this.close();
-  }
-
-  async close(): Promise<void> {
-    this.dead = true;
-    this.ready = false;
-    try {
-      if (this.child && !this.child.killed) {
-        this.child.stdin.end();
-        this.child.kill("SIGTERM");
-        // SIGKILL after 5s if still running
-        setTimeout(() => {
-          if (this.child && !this.child.killed) {
-            try { this.child.kill("SIGKILL"); } catch {}
-          }
-        }, 5000).unref?.();
-      }
-    } catch {}
-  }
-}
-
 /**
- * lcp-sdk.3: pick the adapter implementation per `SHIM_LETTA_TRANSPORT`.
- * `direct` (default) is the production-tested hand-rolled subprocess path.
- * `sdk` routes through `@letta-ai/letta-code-sdk` (Session). The flag is
- * read at adapter-construction time so an operator can flip transports
- * with a process restart, no recompile needed.
- *
- * The SDK adapter is dynamic-imported to keep its module out of the cold
- * load path for the default transport (avoids paying SDK init cost on every
- * shim boot when the feature is off).
+ * Construct an SDK-backed adapter. Dynamic-imported so importing this
+ * module doesn't drag the SDK pump into the cold load path (also breaks
+ * a would-be circular import — the adapter file imports the shared
+ * lifecycle helpers from here).
  */
-type Transport = "direct" | "sdk";
-function resolveTransport(): Transport {
-  const requested = process.env["SHIM_LETTA_TRANSPORT"] === "sdk" ? "sdk" : "direct";
-  // lcp-sdk.6: the legacy per-request spawn path (SHIM_POOL_DISABLE=1 in
-  // chat.ts) bypasses AgentPool entirely — it calls spawn(LETTA_BIN, ...)
-  // directly with no adapter seam. If an operator sets both flags we
-  // can't honor SDK transport, so log a one-time warning and fall back
-  // to direct (the legacy path is direct anyway, so this matches the
-  // path actually in use).
-  if (requested === "sdk" && process.env["SHIM_POOL_DISABLE"] === "1" && !transportWarningEmitted) {
-    transportWarningEmitted = true;
-    logLine(
-      "WARN: SHIM_LETTA_TRANSPORT=sdk has no effect while SHIM_POOL_DISABLE=1 — " +
-      "the legacy per-request spawn path bypasses the adapter seam. " +
-      "Unset SHIM_POOL_DISABLE to enable SDK transport.",
-    );
-    return "direct";
-  }
-  return requested;
-}
-let transportWarningEmitted = false;
-
-async function createAdapter(
-  transport: Transport,
-  opts: LettaSessionAdapterOptions,
-): Promise<LettaSessionAdapter> {
-  if (transport === "sdk") {
-    const { SdkBackedLettaSessionAdapter } = await import("./letta-sdk-adapter.js");
-    return new SdkBackedLettaSessionAdapter(opts);
-  }
-  return new DirectSubprocessLettaSessionAdapter(opts);
+async function createAdapter(opts: LettaSessionAdapterOptions): Promise<LettaSessionAdapter> {
+  const { SdkBackedLettaSessionAdapter } = await import("./letta-sdk-adapter.js");
+  return new SdkBackedLettaSessionAdapter(opts);
 }
 
 class AgentPool {
@@ -1048,21 +507,20 @@ class AgentPool {
         victim?.close();
       }
 
-      const transport = resolveTransport();
-      const w = await createAdapter(transport, { conversationId, agentId });
+      const w = await createAdapter({ conversationId, agentId });
       try {
         await w.start();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        logLine(`spawn failed transport=${transport} key=${key}: ${msg}`);
-        // LettaSessionAdapter#dead is readonly on the interface; both
-        // concrete classes own a mutable backing field. Casting through
-        // unknown avoids leaking that mutability into the public seam.
+        logLine(`spawn failed key=${key}: ${msg}`);
+        // LettaSessionAdapter#dead is readonly on the interface; the SDK
+        // adapter owns a mutable backing field. Cast through unknown so
+        // the public seam stays read-only.
         (w as unknown as { dead: boolean }).dead = true;
         throw err;
       }
       this.workers.set(key, w);
-      logLine(`spawned transport=${transport} key=${key} size=${this.workers.size}`);
+      logLine(`spawned key=${key} size=${this.workers.size}`);
       return w;
     })();
 

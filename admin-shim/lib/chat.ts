@@ -29,7 +29,6 @@ import type {
   UsageStatisticsMessage,
 } from "./types/wire.js";
 
-const POOL_ENABLED = process.env["SHIM_POOL_DISABLE"] !== "1";
 
 /**
  * Shape of the JSON body POSTed to `/v1/agents/{id}/messages`. Mobile,
@@ -434,39 +433,6 @@ export function coalesceAssistantFrames(frames: LettaMessage[]): LettaMessage[] 
 }
 
 /** Options accepted by the legacy per-request spawn arg builder. */
-interface BuildLettaArgsOptions {
-  stream?: boolean;
-}
-
-// Legacy per-request spawn arg builder, kept for the POOL_DISABLE fallback.
-function buildLettaArgs(
-  agentId: string | null | undefined,
-  conversationId: string | null | undefined,
-  text: string,
-  { stream }: BuildLettaArgsOptions = {},
-): string[] {
-  let scope: string[];
-  if (conversationId === "default" && agentId) {
-    scope = ["--agent", agentId, "--conversation", "default"];
-  } else if (conversationId) {
-    scope = ["--conversation", conversationId];
-  } else if (agentId) {
-    scope = ["--agent", agentId];
-  } else {
-    scope = [];
-  }
-  return [
-    "--backend",
-    "local",
-    ...scope,
-    "-p",
-    text,
-    "--output-format",
-    "stream-json",
-    ...(stream ? ["--include-partial-messages"] : []),
-  ];
-}
-
 /** Optional handler args supplied by the route. */
 export interface HandleSendMessageOptions {
   conversationId?: string | undefined;
@@ -692,10 +658,9 @@ export async function handleSendMessage(
     );
   };
 
-  if (POOL_ENABLED) {
-    try {
-      const userOtid = extractUserOtid(body);
-      const pool = getAgentPool();
+  try {
+    const userOtid = extractUserOtid(body);
+    const pool = getAgentPool();
       const worker = await pool.get(conversationId ?? "default", agentId);
       // Track the active run for this request. We surface its id on every
       // outgoing frame so mobile can correlate stream events with the
@@ -769,43 +734,4 @@ export async function handleSendMessage(
         }
       }
     }
-    return;
-  }
-
-  // Legacy per-request spawn path — enabled with SHIM_POOL_DISABLE=1.
-  const { spawn } = await import("node:child_process");
-  const args = buildLettaArgs(agentId, conversationId, text, { stream: wantStream });
-  const child = spawn(process.env["LETTA_BIN"] || "letta", args, {
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdoutBuf = "";
-  child.stdout.on("data", (chunk: Buffer) => {
-    stdoutBuf += chunk.toString("utf8");
-    for (;;) {
-      const idx = stdoutBuf.indexOf("\n");
-      if (idx < 0) break;
-      const line = stdoutBuf.slice(0, idx).trim();
-      stdoutBuf = stdoutBuf.slice(idx + 1);
-      if (!line) continue;
-      try {
-        handleRawFrame(JSON.parse(line));
-      } catch {
-        /* swallow malformed lines */
-      }
-    }
-  });
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderrBuf += chunk.toString("utf8");
-  });
-  child.on("close", (code: number | null) =>
-    finalizeResponse({ exitCode: code, stderrTail: stderrBuf }),
-  );
-  req.on("close", () => {
-    try {
-      if (!child.killed) child.kill("SIGTERM");
-    } catch {
-      /* ignore */
-    }
-  });
 }

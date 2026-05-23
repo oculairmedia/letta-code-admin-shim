@@ -41,26 +41,17 @@ export SHIM_HOST="${SHIM_HOST:-0.0.0.0}"
 # export SHIM_POOL_IDLE_SEC=300
 # export SHIM_POOL_TURN_TIMEOUT=180000
 
-# Letta Code CLI binary the agent-pool spawns.
+# Letta Code CLI binary the SDK adapter spawns.
 #
-# Today the hand-rolled pool reads LETTA_BIN (default: `letta` on PATH) and
-# invokes it as a wrapper script. The lcp-sdk migration (see beads lcp-sdk.*)
-# replaces that with @letta-ai/letta-code-sdk, which spawns `node <cliPath>`
-# and resolves cliPath via LETTA_CLI_PATH first, then require.resolve(
-# "@letta-ai/letta-code"). Set LETTA_CLI_PATH explicitly to pin both paths to
-# the same binary during the migration:
-# export LETTA_CLI_PATH=/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js
-
-# Adapter transport selector (lcp-sdk.3 / lcp-sdk.6). `direct` (default) uses
-# the hand-rolled subprocess pool; `sdk` routes through
-# @letta-ai/letta-code-sdk's Session. The SDK path preserves the same
-# /v1/runs/* + WS/SSE contracts (lcp-sdk.4 wired run lifecycle through both
-# transports). Approvals are NOT yet ported to the SDK path — leave at
-# `direct` if your traffic uses A2UI approval cards (tracked: lcp-sdk.5).
-#
-# Has no effect when SHIM_POOL_DISABLE=1 (the legacy per-request spawn in
-# lib/chat.ts bypasses the adapter seam; a startup warning is logged).
-# export SHIM_LETTA_TRANSPORT=direct
+# The shim drives letta-code through @letta-ai/letta-code-sdk's Session,
+# which spawns `node <cliPath>` and resolves cliPath via LETTA_CLI_PATH
+# first, then require.resolve("@letta-ai/letta-code"). For local-backend
+# mode, the shim routes through admin-shim/scripts/letta-cli-sdk-wrapper.mjs,
+# which prepends `--backend local` before exec'ing the real CLI (see
+# LET-9013). server.ts auto-wires this when LETTA_CLI_PATH is unset; set
+# both vars explicitly to pin to a specific binary:
+# export LETTA_CLI_PATH=/opt/stacks/letta-code-parallel/admin-shim/scripts/letta-cli-sdk-wrapper.mjs
+# export LETTA_CLI_PATH_REAL=/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js
 
 # A2UI dynamic UI support. The shim injects the v0.9 Basic Catalog grammar
 # into the upstream model's system prompt when a WS client opts in via

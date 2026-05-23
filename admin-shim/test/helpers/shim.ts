@@ -143,7 +143,11 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
     LETTA_LOCAL_BACKEND_EXPERIMENTAL: "1",
     LETTA_BASE_URL: "http://127.0.0.1:0",
     LMSTUDIO_BASE_URL: "http://127.0.0.1:0",
+    // lcp-sdk.10: the SDK transport reads LETTA_CLI_PATH (not LETTA_BIN). Set
+    // both so tests work transparently regardless of which the production
+    // code path is using.
     LETTA_BIN: MOCK_LETTA,
+    LETTA_CLI_PATH: MOCK_LETTA,
     SHIM_PORT: "0",
     SHIM_HOST: "127.0.0.1",
     MOBILE_CHANNEL_TOKEN: mobileToken,

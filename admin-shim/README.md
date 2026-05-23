@@ -106,34 +106,35 @@ Full wire contract + 19-field `CronTask` schema:
 Mutation routing rationale (and why there's no `POST /v1/crons`):
 [`docs/DIVERGENCE.md` §5](docs/DIVERGENCE.md).
 
-## SDK migration (lcp-sdk epic)
+## Letta Code transport: SDK Session (lcp-sdk.10)
 
-The hand-rolled `lib/agent-pool.ts` subprocess layer is being replaced with
-`@letta-ai/letta-code-sdk`. The dependency is installed (pinned to `0.1.14`)
-and the SDK path is proven to work against the shim's local backend without
-any production code change yet — see beads `lcp-sdk.1` through `lcp-sdk.10`
-for the staged plan.
+The shim drives letta-code through `@letta-ai/letta-code-sdk`'s `Session`.
+The hand-rolled subprocess transport was retired in lcp-sdk.10. There's
+no transport flag and no fallback path — the SDK adapter is the only
+implementation. The release before this one shipped both behind
+`SHIM_LETTA_TRANSPORT=sdk` if you ever need to compare.
 
-Compatibility findings from `lcp-sdk.1`:
+Operational quirks worth knowing:
 
-- The SDK's `SubprocessTransport` does **not** pass `--backend local`. Our
-  hand-rolled pool does. The SDK works anyway because the CLI honors
-  `LETTA_LOCAL_BACKEND_EXPERIMENTAL=1`; the existing systemd env contract is
-  sufficient (no migration-time env change required for backend selection).
-- The SDK resolves the CLI binary via `LETTA_CLI_PATH`, then
-  `require.resolve("@letta-ai/letta-code")`, then a few hard-coded fallbacks.
-  Today the shim spawns whatever `letta` is on `PATH` (via `LETTA_BIN`). To
-  keep both paths pinned to the same binary during the migration, set
-  `LETTA_CLI_PATH=/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js`
-  (or wherever your install lives).
-- `includePartialMessages: true` in `CreateSessionOptions` maps to the same
-  `--include-partial-messages` CLI flag the pool already passes. The option
-  is still present in `0.1.14`'s type surface (test `sdk-compat: ...
-  includePartialMessages` asserts this).
-- Pre-existing benign noise: the CLI logs
-  `Failed to call /v1/tools/add-base-tools: fetch failed` on startup because
-  `LETTA_BASE_URL=http://127.0.0.1:0` is a deliberate dead URL. Same line
-  appears on the current direct-spawn path — not a SDK regression.
+- **`--backend local` injection**: the SDK doesn't pass `--backend local`
+  when spawning the CLI, and current letta-code versions require it
+  explicitly (`LETTA_LOCAL_BACKEND_EXPERIMENTAL=1` alone isn't enough —
+  tracked upstream as LET-9013). The shim points the SDK's
+  `LETTA_CLI_PATH` at `admin-shim/scripts/letta-cli-sdk-wrapper.mjs`,
+  a tiny node script that injects `--backend local` before exec'ing the
+  real binary. `server.ts` auto-wires this on startup when
+  `LETTA_CLI_PATH` is unset; if you set it explicitly, also set
+  `LETTA_CLI_PATH_REAL` to the path of the real `letta-code` CLI.
+- **Approvals**: letta-code is approval-by-default. The SDK invokes the
+  shim's `canUseTool` callback for every tool; the adapter synthesizes
+  an `approval_request_message` wire frame so mobile's A2UI surface
+  works unchanged. See `_handleCanUseTool` in `lib/letta-sdk-adapter.ts`
+  and `lcp-j3r` for the known synthetic-vs-real `tool_call_id`
+  divergence.
+- **Benign noise**: the CLI logs `Failed to call
+  /v1/tools/add-base-tools: fetch failed` on startup because
+  `LETTA_BASE_URL=http://127.0.0.1:0` is a deliberate dead URL. Not a
+  regression.
 
 ### Run-ID ownership (decision: `lcp-sdk-decide-runid`)
 

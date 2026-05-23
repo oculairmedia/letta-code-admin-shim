@@ -23,6 +23,7 @@ import { URL } from "node:url";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 
 import {
   getAgentRecord,
@@ -69,6 +70,39 @@ import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
 const HOST = process.env["SHIM_HOST"] || "0.0.0.0";
+
+// lcp-sdk.10: the SDK transport requires letta-code to be spawned with
+// `--backend local`. The SDK doesn't pass that flag, so we route through
+// a small wrapper (see admin-shim/scripts/letta-cli-sdk-wrapper.mjs)
+// that injects it before exec. The SDK reads LETTA_CLI_PATH at spawn
+// time; if the operator hasn't set it, point it at the wrapper here so
+// the install just works out of the box. LETTA_CLI_PATH_REAL is the
+// path to the actual letta-code binary the wrapper execs.
+//
+// Remove this auto-wiring once the SDK or CLI honors local-backend
+// selection from `LETTA_LOCAL_BACKEND_EXPERIMENTAL=1` alone (LET-9013).
+function autoWireSdkCliPath(): void {
+  if (process.env["LETTA_CLI_PATH"]) return;
+  const here = new URL(import.meta.url).pathname;
+  const distRoot = join(here, "..", "..");
+  const candidates = [
+    join(distRoot, "..", "scripts", "letta-cli-sdk-wrapper.mjs"),
+    join(distRoot, "scripts", "letta-cli-sdk-wrapper.mjs"),
+  ];
+  const wrapper = candidates.find((p) => existsSync(p));
+  if (!wrapper) return;
+  process.env["LETTA_CLI_PATH"] = wrapper;
+  if (!process.env["LETTA_CLI_PATH_REAL"]) {
+    try {
+      const req = createRequire(import.meta.url);
+      process.env["LETTA_CLI_PATH_REAL"] = req.resolve("@letta-ai/letta-code");
+    } catch {
+      // Operator must set LETTA_CLI_PATH_REAL explicitly if @letta-ai/letta-code
+      // isn't resolvable from this process's module graph (e.g. global install).
+    }
+  }
+}
+autoWireSdkCliPath();
 
 function json(
   res: ServerResponse,
@@ -666,7 +700,24 @@ function handleConversationStream(req: IncomingMessage, res: ServerResponse, ext
     try { res.write(`: ping\n\n`); } catch { /* socket closed */ }
   }, 25_000);
   if (ping.unref) ping.unref();
-  req.on("close", () => clearInterval(ping));
+  // Hard cap the SSE keep-alive duration. Without this, half-closed sockets
+  // (Android backgrounding, NAT timeout, wifi flap) keep the request alive
+  // server-side until kernel TCP keepalive finally tears it down — observed
+  // in the wild as 20–78 minute pending POSTs that look like "the agent
+  // never replied." Clients re-open as needed; SSE is meant to be a
+  // short-lived long-poll, not a persistent channel (that's the WS).
+  const MAX_STREAM_MS = Number(process.env["SHIM_STREAM_MAX_MS"] ?? 60_000);
+  const cap = setTimeout(() => {
+    clearInterval(ping);
+    if (!res.writableEnded) {
+      try { res.end(); } catch { /* socket gone */ }
+    }
+  }, MAX_STREAM_MS);
+  if (cap.unref) cap.unref();
+  req.on("close", () => {
+    clearInterval(ping);
+    clearTimeout(cap);
+  });
 }
 
 async function handleConversationCancel(_req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
