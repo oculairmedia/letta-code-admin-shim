@@ -66,7 +66,7 @@ import {
   type UsageInput,
 } from "./runs.js";
 
-import type { A2uiCapability } from "./a2ui-adapter.js";
+import { ensureA2uiBlockAttached, type A2uiCapability } from "./a2ui-adapter.js";
 
 import { listMessages } from "./store.js";
 
@@ -237,6 +237,22 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     this.currentA2uiCapability = opts.a2uiCapability ?? null;
     this.currentApprovalScopeCache = loadApprovalScopeCache(runHandle.id, this.conversationId);
     this.syntheticSeqId = 1_000_000;
+
+    // lcp-qec: scaffold the per-agent A2UI protocol memory file the
+    // first time an A2UI-capable client lands on this agent. The bootstrap
+    // is idempotent and self-cached (per process + per agent), and now
+    // strictly write-if-absent — once scaffolded, the agent owns the
+    // file forever. Capability-gated so non-A2UI clients don't create
+    // dead memory files on agents that will never emit A2UI.
+    //
+    // Previous home for this call was agent-pool.ts's direct-subprocess
+    // turn driver, which was excised in lcp-sdk.10. Without this re-wire,
+    // newly-provisioned agents on the SDK path never see the A2UI
+    // protocol contract in their memory, and A2UI emissions degrade to
+    // unstructured text.
+    if (this.currentA2uiCapability) {
+      ensureA2uiBlockAttached(this.agentId);
+    }
 
     // Watchdog: same envelope the direct adapter uses. On timeout, flag
     // and signal abort; the stream loop breaks at the next yield.

@@ -202,19 +202,27 @@ export function buildA2uiBlockContent(): string {
     `## Supported widgets (catalog: ${server.catalogId})`,
     server.supportedWidgets.join(", "),
     "",
+    "## Component shape",
+    "Every component is a flat object with `id`, a `component` discriminator, and",
+    "the widget's props at the top level. Children are referenced by ID, never inlined.",
+    "",
+    "Correct:  `{ \"id\": \"my-card\", \"component\": \"Card\", \"child\": \"child-id\" }`",
+    "Wrong:    `{ \"id\": \"my-card\", \"Card\": { \"child\": \"child-id\" } }`",
+    "",
+    "Text uses `text` (not `value`). Surface envelopes use `surfaceId`",
+    "(not `surface`). `createSurface` takes only `surfaceId` + `catalogId`; the",
+    "component tree goes in a separate `updateComponents` message.",
+    "",
     "## Examples",
     "",
-    "### createSurface — create a new UI surface",
+    "### createSurface — open a new UI surface",
     "<a2ui-json>",
     JSON.stringify(
       {
         version: "v0.9",
         createSurface: {
-          surface: { id: "main", root: "rootCard" },
-          components: [
-            { id: "rootCard", Card: { child: "greeting" } },
-            { id: "greeting", Text: { value: "Hello!" } },
-          ],
+          surfaceId: "greeting-surface",
+          catalogId: server.catalogId,
         },
       },
       null,
@@ -222,15 +230,26 @@ export function buildA2uiBlockContent(): string {
     ),
     "</a2ui-json>",
     "",
-    "### updateComponents — patch existing components",
+    "### updateComponents — define or patch the component tree",
+    "The `root` component MUST be the first element in `components`.",
+    "Parents MUST appear before their children (top-down ordering).",
     "<a2ui-json>",
     JSON.stringify(
       {
         version: "v0.9",
         updateComponents: {
-          surface: "main",
+          surfaceId: "greeting-surface",
           components: [
-            { id: "greeting", Text: { value: "Updated!" } },
+            { id: "root", component: "Card", child: "col" },
+            { id: "col", component: "Column", children: ["greeting", "ok-btn"] },
+            { id: "greeting", component: "Text", text: "Hello!", variant: "h3" },
+            {
+              id: "ok-btn",
+              component: "Button",
+              child: "ok-label",
+              action: { event: { name: "dismiss", context: {} } },
+            },
+            { id: "ok-label", component: "Text", text: "OK" },
           ],
         },
       },
@@ -244,7 +263,7 @@ export function buildA2uiBlockContent(): string {
     JSON.stringify(
       {
         version: "v0.9",
-        deleteSurface: { surface: "main" },
+        deleteSurface: { surfaceId: "greeting-surface" },
       },
       null,
       2,
@@ -256,19 +275,34 @@ export function buildA2uiBlockContent(): string {
 // Per-process cache so we touch disk once per agent, not every turn.
 const a2uiBlockAttachedAgents = new Set<string>();
 
-// Idempotent: writes <storageDir>/memfs/<agent>/memory/system/a2ui_protocol.md
-// to match the canonical block content. Safe to call repeatedly; the in-process
-// Set short-circuits subsequent calls for the same agent.
+// lcp-qec: write-if-absent only. Once the file exists on disk the agent
+// owns it — the shim never re-asserts. Previously this overwrote any
+// drift between disk and `buildA2uiBlockContent()`, which destroyed
+// agent-curated corrections (wrong-shape examples in the template
+// kept being restored, and any annotations the agent added to reflect
+// production reality were wiped on every shim restart).
+//
+// Ownership model:
+//   - First time the agent loads with A2UI capability: shim scaffolds
+//     `system/a2ui_protocol.md` from the canonical template.
+//   - Every time after that: the file is the agent's. The shim does not
+//     read, diff, or write it. If the canonical template evolves, that
+//     does NOT propagate into agents that already have the block.
+//   - To re-scaffold an agent: delete the file from the agent's memfs
+//     and the next attach will recreate it.
+//
+// The in-process Set short-circuits subsequent calls for the same agent
+// within one shim process, even when the file already existed on disk
+// at startup (so we don't stat the same path every turn).
 export function ensureA2uiBlockAttached(agentId: string): void {
   if (a2uiBlockAttachedAgents.has(agentId)) return;
   const sysDir = join(blockStorageDir(), "memfs", agentId, "memory", "system");
   const blockPath = join(sysDir, `${A2UI_BLOCK_LABEL}.md`);
-  const desired = buildA2uiBlockContent();
   try {
     if (!existsSync(sysDir)) mkdirSync(sysDir, { recursive: true });
-    const existing = existsSync(blockPath) ? readFileSync(blockPath, "utf8") : null;
-    if (existing !== desired) {
-      writeFileSync(blockPath, desired);
+    if (!existsSync(blockPath)) {
+      // First-time scaffold only. Agent owns it after this.
+      writeFileSync(blockPath, buildA2uiBlockContent());
     }
     a2uiBlockAttachedAgents.add(agentId);
   } catch (err) {
