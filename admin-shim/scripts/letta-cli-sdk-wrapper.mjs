@@ -32,6 +32,8 @@
  */
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
 
 const realCli = process.env["LETTA_CLI_PATH_REAL"];
 if (!realCli) {
@@ -43,11 +45,22 @@ if (!existsSync(realCli)) {
   process.exit(2);
 }
 
+// lcp-ith: register a load-time patch for letta-code's settle-on-turn bug
+// before letta.js evaluates. The register file (sibling of this wrapper)
+// installs the actual loader via module.register(); the loader rewrites
+// the buggy `executeConversationTurn` call site so settleInterruptedToolCalls
+// receives `agentId`. Without this, migrated agents (agent-<uuid>) leak
+// orphan tool_use records on disk and every subsequent turn fails the
+// Anthropic validator. See letta-code-patch-loader.mjs for details.
+const wrapperDir = dirname(fileURLToPath(import.meta.url));
+const registerPath = join(wrapperDir, "letta-code-patch-register.mjs");
+const registerUrl = pathToFileURL(registerPath).href;
+
 const sdkArgs = process.argv.slice(2);
 const hasBackend = sdkArgs.includes("--backend");
 const args = hasBackend ? sdkArgs : ["--backend", "local", ...sdkArgs];
 
-const child = spawn("node", [realCli, ...args], {
+const child = spawn("node", ["--import", registerUrl, realCli, ...args], {
   stdio: "inherit",
   env: process.env,
 });
