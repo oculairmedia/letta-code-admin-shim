@@ -199,7 +199,22 @@ export async function bridgeSendMessage(
   const emit = (frame: BridgeFrame): void => {
     const { seq } = appendRunFrame(runHandle.id, frame);
     if (seq > 0) {
-      (frame as unknown as Record<string, unknown>)["seq"] = seq;
+      const asRec = frame as unknown as Record<string, unknown>;
+      asRec["seq"] = seq;
+      // lcp-pro: alias `seq` as `seq_id` on delta-shaped frames so mobile's
+      // `hasAlreadyIngestedStreamFrame` gate (which dedups by `seqId: Int?`)
+      // fires on the WS path without a mobile-side change. Without this
+      // every reconnect-replay / WS-vs-REST race silently appends a
+      // duplicate delta (the 2026-05-19 "Hello worldHello world" repro).
+      // We overwrite any upstream-supplied seq_id so the wire value is
+      // ALWAYS the shim's authoritative per-run cursor — upstream's value
+      // may be null on synthetic frames (end-of-turn splitter flush, A2UI
+      // host-synthesized frames) and a single source of truth keeps the
+      // gate's monotonicity invariant unbroken across the whole turn.
+      const mt = (frame as { message_type?: unknown }).message_type;
+      if (mt === "assistant_message" || mt === "reasoning_message") {
+        asRec["seq_id"] = seq;
+      }
     }
     onFrame(frame);
   };
@@ -553,7 +568,7 @@ function approvalDecisionFromAction(
   action: A2uiUserAction,
   actionId: string,
 ): { decision: "approve" | "deny"; scope: ApprovalScope; reason: string; userId?: string; actionId: string } | null {
-  if (action.name !== "tool_approval_choice") return null;
+  if (action.name !== "tool_approval_response") return null;
   const context = action.context;
   const rawScope = typeof context["scope"] === "string" ? context["scope"] : "Once";
   const normalizedScope = normalizeApprovalScope(rawScope);

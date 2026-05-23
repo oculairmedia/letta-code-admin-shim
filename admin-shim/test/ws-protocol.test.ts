@@ -891,23 +891,68 @@ test("ws: assistant_message chunks carry monotonic seq_id (lcp-pro dedup bridge)
   // append silently and produce incoherent text (the 2026-05-19 evening
   // "Hello worldHello world" repro).
   const assistants = turn.filter((f) => f.type === "assistant_message") as unknown as Array<{
+    seq?: number | null;
     seq_id?: number | null;
   }>;
   assert.ok(assistants.length > 0, "at least one assistant_message must arrive");
   // Every chunk must carry a numeric seq_id (the per-run cursor stamped by
   // the host's emit()). Strictly increasing across the turn — earlier chunks
-  // have smaller seq_id than later chunks.
+  // have smaller seq_id than later chunks. seq_id is also a strict alias of
+  // `seq` (the per-run frame counter); if upstream supplies its own seq_id
+  // the shim overwrites with the authoritative shim value so the gate's
+  // monotonicity invariant holds across synthetic frames (splitter flush,
+  // a2ui_frame siblings, etc).
   let prev = -Infinity;
   for (const a of assistants) {
     assert.ok(
       typeof a.seq_id === "number",
       `assistant_message must carry numeric seq_id, got: ${a.seq_id}`,
     );
+    assert.equal(
+      a.seq_id,
+      a.seq,
+      `seq_id must alias seq (got seq_id=${a.seq_id} seq=${a.seq})`,
+    );
     assert.ok(
       (a.seq_id as number) > prev,
       `seq_id must be strictly increasing across the turn (got ${a.seq_id} after ${prev})`,
     );
     prev = a.seq_id as number;
+  }
+});
+
+// ─── 18b'. seq_id alias also fires on a2ui-driven flushes ──────────────
+
+test("ws: seq_id alias survives a2ui-enabled turn (splitter flush gets seq_id, not null)", async (t) => {
+  // Force the a2ui-card fixture so the splitter runs end-to-end. The
+  // end-of-turn flush in mobile-channel-host emits an assistant_message
+  // for any text the splitter held back behind a partial tag; that synthetic
+  // frame must also carry a non-null seq_id, otherwise mobile's dedup gate
+  // goes back to dead-code on the very last delta of every a2ui turn.
+  const { conn, agentId, convId } = await setupAuthed(t, {
+    env: { LETTA_MOCK_FORCE_TRACE: "a2ui-card" },
+  });
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "show an approval card",
+    otid: "cm-ws-seq-a2ui",
+    a2ui_capability: { version: "0.9", catalog: "basic" },
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const assistants = turn.filter((f) => f.type === "assistant_message") as unknown as Array<{
+    seq?: number | null;
+    seq_id?: number | null;
+  }>;
+  // Empty assistants is fine for some a2ui-only outputs, but the seq alias
+  // must hold for every one present.
+  for (const a of assistants) {
+    assert.ok(
+      typeof a.seq_id === "number",
+      `a2ui-path assistant_message must carry numeric seq_id (got ${a.seq_id})`,
+    );
+    assert.equal(a.seq_id, a.seq, `seq_id must equal seq on a2ui path`);
   }
 });
 
