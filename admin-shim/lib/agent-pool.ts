@@ -42,6 +42,10 @@ import {
   type UsageInput,
   type ApprovalScope,
 } from "./runs.js";
+import {
+  settleDanglingToolCallsFromFrames,
+  type SettlementReason,
+} from "./turn-settlement.js";
 import type {
   LettaStreamFrame,
   LettaInnerEvent,
@@ -413,6 +417,40 @@ export async function finalizeTurnLifecycle(args: {
     const mt = "message_type" in ev ? ev.message_type : undefined;
     return mt === "stop_reason";
   });
+  // lcp-12w: synthesize an error toolResult for any tool_call this turn
+  // emitted but never returned. Cheap no-op on clean turns; only writes
+  // when an interruption left tool_use orphans on disk. Pairs with the
+  // lcp-ith upstream patch (which catches the same class at NEXT-turn
+  // boundary) — defense in depth. Reason is sourced from the caller's
+  // local lifecycle state; "stream_dropped" is the catch-all for cases
+  // where no result frame arrived and none of the explicit flags fired.
+  const cleanFinish = !cancelled && !finishedTimeout && !finishedExit && Boolean(stopFrame);
+  if (!cleanFinish) {
+    const settleReason: SettlementReason =
+      cancelled ? "cancelled"
+      : finishedTimeout ? "turn_timeout"
+      : finishedExit ? "worker_exit"
+      : "stream_dropped";
+    try {
+      const settled = await settleDanglingToolCallsFromFrames({
+        frames,
+        conversationId,
+        agentId,
+        runId: runHandle.id,
+        reason: settleReason,
+        messageIdsBefore,
+      });
+      if (settled.messagesAppended > 0) {
+        logLine(`settled ${settled.messagesAppended} dangling tool_call(s) for run=${runHandle.id} reason=${settleReason}`);
+        for (const s of settled.settled) {
+          recordRunMessage(runHandle, `synth-settle:${runHandle.id}:${s.tool_call_id}`);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logLine(`turn-settlement failed run=${runHandle.id}: ${msg}`);
+    }
+  }
   const usageFrame = frames.find((f) => {
     const ev = frameEvent(f);
     const mt = "message_type" in ev ? ev.message_type : undefined;
