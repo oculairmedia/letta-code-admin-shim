@@ -58,6 +58,7 @@ import {
   loadApprovalScopeCache,
   recordApprovalDecision,
   recordApprovalPolicy,
+  setMessageIdsAtTurnStart,
   setRunCancelHandler,
   type ApprovalScope,
   type ApprovalScopeCacheEntry,
@@ -204,6 +205,11 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         .map((m) => m?.id)
         .filter((id): id is string => Boolean(id)),
     );
+    // lcp-r0m: stash the same snapshot on the run handle so a concurrent
+    // REST /messages hydrate during this turn can compute the in-flight
+    // set (= current disk ids − pre-turn snapshot) and drop those rows
+    // before they collide with the WS delta stream.
+    setMessageIdsAtTurnStart(runHandle, messageIdsBefore);
 
     // Anchor stamp time: caller may supply a turn-start time captured
     // before this method ran (mobile WS uses this so disk-stamped and

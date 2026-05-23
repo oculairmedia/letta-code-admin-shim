@@ -36,6 +36,7 @@ import {
   finalizeRun,
   markRunFirstToken,
   recordRunMessage,
+  recordRunOtid,
   recordRunStep,
   recordRunTool,
   type RunHandle,
@@ -317,6 +318,16 @@ export function applyFrameRunSideEffects(
     if (mt === "assistant_message" || mt === "tool_call_message" || mt === "approval_request_message") {
       markRunFirstToken(runHandle);
     }
+    // lcp-r0m: stamp the frame's otid into the run's in-flight set as
+    // soon as it goes past. The REST /messages handler filters disk
+    // records by this set, so a mid-turn hydrate never returns the
+    // cumulative assistant_message that the WS stream is still
+    // delivering as deltas. Done unconditionally — any frame that
+    // carries an otid is a frame whose disk twin would race the WS.
+    const evOtid = "otid" in ev && typeof (ev as { otid?: unknown }).otid === "string"
+      ? (ev as { otid: string }).otid
+      : undefined;
+    if (evOtid) recordRunOtid(runHandle, evOtid);
     const evToolCall =
       "tool_call" in ev && ev.tool_call && typeof ev.tool_call === "object"
         ? (ev.tool_call as { name?: unknown })

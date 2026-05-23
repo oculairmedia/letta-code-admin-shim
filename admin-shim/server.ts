@@ -244,9 +244,13 @@ async function handleAgentMessages(
   const conversationId = url.searchParams.get("conversation_id") ?? "default";
   let items = await listMessages(conversationId, agentId, { limit, before });
   // lcp-r0m: drop in-flight assistant/tool messages owned by an active run.
-  // Mirrors the filter in handleListConversationMessages — same race, same
+  // Mirrors the filter in handleConversationMessagesList — same race, same
   // fix. See lib/runs.ts inFlightMessageIds for rationale.
-  const inFlight = inFlightMessageIds(agentId, conversationId);
+  const inFlight = inFlightMessageIds(
+    agentId,
+    conversationId,
+    items.map((m) => (m as { id?: unknown }).id).filter((id): id is string => typeof id === "string"),
+  );
   if (inFlight.size > 0) {
     items = items.filter((m) => {
       const mid = (m as { id?: unknown }).id;
@@ -640,7 +644,11 @@ async function handleConversationMessagesList(
   // messages; returning the cumulative snapshot here races the stream and
   // produces incoherent text on the client (the 2026-05-19 "StandStanding
   // by..." repro). On the next hydrate after turn_done they appear cleanly.
-  const inFlight = inFlightMessageIds(resolved.agentId, resolved.conversationId);
+  const inFlight = inFlightMessageIds(
+    resolved.agentId,
+    resolved.conversationId,
+    items.map((m) => (m as { id?: unknown }).id).filter((id): id is string => typeof id === "string"),
+  );
   if (inFlight.size > 0) {
     items = items.filter((m) => {
       const mid = (m as { id?: unknown }).id;

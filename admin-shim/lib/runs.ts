@@ -81,6 +81,20 @@ export interface RunHandle {
   // record — seq is implicit in file line position; this is just a writer-side
   // counter to avoid re-stat'ing the file on every append.
   frameCount: number;
+  // lcp-r0m: per-turn set of otids currently being streamed by this run.
+  // Populated from frames during the stream (applyFrameRunSideEffects);
+  // useful for any consumer that keys by otid (and a forward seam for
+  // mobile if/when its merger starts keying merges off the wire otid).
+  // Not persisted — purely turn-life transient.
+  inFlightOtids: Set<string>;
+  // lcp-r0m: snapshot of LocalMessage ids that existed on disk BEFORE
+  // this turn started. The REST /messages handler subtracts the union of
+  // these (across all active runs for the (agent, conv) pair) from the
+  // currently-on-disk id list — any id NOT in the snapshot is in-flight
+  // and must be dropped from the projection so mobile's REST hydrate
+  // doesn't race the WS delta stream for the same logical message.
+  // Populated at runTurn entry, never re-read on disk.
+  messageIdsAtTurnStart: Set<string>;
 }
 
 /**
@@ -335,6 +349,8 @@ export function createRun({ agentId, conversationId, onCancel, background }: Cre
     hrStart,
     firstTokenSet: false,
     frameCount: 0,
+    inFlightOtids: new Set<string>(),
+    messageIdsAtTurnStart: new Set<string>(),
   };
   _activeRuns.set(id, handle);
   if (typeof onCancel === "function") {
@@ -373,6 +389,38 @@ export function recordRunMessage(
   if (!handle || !localMessageId) return;
   if (handle.record.message_ids.includes(localMessageId)) return;
   handle.record.message_ids.push(localMessageId);
+}
+
+/**
+ * lcp-r0m: stamp an otid into the run's in-flight set as soon as a
+ * streamed frame referencing it goes past. Called by
+ * `applyFrameRunSideEffects` per-frame; lets the REST /messages handler
+ * filter out the corresponding disk record while the WS stream is still
+ * delivering deltas for it. Idempotent — same otid in the same turn is
+ * a normal multi-frame case (assistant_message chunks share an otid).
+ */
+export function recordRunOtid(
+  handle: RunHandle | null | undefined,
+  otid: string | null | undefined,
+): void {
+  if (!handle || !otid) return;
+  handle.inFlightOtids.add(otid);
+}
+
+/**
+ * lcp-r0m: snapshot the LocalMessage ids that existed on disk BEFORE
+ * this turn started. Caller (adapter._runTurnInner) computes this once
+ * via listMessages right before the first send, then hands it to the
+ * run handle via this setter. The REST /messages filter uses it to
+ * decide which currently-on-disk ids are mid-flight (= NOT in the
+ * snapshot of any active run).
+ */
+export function setMessageIdsAtTurnStart(
+  handle: RunHandle | null | undefined,
+  ids: Iterable<string>,
+): void {
+  if (!handle) return;
+  handle.messageIdsAtTurnStart = new Set(ids);
 }
 
 export function recordRunTool(
@@ -897,19 +945,86 @@ export function listActiveRunsForConversation(
 }
 
 /**
- * lcp-r0m: collect the set of message_ids currently claimed by any
- * active run for the given (agent, conversation) pair. The REST
- * /messages handler uses this to drop in-flight assistant messages
- * from the response.
+ * lcp-r0m: collect the set of message_ids that are mid-flight (i.e.,
+ * currently being written by an active run) for the given (agent,
+ * conversation) pair, given the caller's view of the current on-disk
+ * id list.
+ *
+ * Computed as: every id in `currentDiskIds` that is NOT in any active
+ * run's `messageIdsAtTurnStart` snapshot. That set is exactly the
+ * messages letta-code has appended SINCE the active turn started — the
+ * cumulative assistant_message snapshot that the WS delta stream is
+ * still delivering, plus any tool-result rows landing under the same
+ * turn. The REST /messages handler drops these from its projection so
+ * mobile's snapshot-vs-delta merge doesn't collide ("StandStanding by
+ * ..." repro, 2026-05-19).
+ *
+ * Why we read from a caller-supplied id set rather than calling
+ * listMessages ourselves: the REST handler has already paid for the
+ * disk read; doing it twice would double the cost on every list call.
+ *
+ * The previous shape of this helper returned ids from each run's
+ * `record.message_ids`, but those are only populated by
+ * `recordRunMessage` at TURN END (inside finalizeTurnLifecycle) — i.e.
+ * after the race window has already closed. The mid-turn race needs an
+ * in-flight signal, which is what the pre-turn snapshot provides.
+ *
+ * On no active runs OR no snapshot recorded yet, returns an empty set
+ * (i.e. nothing is in-flight, the caller's filter is a no-op).
  */
 export function inFlightMessageIds(
+  agentId: string,
+  conversationId: string,
+  currentDiskIds?: Iterable<string>,
+): Set<string> {
+  const out = new Set<string>();
+  const handles = listActiveRunsForConversation(agentId, conversationId);
+  if (handles.length === 0) return out;
+  // No caller-supplied id set: legacy callers (and one test) used to read
+  // record.message_ids. Preserve that fallback so a missing argument
+  // gives a defined behavior (empty set + warning would be too loud).
+  if (!currentDiskIds) {
+    for (const handle of handles) {
+      for (const mid of handle.record.message_ids) {
+        if (typeof mid === "string" && mid.length > 0) out.add(mid);
+      }
+    }
+    return out;
+  }
+  // Combine all active runs' pre-turn snapshots — a message id is
+  // in-flight if it's present on disk now AND wasn't present at the
+  // start of ANY active run.
+  const preStartUnion = new Set<string>();
+  for (const handle of handles) {
+    for (const mid of handle.messageIdsAtTurnStart) preStartUnion.add(mid);
+  }
+  for (const id of currentDiskIds) {
+    if (!preStartUnion.has(id)) out.add(id);
+  }
+  return out;
+}
+
+/**
+ * lcp-r0m: collect the otid set currently being streamed by any active
+ * run for the (agent, conversation) pair. The REST /messages handler
+ * filters disk records whose otid is in this set so a mid-turn hydrate
+ * doesn't return the cumulative assistant_message that the WS stream is
+ * still delivering as deltas (the "StandStanding by..." merge collision).
+ *
+ * Unlike inFlightMessageIds — which only populates at finalize via
+ * recordRunMessage and is therefore empty DURING the actual race — this
+ * is populated from every streamed frame in real time via
+ * `recordRunOtid` inside applyFrameRunSideEffects. The race window
+ * closes the instant the first frame for an otid lands.
+ */
+export function inFlightOtids(
   agentId: string,
   conversationId: string,
 ): Set<string> {
   const out = new Set<string>();
   for (const handle of listActiveRunsForConversation(agentId, conversationId)) {
-    for (const mid of handle.record.message_ids) {
-      if (typeof mid === "string" && mid.length > 0) out.add(mid);
+    for (const o of handle.inFlightOtids) {
+      out.add(o);
     }
   }
   return out;
