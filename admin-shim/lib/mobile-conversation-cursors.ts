@@ -1,0 +1,235 @@
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { dirname, join } from "node:path";
+
+import { _internals as storeInternals } from "./store.js";
+
+const DEFAULT_TTL_MS = 60 * 60 * 1000;
+const DEFAULT_MAX_FRAMES = 1_000;
+
+const TTL_MS = Number(process.env["SHIM_MOBILE_CONV_REPLAY_TTL_MS"] ?? DEFAULT_TTL_MS);
+const MAX_FRAMES = Number(process.env["SHIM_MOBILE_CONV_REPLAY_MAX_FRAMES"] ?? DEFAULT_MAX_FRAMES);
+
+interface CursorSidecar {
+  version: 1;
+  conversation_id: string;
+  last_assigned_seq: number;
+  last_ack_seq: number;
+  updated_at: string;
+}
+
+interface ReplayEntry {
+  convSeq: number;
+  tsMs: number;
+  frame: Record<string, unknown>;
+}
+
+interface CursorState {
+  sidecar: CursorSidecar;
+  replay: ReplayEntry[];
+}
+
+export interface ConversationResumeResult {
+  ok: boolean;
+  cursorExpired: boolean;
+  conversationId: string;
+  afterSeq: number;
+  oldestSeq: number | null;
+  lastSeq: number;
+  frames: Record<string, unknown>[];
+}
+
+const states = new Map<string, CursorState>();
+
+export function mobileConversationCursorCapabilities(): Record<string, unknown> {
+  return {
+    resume_cursor_supported: true,
+    conversation_seq_field: "conv_seq",
+    resume_frame: "resume_conversation",
+    ack_frame: "ack",
+    cursor_expired_error: "cursor_expired",
+    replay_ttl_ms: TTL_MS,
+    replay_max_frames: MAX_FRAMES,
+    replay_storage: "durable_jsonl",
+  };
+}
+
+export function stampConversationFrame(
+  conversationId: string,
+  frame: Record<string, unknown>,
+): Record<string, unknown> {
+  const state = getState(conversationId);
+  const convSeq = state.sidecar.last_assigned_seq + 1;
+  state.sidecar = {
+    ...state.sidecar,
+    last_assigned_seq: convSeq,
+    updated_at: new Date().toISOString(),
+  };
+  writeSidecar(conversationId, state.sidecar);
+  const stamped = { ...frame, conversation_id: conversationId, conv_seq: convSeq };
+  appendReplayFrame(conversationId, { convSeq, tsMs: Date.now(), frame: stamped });
+  state.replay.push({ convSeq, tsMs: Date.now(), frame: stamped });
+  pruneReplay(state);
+  return stamped;
+}
+
+export function resumeConversation(conversationId: string, afterSeqInput: unknown): ConversationResumeResult {
+  const afterSeq = normalizeSeq(afterSeqInput);
+  const state = getState(conversationId);
+  pruneReplay(state);
+  const lastSeq = state.sidecar.last_assigned_seq;
+  const replay = readReplayFrames(conversationId);
+  const oldestSeq = replay.length > 0 ? replay[0]!.convSeq : null;
+  const cursorExpired = afterSeq < lastSeq && (oldestSeq === null || afterSeq < oldestSeq - 1);
+  if (cursorExpired) {
+    return { ok: false, cursorExpired: true, conversationId, afterSeq, oldestSeq, lastSeq, frames: [] };
+  }
+  return {
+    ok: true,
+    cursorExpired: false,
+    conversationId,
+    afterSeq,
+    oldestSeq,
+    lastSeq,
+    frames: replay.filter((entry) => entry.convSeq > afterSeq).map((entry) => ({ ...entry.frame, replayed: true })),
+  };
+}
+
+export function ackConversation(conversationId: string, ackSeqInput: unknown): CursorSidecar {
+  const ackSeq = normalizeSeq(ackSeqInput);
+  const state = getState(conversationId);
+  state.sidecar = {
+    ...state.sidecar,
+    last_ack_seq: Math.max(state.sidecar.last_ack_seq, ackSeq),
+    updated_at: new Date().toISOString(),
+  };
+  writeSidecar(conversationId, state.sidecar);
+  pruneReplay(state);
+  return state.sidecar;
+}
+
+function getState(conversationId: string): CursorState {
+  const cached = states.get(conversationId);
+  if (cached) return cached;
+  const sidecar = readSidecar(conversationId);
+  const state: CursorState = { sidecar, replay: [] };
+  states.set(conversationId, state);
+  return state;
+}
+
+function normalizeSeq(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value ?? 0);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function sidecarPath(conversationId: string): string {
+  return join(
+    storeInternals.storageDir(),
+    "mobile-conversation-cursors",
+    `${storeInternals.b64url(conversationId)}.json`,
+  );
+}
+
+function replayPath(conversationId: string): string {
+  return join(
+    storeInternals.storageDir(),
+    "mobile-conversation-cursors",
+    `${storeInternals.b64url(conversationId)}.frames.jsonl`,
+  );
+}
+
+function readSidecar(conversationId: string): CursorSidecar {
+  const path = sidecarPath(conversationId);
+  if (existsSync(path)) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<CursorSidecar>;
+      return {
+        version: 1,
+        conversation_id: conversationId,
+        last_assigned_seq: normalizeSeq(parsed.last_assigned_seq),
+        last_ack_seq: normalizeSeq(parsed.last_ack_seq),
+        updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : new Date().toISOString(),
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[mobile-conversation-cursors] ignoring malformed sidecar ${path}: ${msg}`);
+      // Fall through to a fresh sidecar. A malformed cursor sidecar should not
+      // break the WS handshake; clients can still cold-hydrate.
+    }
+  }
+  return {
+    version: 1,
+    conversation_id: conversationId,
+    last_assigned_seq: 0,
+    last_ack_seq: 0,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function writeSidecar(conversationId: string, sidecar: CursorSidecar): void {
+  const path = sidecarPath(conversationId);
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(sidecar, null, 2) + "\n");
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch (cleanupErr) {
+      const msg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      console.warn(`[mobile-conversation-cursors] failed to remove temp sidecar ${tmp}: ${msg}`);
+    }
+    throw err;
+  }
+}
+
+function appendReplayFrame(conversationId: string, entry: ReplayEntry): void {
+  const path = replayPath(conversationId);
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, JSON.stringify({ seq: entry.convSeq, ts: new Date(entry.tsMs).toISOString(), frame: entry.frame }) + "\n");
+}
+
+function readReplayFrames(conversationId: string): ReplayEntry[] {
+  const path = replayPath(conversationId);
+  if (!existsSync(path)) return [];
+  let body = "";
+  try {
+    body = readFileSync(path, "utf8");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[mobile-conversation-cursors] replay read failed ${path}: ${msg}`);
+    return [];
+  }
+  const entries: ReplayEntry[] = [];
+  for (const line of body.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as { seq?: unknown; ts?: unknown; frame?: unknown };
+      const convSeq = normalizeSeq(parsed.seq);
+      if (convSeq <= 0 || !isRecord(parsed.frame)) continue;
+      const tsMs = typeof parsed.ts === "string" ? Date.parse(parsed.ts) : NaN;
+      entries.push({
+        convSeq,
+        tsMs: Number.isFinite(tsMs) ? tsMs : 0,
+        frame: parsed.frame,
+      });
+    } catch {
+      // Match the run frame-log reader: ignore malformed/partial trailing lines.
+    }
+  }
+  return entries.sort((a, b) => a.convSeq - b.convSeq).slice(-MAX_FRAMES);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function pruneReplay(state: CursorState): void {
+  const cutoff = Date.now() - TTL_MS;
+  state.replay = state.replay.filter((entry) => entry.tsMs >= cutoff && entry.convSeq > state.sidecar.last_ack_seq);
+  if (state.replay.length > MAX_FRAMES) {
+    state.replay = state.replay.slice(state.replay.length - MAX_FRAMES);
+  }
+}
