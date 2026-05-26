@@ -46,6 +46,16 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
     server_id: string;
     server_started_at: string;
     version: string;
+    capabilities?: {
+      mobile_transport?: {
+        mobile_ws?: boolean;
+        ws_endpoint?: string;
+        canonical_live_transport?: string;
+        rest_role?: string;
+        sse_role?: string;
+        exclusivity?: string;
+      };
+    };
   };
   assert.equal(res.status, 200);
   assert.equal(b.status, "ok");
@@ -53,6 +63,53 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
   assert.ok(b.server_id, "server_id present");
   assert.ok(b.server_started_at, "server_started_at present");
   assert.ok(b.version, "version present");
+  assert.equal(b.capabilities?.mobile_transport?.mobile_ws, true);
+  assert.equal(b.capabilities?.mobile_transport?.ws_endpoint, "/shim/v1/mobile");
+  assert.equal(b.capabilities?.mobile_transport?.canonical_live_transport, "ws");
+  assert.equal(b.capabilities?.mobile_transport?.rest_role, "cold_start_reconcile_repair");
+  assert.equal(b.capabilities?.mobile_transport?.sse_role, "legacy_non_canonical_for_mobile_ws_sessions");
+  assert.equal(
+    b.capabilities?.mobile_transport?.exclusivity,
+    "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  );
+});
+
+test("GET /shim/v1/capabilities exposes canonical mobile transport contract", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const { res, body } = await getJson(`${shim.url}/shim/v1/capabilities`);
+  const b = body as {
+    backend?: string;
+    transports?: {
+      rest?: { available?: boolean; role?: string };
+      sse?: { available?: boolean; role?: string };
+      ws?: { available?: boolean; endpoint?: string; canonical_for?: string[] };
+    };
+    mobile_transport?: {
+      mobile_ws?: boolean;
+      ws_endpoint?: string;
+      canonical_live_transport?: string;
+      rest_role?: string;
+      sse_role?: string;
+      exclusivity?: string;
+    };
+  };
+  assert.equal(res.status, 200);
+  assert.equal(b.backend, "letta-code-local");
+  assert.equal(b.transports?.rest?.available, true);
+  assert.equal(b.transports?.rest?.role, "cold_start_reconcile_repair");
+  assert.equal(b.transports?.sse?.available, true);
+  assert.equal(b.transports?.sse?.role, "legacy_non_canonical_for_mobile_ws_sessions");
+  assert.equal(b.transports?.ws?.available, true);
+  assert.equal(b.transports?.ws?.endpoint, "/shim/v1/mobile");
+  assert.deepEqual(b.transports?.ws?.canonical_for, ["mobile_live_mutations"]);
+  assert.equal(b.mobile_transport?.mobile_ws, true);
+  assert.equal(b.mobile_transport?.canonical_live_transport, "ws");
+  assert.equal(
+    b.mobile_transport?.exclusivity,
+    "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  );
 });
 
 test("GET /v1/health (no trailing slash) is also served", async (t) => {

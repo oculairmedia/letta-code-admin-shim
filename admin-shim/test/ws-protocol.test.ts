@@ -76,7 +76,25 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
   const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, deviceId: "dev-handshake-1" });
   t.after(() => conn.close());
   const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
-    | { server_id: string; session_id: string; device_id: string }
+    | {
+        server_id: string;
+        session_id: string;
+        device_id: string;
+        canonical_live_transport?: string;
+        transport_contract?: {
+          mobile_ws?: boolean;
+          ws_endpoint?: string;
+          canonical_live_transport?: string;
+          rest_role?: string;
+          sse_role?: string;
+          exclusivity?: string;
+        };
+        capabilities?: {
+          mobile_transport?: {
+            canonical_live_transport?: string;
+          };
+        };
+      }
     | undefined;
   assert.ok(welcome, "welcome frame must be present after hello");
   assert.equal(typeof welcome.server_id, "string", "welcome.server_id required");
@@ -84,6 +102,17 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
   assert.equal(typeof welcome.session_id, "string", "welcome.session_id required");
   assert.match(welcome.session_id, /^sess-/, "session_id should be sess-<uuid>");
   assert.equal(welcome.device_id, "dev-handshake-1", "welcome.device_id echoes client device_id");
+  assert.equal(welcome.canonical_live_transport, "ws");
+  assert.equal(welcome.transport_contract?.mobile_ws, true);
+  assert.equal(welcome.transport_contract?.ws_endpoint, "/shim/v1/mobile");
+  assert.equal(welcome.transport_contract?.canonical_live_transport, "ws");
+  assert.equal(welcome.transport_contract?.rest_role, "cold_start_reconcile_repair");
+  assert.equal(welcome.transport_contract?.sse_role, "legacy_non_canonical_for_mobile_ws_sessions");
+  assert.equal(
+    welcome.transport_contract?.exclusivity,
+    "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  );
+  assert.equal(welcome.capabilities?.mobile_transport?.canonical_live_transport, "ws");
 });
 
 test("ws: hello can negotiate A2UI capability when server support is enabled", async (t) => {

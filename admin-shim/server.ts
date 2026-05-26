@@ -167,6 +167,14 @@ function readOrCreateServerId(): string {
 const SERVER_ID = readOrCreateServerId();
 const SERVER_VERSION = "shim-0.2.0";
 const SERVER_STARTED_AT = new Date().toISOString();
+const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
+  mobile_ws: true,
+  ws_endpoint: "/shim/v1/mobile",
+  canonical_live_transport: "ws",
+  rest_role: "cold_start_reconcile_repair",
+  sse_role: "legacy_non_canonical_for_mobile_ws_sessions",
+  exclusivity: "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+});
 console.log(`server_id: ${SERVER_ID}`);
 
 function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
@@ -176,6 +184,32 @@ function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
     server_id: SERVER_ID,
     server_started_at: SERVER_STARTED_AT,
     backend: "letta-code-local",
+    capabilities: {
+      mobile_transport: MOBILE_TRANSPORT_CONTRACT,
+    },
+  });
+}
+
+function handleShimCapabilities(_req: IncomingMessage, res: ServerResponse): void {
+  json(res, 200, {
+    server_id: SERVER_ID,
+    backend: "letta-code-local",
+    transports: {
+      rest: {
+        available: true,
+        role: "cold_start_reconcile_repair",
+      },
+      sse: {
+        available: true,
+        role: "legacy_non_canonical_for_mobile_ws_sessions",
+      },
+      ws: {
+        available: true,
+        endpoint: "/shim/v1/mobile",
+        canonical_for: ["mobile_live_mutations"],
+      },
+    },
+    mobile_transport: MOBILE_TRANSPORT_CONTRACT,
   });
 }
 
@@ -1117,6 +1151,9 @@ const server = createServer((req, res) => {
   // Health
   if (req.method === "GET" && (pathname === "/v1/health/" || pathname === "/v1/health")) {
     return handleHealth(req, res);
+  }
+  if (req.method === "GET" && (pathname === "/shim/v1/capabilities" || pathname === "/shim/v1/capabilities/")) {
+    return handleShimCapabilities(req, res);
   }
   if (req.method === "GET" && pathname === "/shim/pool") {
     return handlePoolStats(req, res);
