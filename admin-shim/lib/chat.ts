@@ -569,11 +569,11 @@ export async function handleSendMessage(
     if (res.writableEnded) return;
 
     if (reshaped.message_type === "stop_reason") {
-      // lcp-c4d: first-wins. Multi-step turns can emit several stop_reason
-      // frames upstream; the run-level contract (runs.ts finalizeRun) keeps
-      // the FIRST observed value. Align the SSE-stream contract by ignoring
-      // subsequent stop_reason frames once one is buffered.
-      if (pendingStop === null) pendingStop = reshaped;
+      // lcp-8ri: last-wins for the wire. Multi-step turns emit stop_reason
+      // per step (first is requires_approval, last is end_turn). The run
+      // record wants first-wins (finalizeTurnLifecycle handles that). The
+      // wire should reflect the terminal state.
+      pendingStop = reshaped;
       return;
     }
     if (reshaped.message_type === "usage_statistics") {
@@ -661,7 +661,6 @@ export async function handleSendMessage(
   try {
     const userOtid = extractUserOtid(body);
     const pool = getAgentPool();
-      const worker = await pool.get(conversationId ?? "default", agentId);
       // Track the active run for this request. We surface its id on every
       // outgoing frame so mobile can correlate stream events with the
       // /v1/runs/{id} record it polls. Captured via the onRunCreated hook
@@ -684,7 +683,12 @@ export async function handleSendMessage(
         }
         handleRawFrame(raw);
       };
-      const turn = await worker.runTurn(text, {
+      // lcp-0vi: route through runTurnWithHeal so a dangling-tool-use error
+      // on this turn evicts + heals the transcript before returning. The
+      // healed disk is picked up by the next pool.get() the next time a
+      // user turn comes through; the caller still sees this turn's
+      // failure exactly as before, just with the disk already cleaned.
+      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, text, {
         onFrame: handleRawFrameWithRun,
         onRunCreated: (id: string) => {
           activeRunId = id;

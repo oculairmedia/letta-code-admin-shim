@@ -378,7 +378,12 @@ async function atomicWriteJsonl(path: string, records: unknown[]): Promise<void>
     await fsWriteFile(tmp, payload);
     await fsRename(tmp, path);
   } catch (err) {
-    try { await fsUnlink(tmp); } catch {}
+    try {
+      await fsUnlink(tmp);
+    } catch (cleanupErr) {
+      const msg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      console.warn(`[conversation-healer] failed to remove temp jsonl file ${tmp}: ${msg}`);
+    }
     throw err;
   }
 }

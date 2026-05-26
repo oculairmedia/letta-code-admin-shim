@@ -33,6 +33,10 @@
 import { listMessages, stampNewMessages } from "./store.js";
 import { type A2uiCapability } from "./a2ui-adapter.js";
 import {
+  detectDanglingToolUses,
+  healConversation,
+} from "./conversation-healer.js";
+import {
   finalizeRun,
   markRunFirstToken,
   recordRunMessage,
@@ -203,6 +207,15 @@ export interface RunTurnResult {
   /** Set when an error short-circuited the turn (e.g. stdin write). */
   error?: string;
   /**
+   * lcp-0vi: structured payload of the last SDKErrorMessage observed
+   * during the turn. Surfaced so the heal+retry wrapper can match the
+   * dangling-tool-use signature via detectDanglingToolUses() without
+   * touching the SDK union type directly. Fields mirror what the
+   * detector reads off the wire (message, errorDetail, apiError); the
+   * full SDKErrorMessage stays inside the adapter.
+   */
+  errorPayload?: { message?: string; errorDetail?: string; apiError?: unknown };
+  /**
    * The id of the newest user_message persisted by letta-code during this
    * turn (computed once via the post-turn listMessages diff). Used by
    * mobile-channel-host to bind the mobile-supplied otid without
@@ -248,6 +261,8 @@ export interface LettaSessionAdapter {
   readonly dead: boolean;
   readonly lastUsedAt: number;
   readonly spawnedAt: number;
+  /** lcp-rfb: true while a turn is in flight. housekeep() skips eviction. */
+  readonly busy?: boolean;
   start(): Promise<LettaSessionInit>;
   runTurn(input: string | unknown[], opts?: RunTurnOptions): Promise<AdapterRunTurnResult>;
   abort(reason?: string): Promise<void> | void;
@@ -371,7 +386,10 @@ export function applyFrameRunSideEffects(
       });
       pendingStepUsage = null;
     }
-  } catch {}
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[agent-pool] failed to collect run step metadata: ${msg}`);
+  }
   return pendingStepUsage;
 }
 
@@ -582,6 +600,119 @@ class AgentPool {
     }
   }
 
+  /**
+   * lcp-0vi: drain the warm adapter for (agent, conv) so a subsequent
+   * heal-write to messages.jsonl isn't clobbered when the still-alive
+   * session flushes its stale in-memory snapshot at end-of-turn. Closes
+   * the SDK session and drops the pool entry; the next pool.get() spawns
+   * a fresh adapter that loads the healed disk state.
+   *
+   * Returns true if a worker was evicted, false if none was warm.
+   */
+  async evict(conversationId: string, agentId: string): Promise<boolean> {
+    const key = this._key(conversationId, agentId);
+    const worker = this.workers.get(key);
+    if (!worker) return false;
+    this.workers.delete(key);
+    try {
+      await worker.close();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logLine(`evict close failed key=${key}: ${msg}`);
+    }
+    logLine(`evicted (manual) key=${key} size=${this.workers.size}`);
+    return true;
+  }
+
+  /**
+   * lcp-0vi: get-or-spawn a worker, run one turn, and auto-heal on the
+   * dangling-tool-use failure mode.
+   *
+   * Flow:
+   *   1. pool.get → adapter.runTurn (forwards the caller's opts/onFrame
+   *      verbatim, so the mobile WS / REST lifecycle stays unchanged).
+   *   2. If the result carries an errorPayload AND its content matches the
+   *      Anthropic "tool_use ids without tool_result" signature, the
+   *      transcript is corrupted and the next turn would hit the same
+   *      error. Drain the warm adapter (so a still-alive session doesn't
+   *      flush its stale in-memory snapshot over our heal), apply
+   *      conversation-healer's surgical repair, and return the failure
+   *      to the caller as-is so mobile sees one clean turn_done(error).
+   *      The next user turn picks up the cleaned disk.
+   *   3. Healing audits to `state/runs/<runId>/heal.jsonl` already (wired
+   *      by lcp-ezv).
+   *
+   * Non-goals (deliberately deferred):
+   *   - Inline retry of the same turn. The bead's "retry once" pattern
+   *     means the CLI re-persists the user_message on the second attempt,
+   *     producing visible duplicates on disk and over WS. Without a
+   *     mobile-side coalescer, the UX is worse than a clean failure +
+   *     user-driven retry. If a future cascade-corruption scenario
+   *     reappears we can revisit (the existing /tmp/cascade-heal driver
+   *     shows the cascade loop converges in 5-8 iterations on Meridian-
+   *     class transcripts).
+   *
+   * Returns the underlying AdapterRunTurnResult unchanged on the happy
+   * path. On a healed failure the result is identical to what runTurn
+   * returned — the caller's normal failure path runs.
+   */
+  async runTurnWithHeal(
+    conversationId: string,
+    agentId: string,
+    input: string | unknown[],
+    opts: RunTurnOptions = {},
+  ): Promise<AdapterRunTurnResult> {
+    const adapter = await this.get(conversationId, agentId);
+    const result = await adapter.runTurn(input, opts);
+    if (!result.errorPayload) return result;
+    let ids: string[];
+    try {
+      ids = detectDanglingToolUses(result.errorPayload);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logLine(`detectDanglingToolUses threw: ${msg}`);
+      return result;
+    }
+    if (ids.length === 0) return result;
+    logLine(
+      `heal triggered conv=${conversationId} run=${result.run_id ?? "?"} ids=${ids.length}` +
+      (ids.length > 0 ? ` [${ids.slice(0, 3).join(", ")}${ids.length > 3 ? ", ..." : ""}]` : ""),
+    );
+    // Drain the warm adapter — the heal mutates messages.jsonl in place,
+    // and a still-alive SDK session would clobber it on the next
+    // end-of-turn flush. After eviction the next pool.get() spawns a
+    // fresh session that loads the healed state.
+    await this.evict(conversationId, agentId);
+    try {
+      const report = await healConversation(conversationId, agentId, ids, {
+        runId: result.run_id ?? null,
+      });
+      logLine(
+        `heal complete run=${result.run_id ?? "?"} ` +
+        `removed=${report.removed.length} settled=${report.settled.length} ` +
+        `unresolved=${report.unresolved.length} ` +
+        `(messagesEdited=${report.messagesEdited} messagesRemoved=${report.messagesRemoved} messagesAppended=${report.messagesAppended})`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logLine(`heal failed run=${result.run_id ?? "?"}: ${msg}`);
+    }
+    return result;
+  }
+
+  /**
+   * lcp-rfb: bump lastUsedAt on the adapter for a given conversation.
+   * Called from the WS handler on every inbound frame (pong, user_action,
+   * etc.) so the adapter stays alive as long as a client is connected.
+   */
+  touch(conversationId: string, agentId: string): void {
+    const key = this._key(conversationId, agentId);
+    const w = this.workers.get(key);
+    if (w && !w.dead) {
+      (w as { lastUsedAt: number }).lastUsedAt = Date.now();
+    }
+  }
+
   housekeep(): void {
     const now = Date.now();
     for (const [key, w] of this.workers) {
@@ -590,6 +721,10 @@ class AgentPool {
         continue;
       }
       if (now - w.lastUsedAt > IDLE_EVICT_MS) {
+        if (w.busy) {
+          logLine(`skipping eviction (busy) conv=${key} idle=${(now - w.lastUsedAt) / 1000}s`);
+          continue;
+        }
         logLine(`evicting (idle) conv=${key} idle=${(now - w.lastUsedAt) / 1000}s`);
         this.workers.delete(key);
         w.close();
