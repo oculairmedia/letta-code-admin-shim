@@ -33,7 +33,10 @@
 import { listMessages, stampNewMessages } from "./store.js";
 import { type A2uiCapability } from "./a2ui-adapter.js";
 import {
+  detectConsecutiveUserMessageIndices,
   detectDanglingToolUses,
+  detectRoleAlternationViolation,
+  healConsecutiveUserMessages,
   healConversation,
 } from "./conversation-healer.js";
 import {
@@ -666,14 +669,45 @@ class AgentPool {
     const result = await adapter.runTurn(input, opts);
     if (!result.errorPayload) return result;
     let ids: string[];
+    let roleAlternationViolation = false;
     try {
       ids = detectDanglingToolUses(result.errorPayload);
+      roleAlternationViolation = detectRoleAlternationViolation(result.errorPayload);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      logLine(`detectDanglingToolUses threw: ${msg}`);
+      logLine(`heal error detection threw: ${msg}`);
       return result;
     }
-    if (ids.length === 0) return result;
+    if (ids.length === 0 && !roleAlternationViolation) return result;
+    if (ids.length === 0 && roleAlternationViolation) {
+      let candidateCount = 0;
+      try {
+        candidateCount = detectConsecutiveUserMessageIndices(await listMessages(conversationId, agentId)).length;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`consecutive-user detection failed run=${result.run_id ?? "?"}: ${msg}`);
+        return result;
+      }
+      if (candidateCount === 0) {
+        logLine(`role-alternation heal skipped run=${result.run_id ?? "?"}: no consecutive user messages on disk`);
+        return result;
+      }
+      logLine(`role-alternation heal triggered conv=${conversationId} run=${result.run_id ?? "?"} userMessages=${candidateCount}`);
+      await this.evict(conversationId, agentId);
+      try {
+        const report = await healConsecutiveUserMessages(conversationId, agentId, {
+          runId: result.run_id ?? null,
+        });
+        logLine(
+          `role-alternation heal complete run=${result.run_id ?? "?"} ` +
+          `removed=${report.messagesRemoved} [${report.removed.slice(0, 5).join(", ")}${report.removed.length > 5 ? ", ..." : ""}]`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`role-alternation heal failed run=${result.run_id ?? "?"}: ${msg}`);
+      }
+      return result;
+    }
     logLine(
       `heal triggered conv=${conversationId} run=${result.run_id ?? "?"} ids=${ids.length}` +
       (ids.length > 0 ? ` [${ids.slice(0, 3).join(", ")}${ids.length > 3 ? ", ..." : ""}]` : ""),

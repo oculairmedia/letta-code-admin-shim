@@ -17,7 +17,10 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
 import {
+  detectConsecutiveUserMessageIndices,
   detectDanglingToolUses,
+  detectRoleAlternationViolation,
+  healConsecutiveUserMessages,
   healConversation,
   allIdsHaveToolResults,
 } from "../lib/conversation-healer.js";
@@ -100,6 +103,73 @@ test("detectDanglingToolUses: dedupes ids that appear twice in the error text", 
   // so the second sentence's IDs are picked up too (still post-colon) and
   // get deduped.
   assert.deepEqual(detectDanglingToolUses(detail), ["toolu_X", "toolu_Y"]);
+});
+
+test("detectRoleAlternationViolation: matches Anthropic role alternation errors", () => {
+  assert.equal(
+    detectRoleAlternationViolation({ message: "messages: roles must alternate between user and assistant" }),
+    true,
+  );
+  assert.equal(detectRoleAlternationViolation("rate limited; try again later"), false);
+});
+
+test("detectConsecutiveUserMessageIndices: removes all trailing user runs", () => {
+  const records = [
+    { id: "u0", role: "user" },
+    { id: "a0", role: "assistant" },
+    { id: "u1", role: "user" },
+    { id: "u2", role: "user" },
+    { id: "u3", role: "user" },
+  ];
+  assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2, 3, 4]);
+});
+
+test("detectConsecutiveUserMessageIndices: keeps latest user in an interior run", () => {
+  const records = [
+    { id: "u0", role: "user" },
+    { id: "a0", role: "assistant" },
+    { id: "u1", role: "user" },
+    { id: "u2", role: "user" },
+    { id: "a1", role: "assistant" },
+  ];
+  assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2]);
+});
+
+test("healConsecutiveUserMessages: removes trailing failed user messages and audits", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agentId = "agent-consecutive-test";
+    seedAgent(stateDir, agentId);
+    const convDir = seedConv(stateDir, "default", agentId);
+
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: [{ type: "text", text: "hello" }] },
+      { id: "a0", role: "assistant", content: [{ type: "text", text: "hi" }] },
+      { id: "u1", role: "user", content: [{ type: "text", text: "retry one" }] },
+      { id: "u2", role: "user", content: [{ type: "text", text: "retry two" }] },
+    ]);
+
+    const report = await healConsecutiveUserMessages("default", agentId, {
+      stateDir,
+      runId: "run-consecutive-1",
+      now: 1779500000000,
+    });
+
+    assert.deepEqual(report.removed, ["u1", "u2"]);
+    assert.equal(report.messagesRemoved, 2);
+    assert.deepEqual(
+      readMessages(convDir).map((m) => m["id"]),
+      ["u0", "a0"],
+    );
+
+    const auditPath = join(stateDir, "..", "state", "runs", "run-consecutive-1", "heal.jsonl");
+    assert.ok(existsSync(auditPath), `expected audit sidecar at ${auditPath}`);
+    const entry = JSON.parse(readFileSync(auditPath, "utf8").trim());
+    assert.deepEqual(entry["removed"], ["u1", "u2"]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
+  }
 });
 
 // ── Heal: Meridian-shape case (toolResults exist on disk) ──────────────

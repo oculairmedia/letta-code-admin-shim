@@ -94,6 +94,20 @@ export function detectDanglingToolUses(errorPayload: unknown): string[] {
 }
 
 /**
+ * Match provider errors for role-alternation violations. Anthropic-compatible
+ * APIs reject transcripts that serialize as user → user without an assistant
+ * turn between them; once that shape is on disk, every later turn fails before
+ * the model can respond.
+ */
+export function detectRoleAlternationViolation(errorPayload: unknown): boolean {
+  const text = extractErrorText(errorPayload);
+  if (!text) return false;
+  return /messages[^]+alternate[^]+user[^]+assistant/i.test(text)
+    || /roles?[^]+alternate/i.test(text)
+    || /consecutive[^]+user/i.test(text);
+}
+
+/**
  * The CLI surfaces the API error in a few shapes depending on which
  * code path emits it. Pull a single text blob out of any of them.
  */
@@ -320,6 +334,84 @@ export async function healConversation(
     now: nowMs,
   });
 
+  return report;
+}
+
+/**
+ * Detect user-message runs that would break provider role alternation.
+ *
+ * Interior runs keep the latest user record before the following assistant,
+ * which preserves the last user intent while restoring alternation. A trailing
+ * run with no assistant response is removed entirely: the shim does not inline
+ * retry healed turns, so leaving a final user message would make the next user
+ * turn append another user and immediately recreate the invalid shape.
+ */
+export function detectConsecutiveUserMessageIndices(records: unknown[]): number[] {
+  const toRemove = new Set<number>();
+  let userRun: number[] = [];
+
+  const flushInteriorRun = (): void => {
+    if (userRun.length > 1) {
+      for (const idx of userRun.slice(0, -1)) toRemove.add(idx);
+    }
+    userRun = [];
+  };
+
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i];
+    if (isRecord(record) && record["role"] === "user") {
+      userRun.push(i);
+      continue;
+    }
+    flushInteriorRun();
+  }
+
+  if (userRun.length > 1) {
+    for (const idx of userRun) toRemove.add(idx);
+  }
+
+  return [...toRemove].sort((a, b) => a - b);
+}
+
+/**
+ * Remove consecutive user-message runs from the on-disk transcript.
+ */
+export async function healConsecutiveUserMessages(
+  conversationId: string,
+  agentId: string,
+  opts: HealOptions = {},
+): Promise<HealReport> {
+  const messagesPath = conversationFilePath(conversationId, agentId, "messages.jsonl", opts.stateDir);
+  const records = await readJsonlOrEmpty(messagesPath);
+  const removeIndices = detectConsecutiveUserMessageIndices(records);
+  const removedLabels = removeIndices.map((idx) => {
+    const record = records[idx];
+    if (isRecord(record) && typeof record["id"] === "string") return record["id"];
+    return `user-index-${idx}`;
+  });
+
+  const report: HealReport = {
+    requested: removedLabels,
+    removed: removedLabels,
+    settled: [],
+    unresolved: [],
+    messagesEdited: 0,
+    messagesRemoved: removeIndices.length,
+    messagesAppended: 0,
+  };
+  if (removeIndices.length === 0) return report;
+
+  const removeSet = new Set(removeIndices);
+  const nextRecords = records.filter((_record, idx) => !removeSet.has(idx));
+  await atomicWriteJsonl(messagesPath, nextRecords);
+  await writeHealAudit({
+    conversationId,
+    agentId,
+    runId: opts.runId,
+    stateDir: opts.stateDir,
+    report,
+    now: opts.now ?? Date.now(),
+  });
   return report;
 }
 

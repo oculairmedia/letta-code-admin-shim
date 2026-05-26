@@ -75,6 +75,32 @@ function logLine(msg: string): void {
   console.log(`[sdk-adapter] ${msg}`);
 }
 
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, (_key: string, inner: unknown) => (
+      typeof inner === "bigint" ? inner.toString() : inner
+    ));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return JSON.stringify({ stringify_error: message });
+  }
+}
+
+function sdkErrorPayload(
+  lastError: SDKErrorMessage | null,
+  result: SDKResultMessage | null,
+): { message?: string; errorDetail?: string; apiError?: unknown } | null {
+  const message = lastError?.message ?? result?.error;
+  const errorDetail = lastError?.errorDetail ?? result?.errorDetail;
+  const apiError = lastError?.apiError;
+  if (!message && !errorDetail && !apiError) return null;
+  return {
+    ...(message ? { message } : {}),
+    ...(errorDetail ? { errorDetail } : {}),
+    ...(apiError ? { apiError } : {}),
+  };
+}
+
 /**
  * Default the SDK turn-watchdog to the same envelope the direct adapter uses.
  * Both honor `SHIM_POOL_TURN_TIMEOUT` so an operator switching transports
@@ -315,9 +341,13 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
           // stream loop returns. The CLI may still emit a terminating result
           // frame after this, so we don't break here.
           lastError = msg;
+          logLine(`SDK_ERROR ${safeJson(msg)}`);
         }
         if (msg.type === "result") {
           result = msg;
+          if (!msg.success) {
+            logLine(`SDK_RESULT_ERROR ${safeJson(msg)}`);
+          }
           break;
         }
         if (timedOut) break;
@@ -360,13 +390,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // The fields we carry mirror what `detectDanglingToolUses` reads —
     // {message, errorDetail, apiError} — which is enough to fire detection
     // without hauling the full SDKErrorMessage shape upward.
-    const errorPayload: { message?: string; errorDetail?: string; apiError?: unknown } | null = lastError
-      ? {
-          ...(lastError.message ? { message: lastError.message } : {}),
-          ...(lastError.errorDetail ? { errorDetail: lastError.errorDetail } : {}),
-          ...(lastError.apiError ? { apiError: lastError.apiError } : {}),
-        }
-      : null;
+    const errorPayload = sdkErrorPayload(lastError, result);
     if (timedOut) {
       return { frames, stderr: "", run_id: runHandle.id, timeout: true, cancelled, newUserMessageId, ...(errorPayload ? { errorPayload } : {}) };
     }
