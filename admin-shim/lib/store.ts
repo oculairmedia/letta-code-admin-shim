@@ -49,7 +49,12 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
     await fsWriteFile(tmp, payload);
     await fsRename(tmp, path);
   } catch (err) {
-    try { await fsUnlink(tmp); } catch {}
+    try {
+      await fsUnlink(tmp);
+    } catch (cleanupErr) {
+      const msg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      console.warn(`[store] failed to remove temp json file ${tmp}: ${msg}`);
+    }
     throw err;
   }
 }
@@ -183,6 +188,19 @@ async function readJsonOrNullAsync(path: string): Promise<unknown> {
 async function readJsonlOrEmptyAsync(path: string): Promise<unknown[]> {
   try {
     const raw = await fsReadFile(path, "utf8");
+    return raw
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as unknown);
+  } catch {
+    return [];
+  }
+}
+
+function readJsonlOrEmpty(path: string): unknown[] {
+  try {
+    const raw = readFileSync(path, "utf8");
     return raw
       .split("\n")
       .map((line) => line.trim())
@@ -396,7 +414,15 @@ function makeDirMtimeCache<T>(
   const fn = async (): Promise<T> => {
     const root = rootFn();
     let mtimeMs = -1;
-    try { mtimeMs = (await fsStat(root)).mtimeMs; } catch {}
+    try {
+      mtimeMs = (await fsStat(root)).mtimeMs;
+    } catch (err) {
+      const code = err instanceof Error && "code" in err ? (err as { code?: unknown }).code : undefined;
+      if (code !== "ENOENT") {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[store] failed to stat cache root ${root}: ${msg}`);
+      }
+    }
     if (cached !== null && mtimeMs === cachedMtimeMs) return cached;
     if (inflight) return inflight;
     const expectedMtimeMs = mtimeMs;
@@ -489,6 +515,21 @@ export async function listMessages(
   return scoped;
 }
 
+/**
+ * lcp-pgw: synchronous variant of `listMessages` for use in synchronous
+ * callbacks (e.g. onFrame) that can't await. Same normalization pipeline;
+ * no limit/before support — callers filter externally.
+ */
+export function listMessagesSync(
+  conversationId: string,
+  agentId: string,
+): LocalMessage[] {
+  const key = conversationKey(conversationId, agentId);
+  const dir = join(storageDir(), "conversations", b64url(key));
+  const items = readJsonlOrEmpty(join(dir, "messages.jsonl"));
+  return items.map(normalizeMessage).filter(isLocalMessage);
+}
+
 export function readSystemPrompt(conversationId: string, agentId: string): unknown {
   const key = conversationKey(conversationId, agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
@@ -545,17 +586,26 @@ async function maxRealMessageTime(conversationId: string, agentId: string): Prom
  * Pure substitution — never writes. Run on every read path that projects to
  * the wire so the conversations list sorts by real recent activity.
  */
+// lcp-28r: the CLI's local-backend mode uses 2026-01-01T... as a
+// deterministic monotonic sentinel. Any date matching this prefix is
+// implausible and should be replaced with a real fallback.
+function isSentinelDate(iso: unknown): boolean {
+  return typeof iso === "string" && iso.startsWith("2026-01-01T");
+}
+
 async function withRealTimes(conv: OnDiskConversation): Promise<OnDiskConversation> {
   const max = await maxRealMessageTime(conv.id, conv.agent_id);
-  if (!max) return conv;
-  const currentLast = typeof conv.last_message_at === "string" ? conv.last_message_at : "";
-  const currentUpdated = typeof conv.updated_at === "string" ? conv.updated_at : "";
-  if (max <= currentLast && max <= currentUpdated) return conv;
-  return {
-    ...conv,
-    last_message_at: max > currentLast ? max : conv.last_message_at,
-    updated_at: max > currentUpdated ? max : conv.updated_at,
-  };
+  let last = typeof conv.last_message_at === "string" ? conv.last_message_at : "";
+  let updated = typeof conv.updated_at === "string" ? conv.updated_at : "";
+  const created = typeof conv.created_at === "string" ? conv.created_at : "";
+  // lcp-28r: if the on-disk values are CLI sentinels, substitute the
+  // sidecar max, then created_at, then current time — in that order.
+  if (isSentinelDate(last)) last = max || created || new Date().toISOString();
+  if (isSentinelDate(updated)) updated = max || created || new Date().toISOString();
+  if (max && max > last) last = max;
+  if (max && max > updated) updated = max;
+  if (last === conv.last_message_at && updated === conv.updated_at) return conv;
+  return { ...conv, last_message_at: last, updated_at: updated };
 }
 
 // Mobile reconciles its optimistic Local user bubble against the server-issued

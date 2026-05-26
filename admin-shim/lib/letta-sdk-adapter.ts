@@ -27,6 +27,7 @@ import { randomUUID } from "node:crypto";
 import {
   resumeSession,
   type Session,
+  type SDKErrorMessage,
   type SDKMessage,
   type SDKResultMessage,
 } from "@letta-ai/letta-code-sdk";
@@ -101,6 +102,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   // we need closure access to "the currently active turn." Turns are
   // serialized by `chain`, so at most one runTurn is in flight; these are
   // set at the top of _runTurnInner and cleared in its finally block.
+  get busy(): boolean { return this.currentRunHandle !== null; }
   private currentRunHandle: RunHandle | null = null;
   private currentOnFrame: ((frame: LettaStreamFrame, meta: { runId: string }) => void) | null = null;
   private currentApprovalScopeCache: Map<string, ApprovalScopeCacheEntry> | null = null;
@@ -160,7 +162,10 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // Serialize: if a previous turn is in flight on this adapter, wait for
     // it before starting the next. Matches direct adapter semantics.
     const turn = this.chain.then(() => this._runTurnInner(input, opts));
-    this.chain = turn.catch(() => {}); // keep the chain alive even on failure
+    this.chain = turn.catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[sdk-adapter] turn chain recovered after failure for ${this.conversationId}: ${msg}`);
+    });
     return turn;
   }
 
@@ -180,7 +185,10 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     let cancelled = false;
     const cancelSession = (): void => {
       cancelled = true;
-      void session.abort().catch(() => {});
+      void session.abort().catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[sdk-adapter] session abort failed for ${this.conversationId}: ${msg}`);
+      });
     };
     let runHandle: RunHandle;
     if (opts.runHandle) {
@@ -193,7 +201,12 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         onCancel: cancelSession,
       });
       if (typeof opts.onRunCreated === "function") {
-        try { opts.onRunCreated(runHandle.id); } catch {}
+        try {
+          opts.onRunCreated(runHandle.id);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[sdk-adapter] onRunCreated hook failed for ${runHandle.id}: ${msg}`);
+        }
       }
     }
 
@@ -222,6 +235,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const frames: LettaStreamFrame[] = [];
     let pendingStepUsage: UsageInput | null = null;
     let result: SDKResultMessage | null = null;
+    // lcp-0vi: SDK pumps an `SDKErrorMessage` when the CLI hits a recoverable
+    // failure (e.g. Anthropic invalid_request_error from a dangling tool_use).
+    // We drop the frame from the wire (no LettaStreamFrame variant for it),
+    // but we MUST preserve the payload so the heal+retry wrapper in
+    // agent-pool.ts can match the dangling-tool-use signature and trigger
+    // recovery. Last-write-wins matches the CLI's emit model — only one
+    // error precedes the terminating result frame.
+    let lastError: SDKErrorMessage | null = null;
     let timedOut = false;
 
     const sendInput = (typeof input === "string" ? input : input) as Parameters<Session["send"]>[0];
@@ -258,7 +279,10 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // and signal abort; the stream loop breaks at the next yield.
     let watchdog: NodeJS.Timeout | null = setTimeout(() => {
       timedOut = true;
-      void session.abort().catch(() => {});
+      void session.abort().catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[sdk-adapter] watchdog abort failed for ${this.conversationId}: ${msg}`);
+      });
     }, TURN_TIMEOUT_MS);
 
     try {
@@ -285,6 +309,12 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
               logLine(`onFrame error: ${m}`);
             }
           }
+        }
+        if (msg.type === "error") {
+          // lcp-0vi: stash the error so the heal wrapper sees it after the
+          // stream loop returns. The CLI may still emit a terminating result
+          // frame after this, so we don't break here.
+          lastError = msg;
         }
         if (msg.type === "result") {
           result = msg;
@@ -325,8 +355,20 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       finishedTimeout,
     });
 
+    // lcp-0vi: surface the SDK error payload through every return path so
+    // pool.runTurnWithHeal() can match the dangling-tool-use signature.
+    // The fields we carry mirror what `detectDanglingToolUses` reads —
+    // {message, errorDetail, apiError} — which is enough to fire detection
+    // without hauling the full SDKErrorMessage shape upward.
+    const errorPayload: { message?: string; errorDetail?: string; apiError?: unknown } | null = lastError
+      ? {
+          ...(lastError.message ? { message: lastError.message } : {}),
+          ...(lastError.errorDetail ? { errorDetail: lastError.errorDetail } : {}),
+          ...(lastError.apiError ? { apiError: lastError.apiError } : {}),
+        }
+      : null;
     if (timedOut) {
-      return { frames, stderr: "", run_id: runHandle.id, timeout: true, cancelled, newUserMessageId };
+      return { frames, stderr: "", run_id: runHandle.id, timeout: true, cancelled, newUserMessageId, ...(errorPayload ? { errorPayload } : {}) };
     }
     if (result) {
       return {
@@ -340,10 +382,11 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         // expose them as the mobile-facing run id — the shim continues to
         // own /v1/runs/* (see lcp-sdk-decide-runid). Caller correlates via
         // opts.runHandle.id, which we echo back unchanged.
+        ...(errorPayload ? { errorPayload } : {}),
       };
     }
     // Stream ended without a result frame (e.g. session closed mid-turn).
-    return { frames, stderr: "", run_id: runHandle.id, dead: true, cancelled, newUserMessageId, error: "stream ended without result" };
+    return { frames, stderr: "", run_id: runHandle.id, dead: true, cancelled, newUserMessageId, error: "stream ended without result", ...(errorPayload ? { errorPayload } : {}) };
   }
 
   /**
@@ -550,6 +593,31 @@ function sdkMessageToLettaFrame(
   agentId: string,
   conversationId: string,
 ): LettaStreamFrame | null {
+  // PROBE 2026-05-24 (lcp-4vz / lcp-pgw debug — kept intentionally).
+  //
+  // Logs every SDK msg.type and (when stream_event) the inner message_type.
+  // Critical for diagnosing tool-frame flow issues — empirically proved during
+  // lcp-4vz that the CLI's headless SDK transport NEVER emits tool_return
+  // wire frames for canUseTool-mediated tools (auto_approval path). The
+  // shim works around this by reading tool results from messages.jsonl in
+  // mobile-channel-host.ts (synthesizes wire tool_return_message frames).
+  //
+  // If you see "wait, why am I not getting tool_return on the wire?":
+  //   1. grep /tmp/admin-shim.log for "SDK_MSG inner=tool_return_message"
+  //   2. If absent: the CLI/SDK STILL aren't emitting them; the disk-watch
+  //      workaround in mobile-channel-host (bridgeSendMessage) is what's
+  //      keeping things working. Don't waste time hunting in this file.
+  //   3. If present: something downstream of here is dropping them. Hunt
+  //      in chat.ts:reshapeFrame and emit() in mobile-channel-host.
+  //
+  // Cheap if DEBUG_SDK is unset (logLine no-ops). Leave it.
+  try {
+    const inner = (msg as { event?: { message_type?: string } }).event?.message_type;
+    logLine(`SDK_MSG type=${msg.type}${inner ? ` inner=${inner}` : ""}`);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    logLine(`SDK_MSG logging_failed=${detail}`);
+  }
   switch (msg.type) {
     case "stream_event": {
       // Pass-through. The SDK's pump preserves the raw wire `event` payload
@@ -592,14 +660,67 @@ function sdkMessageToLettaFrame(
       // it inside stream() we ignore it here — start() already recorded the
       // ids and the collector doesn't case on system frames.
       return null;
+    case "tool_result": {
+      // lcp-4vz (closed 2026-05-24): DEAD CODE AS OF letta-code 0.26.1.
+      //
+      // This branch was originally added as a speculative fix when I thought
+      // the SDK was emitting standalone SDKToolResultMessage that I was
+      // dropping. Empirically verified via DEBUG_SDK=1 wire dump: the
+      // CLI's headless SDK transport NEVER emits a `type:"message"` with
+      // `message_type:"tool_return_message"`, so `transformMessage` never
+      // produces an SDKToolResultMessage, so this case never fires.
+      //
+      // The actual fix lives in mobile-channel-host.ts:bridgeSendMessage —
+      // post-turn (and now per-tool via incremental disk-watch in lcp-pgw)
+      // it reads `role:"toolResult"` entries from the conv's messages.jsonl
+      // and synthesizes wire tool_return_message frames into the WS stream.
+      //
+      // KEEPING THIS BRANCH because: if a future CLI/SDK update fixes the
+      // upstream gap and starts emitting standalone tool_result, this
+      // translation will Just Work and the shim's disk synthesis will
+      // become a no-op (it diffs disk-vs-wire and only emits the difference).
+      // Defense in depth, not active code path.
+      //
+      // If you find yourself debugging tool-return flow and this branch IS
+      // firing, that's a SIGNAL — the upstream CLI changed. Update the
+      // mobile-channel-host disk-synthesis logic to honor the new wire
+      // events as authoritative and skip its disk pass when this branch
+      // already emitted the matching tool_call_id.
+      return {
+        type: "stream_event",
+        event: {
+          message_type: "tool_return_message",
+          id: msg.uuid,
+          date: new Date().toISOString(),
+          agent_id: agentId,
+          conversation_id: conversationId,
+          run_id: msg.runId ?? null,
+          tool_call_id: msg.toolCallId,
+          status: msg.isError ? "error" : "success",
+          tool_return: msg.content,
+          tool_returns: [{
+            tool_call_id: msg.toolCallId,
+            status: msg.isError ? "error" : "success",
+            func_response: msg.content,
+            stdout: null,
+            stderr: null,
+            type: "tool",
+          }],
+        } as unknown as LettaInnerEvent,
+        session_id: sessionId,
+        uuid: msg.uuid,
+        timestamp: new Date().toISOString(),
+      };
+    }
     case "assistant":
     case "tool_call":
-    case "tool_result":
     case "reasoning":
-      // Local-backend CLI delivers these inside stream_event frames; the
-      // transformed standalone forms are SDK-side projections only. Skip to
-      // avoid double-counting in run records. Revisit in lcp-sdk.4 if a
-      // remote-backend path proves they're the only source.
+      // These DO arrive as stream_event frames in parallel with their
+      // standalone projections (verified on SDK transport 2026-05-24:
+      // the assistant_message text appears in stream_event chunks AND
+      // as final SDKAssistantMessage). Drop the standalone forms to
+      // avoid double-emission. The stream_event path carries the full
+      // delta sequence reshapeFrame and the A2UI splitter expect.
       return null;
     case "error":
     case "retry":

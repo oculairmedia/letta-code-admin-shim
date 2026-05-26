@@ -13,7 +13,7 @@
  * the only place the shim binds to it.
  */
 
-import { existsSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -33,10 +33,12 @@ import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAct
 import {
   findUnmappedTailUserMessageId,
   getAgentRecord,
+  listMessages,
+  listMessagesSync,
   resolveConversationId,
   writeOtidForLocalId,
 } from "./store.js";
-import type { LettaMessage } from "./types/wire.js";
+import type { LettaMessage, ToolReturn, ToolReturnMessage } from "./types/wire.js";
 import type {
   A2uiFrameMessage,
   A2uiUserAction,
@@ -149,6 +151,18 @@ interface BridgeSendMessageHooks {
  * `onFrame(reshapedFrame)` fires for each vanilla-shaped frame coming
  * out of the worker. The WS handler wraps these into protocol envelopes.
  */
+
+function localPartsToText(parts: unknown): string {
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .filter(
+      (p: unknown): p is { type: "text"; text?: string } =>
+        typeof p === "object" && p !== null && (p as { type?: unknown }).type === "text",
+    )
+    .map((p) => (typeof p.text === "string" ? p.text : ""))
+    .join("");
+}
+
 export async function bridgeSendMessage(
   { agent_id, conversation_id, text, content_parts, otid, a2ui_capability, background }: BridgeSendMessageArgs,
   onFrame: (frame: BridgeFrame) => void,
@@ -169,6 +183,12 @@ export async function bridgeSendMessage(
   const effectiveAgentId = resolveAgentIdAlias(requestedAgentId, (id) => getAgentRecord(id) != null);
   const effectiveConvId = resolved?.conversationId ?? conversation_id;
 
+  // lcp-4vz: snapshot pre-turn message ids so post-turn disk diff can find
+  // new tool results the CLI wrote but never emitted on the wire.
+  const preTurnMessageIds = new Set(
+    (await listMessages(effectiveConvId, effectiveAgentId)).map((m) => m.id),
+  );
+
   // lcp-99a: create the Run record BEFORE awaiting pool.get() so the ws
   // handler can emit turn_started carrying a non-null run_id. Mobile
   // cancel-during-startup then always has a valid target. The cancel
@@ -187,7 +207,12 @@ export async function bridgeSendMessage(
     },
   });
   if (typeof onRunCreated === "function") {
-    try { onRunCreated(runHandle.id); } catch {}
+    try {
+      onRunCreated(runHandle.id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] onRunCreated hook failed for ${runHandle.id}: ${msg}`);
+    }
   }
 
   // lcp-p74.1: every frame the host emits also lands in state/runs/<id>/frames.jsonl
@@ -220,7 +245,6 @@ export async function bridgeSendMessage(
   };
 
   const pool = getAgentPool();
-  const worker = await pool.get(effectiveConvId, effectiveAgentId);
 
   // lcp-cv3: stream assistant_message and reasoning_message chunks as
   // they arrive — DO NOT coalesce server-side. Mobile's stream ingest
@@ -236,6 +260,14 @@ export async function bridgeSendMessage(
   // arrive AFTER the final assistant chunk regardless of upstream order.
   let pendingStop: BridgeFrame | null = null;
   let pendingUsage: BridgeFrame | null = null;
+  // lcp-4vz + lcp-pgw: track tool_call_ids for inline + end-of-turn synthesis.
+  const toolCallIdsSeen: string[] = [];
+  const toolReturnIdsSeen = new Set<string>();
+  // lcp-pgw: flag that flips true when a new tool_call arrives and resets
+  // once the inline flush resolves it. Prevents re-reading disk on every
+  // assistant_message delta — only on the first content frame after each
+  // tool execution completes.
+  let needsInlineFlush = false;
   // Per-otid splitters: each logical assistant message gets its own splitter
   // so trailing-tag hold-back doesn't leak across distinct assistant bubbles
   // (rare on a single turn, but possible for multi-step turns).
@@ -306,7 +338,11 @@ export async function bridgeSendMessage(
   // letta-code's headless stdin accepts either shape on MessageCreate.content.
   const userInput: string | unknown[] =
     Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
-  const turn = await worker.runTurn(userInput, {
+  // lcp-0vi: route through pool.runTurnWithHeal so a dangling-tool-use
+  // failure on this turn evicts the warm adapter + heals the transcript
+  // before returning. The caller sees the original turn result unchanged;
+  // the cleaned disk is picked up on the next user turn.
+  const turn = await pool.runTurnWithHeal(effectiveConvId, effectiveAgentId, userInput, {
     a2uiCapability: a2ui_capability ?? null,
     // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
     // patches the SIGTERM hook onto it via setRunCancelHandler. The
@@ -324,13 +360,84 @@ export async function bridgeSendMessage(
       if (meta?.runId) (reshaped as unknown as Record<string, unknown>)["run_id"] = meta.runId;
       const mt = reshaped.message_type;
       if (mt === "stop_reason") {
-        // lcp-c4d: first-wins (run-record contract).
-        if (pendingStop === null) pendingStop = reshaped;
+        // lcp-8ri: last-wins for the WS emission. Multi-step turns emit
+        // stop_reason per step (first is usually requires_approval, last
+        // is end_turn). The run-record contract wants first-wins but that
+        // is tracked separately in finalizeTurnLifecycle. The wire should
+        // reflect the terminal state so mobile doesn't think the turn is
+        // still pending approval.
+        pendingStop = reshaped;
         return;
       }
       if (mt === "usage_statistics") {
         if (pendingUsage === null) pendingUsage = reshaped;
         return;
+      }
+      // lcp-4vz + lcp-pgw: inline tool_return synthesis. When a content
+      // frame arrives and there are unresolved tool calls, read disk for
+      // their results and emit tool_return frames BEFORE the current frame.
+      // This gives per-tool progressive resolution instead of end-of-turn
+      // batching. Gated by needsInlineFlush so we don't re-read disk on
+      // every assistant_message delta.
+      if (mt === "tool_return_message") {
+        const callId = (reshaped as { tool_call_id?: string | null }).tool_call_id;
+        if (callId) toolReturnIdsSeen.add(callId);
+      }
+      if (needsInlineFlush && (mt === "tool_call_message" || mt === "assistant_message" || mt === "reasoning_message")) {
+        const unresolvedNow = toolCallIdsSeen.filter((id) => !toolReturnIdsSeen.has(id));
+        if (unresolvedNow.length > 0) {
+          try {
+            const diskMsgs = listMessagesSync(effectiveConvId, effectiveAgentId);
+            const newResults = diskMsgs.filter(
+              (m) => m.role === "toolResult" && !preTurnMessageIds.has(m.id),
+            );
+            const byCallId = new Map(newResults.filter((m) => m.toolCallId).map((m) => [m.toolCallId!, m]));
+            // lcp-j3r: positional fallback for synthetic tool_call_ids
+            // (from the canUseTool path) that don't match any disk entry.
+            const unmatchedInline = [...newResults];
+            for (const callId of unresolvedNow) {
+              let entry = byCallId.get(callId);
+              if (!entry && unmatchedInline.length > 0) {
+                entry = unmatchedInline.shift()!;
+              } else if (entry) {
+                const idx = unmatchedInline.indexOf(entry);
+                if (idx >= 0) unmatchedInline.splice(idx, 1);
+              }
+              if (!entry) continue;
+              const returnText = localPartsToText(entry.parts);
+              const isError = entry.isError === true;
+              const status = isError ? "error" : "success";
+              const tr: ToolReturn = {
+                tool_call_id: callId, status,
+                func_response: returnText, stdout: null, stderr: null, type: "tool",
+              };
+              emit({
+                id: `toolreturn-${callId}`,
+                date: new Date().toISOString(),
+                name: (entry.toolName as string | undefined) ?? null,
+                message_type: "tool_return_message",
+                otid: null, sender_id: null, step_id: null,
+                is_err: isError ? true : null, seq_id: null,
+                run_id: runHandle.id,
+                tool_call_id: callId, status,
+                tool_return: returnText, stdout: null, stderr: null,
+                tool_returns: [tr],
+              } satisfies ToolReturnMessage);
+              toolReturnIdsSeen.add(callId);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[mobile-channel] lcp-pgw: inline tool_return synthesis failed: ${msg}`);
+          }
+        }
+        needsInlineFlush = toolCallIdsSeen.some((id) => !toolReturnIdsSeen.has(id));
+      }
+      if (mt === "tool_call_message") {
+        const tc = (reshaped as { tool_call?: { tool_call_id?: string } | null }).tool_call;
+        if (tc?.tool_call_id) {
+          toolCallIdsSeen.push(tc.tool_call_id);
+          needsInlineFlush = true;
+        }
       }
       // Stable per-otid id so mobile's findByServerId merges chunks of
       // the same logical message. Spec §2.2 + §4.2 prescribes the
@@ -423,6 +530,85 @@ export async function bridgeSendMessage(
         widget_types_seen: [...a2uiWidgetsSeen].sort(),
         splitter_overhead_ms: a2uiMetrics.splitter_overhead_ms,
       }));
+    }
+  }
+
+  // lcp-4vz: synthesize missing tool_return_message frames from disk.
+  // The CLI's headless SDK transport never emits tool_return on the wire —
+  // the results exist on disk in messages.jsonl but never cross the SDK
+  // boundary. For each tool_call without a matching tool_return, read the
+  // result from disk and emit it so mobile's tool cards resolve.
+  //
+  // Timing: this runs AFTER pool.runTurnWithHeal returns, which means
+  // finalizeRun has already removed the run from _activeRuns. The normal
+  // emit() path calls appendRunFrame which silently no-ops on finalized
+  // runs (returns seq=-1). To ensure synthesized frames persist for
+  // reconnect/replay, we append directly to the frames file.
+  const unresolvedCallIds = toolCallIdsSeen.filter((id) => !toolReturnIdsSeen.has(id));
+  if (unresolvedCallIds.length > 0) {
+    try {
+      const postMessages = await listMessages(effectiveConvId, effectiveAgentId);
+      const newToolResults = postMessages.filter(
+        (m) => m.role === "toolResult" && !preTurnMessageIds.has(m.id),
+      );
+      const diskByCallId = new Map<string, typeof newToolResults[number]>();
+      for (const m of newToolResults) {
+        if (m.toolCallId) diskByCallId.set(m.toolCallId, m);
+      }
+      const unmatchedDisk = [...newToolResults];
+      const framesPath = getFramesFilePath(runHandle.id);
+      let synthSeq = 900_000;
+      for (const callId of unresolvedCallIds) {
+        let entry = diskByCallId.get(callId);
+        if (!entry && unmatchedDisk.length > 0) {
+          entry = unmatchedDisk.shift()!;
+        } else if (entry) {
+          const idx = unmatchedDisk.indexOf(entry);
+          if (idx >= 0) unmatchedDisk.splice(idx, 1);
+        }
+        if (!entry) continue;
+        const returnText = localPartsToText(entry.parts);
+        const isError = entry.isError === true;
+        const status = isError ? "error" : "success";
+        const tr: ToolReturn = {
+          tool_call_id: callId,
+          status,
+          func_response: returnText,
+          stdout: null,
+          stderr: null,
+          type: "tool",
+        };
+        const frame: ToolReturnMessage = {
+          id: `toolreturn-${callId}`,
+          date: new Date().toISOString(),
+          name: (entry.toolName as string | undefined) ?? null,
+          message_type: "tool_return_message",
+          otid: null,
+          sender_id: null,
+          step_id: null,
+          is_err: isError ? true : null,
+          seq_id: null,
+          run_id: runHandle.id,
+          tool_call_id: callId,
+          status,
+          tool_return: returnText,
+          stdout: null,
+          stderr: null,
+          tool_returns: [tr],
+        };
+        try {
+          const seq = ++synthSeq;
+          appendFileSync(framesPath, JSON.stringify({ seq, ts: new Date().toISOString(), frame }) + "\n");
+          (frame as unknown as Record<string, unknown>)["seq"] = seq;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[mobile-channel] lcp-4vz: failed to persist synthesized tool_return frame: ${msg}`);
+        }
+        onFrame(frame);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] lcp-4vz: tool_return synthesis failed: ${msg}`);
     }
   }
 
@@ -520,6 +706,10 @@ function syntheticInputFromAction(
   action: A2uiUserAction,
   actionId: string,
 ): { agent_id: string; conversation_id: string; text: string } | null {
+  // Tool-approval UI events are control-plane signals, not user prompts. The
+  // stable dispatcher path is `tool_approval_response`; older/alternate card
+  // names are recorded for audit but must not be injected as chat input.
+  if (action.name.startsWith("tool_approval_")) return null;
   if (!action.run_id) return null;
   const run = getRun(action.run_id);
   if (!run?.agent_id || !run.conversation_id) return null;
@@ -694,7 +884,12 @@ export function subscribeToRun(
   function stop(): void {
     stopped = true;
     if (watcher) {
-      try { watcher.close(); } catch {}
+      try {
+        watcher.close();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[mobile-channel] failed to close run subscription watcher for ${runId}: ${msg}`);
+      }
       watcher = null;
     }
   }
@@ -924,6 +1119,8 @@ interface MobileChannelHost {
   getA2uiServerCapabilities: typeof getA2uiServerCapabilities;
   bridgeSendMessage: typeof bridgeSendMessage;
   cancelRun: (runId: string) => boolean;
+  /** lcp-rfb: bump adapter lastUsedAt so inbound WS frames prevent idle eviction. */
+  touchAdapter: (conversationId: string, agentId: string) => void;
   handleUserAction: typeof handleUserAction;
   subscribeToRun: typeof subscribeToRun;
   handleCronList: typeof handleCronList;
@@ -1028,6 +1225,7 @@ async function createMobileChannelAdapter(
     getA2uiServerCapabilities,
     bridgeSendMessage,
     cancelRun: (runId: string) => cancelRun(runId),
+    touchAdapter: (convId: string, agId: string) => getAgentPool().touch(convId, agId),
     handleUserAction,
     subscribeToRun,
     handleCronList,
