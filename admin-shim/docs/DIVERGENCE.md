@@ -120,7 +120,17 @@ The shim returns those PLUS:
   "status": "ok",
   "server_id": "<persistent UUID>",
   "server_started_at": "2026-05-14T15:38:22.085Z",
-  "backend": "letta-code-local"
+  "backend": "letta-code-local",
+  "capabilities": {
+    "mobile_transport": {
+      "mobile_ws": true,
+      "ws_endpoint": "/shim/v1/mobile",
+      "canonical_live_transport": "ws",
+      "rest_role": "cold_start_reconcile_repair",
+      "sse_role": "legacy_non_canonical_for_mobile_ws_sessions",
+      "exclusivity": "after_ws_welcome_do_not_consume_sse_for_owned_conversations"
+    }
+  }
 }
 ```
 
@@ -129,6 +139,13 @@ updated mobile) can use `server_id` to bind their cache namespace and
 self-invalidate when this server is replaced by a different one with the
 same URL. See `STALE_AGENT_REF.md` (future) for the cache-invalidation
 flow this enables.
+
+The `capabilities.mobile_transport` block lets mobile distinguish this
+admin-shim from strict Python Letta before attempting a WS upgrade. It also
+states the canonical transport rule: after `/shim/v1/mobile` returns
+`welcome`, WS is the live mutation transport for conversations owned by that
+session; REST is cold-start/reconcile/repair, and SSE is legacy/non-canonical
+for those mobile WS-owned conversations.
 
 ## Intentional divergence #3: shim-only endpoints
 
@@ -202,6 +219,27 @@ Implementation:
 - WS protocol: see `MOBILE_WS_PROTOCOL.md` §10 for the full frame
   catalog and `CronTask` schema.
 
+## Intentional divergence #6: mobile canonical transport metadata
+
+Strict Python Letta exposes REST + SSE only. The admin-shim additionally
+exposes the mobile channel at `WS /shim/v1/mobile`, so updated mobile clients
+need a deterministic way to select one live transport and avoid duplicate
+timeline mutations.
+
+The shim advertises this in two places:
+
+| Surface | Contract |
+| --- | --- |
+| `GET /v1/health/` | Additive `capabilities.mobile_transport` block. Vanilla clients can ignore it. |
+| `GET /shim/v1/capabilities` | Shim-native metadata endpoint with REST/SSE/WS roles. |
+| WS `welcome` | `canonical_live_transport: "ws"` and `transport_contract` after a successful hello. |
+
+Rule for mobile: once a socket successfully upgrades to `/shim/v1/mobile` and
+receives `welcome`, that WS session is canonical for live mutations for the
+conversations it owns. Do not also consume
+`/v1/conversations/{id}/stream` for those conversations. REST `/messages`
+remains the durable cold-start, post-turn reconciliation, and repair surface.
+
 ## What's NOT a divergence (and should stay that way)
 
 - **Conversation list and detail responses** — same shape as vanilla.
@@ -246,6 +284,9 @@ working off the same codebase indefinitely.
 | Feature | Vanilla | Shim today | Notes |
 |---|---|---|---|
 | `/v1/health/` extra fields | none | `server_id`, `server_started_at`, `backend` | Additive, clients can ignore |
+| `/v1/health/` mobile capability | none | `capabilities.mobile_transport` | Lets mobile detect admin-shim WS support |
+| `/shim/v1/capabilities` | n/a | REST/SSE/WS role metadata | Shim-only discovery endpoint |
+| WS `welcome` canonical transport | n/a | `canonical_live_transport: "ws"` | Suppress concurrent mobile SSE after welcome |
 | Streaming chunked assistant | one frame per turn | one frame per turn (coalesced) | Matches vanilla |
 | Streaming chunked tool calls | per-call frames | per-call frames | Matches vanilla |
 | `stop_reason` envelope | bare | bare | Matches vanilla |

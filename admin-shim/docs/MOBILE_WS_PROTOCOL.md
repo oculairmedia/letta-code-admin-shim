@@ -99,8 +99,23 @@ id is returned by `GET /v1/health`:
 ```json
 { "version": "shim-0.2.0", "status": "ok",
   "server_id": "…uuid…", "server_started_at": "...",
-  "backend": "letta-code-local" }
+  "backend": "letta-code-local",
+  "capabilities": {
+    "mobile_transport": {
+      "mobile_ws": true,
+      "ws_endpoint": "/shim/v1/mobile",
+      "canonical_live_transport": "ws",
+      "rest_role": "cold_start_reconcile_repair",
+      "sse_role": "legacy_non_canonical_for_mobile_ws_sessions",
+      "exclusivity": "after_ws_welcome_do_not_consume_sse_for_owned_conversations"
+    }
+  } }
 ```
+
+Shim-aware clients that need a dedicated metadata endpoint can also read
+`GET /shim/v1/capabilities`. Strict Python Letta backends do not expose the
+mobile WS endpoint or these shim capability fields, so mobile can distinguish
+REST+SSE-only servers before attempting the WS upgrade.
 
 A client should:
 
@@ -553,6 +568,15 @@ Type-specific fields below.
   "server_id": "9c2d7e4f-…",
   "session_id": "sess-1f6c8a4d-…",
   "device_id": "android-emanuel-pixel-7",
+  "canonical_live_transport": "ws",
+  "transport_contract": {
+    "mobile_ws": true,
+    "ws_endpoint": "/shim/v1/mobile",
+    "canonical_live_transport": "ws",
+    "rest_role": "cold_start_reconcile_repair",
+    "sse_role": "legacy_non_canonical_for_mobile_ws_sessions",
+    "exclusivity": "after_ws_welcome_do_not_consume_sse_for_owned_conversations"
+  },
   "a2ui_negotiated": true,
   "a2ui": { "version": "0.9", "catalog_id": "basic" } }
 ```
@@ -561,6 +585,15 @@ Type-specific fields below.
 - `session_id` — server-assigned, `sess-<uuid>`. Logging only.
 - `device_id` — echoes the client's `hello.device_id` (or the assigned
   `anon-<uuid>`).
+- `canonical_live_transport` — currently always `"ws"` for this endpoint.
+  After receiving `welcome`, mobile treats this WS session as the canonical
+  live mutation source for conversations it owns.
+- `transport_contract` — canonical mobile transport rule. REST remains for
+  cold-start hydrate, post-turn reconciliation, and repair. SSE remains a
+  legacy/non-canonical path and MUST NOT be consumed concurrently for
+  conversations owned by this active WS session.
+- `capabilities.mobile_transport` — same contract nested under a capability
+  map for clients that prefer feature-style parsing.
 - `a2ui_negotiated` — `true` only when the client requested A2UI in `hello`
   and the server accepted it for this session. Non-A2UI clients may ignore
   this field; current server frames include `false` when not negotiated.
