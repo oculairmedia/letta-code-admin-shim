@@ -58,6 +58,7 @@ export function handleConnection(ws, request, host) {
   let closed = false;
   let pingTimer = null;
   let idleTimer = null;
+  let a2uiCapability = null;
   // Single-flight per session: a second send_message arriving while the
   // first is still streaming is rejected with PROTOCOL_VIOLATION. Cancel
   // is the only way to abort an in-flight turn over the same socket.
@@ -131,6 +132,25 @@ export function handleConnection(ws, request, host) {
         log(`auth skipped (no token configured) for device=${frame.device_id ?? "?"}`);
       }
       const deviceId = frame.device_id || `anon-${randomUUID()}`;
+      const serverA2ui = typeof host.getA2uiServerCapabilities === "function"
+        ? host.getA2uiServerCapabilities()
+        : { enabled: false };
+      if (frame.a2ui_version) {
+        const supportedCatalogs = Array.isArray(frame.supported_catalogs) ? frame.supported_catalogs.filter((v) => typeof v === "string") : [];
+        const supportedWidgets = Array.isArray(frame.supported_widgets) ? frame.supported_widgets.filter((v) => typeof v === "string") : [];
+        const versionMatches = typeof frame.a2ui_version === "string" && frame.a2ui_version === serverA2ui.version;
+        const catalogId = typeof serverA2ui.catalogId === "string" ? serverA2ui.catalogId : "basic";
+        const catalogMatches = supportedCatalogs.length === 0 || supportedCatalogs.includes(catalogId);
+        if (serverA2ui.enabled && versionMatches && catalogMatches) {
+          a2uiCapability = {
+            version: frame.a2ui_version,
+            catalogId,
+            supportedCatalogs: supportedCatalogs.length > 0 ? supportedCatalogs : [catalogId],
+            supportedWidgets,
+            ...(frame.theme_hints && typeof frame.theme_hints === "object" && !Array.isArray(frame.theme_hints) ? { themeHints: frame.theme_hints } : {}),
+          };
+        }
+      }
       device = recordDeviceConnect({
         deviceId,
         token: frame.token,
@@ -144,9 +164,26 @@ export function handleConnection(ws, request, host) {
           server_id: host.getServerId(),
           session_id: sessionId,
           device_id: deviceId,
+          a2ui_negotiated: Boolean(a2uiCapability),
+          a2ui: a2uiCapability ? {
+            version: a2uiCapability.version,
+            catalog_id: a2uiCapability.catalogId,
+          } : null,
         }),
         log,
       );
+      if (a2uiCapability) {
+        safeSend(
+          ws,
+          makeFrame("a2ui_capabilities", {
+            version: a2uiCapability.version,
+            catalog_id: a2uiCapability.catalogId,
+            supported_catalogs: serverA2ui.supportedCatalogs ?? [a2uiCapability.catalogId],
+            supported_widgets: serverA2ui.supportedWidgets ?? [],
+          }),
+          log,
+        );
+      }
       startPings();
       return;
     }
@@ -242,7 +279,7 @@ export function handleConnection(ws, request, host) {
         let turnResult = null;
         try {
           turnResult = await host.sendMessage(
-            { agent_id, conversation_id, text, content_parts, otid, turn_id: turnId, session_id: sessionId },
+            { agent_id, conversation_id, text, content_parts, otid, turn_id: turnId, session_id: sessionId, a2ui_capability: a2uiCapability },
             (outFrame) => {
               if (closed) return;
               const mt = outFrame.message_type;

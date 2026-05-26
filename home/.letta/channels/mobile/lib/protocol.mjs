@@ -20,7 +20,7 @@ import { randomUUID } from "node:crypto";
 export const PROTOCOL_VERSION = 1;
 
 export const CLIENT_FRAMES = Object.freeze([
-  "hello", // { token, device_id, client_version }
+  "hello", // { token, device_id, client_version, a2ui_version?, supported_catalogs?, supported_widgets?, theme_hints? }
   "send_message", // { agent_id, conversation_id, text, otid? }
   "cancel", // { run_id }   — cancel an in-flight turn
   "ack", // { target_id }
@@ -29,7 +29,8 @@ export const CLIENT_FRAMES = Object.freeze([
 ]);
 
 export const SERVER_FRAMES = Object.freeze([
-  "welcome", // { server_id, session_id, device_id }
+  "welcome", // { server_id, session_id, device_id, a2ui_negotiated?, a2ui? }
+  "a2ui_capabilities", // { version, catalog_id, supported_catalogs, supported_widgets }
   "error", // { code, message, turn_id? }
   "ping", // (no extras)
   "turn_started", // { agent_id, conversation_id, turn_id, run_id }

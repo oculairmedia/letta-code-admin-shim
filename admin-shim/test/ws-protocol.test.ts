@@ -86,6 +86,59 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
   assert.equal(welcome.device_id, "dev-handshake-1", "welcome.device_id echoes client device_id");
 });
 
+test("ws: hello can negotiate A2UI capability when server support is enabled", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    deviceId: "dev-a2ui-1",
+    helloExtras: {
+      a2ui_version: "0.9",
+      supported_catalogs: ["basic"],
+      supported_widgets: ["Text", "Button", "ToolApprovalCard"],
+      theme_hints: { color_scheme: "dark" },
+    },
+  });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: { version?: string; catalog_id?: string } | null }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, true);
+  assert.equal(welcome.a2ui?.version, "0.9");
+  assert.equal(welcome.a2ui?.catalog_id, "basic");
+
+  const capabilities = await conn.waitFor("a2ui_capabilities", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+    version?: string;
+    catalog_id?: string;
+    supported_widgets?: unknown;
+  };
+  assert.equal(capabilities.version, "0.9");
+  assert.equal(capabilities.catalog_id, "basic");
+  assert.ok(Array.isArray(capabilities.supported_widgets));
+});
+
+test("ws: A2UI request is ignored when server support is disabled", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "0" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    helloExtras: {
+      a2ui_version: "0.9",
+      supported_catalogs: ["basic"],
+      supported_widgets: ["Text"],
+    },
+  });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: unknown }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, false);
+  assert.equal(welcome.a2ui, null);
+  assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+});
+
 // ─── 2. Auth failure ────────────────────────────────────────────────
 
 test("ws: wrong token → error{invalid_token} and connection closes", async (t) => {

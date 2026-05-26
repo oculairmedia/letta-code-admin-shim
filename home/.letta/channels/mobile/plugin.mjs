@@ -63,6 +63,7 @@ function createMobileAdapter(account, host) {
         log: (msg) => host.log?.(`[mobile:${accountId}] ${msg}`),
         getToken: () => resolveToken(account),
         getServerId: () => host.getServerId?.() ?? "unknown",
+        getA2uiServerCapabilities: () => host.getA2uiServerCapabilities?.() ?? { enabled: false },
         sendMessage: host.bridgeSendMessage,
         cancelRun: host.cancelRun ?? (() => false),
       });

@@ -21,6 +21,7 @@ import type { IncomingMessage } from "node:http";
 
 import { reshapeFrame } from "./chat.js";
 import { cancelRun, getAgentPool } from "./agent-pool.js";
+import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
 import { createRun } from "./runs.js";
 import {
   findUnmappedTailUserMessageId,
@@ -108,6 +109,7 @@ interface BridgeSendMessageArgs {
    */
   content_parts?: unknown[] | null;
   otid?: string | null;
+  a2ui_capability?: A2uiCapability | null;
 }
 
 interface BridgeSendMessageHooks {
@@ -123,7 +125,7 @@ interface BridgeSendMessageHooks {
  * out of the worker. The WS handler wraps these into protocol envelopes.
  */
 async function bridgeSendMessage(
-  { agent_id, conversation_id, text, content_parts, otid }: BridgeSendMessageArgs,
+  { agent_id, conversation_id, text, content_parts, otid, a2ui_capability }: BridgeSendMessageArgs,
   onFrame: (frame: BridgeFrame) => void,
   { onRunCreated }: BridgeSendMessageHooks = {},
 ): Promise<unknown> {
@@ -193,6 +195,7 @@ async function bridgeSendMessage(
   const userInput: string | unknown[] =
     Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
   const turn = await worker.runTurn(userInput, {
+    a2uiCapability: a2ui_capability ?? null,
     // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
     // patches the SIGTERM hook onto it via setRunCancelHandler. The
     // worker will NOT call onRunCreated when a handle is provided —
@@ -289,6 +292,7 @@ interface GetMobileChannelAdapterOptions {
 interface MobileChannelHost {
   log: (msg: string) => void;
   getServerId: () => string;
+  getA2uiServerCapabilities: typeof getA2uiServerCapabilities;
   bridgeSendMessage: typeof bridgeSendMessage;
   cancelRun: (runId: string) => boolean;
 }
@@ -384,6 +388,7 @@ async function createMobileChannelAdapter(
   const host: MobileChannelHost = {
     log: (msg: string) => log.log?.(msg),
     getServerId,
+    getA2uiServerCapabilities,
     bridgeSendMessage,
     cancelRun: (runId: string) => cancelRun(runId),
   };
