@@ -130,7 +130,8 @@ test("a2ui-ws: assistant_message with <a2ui-json> blocks splits into text + a2ui
   assert.equal(metrics["event"], "turn_metrics");
   assert.equal(typeof metrics["run_id"], "string");
   assert.equal(typeof metrics["agent_id"], "string");
-  assert.equal(typeof metrics["total_frames"], "number");
+  assert.equal(metrics["total_frames"], a2uiFrames.length, "turn_metrics.total_frames must match delivered WS a2ui_frame count");
+  assert.equal(metrics["parse_ok"], a2uiFrames.filter((f) => f.ok).length);
   assert.equal(typeof metrics["parse_ok"], "number");
   assert.equal(typeof metrics["parse_err"], "number");
   assert.equal(typeof metrics["validate_ok"], "number");
