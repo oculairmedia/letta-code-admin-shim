@@ -13,6 +13,7 @@ home/.npm/
 home/.letta/projects/
 home/.letta/transcripts/
 home/.letta/remote-settings.json
+home/.letta/.bootstrapped
 home/.letta/crons.json
 home/crons.json
 
