@@ -66,6 +66,25 @@ function createMobileAdapter(account, host) {
         getA2uiServerCapabilities: () => host.getA2uiServerCapabilities?.() ?? { enabled: false },
         sendMessage: host.bridgeSendMessage,
         cancelRun: host.cancelRun ?? (() => false),
+        // Phase 5: forward user_action ingestion to the outer host's
+        // sidecar recorder. ws-handler short-circuits to internal_error
+        // when this is missing — so wiring it here is required for the
+        // user_action round-trip to succeed.
+        handleUserAction: host.handleUserAction
+          ? (action) => host.handleUserAction(action)
+          : undefined,
+        // lcp-p74.2: replay+live-tail subscription so disconnected clients
+        // can resume from a known cursor.
+        subscribeToRun: host.subscribeToRun
+          ? (runId, cursor, cbs) => host.subscribeToRun(runId, cursor, cbs)
+          : undefined,
+        // lcp-2gx: cron CRUD over WS + crons_updated push.
+        handleCronList: host.handleCronList,
+        handleCronAdd: host.handleCronAdd,
+        handleCronGet: host.handleCronGet,
+        handleCronDelete: host.handleCronDelete,
+        handleCronDeleteAll: host.handleCronDeleteAll,
+        subscribeCronEvents: host.subscribeCronEvents,
       });
     },
   };

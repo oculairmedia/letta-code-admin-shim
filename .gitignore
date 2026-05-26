@@ -13,8 +13,21 @@ home/.npm/
 home/.letta/projects/
 home/.letta/transcripts/
 home/.letta/remote-settings.json
+home/.letta/.bootstrapped
 home/.letta/crons.json
 home/crons.json
+
+# Per-machine user home pollution when the shim runs with HOME=./home.
+# These directories belong to whichever runtime tools we shell out to
+# (bun, node, git config) and should never be checked in.
+home/.bun/
+home/.cache/
+home/.config/
+home/.gitconfig
+
+# Beads per-machine sync state (the dir form is already in .beads/.gitignore,
+# but the JSON file alias slips through at the workspace level).
+.beads/export-state.json
 
 # letta-code project metadata — local to each clone, regenerated on use.
 .letta/.lettaignore

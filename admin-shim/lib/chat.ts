@@ -29,7 +29,6 @@ import type {
   UsageStatisticsMessage,
 } from "./types/wire.js";
 
-const POOL_ENABLED = process.env["SHIM_POOL_DISABLE"] !== "1";
 
 /**
  * Shape of the JSON body POSTed to `/v1/agents/{id}/messages`. Mobile,
@@ -237,6 +236,11 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
       completion_tokens: (f["completion_tokens"] ?? 0) as number,
       prompt_tokens: (f["prompt_tokens"] ?? 0) as number,
       total_tokens: (f["total_tokens"] ?? 0) as number,
+      // Per-step semantics: each upstream usage_statistics frame
+      // represents ONE step's worth of tokens. Cumulative counts are
+      // the consumer's job to sum (or read off the run-level
+      // aggregate). lcp-d9o fixes the non-streaming response where
+      // this was wrongly hardcoded for the WHOLE turn.
       step_count: 1,
       run_ids: runIds,
       cached_input_tokens: (f["cached_input_tokens"] ?? 0) as number,
@@ -429,39 +433,6 @@ export function coalesceAssistantFrames(frames: LettaMessage[]): LettaMessage[] 
 }
 
 /** Options accepted by the legacy per-request spawn arg builder. */
-interface BuildLettaArgsOptions {
-  stream?: boolean;
-}
-
-// Legacy per-request spawn arg builder, kept for the POOL_DISABLE fallback.
-function buildLettaArgs(
-  agentId: string | null | undefined,
-  conversationId: string | null | undefined,
-  text: string,
-  { stream }: BuildLettaArgsOptions = {},
-): string[] {
-  let scope: string[];
-  if (conversationId === "default" && agentId) {
-    scope = ["--agent", agentId, "--conversation", "default"];
-  } else if (conversationId) {
-    scope = ["--conversation", conversationId];
-  } else if (agentId) {
-    scope = ["--agent", agentId];
-  } else {
-    scope = [];
-  }
-  return [
-    "--backend",
-    "local",
-    ...scope,
-    "-p",
-    text,
-    "--output-format",
-    "stream-json",
-    ...(stream ? ["--include-partial-messages"] : []),
-  ];
-}
-
 /** Optional handler args supplied by the route. */
 export interface HandleSendMessageOptions {
   conversationId?: string | undefined;
@@ -598,11 +569,11 @@ export async function handleSendMessage(
     if (res.writableEnded) return;
 
     if (reshaped.message_type === "stop_reason") {
-      // lcp-c4d: first-wins. Multi-step turns can emit several stop_reason
-      // frames upstream; the run-level contract (runs.ts finalizeRun) keeps
-      // the FIRST observed value. Align the SSE-stream contract by ignoring
-      // subsequent stop_reason frames once one is buffered.
-      if (pendingStop === null) pendingStop = reshaped;
+      // lcp-8ri: last-wins for the wire. Multi-step turns emit stop_reason
+      // per step (first is requires_approval, last is end_turn). The run
+      // record wants first-wins (finalizeTurnLifecycle handles that). The
+      // wire should reflect the terminal state.
+      pendingStop = reshaped;
       return;
     }
     if (reshaped.message_type === "usage_statistics") {
@@ -658,6 +629,13 @@ export async function handleSendMessage(
       (f): f is UsageStatisticsMessage => f.message_type === "usage_statistics",
     );
 
+    // lcp-d9o: step_count reflects the actual number of agent steps in
+    // this turn. Each step emits its own `usage_statistics` frame from
+    // letta-code; counting them gives the right total. The coalesced
+    // `usageFrame` is a "first-wins" projection (lcp-c4d) for the token
+    // counters, but step_count is a CARDINALITY signal, so we read from
+    // the raw `frames` collection that retained every step's record.
+    const usageStepCount = frames.filter((f) => f.message_type === "usage_statistics").length;
     res.writeHead(exitCode === 0 ? 200 : 500, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
@@ -670,7 +648,7 @@ export async function handleSendMessage(
               completion_tokens: usageFrame.completion_tokens ?? 0,
               prompt_tokens: usageFrame.prompt_tokens ?? 0,
               total_tokens: usageFrame.total_tokens ?? 0,
-              step_count: 1,
+              step_count: usageStepCount,
             }
           : { completion_tokens: 0, prompt_tokens: 0, total_tokens: 0, step_count: 0 },
         agent_id: agentId,
@@ -680,11 +658,9 @@ export async function handleSendMessage(
     );
   };
 
-  if (POOL_ENABLED) {
-    try {
-      const userOtid = extractUserOtid(body);
-      const pool = getAgentPool();
-      const worker = await pool.get(conversationId ?? "default", agentId);
+  try {
+    const userOtid = extractUserOtid(body);
+    const pool = getAgentPool();
       // Track the active run for this request. We surface its id on every
       // outgoing frame so mobile can correlate stream events with the
       // /v1/runs/{id} record it polls. Captured via the onRunCreated hook
@@ -707,7 +683,12 @@ export async function handleSendMessage(
         }
         handleRawFrame(raw);
       };
-      const turn = await worker.runTurn(text, {
+      // lcp-0vi: route through runTurnWithHeal so a dangling-tool-use error
+      // on this turn evicts + heals the transcript before returning. The
+      // healed disk is picked up by the next pool.get() the next time a
+      // user turn comes through; the caller still sees this turn's
+      // failure exactly as before, just with the disk already cleaned.
+      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, text, {
         onFrame: handleRawFrameWithRun,
         onRunCreated: (id: string) => {
           activeRunId = id;
@@ -757,43 +738,4 @@ export async function handleSendMessage(
         }
       }
     }
-    return;
-  }
-
-  // Legacy per-request spawn path — enabled with SHIM_POOL_DISABLE=1.
-  const { spawn } = await import("node:child_process");
-  const args = buildLettaArgs(agentId, conversationId, text, { stream: wantStream });
-  const child = spawn(process.env["LETTA_BIN"] || "letta", args, {
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdoutBuf = "";
-  child.stdout.on("data", (chunk: Buffer) => {
-    stdoutBuf += chunk.toString("utf8");
-    for (;;) {
-      const idx = stdoutBuf.indexOf("\n");
-      if (idx < 0) break;
-      const line = stdoutBuf.slice(0, idx).trim();
-      stdoutBuf = stdoutBuf.slice(idx + 1);
-      if (!line) continue;
-      try {
-        handleRawFrame(JSON.parse(line));
-      } catch {
-        /* swallow malformed lines */
-      }
-    }
-  });
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderrBuf += chunk.toString("utf8");
-  });
-  child.on("close", (code: number | null) =>
-    finalizeResponse({ exitCode: code, stderrTail: stderrBuf }),
-  );
-  req.on("close", () => {
-    try {
-      if (!child.killed) child.kill("SIGTERM");
-    } catch {
-      /* ignore */
-    }
-  });
 }

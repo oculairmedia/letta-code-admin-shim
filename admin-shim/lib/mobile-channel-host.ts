@@ -13,23 +13,36 @@
  * the only place the shim binds to it.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { IncomingMessage } from "node:http";
 
 import { reshapeFrame } from "./chat.js";
-import { cancelRun, getAgentPool } from "./agent-pool.js";
+import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
+import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
-import { createRun } from "./runs.js";
+import {
+  A2uiStreamSplitter,
+  validateA2uiMessage,
+  type A2uiBlock,
+  type A2uiMetrics,
+} from "./a2ui-stream-splitter.js";
+import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
 import {
   findUnmappedTailUserMessageId,
+  getAgentRecord,
+  listMessages,
+  listMessagesSync,
   resolveConversationId,
   writeOtidForLocalId,
 } from "./store.js";
-import type { LettaMessage } from "./types/wire.js";
+import type { LettaMessage, ToolReturn, ToolReturnMessage } from "./types/wire.js";
 import type {
+  A2uiFrameMessage,
+  A2uiUserAction,
+  A2uiUserActionAck,
   BridgeSendMessageArgs as PublicBridgeSendMessageArgs,
   BridgeSendMessageHooks as PublicBridgeSendMessageHooks,
   ChannelAccount as PublicChannelAccount,
@@ -51,6 +64,9 @@ export type {
   PublicChannelHost,
   PublicChannelPlugin,
   PublicHostLogger,
+  A2uiFrameMessage,
+  A2uiUserAction,
+  A2uiUserActionAck,
 };
 
 function channelDir(): string {
@@ -92,8 +108,12 @@ function loadAccount(): MobileAccount | null {
  * before forwarding so mobile can correlate to `/v1/runs/{id}`. The
  * `run_id` field exists on every `LettaMessageBase` variant so the cast
  * below is structurally narrowing only.
+ *
+ * When A2UI is negotiated for the session the host also synthesizes
+ * {@link A2uiFrameMessage} entries — one per `<a2ui-json>` block extracted
+ * from the assistant_message text stream.
  */
-type BridgeFrame = LettaMessage;
+type BridgeFrame = LettaMessage | A2uiFrameMessage;
 
 /** Args to `bridgeSendMessage`. */
 interface BridgeSendMessageArgs {
@@ -110,6 +130,13 @@ interface BridgeSendMessageArgs {
   content_parts?: unknown[] | null;
   otid?: string | null;
   a2ui_capability?: A2uiCapability | null;
+  /**
+   * lcp-4tv: marks the resulting Run as background. Cron-driven and
+   * other operator-initiated turns set this true so list filters
+   * (`/v1/runs?background=true`) can pull them out. Defaults to false
+   * (foreground / user-initiated).
+   */
+  background?: boolean;
 }
 
 interface BridgeSendMessageHooks {
@@ -124,8 +151,20 @@ interface BridgeSendMessageHooks {
  * `onFrame(reshapedFrame)` fires for each vanilla-shaped frame coming
  * out of the worker. The WS handler wraps these into protocol envelopes.
  */
-async function bridgeSendMessage(
-  { agent_id, conversation_id, text, content_parts, otid, a2ui_capability }: BridgeSendMessageArgs,
+
+function localPartsToText(parts: unknown): string {
+  if (!Array.isArray(parts)) return "";
+  return parts
+    .filter(
+      (p: unknown): p is { type: "text"; text?: string } =>
+        typeof p === "object" && p !== null && (p as { type?: unknown }).type === "text",
+    )
+    .map((p) => (typeof p.text === "string" ? p.text : ""))
+    .join("");
+}
+
+export async function bridgeSendMessage(
+  { agent_id, conversation_id, text, content_parts, otid, a2ui_capability, background }: BridgeSendMessageArgs,
   onFrame: (frame: BridgeFrame) => void,
   { onRunCreated }: BridgeSendMessageHooks = {},
 ): Promise<unknown> {
@@ -140,8 +179,15 @@ async function bridgeSendMessage(
   // bare literal "default" which the resolver refuses), fall back to
   // the client's pair so the worker pool can still target a fresh conv.
   const resolved = await resolveConversationId(conversation_id);
-  const effectiveAgentId = resolved?.agentId ?? agent_id;
+  const requestedAgentId = resolved?.agentId ?? agent_id;
+  const effectiveAgentId = resolveAgentIdAlias(requestedAgentId, (id) => getAgentRecord(id) != null);
   const effectiveConvId = resolved?.conversationId ?? conversation_id;
+
+  // lcp-4vz: snapshot pre-turn message ids so post-turn disk diff can find
+  // new tool results the CLI wrote but never emitted on the wire.
+  const preTurnMessageIds = new Set(
+    (await listMessages(effectiveConvId, effectiveAgentId)).map((m) => m.id),
+  );
 
   // lcp-99a: create the Run record BEFORE awaiting pool.get() so the ws
   // handler can emit turn_started carrying a non-null run_id. Mobile
@@ -152,6 +198,7 @@ async function bridgeSendMessage(
   const runHandle = createRun({
     agentId: effectiveAgentId,
     conversationId: effectiveConvId,
+    background: background ?? false,
     onCancel: () => {
       // Replaced by runTurn(). If a cancel lands before runTurn() patches
       // this in, it's a no-op — the worker doesn't exist yet so there's
@@ -160,11 +207,44 @@ async function bridgeSendMessage(
     },
   });
   if (typeof onRunCreated === "function") {
-    try { onRunCreated(runHandle.id); } catch {}
+    try {
+      onRunCreated(runHandle.id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] onRunCreated hook failed for ${runHandle.id}: ${msg}`);
+    }
   }
 
+  // lcp-p74.1: every frame the host emits also lands in state/runs/<id>/frames.jsonl
+  // so a disconnected mobile client can later subscribe(run_id, cursor) (lcp-p74.2)
+  // and replay. Wrapping at the consumer-emit boundary captures the post-reshape
+  // shape — i.e. exactly what the WS would see, not the raw upstream frame.
+  // lcp-p74.2: stamp the assigned seq onto the frame so live consumers track
+  // their cursor in lockstep with what subscribe(run_id, cursor) would replay.
+  const emit = (frame: BridgeFrame): void => {
+    const { seq } = appendRunFrame(runHandle.id, frame);
+    if (seq > 0) {
+      const asRec = frame as unknown as Record<string, unknown>;
+      asRec["seq"] = seq;
+      // lcp-pro: alias `seq` as `seq_id` on delta-shaped frames so mobile's
+      // `hasAlreadyIngestedStreamFrame` gate (which dedups by `seqId: Int?`)
+      // fires on the WS path without a mobile-side change. Without this
+      // every reconnect-replay / WS-vs-REST race silently appends a
+      // duplicate delta (the 2026-05-19 "Hello worldHello world" repro).
+      // We overwrite any upstream-supplied seq_id so the wire value is
+      // ALWAYS the shim's authoritative per-run cursor — upstream's value
+      // may be null on synthetic frames (end-of-turn splitter flush, A2UI
+      // host-synthesized frames) and a single source of truth keeps the
+      // gate's monotonicity invariant unbroken across the whole turn.
+      const mt = (frame as { message_type?: unknown }).message_type;
+      if (mt === "assistant_message" || mt === "reasoning_message") {
+        asRec["seq_id"] = seq;
+      }
+    }
+    onFrame(frame);
+  };
+
   const pool = getAgentPool();
-  const worker = await pool.get(effectiveConvId, effectiveAgentId);
 
   // lcp-cv3: stream assistant_message and reasoning_message chunks as
   // they arrive — DO NOT coalesce server-side. Mobile's stream ingest
@@ -180,6 +260,70 @@ async function bridgeSendMessage(
   // arrive AFTER the final assistant chunk regardless of upstream order.
   let pendingStop: BridgeFrame | null = null;
   let pendingUsage: BridgeFrame | null = null;
+  // lcp-4vz + lcp-pgw: track tool_call_ids for inline + end-of-turn synthesis.
+  const toolCallIdsSeen: string[] = [];
+  const toolReturnIdsSeen = new Set<string>();
+  // lcp-pgw: flag that flips true when a new tool_call arrives and resets
+  // once the inline flush resolves it. Prevents re-reading disk on every
+  // assistant_message delta — only on the first content frame after each
+  // tool execution completes.
+  let needsInlineFlush = false;
+  // Per-otid splitters: each logical assistant message gets its own splitter
+  // so trailing-tag hold-back doesn't leak across distinct assistant bubbles
+  // (rare on a single turn, but possible for multi-step turns).
+  const splittersByOtid = new Map<string, A2uiStreamSplitter>();
+  const a2uiEnabled = a2ui_capability != null;
+  const a2uiMetricsVerbosity = process.env["A2UI_METRICS_VERBOSITY"] ?? "normal";
+  const a2uiMetricsEnabled = a2uiMetricsVerbosity !== "off";
+  const a2uiMetrics: A2uiMetrics = {
+    total_frames: 0,
+    parse_ok: 0,
+    parse_err: 0,
+    validate_ok: 0,
+    validate_err: 0,
+    widget_types_seen: [],
+    splitter_overhead_ms: 0,
+  };
+  const a2uiWidgetsSeen = new Set<string>();
+  const truncateA2uiRaw = (raw: string): string => raw.length > 200 ? `${raw.slice(0, 200)}…` : raw;
+  const mergeA2uiMetrics = (metrics: A2uiMetrics): void => {
+    a2uiMetrics.total_frames += metrics.total_frames;
+    a2uiMetrics.parse_ok += metrics.parse_ok;
+    a2uiMetrics.parse_err += metrics.parse_err;
+    a2uiMetrics.validate_ok += metrics.validate_ok;
+    a2uiMetrics.validate_err += metrics.validate_err;
+    a2uiMetrics.splitter_overhead_ms += metrics.splitter_overhead_ms;
+    for (const widget of metrics.widget_types_seen) a2uiWidgetsSeen.add(widget);
+  };
+  const logA2uiWarning = (payload: Record<string, unknown>): void => {
+    if (!a2uiMetricsEnabled) return;
+    console.error(JSON.stringify({ level: "warn", module: "a2ui", run_id: runHandle.id, agent_id: effectiveAgentId, ...payload }));
+  };
+  const newSplitter = (): A2uiStreamSplitter =>
+    new A2uiStreamSplitter({
+      validate: (message) => validateA2uiMessage(message, { expectedCatalogId: a2ui_capability?.catalogId }),
+      onMetrics: mergeA2uiMetrics,
+      onParseError: (raw, error) => {
+        logA2uiWarning({ event: "parse_error", error, raw: truncateA2uiRaw(raw) });
+      },
+      onValidationError: (raw, error, widgetType) => {
+        logA2uiWarning({ event: "validation_error", widget_type: widgetType, error, raw: truncateA2uiRaw(raw) });
+      },
+    });
+  const buildA2uiFrame = (
+    block: A2uiBlock,
+    otid: string | null,
+    runId: string | null,
+  ): A2uiFrameMessage => ({
+    message_type: "a2ui_frame",
+    run_id: runId,
+    otid,
+    a2ui: block.parsed,
+    raw: block.raw,
+    ok: block.ok,
+    parse_error: block.parseError,
+    validation_error: block.validationError,
+  });
 
   // Smoothing intentionally NOT done server-side. lcp-cv3 contract:
   // forward every chunk as a pure delta. The mobile renderer (Android
@@ -194,7 +338,11 @@ async function bridgeSendMessage(
   // letta-code's headless stdin accepts either shape on MessageCreate.content.
   const userInput: string | unknown[] =
     Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
-  const turn = await worker.runTurn(userInput, {
+  // lcp-0vi: route through pool.runTurnWithHeal so a dangling-tool-use
+  // failure on this turn evicts the warm adapter + heals the transcript
+  // before returning. The caller sees the original turn result unchanged;
+  // the cleaned disk is picked up on the next user turn.
+  const turn = await pool.runTurnWithHeal(effectiveConvId, effectiveAgentId, userInput, {
     a2uiCapability: a2ui_capability ?? null,
     // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
     // patches the SIGTERM hook onto it via setRunCancelHandler. The
@@ -212,13 +360,84 @@ async function bridgeSendMessage(
       if (meta?.runId) (reshaped as unknown as Record<string, unknown>)["run_id"] = meta.runId;
       const mt = reshaped.message_type;
       if (mt === "stop_reason") {
-        // lcp-c4d: first-wins (run-record contract).
-        if (pendingStop === null) pendingStop = reshaped;
+        // lcp-8ri: last-wins for the WS emission. Multi-step turns emit
+        // stop_reason per step (first is usually requires_approval, last
+        // is end_turn). The run-record contract wants first-wins but that
+        // is tracked separately in finalizeTurnLifecycle. The wire should
+        // reflect the terminal state so mobile doesn't think the turn is
+        // still pending approval.
+        pendingStop = reshaped;
         return;
       }
       if (mt === "usage_statistics") {
         if (pendingUsage === null) pendingUsage = reshaped;
         return;
+      }
+      // lcp-4vz + lcp-pgw: inline tool_return synthesis. When a content
+      // frame arrives and there are unresolved tool calls, read disk for
+      // their results and emit tool_return frames BEFORE the current frame.
+      // This gives per-tool progressive resolution instead of end-of-turn
+      // batching. Gated by needsInlineFlush so we don't re-read disk on
+      // every assistant_message delta.
+      if (mt === "tool_return_message") {
+        const callId = (reshaped as { tool_call_id?: string | null }).tool_call_id;
+        if (callId) toolReturnIdsSeen.add(callId);
+      }
+      if (needsInlineFlush && (mt === "tool_call_message" || mt === "assistant_message" || mt === "reasoning_message")) {
+        const unresolvedNow = toolCallIdsSeen.filter((id) => !toolReturnIdsSeen.has(id));
+        if (unresolvedNow.length > 0) {
+          try {
+            const diskMsgs = listMessagesSync(effectiveConvId, effectiveAgentId);
+            const newResults = diskMsgs.filter(
+              (m) => m.role === "toolResult" && !preTurnMessageIds.has(m.id),
+            );
+            const byCallId = new Map(newResults.filter((m) => m.toolCallId).map((m) => [m.toolCallId!, m]));
+            // lcp-j3r: positional fallback for synthetic tool_call_ids
+            // (from the canUseTool path) that don't match any disk entry.
+            const unmatchedInline = [...newResults];
+            for (const callId of unresolvedNow) {
+              let entry = byCallId.get(callId);
+              if (!entry && unmatchedInline.length > 0) {
+                entry = unmatchedInline.shift()!;
+              } else if (entry) {
+                const idx = unmatchedInline.indexOf(entry);
+                if (idx >= 0) unmatchedInline.splice(idx, 1);
+              }
+              if (!entry) continue;
+              const returnText = localPartsToText(entry.parts);
+              const isError = entry.isError === true;
+              const status = isError ? "error" : "success";
+              const tr: ToolReturn = {
+                tool_call_id: callId, status,
+                func_response: returnText, stdout: null, stderr: null, type: "tool",
+              };
+              emit({
+                id: `toolreturn-${callId}`,
+                date: new Date().toISOString(),
+                name: (entry.toolName as string | undefined) ?? null,
+                message_type: "tool_return_message",
+                otid: null, sender_id: null, step_id: null,
+                is_err: isError ? true : null, seq_id: null,
+                run_id: runHandle.id,
+                tool_call_id: callId, status,
+                tool_return: returnText, stdout: null, stderr: null,
+                tool_returns: [tr],
+              } satisfies ToolReturnMessage);
+              toolReturnIdsSeen.add(callId);
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[mobile-channel] lcp-pgw: inline tool_return synthesis failed: ${msg}`);
+          }
+        }
+        needsInlineFlush = toolCallIdsSeen.some((id) => !toolReturnIdsSeen.has(id));
+      }
+      if (mt === "tool_call_message") {
+        const tc = (reshaped as { tool_call?: { tool_call_id?: string } | null }).tool_call;
+        if (tc?.tool_call_id) {
+          toolCallIdsSeen.push(tc.tool_call_id);
+          needsInlineFlush = true;
+        }
       }
       // Stable per-otid id so mobile's findByServerId merges chunks of
       // the same logical message. Spec §2.2 + §4.2 prescribes the
@@ -229,20 +448,174 @@ async function bridgeSendMessage(
         if (typeof otid === "string" && otid.length > 0) {
           (reshaped as unknown as Record<string, unknown>)["id"] = `cm-stream-${otid}`;
         }
+        // A2UI: pull `<a2ui-json>` blocks out of the assistant text. The
+        // splitter emits separate A2UI frames downstream and replaces the
+        // assistant_message content with the surrounding conversational
+        // text. Splitter only runs when a capability was negotiated; in
+        // that case the model has the v0.9 prompt and may emit blocks.
+        if (a2uiEnabled) {
+          const otidKey = typeof otid === "string" && otid.length > 0 ? otid : "__no-otid__";
+          let splitter = splittersByOtid.get(otidKey);
+          if (!splitter) {
+            splitter = newSplitter();
+            splittersByOtid.set(otidKey, splitter);
+          }
+          const contentDelta = typeof (reshaped as { content?: unknown }).content === "string"
+            ? (reshaped as { content: string }).content
+            : "";
+          const split = splitter.feed(contentDelta);
+          // Emit the user-visible text delta (may be empty when the chunk
+          // was 100% tag bytes). Skip pure no-op chunks so we don't ship
+          // empty bubbles down the wire.
+          if (split.text.length > 0) {
+            (reshaped as unknown as Record<string, unknown>)["content"] = split.text;
+            emit(reshaped);
+          }
+          // Forward each completed A2UI block as a host-synthesized frame.
+          const runId = (reshaped as { run_id?: string | null }).run_id ?? null;
+          for (const block of split.frames) {
+            emit(buildA2uiFrame(block, otid ?? null, runId));
+          }
+          return;
+        }
       } else if (mt === "reasoning_message") {
         const otid = (reshaped as { otid?: string | null }).otid;
         if (typeof otid === "string" && otid.length > 0) {
           (reshaped as unknown as Record<string, unknown>)["id"] = `cm-reason-${otid}`;
         }
       }
-      onFrame(reshaped);
+      emit(reshaped);
     },
   });
 
+  // End-of-turn tail: drain each splitter's pending state. Any text the
+  // splitter was holding back as a possible tag opening flushes to a final
+  // assistant_message delta; unclosed `<a2ui-json>` blocks are logged and
+  // dropped so the renderer never observes a truncated A2UI frame.
+  if (a2uiEnabled) {
+    for (const [otidKey, splitter] of splittersByOtid) {
+      const flush = splitter.flush();
+      if (flush.text.length > 0) {
+        const fakeOtid = otidKey === "__no-otid__" ? null : otidKey;
+        emit({
+          id: fakeOtid ? `cm-stream-${fakeOtid}` : `cm-stream-flush-${Date.now()}`,
+          date: new Date().toISOString(),
+          name: null,
+          message_type: "assistant_message",
+          otid: fakeOtid,
+          sender_id: null,
+          step_id: null,
+          is_err: null,
+          seq_id: null,
+          run_id: null,
+          content: flush.text,
+        });
+      }
+      if (flush.unclosed) {
+        console.error(`[mobile-channel] A2UI splitter ended mid-tag (otid=${otidKey})`);
+      }
+    }
+    if (a2uiMetricsEnabled) {
+      console.log(JSON.stringify({
+        level: "info",
+        module: "a2ui",
+        event: "turn_metrics",
+        run_id: runHandle.id,
+        agent_id: effectiveAgentId,
+        total_frames: a2uiMetrics.total_frames,
+        parse_ok: a2uiMetrics.parse_ok,
+        parse_err: a2uiMetrics.parse_err,
+        validate_ok: a2uiMetrics.validate_ok,
+        validate_err: a2uiMetrics.validate_err,
+        widget_types_seen: [...a2uiWidgetsSeen].sort(),
+        splitter_overhead_ms: a2uiMetrics.splitter_overhead_ms,
+      }));
+    }
+  }
+
+  // lcp-4vz: synthesize missing tool_return_message frames from disk.
+  // The CLI's headless SDK transport never emits tool_return on the wire —
+  // the results exist on disk in messages.jsonl but never cross the SDK
+  // boundary. For each tool_call without a matching tool_return, read the
+  // result from disk and emit it so mobile's tool cards resolve.
+  //
+  // Timing: this runs AFTER pool.runTurnWithHeal returns, which means
+  // finalizeRun has already removed the run from _activeRuns. The normal
+  // emit() path calls appendRunFrame which silently no-ops on finalized
+  // runs (returns seq=-1). To ensure synthesized frames persist for
+  // reconnect/replay, we append directly to the frames file.
+  const unresolvedCallIds = toolCallIdsSeen.filter((id) => !toolReturnIdsSeen.has(id));
+  if (unresolvedCallIds.length > 0) {
+    try {
+      const postMessages = await listMessages(effectiveConvId, effectiveAgentId);
+      const newToolResults = postMessages.filter(
+        (m) => m.role === "toolResult" && !preTurnMessageIds.has(m.id),
+      );
+      const diskByCallId = new Map<string, typeof newToolResults[number]>();
+      for (const m of newToolResults) {
+        if (m.toolCallId) diskByCallId.set(m.toolCallId, m);
+      }
+      const unmatchedDisk = [...newToolResults];
+      const framesPath = getFramesFilePath(runHandle.id);
+      let synthSeq = 900_000;
+      for (const callId of unresolvedCallIds) {
+        let entry = diskByCallId.get(callId);
+        if (!entry && unmatchedDisk.length > 0) {
+          entry = unmatchedDisk.shift()!;
+        } else if (entry) {
+          const idx = unmatchedDisk.indexOf(entry);
+          if (idx >= 0) unmatchedDisk.splice(idx, 1);
+        }
+        if (!entry) continue;
+        const returnText = localPartsToText(entry.parts);
+        const isError = entry.isError === true;
+        const status = isError ? "error" : "success";
+        const tr: ToolReturn = {
+          tool_call_id: callId,
+          status,
+          func_response: returnText,
+          stdout: null,
+          stderr: null,
+          type: "tool",
+        };
+        const frame: ToolReturnMessage = {
+          id: `toolreturn-${callId}`,
+          date: new Date().toISOString(),
+          name: (entry.toolName as string | undefined) ?? null,
+          message_type: "tool_return_message",
+          otid: null,
+          sender_id: null,
+          step_id: null,
+          is_err: isError ? true : null,
+          seq_id: null,
+          run_id: runHandle.id,
+          tool_call_id: callId,
+          status,
+          tool_return: returnText,
+          stdout: null,
+          stderr: null,
+          tool_returns: [tr],
+        };
+        try {
+          const seq = ++synthSeq;
+          appendFileSync(framesPath, JSON.stringify({ seq, ts: new Date().toISOString(), frame }) + "\n");
+          (frame as unknown as Record<string, unknown>)["seq"] = seq;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[mobile-channel] lcp-4vz: failed to persist synthesized tool_return frame: ${msg}`);
+        }
+        onFrame(frame);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] lcp-4vz: tool_return synthesis failed: ${msg}`);
+    }
+  }
+
   // End-of-turn tail: stop_reason → usage_statistics. Assistant chunks
   // were already forwarded inline above.
-  if (pendingStop) onFrame(pendingStop);
-  if (pendingUsage) onFrame(pendingUsage);
+  if (pendingStop) emit(pendingStop);
+  if (pendingUsage) emit(pendingUsage);
 
   // Bind mobile's otid to the user message letta-code persisted — same
   // path the SSE handler runs so the disk projection echoes the otid back
@@ -281,6 +654,453 @@ interface GetMobileChannelAdapterOptions {
 }
 
 /**
+ * Phase 5: handle an inbound A2UI user_action frame. Approval actions resolve
+ * pending dispatcher gates; non-approval actions with a resolvable run become
+ * synthetic agent input; every action is recorded to the run sidecar.
+ */
+function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
+  const actionId =
+    typeof action.action_id === "string" && action.action_id.length > 0
+      ? action.action_id
+      : `act-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  if (typeof action.name !== "string" || action.name.length === 0) {
+    return { action_id: actionId, status: "rejected", reason: "missing event name" };
+  }
+  const approvalDecision = approvalDecisionFromAction(action, actionId);
+  const matchedApproval = Boolean(approvalDecision && action.run_id && resolveApprovalGate(action.run_id, approvalDecision));
+  const syntheticInput = !approvalDecision ? syntheticInputFromAction(action, actionId) : null;
+  const routedAs = matchedApproval
+    ? "approval"
+    : syntheticInput
+      ? "synthetic_input"
+      : "recorded_only";
+  recordA2uiUserAction({
+    run_id: action.run_id,
+    session_id: action.session_id,
+    turn_id: action.turn_id,
+    surface_id: action.surface_id,
+    component_id: action.component_id ?? null,
+    name: action.name,
+    context: action.context ?? {},
+    action_id: actionId,
+    routed_as: routedAs,
+  });
+  console.log(JSON.stringify({
+    level: "info",
+    module: "a2ui",
+    event: "user_action_routed",
+    run_id: action.run_id,
+    surface_id: action.surface_id,
+    component_id: action.component_id ?? null,
+    action_name: action.name,
+    action_id: actionId,
+    routed_as: routedAs,
+  }));
+  if (syntheticInput) {
+    return { action_id: actionId, status: "accepted", routed_as: routedAs, synthetic_input: syntheticInput };
+  }
+  return { action_id: actionId, status: "accepted", routed_as: routedAs };
+}
+
+function syntheticInputFromAction(
+  action: A2uiUserAction,
+  actionId: string,
+): { agent_id: string; conversation_id: string; text: string } | null {
+  // Tool-approval UI events are control-plane signals, not user prompts. The
+  // stable dispatcher path is `tool_approval_response`; older/alternate card
+  // names are recorded for audit but must not be injected as chat input.
+  if (action.name.startsWith("tool_approval_")) return null;
+  if (!action.run_id) return null;
+  const run = getRun(action.run_id);
+  if (!run?.agent_id || !run.conversation_id) return null;
+  return {
+    agent_id: run.agent_id,
+    conversation_id: run.conversation_id,
+    text: formatSyntheticA2uiAction(action, actionId),
+  };
+}
+
+function formatSyntheticA2uiAction(action: A2uiUserAction, actionId: string): string {
+  // lcp-crp follow-up: previous format read like a system log ("[system: A2UI
+  // user action] event: demo.send context: {...}") so the LLM treated it as a
+  // notification and responded in 7 tokens. Rephrase as a clear user-input
+  // signal with the full context body inline so any data the mobile client
+  // captures (TextField values, picker choices, form snapshots) is visible
+  // to the agent without it having to parse "context: <json>" out of band.
+  const componentId = action.component_id ?? componentIdFromContext(action.context) ?? null;
+  const componentClause = componentId !== null ? ` (component "${componentId}")` : "";
+  const ctx = action.context ?? {};
+  const ctxHasData = Object.keys(ctx).length > 0;
+  const ctxBody = ctxHasData ? JSON.stringify(ctx, null, 2) : "(no additional data)";
+  return [
+    "[User UI interaction via A2UI]",
+    "",
+    `The user performed the action "${action.name}" on surface "${action.surface_id ?? "(unspecified)"}"${componentClause}.`,
+    "",
+    "Data the user submitted with this interaction:",
+    ctxBody,
+    "",
+    "Respond as you would to a normal user message based on this interaction. Treat the data above as the user's input.",
+    `(traceId: ${actionId})`,
+  ].join("\n");
+}
+
+function componentIdFromContext(context: Record<string, unknown>): string | null {
+  const camel = context["componentId"];
+  if (typeof camel === "string" && camel.length > 0) return camel;
+  const snake = context["component_id"];
+  if (typeof snake === "string" && snake.length > 0) return snake;
+  const id = context["id"];
+  return typeof id === "string" && id.length > 0 ? id : null;
+}
+
+function approvalDecisionFromAction(
+  action: A2uiUserAction,
+  actionId: string,
+): { decision: "approve" | "deny"; scope: ApprovalScope; reason: string; userId?: string; actionId: string } | null {
+  if (action.name !== "tool_approval_response") return null;
+  const context = action.context;
+  const rawScope = typeof context["scope"] === "string" ? context["scope"] : "Once";
+  const normalizedScope = normalizeApprovalScope(rawScope);
+  if (!normalizedScope) return null;
+  const rawDecision = context["decision"];
+  const rawApprove = context["approve"];
+  const decision: "approve" | "deny" =
+    normalizedScope === "Deny" || rawDecision === "deny" || rawApprove === false
+      ? "deny"
+      : "approve";
+  const reason = typeof context["reason"] === "string"
+    ? context["reason"]
+    : decision === "deny"
+      ? "user_denied"
+      : "user_approved";
+  const userId = typeof context["user_id"] === "string" ? context["user_id"] : undefined;
+  return {
+    decision,
+    scope: normalizedScope,
+    reason,
+    actionId,
+    ...(userId ? { userId } : {}),
+  };
+}
+
+function normalizeApprovalScope(value: string): ApprovalScope | null {
+  switch (value.toLowerCase()) {
+    case "once":
+      return "Once";
+    case "session":
+      return "Session";
+    case "forever":
+      return "Forever";
+    case "deny":
+      return "Deny";
+    default:
+      return null;
+  }
+}
+
+/**
+ * lcp-p74.2: subscribe to a run's frame log. Replays every frame with
+ * seq > cursor in original order, then live-tails new appends as the
+ * worker continues to emit. Calls `onDone` once the run reaches a
+ * terminal state AND the tail has caught up. Returns an `unsubscribe`
+ * function the caller binds to its WS close handler.
+ *
+ * Errors via `onError` and stops: unknown runId (no frames.jsonl on
+ * disk), file read failure. The function does NOT throw — callers
+ * propagate via the error callback so the WS layer can map to a
+ * protocol frame uniformly.
+ */
+export interface SubscribeToRunCallbacks {
+  onFrame: (frame: unknown, seq: number) => void;
+  onDone: (info: { last_seq: number; status: string }) => void;
+  onError: (info: { code: string; message: string }) => void;
+}
+
+export function subscribeToRun(
+  runId: string,
+  cursor: number,
+  cbs: SubscribeToRunCallbacks,
+): { unsubscribe: () => void } {
+  const path = getFramesFilePath(runId);
+  if (!existsSync(path)) {
+    cbs.onError({ code: "run_not_found", message: `no frames recorded for run ${runId}` });
+    return { unsubscribe: () => {} };
+  }
+
+  let lastSeqSent = Math.max(0, Number.isFinite(cursor) ? cursor : 0);
+  let stopped = false;
+  let watcher: FSWatcher | null = null;
+  let polling = false;
+
+  // Replay (and live-tail) is "read whole file, filter by seq > lastSeqSent,
+  // emit, advance lastSeqSent". Re-reading on every change is O(n) per
+  // append; fine for v1 since runs rarely exceed thousands of frames and
+  // appendFileSync guarantees lines are ordered + complete.
+  const readAndEmit = (): void => {
+    if (stopped) return;
+    let body: string;
+    try {
+      body = readFileSync(path, "utf8");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      cbs.onError({ code: "internal_error", message: `frames.jsonl read failed: ${msg}` });
+      stop();
+      return;
+    }
+    for (const line of body.split("\n")) {
+      if (stopped) return;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let obj: { seq?: number; frame?: unknown };
+      try {
+        obj = JSON.parse(trimmed);
+      } catch {
+        continue; // skip malformed (partial trailing line during a write race, etc.)
+      }
+      if (typeof obj.seq !== "number" || obj.seq <= lastSeqSent) continue;
+      cbs.onFrame(obj.frame, obj.seq);
+      lastSeqSent = obj.seq;
+    }
+  };
+
+  const checkTerminalAndMaybeFinish = (): boolean => {
+    if (stopped) return true;
+    const run = getRun(runId);
+    if (!run) return false;
+    const terminal = run.status === "completed" || run.status === "failed" || run.status === "cancelled" || run.status === "expired";
+    if (!terminal) return false;
+    // Final tail to make sure we got everything written after the status
+    // flip — finalizeRun writes run.json before any final flush of frames
+    // in practice, but a defensive re-read closes the race.
+    readAndEmit();
+    if (!stopped) {
+      cbs.onDone({ last_seq: lastSeqSent, status: run.status ?? "unknown" });
+      stop();
+    }
+    return true;
+  };
+
+  function stop(): void {
+    stopped = true;
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[mobile-channel] failed to close run subscription watcher for ${runId}: ${msg}`);
+      }
+      watcher = null;
+    }
+  }
+
+  // Initial replay + immediate terminal check (handles already-completed runs).
+  readAndEmit();
+  if (checkTerminalAndMaybeFinish()) return { unsubscribe: stop };
+
+  // Live-tail. fs.watch can fire multiple times per append on some FSes;
+  // dedup via the polling guard. We use 'change' events; 'rename' would
+  // mean the file was rotated/deleted — treat as terminal-ish error.
+  try {
+    watcher = fsWatch(path, (eventType) => {
+      if (stopped || polling) return;
+      polling = true;
+      try {
+        if (eventType === "change") {
+          readAndEmit();
+          checkTerminalAndMaybeFinish();
+        } else if (eventType === "rename") {
+          cbs.onError({ code: "internal_error", message: "frames.jsonl was rotated or deleted during subscription" });
+          stop();
+        }
+      } finally {
+        polling = false;
+      }
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    cbs.onError({ code: "internal_error", message: `fs.watch failed: ${msg}` });
+    stop();
+  }
+
+  return { unsubscribe: stop };
+}
+
+// ── Cron WS handlers (lcp-2gx) ──────────────────────────────────
+//
+// Backed by lib/crons.ts. The same store the bundled letta-code self-schedule
+// skill writes to, so frames here interoperate with that.
+//
+// After each successful mutation we broadcast a `client_mutation` cron event
+// so peer WS clients receive a `crons_updated` push within a few hundred μs
+// — the fs.watch path in cron-scheduler would also catch the write, but its
+// 200ms debounce is slower than direct broadcast.
+
+import {
+  addTask as cronAddTask,
+  deleteAllTasks as cronDeleteAllTasks,
+  deleteTask as cronDeleteTask,
+  getTask as cronGetTask,
+  isValidCron,
+  listTasks as cronListTasks,
+  parseAt,
+  parseEvery,
+  getActiveTasks as cronGetActiveTasks,
+} from "./crons.js";
+import { broadcastCronEvent, subscribeCronEvents } from "./cron-events.js";
+import type {
+  AddTaskInput,
+  AddTaskResult,
+  CronTask,
+  ListTaskFilters,
+} from "./types/crons.js";
+
+export interface CronAddRequest {
+  agent_id: string;
+  conversation_id?: string;
+  name?: string;
+  description?: string;
+  prompt: string;
+  recurring?: boolean;
+  cron?: string;
+  every?: string;
+  at?: string;
+  timezone?: string;
+}
+
+export interface CronAddResponse {
+  success: true;
+  task: CronTask;
+  warning?: string;
+}
+
+export interface CronErrorResponse {
+  success: false;
+  error: string;
+}
+
+/** Read a snapshot of crons. Agent_id alias is resolved before listing. */
+export function handleCronList(filters: ListTaskFilters = {}): { tasks: CronTask[] } {
+  const effective: ListTaskFilters = {};
+  if (filters.agent_id) {
+    effective.agent_id = resolveAgentIdAlias(filters.agent_id, (id) => getAgentRecord(id) != null);
+  }
+  if (filters.conversation_id) effective.conversation_id = filters.conversation_id;
+  return { tasks: cronListTasks(effective) };
+}
+
+export function handleCronGet(taskId: string): CronTask | null {
+  return cronGetTask(taskId);
+}
+
+/**
+ * Validate + add a cron task. Supports raw `cron` expression or shortcuts
+ * via `every` / `at`. Resolves agent_id alias before persistence.
+ */
+export function handleCronAdd(req: CronAddRequest): CronAddResponse | CronErrorResponse {
+  if (!req.agent_id || typeof req.agent_id !== "string") {
+    return { success: false, error: "agent_id is required" };
+  }
+  if (typeof req.prompt !== "string" || req.prompt.length === 0) {
+    return { success: false, error: "prompt is required" };
+  }
+
+  const effectiveAgent = resolveAgentIdAlias(req.agent_id, (id) => getAgentRecord(id) != null);
+
+  // Resolve schedule: exactly one of cron / every / at.
+  let cronExpr: string | null = null;
+  let scheduledFor: Date | undefined;
+  let recurring = req.recurring ?? true;
+  const provided = [req.cron, req.every, req.at].filter((v) => typeof v === "string" && v.length > 0).length;
+  if (provided === 0) {
+    return { success: false, error: "one of `cron`, `every`, or `at` is required" };
+  }
+  if (provided > 1) {
+    return { success: false, error: "exactly one of `cron`, `every`, or `at` may be set" };
+  }
+  if (req.cron) {
+    if (!isValidCron(req.cron)) {
+      return { success: false, error: `invalid cron expression: ${req.cron}` };
+    }
+    cronExpr = req.cron;
+  } else if (req.every) {
+    const parsed = parseEvery(req.every);
+    if (!parsed) return { success: false, error: `invalid every: ${req.every}` };
+    cronExpr = parsed.cron;
+    recurring = true;
+  } else if (req.at) {
+    const parsed = parseAt(req.at);
+    if (!parsed) return { success: false, error: `invalid at: ${req.at}` };
+    cronExpr = parsed.cron;
+    scheduledFor = parsed.scheduledFor;
+    recurring = false;
+  }
+  if (!cronExpr) {
+    return { success: false, error: "could not resolve cron expression" };
+  }
+
+  const input: AddTaskInput = {
+    agent_id: effectiveAgent,
+    name: req.name ?? `task-${Date.now()}`,
+    description: req.description ?? "",
+    cron: cronExpr,
+    recurring,
+    prompt: req.prompt,
+  };
+  if (req.conversation_id) input.conversation_id = req.conversation_id;
+  if (req.timezone) input.timezone = req.timezone;
+  if (scheduledFor !== undefined) input.scheduled_for = scheduledFor;
+
+  let result: AddTaskResult;
+  try {
+    result = cronAddTask(input);
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  broadcastCronEvent({
+    reason: "client_mutation",
+    tasks_active: cronGetActiveTasks().length,
+    at: new Date().toISOString(),
+  });
+
+  const response: CronAddResponse = { success: true, task: result.task };
+  if (result.warning) response.warning = result.warning;
+  return response;
+}
+
+export function handleCronDelete(taskId: string): { success: boolean; error?: string } {
+  if (typeof taskId !== "string" || taskId.length === 0) {
+    return { success: false, error: "task_id is required" };
+  }
+  const removed = cronDeleteTask(taskId);
+  if (!removed) return { success: false, error: `task ${taskId} not found` };
+
+  broadcastCronEvent({
+    reason: "client_mutation",
+    tasks_active: cronGetActiveTasks().length,
+    at: new Date().toISOString(),
+  });
+  return { success: true };
+}
+
+export function handleCronDeleteAll(agentId: string): { success: boolean; count: number; error?: string } {
+  if (typeof agentId !== "string" || agentId.length === 0) {
+    return { success: false, count: 0, error: "agent_id is required" };
+  }
+  const effective = resolveAgentIdAlias(agentId, (id) => getAgentRecord(id) != null);
+  const count = cronDeleteAllTasks(effective);
+  if (count > 0) {
+    broadcastCronEvent({
+      reason: "client_mutation",
+      tasks_active: cronGetActiveTasks().length,
+      at: new Date().toISOString(),
+    });
+  }
+  return { success: true, count };
+}
+
+/**
  * The `host` object the shim hands the channel plugin. Mirrors the
  * informal contract the plugin reads in `acceptConnection` (see
  * home/.letta/channels/mobile/plugin.mjs):
@@ -288,6 +1108,10 @@ interface GetMobileChannelAdapterOptions {
  *  - `getServerId()` — server identity for the welcome envelope
  *  - `bridgeSendMessage(args, onFrame, hooks)` — turn driver
  *  - `cancelRun(runId)` — cancel hook from the worker pool
+ *  - `handleUserAction(action)` — A2UI user_action ingestion
+ *  - `subscribeToRun(runId, cursor, cbs)` — lcp-p74.2 replay + live-tail
+ *  - `handleCron*` — lcp-2gx WS-side CRUD for crons.json
+ *  - `subscribeCronEvents(listener)` — register for crons_updated push
  */
 interface MobileChannelHost {
   log: (msg: string) => void;
@@ -295,6 +1119,16 @@ interface MobileChannelHost {
   getA2uiServerCapabilities: typeof getA2uiServerCapabilities;
   bridgeSendMessage: typeof bridgeSendMessage;
   cancelRun: (runId: string) => boolean;
+  /** lcp-rfb: bump adapter lastUsedAt so inbound WS frames prevent idle eviction. */
+  touchAdapter: (conversationId: string, agentId: string) => void;
+  handleUserAction: typeof handleUserAction;
+  subscribeToRun: typeof subscribeToRun;
+  handleCronList: typeof handleCronList;
+  handleCronAdd: typeof handleCronAdd;
+  handleCronGet: typeof handleCronGet;
+  handleCronDelete: typeof handleCronDelete;
+  handleCronDeleteAll: typeof handleCronDeleteAll;
+  subscribeCronEvents: typeof subscribeCronEvents;
 }
 
 /**
@@ -391,6 +1225,15 @@ async function createMobileChannelAdapter(
     getA2uiServerCapabilities,
     bridgeSendMessage,
     cancelRun: (runId: string) => cancelRun(runId),
+    touchAdapter: (convId: string, agId: string) => getAgentPool().touch(convId, agId),
+    handleUserAction,
+    subscribeToRun,
+    handleCronList,
+    handleCronAdd,
+    handleCronGet,
+    handleCronDelete,
+    handleCronDeleteAll,
+    subscribeCronEvents,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();

@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -22,6 +22,7 @@ import {
   seedMessage,
   externalConvId,
 } from "./helpers/index.js";
+import type { LocalMessagePart } from "../lib/types/letta-stream.js";
 
 // ── helpers ─────────────────────────────────────────────────────────
 
@@ -45,6 +46,16 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
     server_id: string;
     server_started_at: string;
     version: string;
+    capabilities?: {
+      mobile_transport?: {
+        mobile_ws?: boolean;
+        ws_endpoint?: string;
+        canonical_live_transport?: string;
+        rest_role?: string;
+        sse_role?: string;
+        exclusivity?: string;
+      };
+    };
   };
   assert.equal(res.status, 200);
   assert.equal(b.status, "ok");
@@ -52,6 +63,53 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
   assert.ok(b.server_id, "server_id present");
   assert.ok(b.server_started_at, "server_started_at present");
   assert.ok(b.version, "version present");
+  assert.equal(b.capabilities?.mobile_transport?.mobile_ws, true);
+  assert.equal(b.capabilities?.mobile_transport?.ws_endpoint, "/shim/v1/mobile");
+  assert.equal(b.capabilities?.mobile_transport?.canonical_live_transport, "ws");
+  assert.equal(b.capabilities?.mobile_transport?.rest_role, "cold_start_reconcile_repair");
+  assert.equal(b.capabilities?.mobile_transport?.sse_role, "legacy_non_canonical_for_mobile_ws_sessions");
+  assert.equal(
+    b.capabilities?.mobile_transport?.exclusivity,
+    "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  );
+});
+
+test("GET /shim/v1/capabilities exposes canonical mobile transport contract", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const { res, body } = await getJson(`${shim.url}/shim/v1/capabilities`);
+  const b = body as {
+    backend?: string;
+    transports?: {
+      rest?: { available?: boolean; role?: string };
+      sse?: { available?: boolean; role?: string };
+      ws?: { available?: boolean; endpoint?: string; canonical_for?: string[] };
+    };
+    mobile_transport?: {
+      mobile_ws?: boolean;
+      ws_endpoint?: string;
+      canonical_live_transport?: string;
+      rest_role?: string;
+      sse_role?: string;
+      exclusivity?: string;
+    };
+  };
+  assert.equal(res.status, 200);
+  assert.equal(b.backend, "letta-code-local");
+  assert.equal(b.transports?.rest?.available, true);
+  assert.equal(b.transports?.rest?.role, "cold_start_reconcile_repair");
+  assert.equal(b.transports?.sse?.available, true);
+  assert.equal(b.transports?.sse?.role, "legacy_non_canonical_for_mobile_ws_sessions");
+  assert.equal(b.transports?.ws?.available, true);
+  assert.equal(b.transports?.ws?.endpoint, "/shim/v1/mobile");
+  assert.deepEqual(b.transports?.ws?.canonical_for, ["mobile_live_mutations"]);
+  assert.equal(b.mobile_transport?.mobile_ws, true);
+  assert.equal(b.mobile_transport?.canonical_live_transport, "ws");
+  assert.equal(
+    b.mobile_transport?.exclusivity,
+    "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  );
 });
 
 test("GET /v1/health (no trailing slash) is also served", async (t) => {
@@ -216,6 +274,12 @@ test("GET /v1/agents/{id}/messages returns [] when no messages in default conv",
 });
 
 test("GET /v1/agents/{id}/messages returns vanilla-shaped messages", async (t) => {
+  // lcp-cox: this endpoint now fans out one LocalMessage → one or more
+  // vanilla LettaMessage variants, matching /v1/conversations/{id}/messages
+  // and what real Letta servers return. The old legacy-hybrid record (with
+  // top-level role / agent_id / conversation_id and content: Array<{type,
+  // text}>) is gone — mobile already handles both shapes via its loose
+  // LettaMessageSerializer.
   const shim = await startShim();
   t.after(() => shim.stop());
 
@@ -237,30 +301,157 @@ test("GET /v1/agents/{id}/messages returns vanilla-shaped messages", async (t) =
   const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/messages`);
   const arr = body as Array<{
     id: string;
-    role: string;
     message_type: string;
-    agent_id: string;
-    conversation_id: string;
-    content: Array<{ type: string; text: string }>;
+    content: string;
     otid: string;
+    name: string | null;
+    is_err: unknown;
   }>;
   assert.equal(res.status, 200);
   assert.equal(arr.length, 2);
   const u = arr[0]!;
   assert.equal(u.id, "ui-msg-u1");
-  assert.equal(u.role, "user");
   assert.equal(u.message_type, "user_message");
-  assert.equal(u.agent_id, id);
-  assert.equal(u.conversation_id, "default");
-  assert.ok(Array.isArray(u.content));
-  assert.equal(u.content[0]!.type, "text");
-  assert.equal(u.content[0]!.text, "hello world");
-  // otid defaults to localMsg.id in localMessageToLettaMessage
+  assert.equal(u.content, "hello world");
+  // otid defaults to localMsg.id when no mobile-supplied otid is recorded.
   assert.equal(u.otid, "ui-msg-u1");
+  assert.equal(u.name, null);
+  assert.equal(u.is_err, null);
 
   const a = arr[1]!;
+  assert.equal(a.id, "ui-msg-a1");
   assert.equal(a.message_type, "assistant_message");
-  assert.equal(a.role, "assistant");
+  assert.equal(a.content, "hi back");
+});
+
+test("GET /v1/agents/{id}/messages fans out tool turns to tool_call_message + tool_return_message (lcp-cox)", async (t) => {
+  // Regression gate: the legacy hybrid that this endpoint used to serve
+  // hard-coded tool_calls=null, so mobile saw tool turns as bare assistant
+  // bubbles on context-window inspection. After lcp-cox the endpoint uses
+  // the same fan-out projection as /v1/conversations/{id}/messages.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const id = seedAgent(shim.stateDir, { id: "agent-tool-001" });
+  seedConversation(shim.stateDir, id);
+  // user typed a request
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ui-msg-u1",
+    role: "user",
+    content: "list files",
+    sourceMessageIndex: 0,
+  });
+  // assistant emitted a new-shape toolCall part (letta-code 0.25.x)
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ui-msg-a1",
+    role: "assistant",
+    parts: [
+      { type: "text", text: "" },
+      {
+        // Cast — `toolCall` is the new-shape part type letta-code 0.25.x
+        // writes; the union here still accepts it via the new
+        // LocalMessageToolCallContentPart variant.
+        type: "toolCall",
+        id: "toolu_LCPCOX_01",
+        name: "Bash",
+        arguments: { command: "ls" },
+      } as unknown as LocalMessagePart,
+    ],
+    sourceMessageIndex: 1,
+  });
+  // top-level toolResult row (new shape)
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ui-msg-a1:tool-result:toolu_LCPCOX_01",
+    role: "toolResult",
+    parts: [{ type: "text", text: "README.md\nserver.ts\n" }],
+    sourceMessageIndex: 2,
+    extra: {
+      toolCallId: "toolu_LCPCOX_01",
+      toolName: "Bash",
+      isError: false,
+    },
+  });
+
+  const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/messages`);
+  const arr = body as Array<{
+    id: string;
+    message_type: string;
+    name?: string | null;
+    content?: string;
+    tool_call?: { tool_call_id: string; name: string; arguments: string };
+    tool_call_id?: string;
+    tool_return?: string;
+    status?: string;
+  }>;
+  assert.equal(res.status, 200);
+  const types = arr.map((m) => m.message_type);
+  assert.deepEqual(
+    types,
+    ["user_message", "tool_call_message", "tool_return_message"],
+    `fan-out drift: got [${types.join(", ")}]`,
+  );
+
+  const tc = arr[1]!;
+  assert.equal(tc.tool_call?.tool_call_id, "toolu_LCPCOX_01");
+  assert.equal(tc.tool_call?.name, "Bash");
+  assert.equal(tc.tool_call?.arguments, JSON.stringify({ command: "ls" }));
+  // Mobile dedups streamed and history-list copies of the same tool call
+  // by id — this shared id format is the dedup contract.
+  assert.equal(tc.id, "toolcall-toolu_LCPCOX_01");
+
+  const tr = arr[2]!;
+  assert.equal(tr.tool_call_id, "toolu_LCPCOX_01");
+  assert.equal(tr.name, "Bash");
+  assert.equal(tr.status, "success");
+  assert.equal(tr.tool_return, "README.md\nserver.ts\n");
+  assert.equal(tr.id, "toolreturn-toolu_LCPCOX_01");
+});
+
+test("GET /v1/agents/{id}/context.messages also fans out tool turns (lcp-cox)", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const id = seedAgent(shim.stateDir, { id: "agent-ctx-tool", systemPrompt: "sys" });
+  seedConversation(shim.stateDir, id);
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ctx-u1",
+    role: "user",
+    content: "do it",
+    sourceMessageIndex: 0,
+  });
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ctx-a1",
+    role: "assistant",
+    parts: [
+      {
+        type: "toolCall",
+        id: "toolu_CTX_01",
+        name: "Read",
+        arguments: { file_path: "/tmp/x" },
+      } as unknown as LocalMessagePart,
+    ],
+    sourceMessageIndex: 1,
+  });
+  seedMessage(shim.stateDir, id, "default", {
+    id: "ctx-a1:tool-result:toolu_CTX_01",
+    role: "toolResult",
+    parts: [{ type: "text", text: "Error: ENOENT" }],
+    sourceMessageIndex: 2,
+    extra: { toolCallId: "toolu_CTX_01", toolName: "Read", isError: true },
+  });
+
+  const { res, body } = await getJson(`${shim.url}/v1/agents/${id}/context`);
+  const b = body as { messages: Array<{ message_type: string; is_err?: unknown; status?: string }> };
+  assert.equal(res.status, 200);
+  const types = b.messages.map((m) => m.message_type);
+  assert.deepEqual(
+    types,
+    ["user_message", "tool_call_message", "tool_return_message"],
+    `context messages drift: got [${types.join(", ")}]`,
+  );
+  const tr = b.messages[2]!;
+  assert.equal(tr.is_err, true);
+  assert.equal(tr.status, "error");
 });
 
 test("GET /v1/agents/{id}/messages honors limit and before", async (t) => {
@@ -463,6 +654,114 @@ test("GET /v1/conversations lists across agents and emits external ids", async (
   }
 });
 
+test("GET /v1/conversations reflects last_message_at bumps after a turn (lcp-5ky)", async (t) => {
+  // Regression: the listAllConversations cache is keyed on the conversations
+  // root mtime, which doesn't change when a child conversation.json is
+  // rewritten in place. Without an explicit invalidate the mobile list
+  // shows stale recent-activity ordering forever — defended here.
+  //
+  // The mock letta binary doesn't write to messages.jsonl, so we pre-seed
+  // an unstamped user message before triggering the turn. That gives
+  // stampNewMessages something to write a sidecar entry for, which is the
+  // path that fires bumpConversationLastMessageAt. With the cache
+  // invalidate in place, the second GET sees the bumped timestamp; without
+  // it, the GET returns the original (pre-bump) value.
+  const { openMobileWs } = await import("./helpers/index.js");
+  const shim = await startShim();
+  t.after(() => shim.stop());
+  const agentId = seedAgent(shim.stateDir, { id: "agent-bump-1" });
+  seedConversation(shim.stateDir, agentId);
+
+  const before = await getJson(`${shim.url}/v1/conversations`);
+  const beforeRow = (before.body as Array<{ id: string; last_message_at: string | null }>)
+    .find((c) => c.id === externalConvId(agentId));
+  assert.ok(beforeRow, "seeded conv must appear in the list");
+  const beforeIso = beforeRow.last_message_at ?? "";
+
+  // Pre-seed a user message so stampNewMessages has work to do.
+  seedMessage(shim.stateDir, agentId, "default", {
+    role: "user",
+    content: "pre-seed for bump test",
+  });
+
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: 8000 });
+  t.after(() => conn.close());
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: externalConvId(agentId),
+    text: "reply with pong",
+    otid: "cm-bump-1",
+  });
+  await conn.collectTurn({ timeoutMs: 8000 });
+
+  const after = await getJson(`${shim.url}/v1/conversations`);
+  const afterRow = (after.body as Array<{ id: string; last_message_at: string | null }>)
+    .find((c) => c.id === externalConvId(agentId));
+  assert.ok(afterRow, "conv must still appear post-turn");
+  const afterIso = afterRow.last_message_at ?? "";
+  assert.ok(afterIso, "last_message_at must be populated after a turn");
+  assert.ok(
+    afterIso > beforeIso,
+    `last_message_at must advance after a turn: before=${beforeIso} after=${afterIso}`,
+  );
+});
+
+test("GET /v1/conversations substitutes last_message_at from _real-times sidecar (lcp-dfz)", async (t) => {
+  // Regression for lcp-dfz: even when conversation.json's last_message_at is
+  // frozen at letta-code's Jan-1-2026 sentinel (because the worker's
+  // LocalStore rewrote conv.json after the shim's bumpConversationLastMessageAt
+  // wrote a real timestamp), the API must serve the sidecar-derived value so
+  // the mobile list sorts by real activity. The previous fix (lcp-pwz) was
+  // write-time only and lost a ~4s race to letta-code's post-turn persistence.
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-realtimes-1" });
+  const seeded = seedConversation(shim.stateDir, agentId, { id: "conv-realtimes-1" });
+
+  // Simulate the post-race on-disk state: conversation.json carries the
+  // sentinel (what letta-code writes after the shim bumps), and the
+  // _real-times.json sidecar carries the true wallclock max (what
+  // stampNewMessages wrote before letta-code clobbered conv.json).
+  const sentinelIso = "2026-01-01T01:13:27.000Z";
+  const realIso = "2026-05-22T13:20:52.607Z";
+  writeFileSync(
+    `${seeded.dir}/conversation.json`,
+    JSON.stringify(
+      {
+        id: "conv-realtimes-1",
+        agent_id: agentId,
+        created_at: sentinelIso,
+        updated_at: sentinelIso,
+        last_message_at: sentinelIso,
+        summary: null,
+        in_context_message_ids: [],
+      },
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    `${seeded.dir}/_real-times.json`,
+    JSON.stringify({ "ui-msg-1": "2026-05-22T13:20:50.000Z", "ui-msg-2": realIso }, null, 2),
+  );
+
+  const { res, body } = await getJson(`${shim.url}/v1/conversations`);
+  assert.equal(res.status, 200);
+  const row = (body as Array<{ id: string; last_message_at: string | null; updated_at: string | null }>)
+    .find((c) => c.id === "conv-realtimes-1");
+  assert.ok(row, "seeded conv must appear in the list");
+  assert.equal(row.last_message_at, realIso, "last_message_at must be derived from sidecar, not conv.json sentinel");
+  assert.equal(row.updated_at, realIso, "updated_at must be derived from sidecar, not conv.json sentinel");
+
+  // Single-conv GET path uses the same substitution.
+  const detail = await getJson(`${shim.url}/v1/conversations/conv-realtimes-1`);
+  const detailBody = detail.body as { last_message_at: string | null; updated_at: string | null };
+  assert.equal(detailBody.last_message_at, realIso);
+  assert.equal(detailBody.updated_at, realIso);
+});
+
 test("GET /v1/conversations/{external-default-id} resolves to the agent's default conv", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
@@ -549,6 +848,29 @@ test("GET /v1/conversations/{ext}/messages projects user message with otid=local
   // Other vanilla fields
   assert.equal(m.name, null);
   assert.equal(m.is_err, null);
+});
+
+test("GET /api/conversations/{ext}/messages is shim-native local-store hydrate", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const aid = seedAgent(shim.stateDir, { id: "agent-api-conv-hydrate" });
+  seedConversation(shim.stateDir, aid);
+  seedMessage(shim.stateDir, aid, "default", {
+    id: "ui-msg-api-hydrate",
+    role: "user",
+    content: "hydrate me locally",
+    sourceMessageIndex: 0,
+  });
+
+  const ext = externalConvId(aid);
+  const { res, body } = await getJson(`${shim.url}/api/conversations/${ext}/messages`);
+  const arr = body as Array<{ id: string; message_type: string; content: string }>;
+  assert.equal(res.status, 200);
+  assert.equal(arr.length, 1);
+  assert.equal(arr[0]!.id, "ui-msg-api-hydrate");
+  assert.equal(arr[0]!.message_type, "user_message");
+  assert.equal(arr[0]!.content, "hydrate me locally");
 });
 
 test("GET /v1/conversations/{ext}/messages strips <system-reminder> envelopes from user content", async (t) => {

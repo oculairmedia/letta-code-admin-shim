@@ -1,7 +1,22 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { A2UI_V09_BASIC_PROMPT_TEMPLATE } from "./a2ui-v09-basic-prompt.js";
 
+// Handshake/capability frames use the shim-local version string ("0.9").
+// A2UI JSON message envelopes remain upstream-spec shaped and require
+// `version: "v0.9"`; see validateA2uiMessage in a2ui-stream-splitter.ts.
 export const DEFAULT_A2UI_VERSION = "0.9";
 export const DEFAULT_A2UI_CATALOG_ID = "basic";
+const UPSTREAM_A2UI_BASIC_CATALOG_ID = "https://a2ui.org/specification/v0_9/basic_catalog.json";
+const DEFAULT_A2UI_SUPPORTED_WIDGETS = [
+  "Text",
+  "Button",
+  "Card",
+  "List",
+  "TextField",
+  "ChoicePicker",
+] as const;
 
 export interface A2uiCapability {
   version: string;
@@ -20,6 +35,8 @@ export interface A2uiServerCapabilities {
   supportedCatalogs: readonly string[];
   supportedWidgets: readonly string[];
 }
+
+const A2UI_PRIMARY_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 function envFlag(name: string, defaultValue: boolean): boolean {
   const raw = process.env[name];
@@ -42,17 +59,7 @@ export function getA2uiServerCapabilities(): A2uiServerCapabilities {
     roleDescription: envString("A2UI_ROLE_DESCRIPTION", "You are a Letta agent that can emit A2UI dynamic interface messages when useful."),
     uiDescription: envString("A2UI_UI_DESCRIPTION", "Use the A2UI v0.9 Basic Catalog to create concise, safe, task-focused UI surfaces for the connected client."),
     supportedCatalogs: [catalogId],
-    supportedWidgets: [
-      "Text",
-      "Button",
-      "Card",
-      "Form",
-      "List",
-      "TextField",
-      "ChoicePicker",
-      "StatusBeacon",
-      "ToolApprovalCard",
-    ],
+    supportedWidgets: DEFAULT_A2UI_SUPPORTED_WIDGETS,
   };
 }
 
@@ -70,7 +77,22 @@ function asStringArray(value: unknown): string[] | null {
 function asThemeHints(value: unknown): Readonly<Record<string, unknown>> | undefined | null {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "object" || Array.isArray(value)) return null;
-  return value as Readonly<Record<string, unknown>>;
+  const hints = { ...(value as Record<string, unknown>) };
+  const primaryColor = hints["primaryColor"];
+  if (primaryColor !== undefined && (typeof primaryColor !== "string" || !A2UI_PRIMARY_COLOR_RE.test(primaryColor))) {
+    console.error("[a2ui] ignoring invalid theme_hints.primaryColor; expected ^#[0-9a-fA-F]{6}$");
+    delete hints["primaryColor"];
+  }
+  return Object.keys(hints).length > 0 ? hints : undefined;
+}
+
+function buildThemeHintsPrompt(themeHints: Readonly<Record<string, unknown>> | undefined): string | null {
+  if (!themeHints) return null;
+  return [
+    "Client theme hints for A2UI surfaces:",
+    JSON.stringify(themeHints),
+    "When emitting createSurface, set createSurface.theme from these sanitized hints when useful. theme.primaryColor, if present, is already validated as a strict 6-digit hex string. color_scheme is a renderer preference hint (light/dark/system), not a direct primaryColor value.",
+  ].join("\n");
 }
 
 export function negotiateA2uiCapability(
@@ -92,12 +114,14 @@ export function negotiateA2uiCapability(
 
   const catalogs = requestedCatalogs.length > 0 ? requestedCatalogs : [server.catalogId];
   if (!catalogs.includes(server.catalogId)) return null;
+  const supportedByServer = new Set(server.supportedWidgets);
+  const widgets = requestedWidgets.filter((widget) => supportedByServer.has(widget));
 
   return {
     version,
     catalogId: server.catalogId,
     supportedCatalogs: catalogs,
-    supportedWidgets: requestedWidgets,
+    supportedWidgets: widgets.length > 0 ? widgets : server.supportedWidgets,
     ...(themeHints ? { themeHints } : {}),
   };
 }
@@ -109,28 +133,183 @@ export function buildA2uiSystemPrompt(capability: A2uiCapability): string {
     : "the standard Basic Catalog widgets";
   const prompt = A2UI_V09_BASIC_PROMPT_TEMPLATE
     .replace("__A2UI_ROLE_DESCRIPTION__", server.roleDescription)
-    .replace("__A2UI_UI_DESCRIPTION__", server.uiDescription);
+    .replace("__A2UI_UI_DESCRIPTION__", server.uiDescription)
+    .replaceAll(UPSTREAM_A2UI_BASIC_CATALOG_ID, capability.catalogId);
+  const themeHintsPrompt = buildThemeHintsPrompt(capability.themeHints);
 
   return [
     prompt,
     "## Shim Session Capability Negotiation:",
     `A2UI dynamic UI mode is enabled for this session. Target A2UI version: ${capability.version}. Catalog: ${capability.catalogId}.`,
     `The connected client declared render support for: ${widgets}.`,
+    "Each `<a2ui-json>` block must contain exactly one A2UI v0.9 message object. Do not emit a top-level array; emit multiple adjacent `<a2ui-json>` blocks when you need createSurface plus updateComponents or other multi-message sequences.",
+    "Do not set createSurface.sendDataModel to true in this shim profile. User-action data-model delivery is deferred until the tool-dispatcher gate can consume it end-to-end.",
+    ...(themeHintsPrompt ? [themeHintsPrompt] : []),
     "Only emit A2UI blocks when a rich UI helps the user; otherwise continue with normal conversational text.",
   ].join("\n\n");
 }
 
+// lcp-crp: per-turn injection retired. The 40KB A2UI prompt (97% inline
+// JSON Schema) used to be prepended to every user turn here, which
+// overflowed context on existing chats. The contract now lives in a
+// per-agent core-memory block written by ensureA2uiBlockAttached on first
+// A2UI-enabled turn (see below). Kept as a typed no-op for API stability;
+// remove in a follow-up after callsites are confirmed clean.
 export function augmentUserInputForA2ui(
   userInput: string | unknown[],
-  capability: A2uiCapability | null | undefined,
+  _capability: A2uiCapability | null | undefined,
 ): string | unknown[] {
-  if (!capability) return userInput;
-  const augmentation = buildA2uiSystemPrompt(capability);
-  if (Array.isArray(userInput)) {
-    return [
-      { type: "text", text: augmentation },
-      ...userInput,
-    ];
+  return userInput;
+}
+
+// Core-memory block label written into <storageDir>/memfs/<agent>/memory/system/.
+// Matches the existing snake_case convention (human, language, matrix_capabilities).
+export const A2UI_BLOCK_LABEL = "a2ui_protocol";
+
+function blockStorageDir(): string {
+  return (
+    process.env["LETTA_LOCAL_BACKEND_DIR"] ||
+    join(process.env["LETTA_HOME"] || join(process.env["HOME"] || "/root", ".letta"), "lc-local-backend")
+  );
+}
+
+// Slim ~2KB block content: rules + examples, NO embedded JSON Schema.
+// Letta-code's memfs reader includes every system/*.md file in the agent's
+// persistent context on every turn, so the contract is available without
+// being re-stuffed into the user message.
+export function buildA2uiBlockContent(): string {
+  const server = getA2uiServerCapabilities();
+  return [
+    "# A2UI Dynamic UI Protocol (v0.9, Basic Catalog)",
+    "",
+    server.roleDescription,
+    "",
+    "## Output format",
+    "- Wrap each A2UI message in `<a2ui-json>` and `</a2ui-json>` tags.",
+    "- Each block contains exactly one A2UI v0.9 message object. To send multiple messages, use multiple adjacent `<a2ui-json>` blocks; do NOT use a top-level array.",
+    "- Between or around blocks, you may write conversational text.",
+    "",
+    "## Component ordering",
+    "Within `components`:",
+    "- The `root` component MUST be the FIRST element.",
+    "- Parent components MUST appear before their child components.",
+    "This lets the streaming parser render the UI incrementally.",
+    "",
+    "## Profile rules",
+    "- Do NOT set `createSurface.sendDataModel: true` in this shim profile. User-action data-model delivery is deferred until the tool-dispatcher gate can consume it end-to-end.",
+    "- Only emit A2UI blocks when a rich UI helps the user; otherwise continue with normal conversational text.",
+    "",
+    `## Supported widgets (catalog: ${server.catalogId})`,
+    server.supportedWidgets.join(", "),
+    "",
+    "## Component shape",
+    "Every component is a flat object with `id`, a `component` discriminator, and",
+    "the widget's props at the top level. Children are referenced by ID, never inlined.",
+    "",
+    "Correct:  `{ \"id\": \"my-card\", \"component\": \"Card\", \"child\": \"child-id\" }`",
+    "Wrong:    `{ \"id\": \"my-card\", \"Card\": { \"child\": \"child-id\" } }`",
+    "",
+    "Text uses `text` (not `value`). Surface envelopes use `surfaceId`",
+    "(not `surface`). `createSurface` takes only `surfaceId` + `catalogId`; the",
+    "component tree goes in a separate `updateComponents` message.",
+    "",
+    "## Examples",
+    "",
+    "### createSurface — open a new UI surface",
+    "<a2ui-json>",
+    JSON.stringify(
+      {
+        version: "v0.9",
+        createSurface: {
+          surfaceId: "greeting-surface",
+          catalogId: server.catalogId,
+        },
+      },
+      null,
+      2,
+    ),
+    "</a2ui-json>",
+    "",
+    "### updateComponents — define or patch the component tree",
+    "The `root` component MUST be the first element in `components`.",
+    "Parents MUST appear before their children (top-down ordering).",
+    "<a2ui-json>",
+    JSON.stringify(
+      {
+        version: "v0.9",
+        updateComponents: {
+          surfaceId: "greeting-surface",
+          components: [
+            { id: "root", component: "Card", child: "col" },
+            { id: "col", component: "Column", children: ["greeting", "ok-btn"] },
+            { id: "greeting", component: "Text", text: "Hello!", variant: "h3" },
+            {
+              id: "ok-btn",
+              component: "Button",
+              child: "ok-label",
+              action: { event: { name: "dismiss", context: {} } },
+            },
+            { id: "ok-label", component: "Text", text: "OK" },
+          ],
+        },
+      },
+      null,
+      2,
+    ),
+    "</a2ui-json>",
+    "",
+    "### deleteSurface — close a surface",
+    "<a2ui-json>",
+    JSON.stringify(
+      {
+        version: "v0.9",
+        deleteSurface: { surfaceId: "greeting-surface" },
+      },
+      null,
+      2,
+    ),
+    "</a2ui-json>",
+  ].join("\n");
+}
+
+// Per-process cache so we touch disk once per agent, not every turn.
+const a2uiBlockAttachedAgents = new Set<string>();
+
+// lcp-qec: write-if-absent only. Once the file exists on disk the agent
+// owns it — the shim never re-asserts. Previously this overwrote any
+// drift between disk and `buildA2uiBlockContent()`, which destroyed
+// agent-curated corrections (wrong-shape examples in the template
+// kept being restored, and any annotations the agent added to reflect
+// production reality were wiped on every shim restart).
+//
+// Ownership model:
+//   - First time the agent loads with A2UI capability: shim scaffolds
+//     `system/a2ui_protocol.md` from the canonical template.
+//   - Every time after that: the file is the agent's. The shim does not
+//     read, diff, or write it. If the canonical template evolves, that
+//     does NOT propagate into agents that already have the block.
+//   - To re-scaffold an agent: delete the file from the agent's memfs
+//     and the next attach will recreate it.
+//
+// The in-process Set short-circuits subsequent calls for the same agent
+// within one shim process, even when the file already existed on disk
+// at startup (so we don't stat the same path every turn).
+export function ensureA2uiBlockAttached(agentId: string): void {
+  if (a2uiBlockAttachedAgents.has(agentId)) return;
+  const sysDir = join(blockStorageDir(), "memfs", agentId, "memory", "system");
+  const blockPath = join(sysDir, `${A2UI_BLOCK_LABEL}.md`);
+  try {
+    if (!existsSync(sysDir)) mkdirSync(sysDir, { recursive: true });
+    if (!existsSync(blockPath)) {
+      // First-time scaffold only. Agent owns it after this.
+      writeFileSync(blockPath, buildA2uiBlockContent());
+    }
+    a2uiBlockAttachedAgents.add(agentId);
+  } catch (err) {
+    // Non-fatal: if attach fails the worst case is the agent loses the
+    // contract for one turn. Per-turn augment is already a no-op, so we'd
+    // rather miss the UI than break the turn with an unrelated FS error.
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[a2ui] ensureA2uiBlockAttached failed for ${agentId}: ${msg}`);
   }
-  return `${augmentation}\n\nUser request:\n${userInput}`;
 }

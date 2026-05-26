@@ -76,7 +76,25 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
   const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, deviceId: "dev-handshake-1" });
   t.after(() => conn.close());
   const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
-    | { server_id: string; session_id: string; device_id: string }
+    | {
+        server_id: string;
+        session_id: string;
+        device_id: string;
+        canonical_live_transport?: string;
+        transport_contract?: {
+          mobile_ws?: boolean;
+          ws_endpoint?: string;
+          canonical_live_transport?: string;
+          rest_role?: string;
+          sse_role?: string;
+          exclusivity?: string;
+        };
+        capabilities?: {
+          mobile_transport?: {
+            canonical_live_transport?: string;
+          };
+        };
+      }
     | undefined;
   assert.ok(welcome, "welcome frame must be present after hello");
   assert.equal(typeof welcome.server_id, "string", "welcome.server_id required");
@@ -84,6 +102,17 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
   assert.equal(typeof welcome.session_id, "string", "welcome.session_id required");
   assert.match(welcome.session_id, /^sess-/, "session_id should be sess-<uuid>");
   assert.equal(welcome.device_id, "dev-handshake-1", "welcome.device_id echoes client device_id");
+  assert.equal(welcome.canonical_live_transport, "ws");
+  assert.equal(welcome.transport_contract?.mobile_ws, true);
+  assert.equal(welcome.transport_contract?.ws_endpoint, "/shim/v1/mobile");
+  assert.equal(welcome.transport_contract?.canonical_live_transport, "ws");
+  assert.equal(welcome.transport_contract?.rest_role, "cold_start_reconcile_repair");
+  assert.equal(welcome.transport_contract?.sse_role, "legacy_non_canonical_for_mobile_ws_sessions");
+  assert.equal(
+    welcome.transport_contract?.exclusivity,
+    "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  );
+  assert.equal(welcome.capabilities?.mobile_transport?.canonical_live_transport, "ws");
 });
 
 test("ws: hello can negotiate A2UI capability when server support is enabled", async (t) => {
@@ -116,6 +145,37 @@ test("ws: hello can negotiate A2UI capability when server support is enabled", a
   assert.equal(capabilities.version, "0.9");
   assert.equal(capabilities.catalog_id, "basic");
   assert.ok(Array.isArray(capabilities.supported_widgets));
+  assert.deepEqual(capabilities.supported_widgets, ["Text", "Button", "Card", "List", "TextField", "ChoicePicker"]);
+});
+
+test("ws: tokenless A2UI hello does not crash when mobile auth is unconfigured", async (t) => {
+  const shim = await startShim({
+    mobileToken: "",
+    env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic", MOBILE_CHANNEL_TOKEN: "" },
+  });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: null,
+    deviceId: "dev-a2ui-tokenless",
+    helloExtras: {
+      a2ui_version: "0.9",
+      supported_catalogs: ["basic"],
+      supported_widgets: ["Text", "Button", "ToolApprovalCard"],
+    },
+    timeoutMs: WS_TIMEOUT_MS,
+  });
+  t.after(() => conn.close());
+
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: { version?: string; catalog_id?: string } | null }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, true);
+  assert.equal(welcome.a2ui?.version, "0.9");
+  assert.equal(welcome.a2ui?.catalog_id, "basic");
+  await conn.waitFor("a2ui_capabilities", { timeoutMs: WS_TIMEOUT_MS });
+  assert.equal(conn.closed, false, "tokenless negotiated hello must keep the server process alive");
+  assert.doesNotMatch(shim.readLog(), /ERR_INVALID_ARG_TYPE|TypeError/, "tokenless hello must not crash device state hashing");
 });
 
 test("ws: A2UI request is ignored when server support is disabled", async (t) => {
@@ -137,6 +197,99 @@ test("ws: A2UI request is ignored when server support is disabled", async (t) =>
   assert.equal(welcome.a2ui_negotiated, false);
   assert.equal(welcome.a2ui, null);
   assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+});
+
+test("ws: A2UI version mismatch returns negotiated=false with reason", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    helloExtras: {
+      a2ui_version: "0.10",
+      supported_catalogs: ["basic"],
+      supported_widgets: ["Text"],
+    },
+  });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: unknown; a2ui_rejection_reason?: string }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, false);
+  assert.equal(welcome.a2ui, null);
+  assert.equal(welcome.a2ui_rejection_reason, "version_mismatch");
+  assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+});
+
+test("ws: A2UI catalog mismatch returns negotiated=false with reason", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    helloExtras: {
+      a2ui_version: "0.9",
+      supported_catalogs: ["enterprise"],
+      supported_widgets: ["Text"],
+    },
+  });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: unknown; a2ui_rejection_reason?: string }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, false);
+  assert.equal(welcome.a2ui, null);
+  assert.equal(welcome.a2ui_rejection_reason, "catalog_mismatch");
+  assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+});
+
+test("ws: A2UI-enabled server does not negotiate when client omits a2ui_version", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const agentId = seedAgent(shim.stateDir, { id: `agent-no-a2ui-${Date.now()}` });
+  seedConversation(shim.stateDir, agentId);
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+  const welcome = conn.frames.find((f) => f.type === "welcome") as unknown as
+    | { a2ui_negotiated?: boolean; a2ui?: unknown; a2ui_rejection_reason?: string }
+    | undefined;
+  assert.ok(welcome, "welcome frame must be present");
+  assert.equal(welcome.a2ui_negotiated, false);
+  assert.equal(welcome.a2ui, null);
+  assert.equal(welcome.a2ui_rejection_reason, undefined);
+  assert.equal(conn.frames.some((f) => f.type === "a2ui_capabilities"), false);
+
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: externalConvId(agentId),
+    text: "show approval card",
+    otid: "cm-no-a2ui-schema",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  assert.equal(turn.some((f) => f.type === "a2ui_frame"), false);
+});
+
+test("ws: inbound A2UI frames are rejected when A2UI was not negotiated", async (t) => {
+  const shim = await startShim({ env: { A2UI_ENABLED: "1", A2UI_VERSION: "0.9", A2UI_CATALOG_ID: "basic" } });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+
+  conn.send({ type: "user_action", name: "tool_approval_choice", context: {} });
+  const userActionErr = await conn.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { code?: string; message?: string };
+  assert.equal(userActionErr.code, "protocol_violation");
+  assert.match(userActionErr.message ?? "", /negotiated A2UI/);
+  assert.equal(conn.closed, false, "socket remains open after soft protocol error");
+
+  const conn2 = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn2.close());
+
+  conn2.send({ type: "a2ui_frame", ok: true, a2ui: { version: "v0.9" } });
+  const a2uiFrameErr = await conn2.waitFor("error", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { code?: string; message?: string };
+  assert.equal(a2uiFrameErr.code, "protocol_violation");
+  assert.match(a2uiFrameErr.message ?? "", /server-to-client/);
+  assert.equal(conn2.closed, false, "socket remains open after soft protocol error");
 });
 
 // ─── 2. Auth failure ────────────────────────────────────────────────
@@ -203,6 +356,28 @@ test("ws: send_message → turn_started → assistant_message → stop_reason �
   // Order: turn_started first; turn_done last.
   assert.equal(types[0], "turn_started", "turn_started must be the first frame of the turn");
   assert.equal(types[types.length - 1], "turn_done", "turn_done must be the last frame of the turn");
+});
+
+test("ws: cached legacy agent id aliases to active local backend agent", async (t) => {
+  const canonicalAgentId = "agent-local-ffa3a92b-f5d6-45e1-8866-f3c965a92133";
+  const staleAgentId = "agent-597b5756-2915-4560-ba6b-91005f085166";
+  const { shim, conn } = await setupAuthed(t, { agentId: canonicalAgentId });
+
+  conn.send({
+    type: "send_message",
+    agent_id: staleAgentId,
+    conversation_id: "default",
+    text: "reply with one word: pong",
+    otid: "cm-stale-agent-alias",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const assistantText = turn
+    .filter((f) => f.type === "assistant_message")
+    .map((f) => typeof f["content"] === "string" ? f["content"] : "")
+    .join("");
+  assert.match(assistantText, /pong/i, "aliased stale id must still produce assistant output");
+  assert.match(shim.readLog(), new RegExp(`spawned key=${canonicalAgentId}::default`));
+  assert.doesNotMatch(shim.readLog(), /Agent agent-597b5756-2915-4560-ba6b-91005f085166 not found|pool spawn timeout/);
 });
 
 // ─── 5. Tool call forwarded ────────────────────────────────────────
@@ -630,6 +805,241 @@ test("ws: assistant_message chunks concatenate to the full reply (lcp-cv3 stream
   }
 });
 
+// ─── 18a. assistant_message pure-delta contract (anti-snapshot) ────────
+
+test("ws: assistant_message chunks are pure deltas — no chunk is a snapshot of accumulated content (lcp-cv3 contract)", async (t) => {
+  // The lcp-cv3 contract: assistant_message frames over WS are PURE DELTAS.
+  // Each chunk's `content` is the newly-emitted tokens since the previous
+  // chunk with the same envelope id — NOT a cumulative snapshot of the
+  // logical message.
+  //
+  // This invariant was implicit (a comment in mobile-channel-host.ts) and
+  // unenforced until 2026-05-19 — when the REST-vs-WS race (lcp-r0m) made
+  // it visible by causing snapshots to land on the same serverId as live
+  // deltas. The client's `oldText + newText` merge produced incoherent text
+  // (the "StandStanding by..." repro).
+  //
+  // This test pins the contract at the WS boundary: for every group of
+  // chunks sharing an envelope id, no chunk's content may equal or be a
+  // strict prefix of the accumulated content from earlier chunks in that
+  // group. If a snapshot ever leaks through this gate, mobile's merge
+  // would double-append it. Catching it here means it never reaches a
+  // mobile build that lacks defensive merging (the gz2b backport).
+  //
+  // Companion tests:
+  //   - "lcp-cv3 streaming" (above): verifies chunks concatenate.
+  //   - "lcp-pro dedup bridge" (below): verifies monotonic seq_id.
+  //   - "lcp-r0m REST /messages drops in-flight content": verifies the
+  //     race source is gated.
+  const { conn, agentId, convId } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "bullet list three things about TCP/IP", // multi-step → multiple chunks
+    otid: "cm-ws-pure-delta",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const assistants = turn.filter((f) => f.type === "assistant_message") as unknown as Array<{
+    id?: string; content?: string;
+  }>;
+  assert.ok(assistants.length > 0, "at least one assistant_message must arrive");
+
+  // Group chunks by envelope id, in arrival order.
+  const groups = new Map<string, Array<string>>();
+  for (const a of assistants) {
+    const id = a.id ?? "";
+    const list = groups.get(id) ?? [];
+    list.push(a.content ?? "");
+    groups.set(id, list);
+  }
+
+  // For each group, walk the chunks in order. After each chunk, the
+  // accumulated content is `chunks[0] + chunks[1] + ...`. The next chunk
+  // MUST NOT be:
+  //   - equal to the accumulated content so far (a republished snapshot)
+  //   - a strict prefix of the accumulated content (a stale earlier
+  //     snapshot landing late)
+  //   - a string for which the accumulated content is a strict prefix
+  //     (i.e. the chunk is itself a snapshot starting with the old buffer
+  //     plus new tail — this is the exact "StandStanding by..." shape if
+  //     the client appends it as a delta).
+  // The only allowed shape for a non-empty chunk is a TRUE DELTA: text
+  // that, when appended, produces strictly new content.
+  for (const [groupId, chunks] of groups) {
+    let accumulated = "";
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i] ?? "";
+      // Empty chunks are allowed (e.g. tag-only chunks under A2UI splitter
+      // emit empty conversational text on some flushes). Skip them.
+      if (chunk.length === 0) {
+        continue;
+      }
+      // After the first chunk, every subsequent non-empty chunk must be a
+      // true delta against the accumulator.
+      if (accumulated.length > 0) {
+        assert.notEqual(
+          chunk,
+          accumulated,
+          `group ${groupId} chunk ${i}: chunk content equals the accumulated buffer — that's a snapshot, not a delta`,
+        );
+        assert.ok(
+          !accumulated.startsWith(chunk),
+          `group ${groupId} chunk ${i}: chunk content is a strict prefix of accumulated buffer (stale snapshot landing late)`,
+        );
+        assert.ok(
+          !chunk.startsWith(accumulated),
+          `group ${groupId} chunk ${i}: chunk content starts with the accumulated buffer (cumulative snapshot, not a pure delta). ` +
+          `If this fires, the WS path leaked a snapshot frame. Expected pure delta. ` +
+          `accumulated=${JSON.stringify(accumulated.slice(0, 80))}... ` +
+          `chunk=${JSON.stringify(chunk.slice(0, 80))}...`,
+        );
+      }
+      accumulated += chunk;
+    }
+    assert.ok(accumulated.length > 0, `group ${groupId} accumulated to empty content`);
+  }
+});
+
+// ─── 18b. assistant_message carries monotonic seq_id (lcp-pro) ─────────
+
+test("ws: assistant_message chunks carry monotonic seq_id (lcp-pro dedup bridge)", async (t) => {
+  const { conn, agentId, convId } = await setupAuthed(t);
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "reply with pong",
+    otid: "cm-ws-seq",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  // lcp-pro: stamp the per-run `seq` value as `seq_id` on every
+  // assistant_message and reasoning_message frame so the mobile client's
+  // existing hasAlreadyIngestedStreamFrame dedup gate fires on the WS path.
+  // Without this, duplicate deltas from reconnect-replay or WS-vs-REST race
+  // append silently and produce incoherent text (the 2026-05-19 evening
+  // "Hello worldHello world" repro).
+  const assistants = turn.filter((f) => f.type === "assistant_message") as unknown as Array<{
+    seq?: number | null;
+    seq_id?: number | null;
+  }>;
+  assert.ok(assistants.length > 0, "at least one assistant_message must arrive");
+  // Every chunk must carry a numeric seq_id (the per-run cursor stamped by
+  // the host's emit()). Strictly increasing across the turn — earlier chunks
+  // have smaller seq_id than later chunks. seq_id is also a strict alias of
+  // `seq` (the per-run frame counter); if upstream supplies its own seq_id
+  // the shim overwrites with the authoritative shim value so the gate's
+  // monotonicity invariant holds across synthetic frames (splitter flush,
+  // a2ui_frame siblings, etc).
+  let prev = -Infinity;
+  for (const a of assistants) {
+    assert.ok(
+      typeof a.seq_id === "number",
+      `assistant_message must carry numeric seq_id, got: ${a.seq_id}`,
+    );
+    assert.equal(
+      a.seq_id,
+      a.seq,
+      `seq_id must alias seq (got seq_id=${a.seq_id} seq=${a.seq})`,
+    );
+    assert.ok(
+      (a.seq_id as number) > prev,
+      `seq_id must be strictly increasing across the turn (got ${a.seq_id} after ${prev})`,
+    );
+    prev = a.seq_id as number;
+  }
+});
+
+// ─── 18b'. seq_id alias also fires on a2ui-driven flushes ──────────────
+
+test("ws: seq_id alias survives a2ui-enabled turn (splitter flush gets seq_id, not null)", async (t) => {
+  // Force the a2ui-card fixture so the splitter runs end-to-end. The
+  // end-of-turn flush in mobile-channel-host emits an assistant_message
+  // for any text the splitter held back behind a partial tag; that synthetic
+  // frame must also carry a non-null seq_id, otherwise mobile's dedup gate
+  // goes back to dead-code on the very last delta of every a2ui turn.
+  const { conn, agentId, convId } = await setupAuthed(t, {
+    env: { LETTA_MOCK_FORCE_TRACE: "a2ui-card" },
+  });
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "show an approval card",
+    otid: "cm-ws-seq-a2ui",
+    a2ui_capability: { version: "0.9", catalog: "basic" },
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const assistants = turn.filter((f) => f.type === "assistant_message") as unknown as Array<{
+    seq?: number | null;
+    seq_id?: number | null;
+  }>;
+  // Empty assistants is fine for some a2ui-only outputs, but the seq alias
+  // must hold for every one present.
+  for (const a of assistants) {
+    assert.ok(
+      typeof a.seq_id === "number",
+      `a2ui-path assistant_message must carry numeric seq_id (got ${a.seq_id})`,
+    );
+    assert.equal(a.seq_id, a.seq, `seq_id must equal seq on a2ui path`);
+  }
+});
+
+// ─── 18c. REST /messages drops in-flight content during a WS turn ─────
+
+test("ws: REST /messages drops in-flight content during a WS turn (lcp-r0m)", async (t) => {
+  // Slow the mock so the turn stays in-flight long enough to issue a REST
+  // GET and observe filtering. Same trick as the cancel/single-flight tests.
+  const { shim, conn, agentId, convId } = await setupAuthed(t, {
+    env: { LETTA_MOCK_DELAY_MS: "200" },
+  });
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "reply with pong",
+    otid: "cm-ws-r0m",
+  });
+  // Wait for at least one assistant_message chunk so the run has registered
+  // at least one persisted message in RunRecord.message_ids.
+  let sawAssistantChunk = false;
+  const startWait = Date.now();
+  while (Date.now() - startWait < WS_TIMEOUT_MS) {
+    if (conn.frames.some((f) => f.type === "assistant_message")) {
+      sawAssistantChunk = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(sawAssistantChunk, "should observe at least one assistant_message before REST poll");
+  // Issue REST GET /v1/conversations/{convId}/messages while the turn is
+  // still in flight. The handler must filter out in-flight messages so the
+  // client never sees a cumulative snapshot that races the WS deltas.
+  const restUrl = new URL(`/v1/conversations/${convId}/messages?limit=250&order=desc`, shim.url!);
+  const resp = await fetch(restUrl, {
+    headers: { authorization: `Bearer ${shim.mobileToken}` },
+  });
+  assert.equal(resp.status, 200, "REST /messages must succeed during in-flight turn");
+  const items = await resp.json() as Array<{ id?: string; message_type?: string; content?: unknown }>;
+  // Any in-flight assistant_message MUST NOT appear. The in-flight set is
+  // populated by recordRunMessage as letta-code persists each message
+  // mid-turn; the REST handler consults inFlightMessageIds(agentId, convId)
+  // and filters the response. If we see an assistant_message here with
+  // content matching the active stream, the filter regressed.
+  const restAssistants = items.filter((m) => m.message_type === "assistant_message");
+  assert.equal(
+    restAssistants.length,
+    0,
+    `REST /messages must drop in-flight assistant_messages (got ${restAssistants.length})`,
+  );
+  // Let the turn complete cleanly so the test's afterEach doesn't dangle.
+  // (We don't assert post-turn_done REST shape here — the mock doesn't
+  // append to messages.jsonl on its own, so a positive disk assertion
+  // needs a different setup path. See "otid in send_message propagates"
+  // for the pattern when a disk-state assertion is needed.)
+  await conn.waitFor("turn_done", { timeoutMs: WS_TIMEOUT_MS });
+});
+
 // ─── 19. turn_started carries agent + conv ids ──────────────────────
 
 test("ws: turn_started includes agent_id, conversation_id, turn_id", async (t) => {
@@ -714,6 +1124,36 @@ test("ws: lcp-srk — turn_done carries lossy=false + drop_count=0 on a clean tu
   // lcp-gs2: error fields are present but null on non-failed turns.
   assert.equal(done.error_code, null, "error_code null on completed turn");
   assert.equal(done.error_message, null, "error_message null on completed turn");
+});
+
+test("ws: stop_reason=error emits error frame and failed turn_done", async (t) => {
+  const { conn, agentId, convId } = await setupAuthed(t, {
+    env: { LETTA_MOCK_STOP_REASON: "error" },
+  });
+  conn.send({
+    type: "send_message",
+    agent_id: agentId,
+    conversation_id: convId,
+    text: "reply with pong",
+    otid: "cm-ws-stop-error",
+  });
+  const turn = await conn.collectTurn({ timeoutMs: WS_TIMEOUT_MS });
+  const err = turn.find((f) => f.type === "error") as unknown as
+    { code?: string; message?: string; run_id?: string | null } | undefined;
+  const stop = turn.find((f) => f.type === "stop_reason") as unknown as
+    { stop_reason?: string; run_id?: string | null } | undefined;
+  const done = turn.find((f) => f.type === "turn_done") as unknown as
+    { status?: string; error_code?: string | null; error_message?: string | null; run_id?: string | null } | undefined;
+
+  assert.ok(err, "upstream stop_reason=error must produce an explicit error frame");
+  assert.equal(err.code, "internal_error");
+  assert.match(err.message ?? "", /stop_reason=error/);
+  assert.equal(stop?.stop_reason, "error", "original stop_reason must still pass through");
+  assert.equal(done?.status, "failed", "turn_done must make the terminal failure authoritative");
+  assert.equal(done?.error_code, "internal_error");
+  assert.match(done?.error_message ?? "", /stop_reason=error/);
+  assert.ok(done?.run_id, "failed turn_done must still carry the shim run_id");
+  assert.equal(err.run_id, done?.run_id, "error frame and turn_done must refer to the same run");
 });
 
 // ─── 21c. lcp-sep: tool_call frames may stream progressive args ────

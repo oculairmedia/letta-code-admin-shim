@@ -1,0 +1,6 @@
+Intro text with a split-looking marker <a2ui-jso before the real block.
+<a2ui-json>{"version":"v0.9","createSurface":{"surfaceId":"approval-1","catalogId":"basic"}}</a2ui-json>
+Malformed follows and must surface as !ok:
+<a2ui-json>{"version":"v0.9","createSurface":</a2ui-json>
+Trailing unclosed block is dropped:
+<a2ui-json>{"version":"v0.9","deleteSurface":{"surfaceId":"approval-1"}}

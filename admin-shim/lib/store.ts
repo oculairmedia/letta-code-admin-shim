@@ -49,7 +49,12 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
     await fsWriteFile(tmp, payload);
     await fsRename(tmp, path);
   } catch (err) {
-    try { await fsUnlink(tmp); } catch {}
+    try {
+      await fsUnlink(tmp);
+    } catch (cleanupErr) {
+      const msg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      console.warn(`[store] failed to remove temp json file ${tmp}: ${msg}`);
+    }
     throw err;
   }
 }
@@ -193,6 +198,19 @@ async function readJsonlOrEmptyAsync(path: string): Promise<unknown[]> {
   }
 }
 
+function readJsonlOrEmpty(path: string): unknown[] {
+  try {
+    const raw = readFileSync(path, "utf8");
+    return raw
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as unknown);
+  } catch {
+    return [];
+  }
+}
+
 // ── Type guards ───────────────────────────────────────────────────────
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -301,7 +319,7 @@ function conversationKey(conversationId: string, agentId: string): string {
     : `conversation:${conversationId}`;
 }
 
-export function listConversationsForAgent(agentId: string): OnDiskConversation[] {
+export async function listConversationsForAgent(agentId: string): Promise<OnDiskConversation[]> {
   const root = join(storageDir(), "conversations");
   if (!existsSync(root)) return [];
   const out: OnDiskConversation[] = [];
@@ -319,17 +337,18 @@ export function listConversationsForAgent(agentId: string): OnDiskConversation[]
       continue;
     const conv = readJsonOrNull(join(root, dirName, "conversation.json"));
     if (!isConversationOnDisk(conv) || conv.agent_id !== agentId) continue;
-    out.push(conv);
+    out.push(await withRealTimes(conv));
   }
   return out;
 }
 
-// lcp-5e5: dir-mtime cache of the conversation list. Same staleness
-// caveat as listAgents — content-only updates to an existing
-// conversation.json (e.g. last_message_at bumps) don't invalidate.
-// Per-conv detail fetches (getConversation, listConversationsForAgent)
-// bypass this cache and read the file directly, so detail freshness
-// is preserved.
+// lcp-5e5 + lcp-5ky: dir-mtime cache of the conversation list. The
+// dir-mtime check catches conv-add and conv-remove, but content-only
+// writes to an existing conversation.json (e.g. last_message_at bumps
+// during a turn) don't change the parent dir's mtime and would silently
+// serve stale timestamps. The writer path (bumpConversationLastMessageAt)
+// calls .invalidate() to drop the cached snapshot — that keeps the
+// mobile conversations list correctly ordered by recent activity.
 const _listAllConversationsCached = makeDirMtimeCache(
   () => join(storageDir(), "conversations"),
   async () => {
@@ -339,7 +358,7 @@ const _listAllConversationsCached = makeDirMtimeCache(
     for (const dirName of await fsReaddir(root)) {
       const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
       if (!isConversationOnDisk(conv)) continue;
-      out.push(conv);
+      out.push(await withRealTimes(conv));
     }
     return out;
   },
@@ -375,17 +394,35 @@ export function listAllConversations(): Promise<OnDiskConversation[]> {
  * lcp-5e5 (listAgents / listAllConversations — staleness window is
  * acceptable for mobile's poll cadence; see those callers).
  */
+interface DirMtimeCache<T> {
+  (): Promise<T>;
+  /**
+   * Drop the cached snapshot so the next caller re-runs the loader. Use
+   * after a content-only write that wouldn't bump the directory's mtime
+   * (e.g. updating a field inside an existing child file).
+   */
+  invalidate: () => void;
+}
+
 function makeDirMtimeCache<T>(
   rootFn: () => string,
   loader: () => Promise<T>,
-): () => Promise<T> {
+): DirMtimeCache<T> {
   let cached: T | null = null;
   let cachedMtimeMs = -1;
   let inflight: Promise<T> | null = null;
-  return async () => {
+  const fn = async (): Promise<T> => {
     const root = rootFn();
     let mtimeMs = -1;
-    try { mtimeMs = (await fsStat(root)).mtimeMs; } catch {}
+    try {
+      mtimeMs = (await fsStat(root)).mtimeMs;
+    } catch (err) {
+      const code = err instanceof Error && "code" in err ? (err as { code?: unknown }).code : undefined;
+      if (code !== "ENOENT") {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[store] failed to stat cache root ${root}: ${msg}`);
+      }
+    }
     if (cached !== null && mtimeMs === cachedMtimeMs) return cached;
     if (inflight) return inflight;
     const expectedMtimeMs = mtimeMs;
@@ -401,6 +438,11 @@ function makeDirMtimeCache<T>(
     })();
     return inflight;
   };
+  (fn as DirMtimeCache<T>).invalidate = () => {
+    cached = null;
+    cachedMtimeMs = -1;
+  };
+  return fn as DirMtimeCache<T>;
 }
 
 // lcp-efg cache: external conv id -> ResolvedConversation. Invalidated when
@@ -439,7 +481,7 @@ export async function getConversation(externalId: string, agentIdHint?: string |
     const key = conversationKey(externalId, agentIdHint);
     const dir = join(storageDir(), "conversations", b64url(key));
     const conv = await readJsonOrNullAsync(join(dir, "conversation.json"));
-    if (isConversationOnDisk(conv)) return conv;
+    if (isConversationOnDisk(conv)) return withRealTimes(conv);
   }
   // Mobile's external id may be `conv-default-{agentId}` → translate.
   const resolved = await resolveConversationId(externalId);
@@ -447,7 +489,7 @@ export async function getConversation(externalId: string, agentIdHint?: string |
   const key = conversationKey(resolved.conversationId, resolved.agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
   const conv = await readJsonOrNullAsync(join(dir, "conversation.json"));
-  return isConversationOnDisk(conv) ? conv : null;
+  return isConversationOnDisk(conv) ? withRealTimes(conv) : null;
 }
 
 export async function getAgentIdForConversation(externalId: string): Promise<string | null> {
@@ -471,6 +513,21 @@ export async function listMessages(
   }
   if (limit && limit > 0) scoped = scoped.slice(-limit);
   return scoped;
+}
+
+/**
+ * lcp-pgw: synchronous variant of `listMessages` for use in synchronous
+ * callbacks (e.g. onFrame) that can't await. Same normalization pipeline;
+ * no limit/before support — callers filter externally.
+ */
+export function listMessagesSync(
+  conversationId: string,
+  agentId: string,
+): LocalMessage[] {
+  const key = conversationKey(conversationId, agentId);
+  const dir = join(storageDir(), "conversations", b64url(key));
+  const items = readJsonlOrEmpty(join(dir, "messages.jsonl"));
+  return items.map(normalizeMessage).filter(isLocalMessage);
 }
 
 export function readSystemPrompt(conversationId: string, agentId: string): unknown {
@@ -506,6 +563,49 @@ export async function readMessageTimestamps(conversationId: string, agentId: str
   const path = timestampSidecarPath(conversationId, agentId);
   const raw = await readJsonOrNullAsync(path);
   return isStringRecord(raw) ? raw : {};
+}
+
+// lcp-dfz: derive the effective last_message_at from the sidecar. letta-code's
+// in-process LocalStore rewrites conversation.json at end-of-turn with sentinel
+// dates (2026-01-01T00:00:<seqIndex+1>.000Z), clobbering whatever
+// bumpConversationLastMessageAt wrote ~seconds earlier. The sidecar is the only
+// file letta-code never touches, so it's the race-free source of truth.
+async function maxRealMessageTime(conversationId: string, agentId: string): Promise<string> {
+  const map = await readMessageTimestamps(conversationId, agentId);
+  let max = "";
+  for (const iso of Object.values(map)) {
+    if (typeof iso === "string" && iso > max) max = iso;
+  }
+  return max;
+}
+
+/**
+ * Return a conv record whose last_message_at / updated_at reflect the
+ * sidecar's max real timestamp if it's newer than what's on disk.
+ *
+ * Pure substitution — never writes. Run on every read path that projects to
+ * the wire so the conversations list sorts by real recent activity.
+ */
+// lcp-28r: the CLI's local-backend mode uses 2026-01-01T... as a
+// deterministic monotonic sentinel. Any date matching this prefix is
+// implausible and should be replaced with a real fallback.
+function isSentinelDate(iso: unknown): boolean {
+  return typeof iso === "string" && iso.startsWith("2026-01-01T");
+}
+
+async function withRealTimes(conv: OnDiskConversation): Promise<OnDiskConversation> {
+  const max = await maxRealMessageTime(conv.id, conv.agent_id);
+  let last = typeof conv.last_message_at === "string" ? conv.last_message_at : "";
+  let updated = typeof conv.updated_at === "string" ? conv.updated_at : "";
+  const created = typeof conv.created_at === "string" ? conv.created_at : "";
+  // lcp-28r: if the on-disk values are CLI sentinels, substitute the
+  // sidecar max, then created_at, then current time — in that order.
+  if (isSentinelDate(last)) last = max || created || new Date().toISOString();
+  if (isSentinelDate(updated)) updated = max || created || new Date().toISOString();
+  if (max && max > last) last = max;
+  if (max && max > updated) updated = max;
+  if (last === conv.last_message_at && updated === conv.updated_at) return conv;
+  return { ...conv, last_message_at: last, updated_at: updated };
 }
 
 // Mobile reconciles its optimistic Local user bubble against the server-issued
@@ -626,10 +726,17 @@ export async function stampNewMessages(
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[store] stamp sidecar write failed for ${conversationId}: ${msg}`);
     }
-    // lcp-pwz: bump conversation.json's last_message_at / updated_at so the
-    // mobile conversations list (sorted by last_message_at) reflects real
-    // recent activity. Without this, both fields stay frozen at conv-create
-    // time and the list order is wrong forever.
+    // lcp-dfz: invalidate the list cache as soon as the sidecar is on disk.
+    // Read paths derive last_message_at from this sidecar (see withRealTimes)
+    // so the next GET /v1/conversations rebuilds with the fresh max time —
+    // even if bumpConversationLastMessageAt below loses its race with
+    // letta-code's end-of-turn conversation.json rewrite.
+    _listAllConversationsCached.invalidate();
+    // lcp-pwz: also try to persist the bump to conversation.json. Best-effort
+    // — letta-code's LocalStore commonly rewrites conversation.json a few
+    // seconds later with sentinel dates, clobbering this. The read-time
+    // substitution above is the load-bearing fix; this write just keeps
+    // disk-state consistent for external readers when no race occurs.
     await bumpConversationLastMessageAt(conversationId, agentId, maxStampedIso);
   }
 }
@@ -656,6 +763,9 @@ async function bumpConversationLastMessageAt(
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[store] conversation.json bump failed for ${conversationId}: ${msg}`);
   }
+  // Cache invalidation lives in the caller (stampNewMessages) so it fires
+  // regardless of whether this best-effort persistent write wins or loses
+  // the race with letta-code's end-of-turn conversation.json rewrite.
 }
 
 export function readBlocksForAgent(agentId: string): Block[] {

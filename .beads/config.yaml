@@ -52,3 +52,7 @@
 # - linear.api-key
 # - github.org
 # - github.repo
+
+# sync.remote: "git+https://github.com/oculairmedia/letta-code-admin-shim.git"
+
+federation.remote: "git+https://github.com/oculairmedia/letta-code-admin-shim.git"

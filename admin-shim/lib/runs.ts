@@ -77,6 +77,24 @@ export interface RunHandle {
   record: RunRecord;
   hrStart: [number, number];
   firstTokenSet: boolean;
+  // lcp-p74.1: monotonic seq per run for frames.jsonl. Not persisted on the
+  // record — seq is implicit in file line position; this is just a writer-side
+  // counter to avoid re-stat'ing the file on every append.
+  frameCount: number;
+  // lcp-r0m: per-turn set of otids currently being streamed by this run.
+  // Populated from frames during the stream (applyFrameRunSideEffects);
+  // useful for any consumer that keys by otid (and a forward seam for
+  // mobile if/when its merger starts keying merges off the wire otid).
+  // Not persisted — purely turn-life transient.
+  inFlightOtids: Set<string>;
+  // lcp-r0m: snapshot of LocalMessage ids that existed on disk BEFORE
+  // this turn started. The REST /messages handler subtracts the union of
+  // these (across all active runs for the (agent, conv) pair) from the
+  // currently-on-disk id list — any id NOT in the snapshot is in-flight
+  // and must be dropped from the projection so mobile's REST hydrate
+  // doesn't race the WS delta stream for the same logical message.
+  // Populated at runTurn entry, never re-read on disk.
+  messageIdsAtTurnStart: Set<string>;
 }
 
 /**
@@ -99,6 +117,13 @@ export interface CreateRunOptions {
   agentId?: string | null;
   conversationId?: string | null;
   onCancel?: (reason: string) => void;
+  /**
+   * lcp-4tv: when true, mark the run as "background" so list filters
+   * (`/v1/runs?background=true`) can distinguish operator-initiated /
+   * cron-driven turns from user-initiated ones. Defaults to false to
+   * match the prior hardcoded behavior.
+   */
+  background?: boolean;
 }
 
 /** Argument bag for finalizeRun. */
@@ -201,6 +226,14 @@ function stepsFile(runId: string): string {
   return join(runDir(runId), "steps.jsonl");
 }
 
+function framesFile(runId: string): string {
+  return join(runDir(runId), "frames.jsonl");
+}
+
+function userActionsFile(runId: string): string {
+  return join(runDir(runId), "user-actions.jsonl");
+}
+
 /**
  * Best-effort read of a JSON file. Returns `null` on any error
  * (missing, malformed, permission). Caller is responsible for narrowing
@@ -284,12 +317,12 @@ export function toWireRun(record: RunRecord): Run {
  * caller (agent-pool) registers it to SIGTERM the worker; we keep it out
  * of the persisted record because functions don't serialize.
  */
-export function createRun({ agentId, conversationId, onCancel }: CreateRunOptions = {}): RunHandle {
+export function createRun({ agentId, conversationId, onCancel, background }: CreateRunOptions = {}): RunHandle {
   const id = `run-${randomUUID()}`;
   const record: RunRecord = {
     id,
     agent_id: agentId ?? null,
-    background: false,
+    background: background ?? false,
     base_template_id: null,
     callback_error: null,
     callback_sent_at: null,
@@ -315,6 +348,9 @@ export function createRun({ agentId, conversationId, onCancel }: CreateRunOption
     record,
     hrStart,
     firstTokenSet: false,
+    frameCount: 0,
+    inFlightOtids: new Set<string>(),
+    messageIdsAtTurnStart: new Set<string>(),
   };
   _activeRuns.set(id, handle);
   if (typeof onCancel === "function") {
@@ -355,6 +391,38 @@ export function recordRunMessage(
   handle.record.message_ids.push(localMessageId);
 }
 
+/**
+ * lcp-r0m: stamp an otid into the run's in-flight set as soon as a
+ * streamed frame referencing it goes past. Called by
+ * `applyFrameRunSideEffects` per-frame; lets the REST /messages handler
+ * filter out the corresponding disk record while the WS stream is still
+ * delivering deltas for it. Idempotent — same otid in the same turn is
+ * a normal multi-frame case (assistant_message chunks share an otid).
+ */
+export function recordRunOtid(
+  handle: RunHandle | null | undefined,
+  otid: string | null | undefined,
+): void {
+  if (!handle || !otid) return;
+  handle.inFlightOtids.add(otid);
+}
+
+/**
+ * lcp-r0m: snapshot the LocalMessage ids that existed on disk BEFORE
+ * this turn started. Caller (adapter._runTurnInner) computes this once
+ * via listMessages right before the first send, then hands it to the
+ * run handle via this setter. The REST /messages filter uses it to
+ * decide which currently-on-disk ids are mid-flight (= NOT in the
+ * snapshot of any active run).
+ */
+export function setMessageIdsAtTurnStart(
+  handle: RunHandle | null | undefined,
+  ids: Iterable<string>,
+): void {
+  if (!handle) return;
+  handle.messageIdsAtTurnStart = new Set(ids);
+}
+
 export function recordRunTool(
   handle: RunHandle | null | undefined,
   toolName: string | null | undefined,
@@ -362,6 +430,284 @@ export function recordRunTool(
   if (!handle || !toolName) return;
   if (handle.record.tools_used.includes(toolName)) return;
   handle.record.tools_used.push(toolName);
+}
+
+/**
+ * Phase 5: append a user_action sidecar entry under
+ * `state/runs/<run-id>/user-actions.jsonl`. Channel adapters call this
+ * when an A2UI user_action frame arrives. The shim does NOT yet inject
+ * the action into letta-code's tool dispatcher — that integration lives
+ * in a follow-up bead once letta-code exposes a stable approval API.
+ * Until then the sidecar is the canonical record and downstream callers
+ * (debug tooling, replay) read it directly.
+ *
+ * `runId` may be null when the action lands outside a turn; the entry
+ * is still appended under a deterministic `unbound-<sessionId>` bucket
+ * so the audit trail is preserved.
+ */
+export function recordA2uiUserAction(entry: {
+  run_id: string | null;
+  session_id: string;
+  turn_id: string | null;
+  surface_id: string | null;
+  component_id?: string | null;
+  name: string;
+  context: Record<string, unknown>;
+  action_id: string;
+  routed_as?: "approval" | "synthetic_input" | "recorded_only";
+}): void {
+  const bucket = entry.run_id ?? `unbound-${entry.session_id}`;
+  try {
+    mkdirSync(runDir(bucket), { recursive: true });
+    appendFileSync(
+      userActionsFile(bucket),
+      JSON.stringify({ ...entry, recorded_at: nowIso() }) + "\n",
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] user-action append failed for ${bucket}: ${msg}`);
+  }
+}
+
+/**
+ * lcp-p74.2: absolute path to a run's frames.jsonl. May not exist yet.
+ * Exported so the subscribe reader/tail (subscribeToRun) can resolve the
+ * file without duplicating the storageDir + runDir logic.
+ */
+export function getFramesFilePath(runId: string): string {
+  return framesFile(runId);
+}
+
+/**
+ * lcp-p74.1: append a single frame to <run-dir>/frames.jsonl with a
+ * monotonic seq. Each line: { seq, ts, frame }. Returns the seq assigned to
+ * this frame (or -1 if the run isn't tracked — caller can ignore for
+ * fire-and-forget cases).
+ *
+ * Atomicity: one appendFileSync per line. POSIX guarantees atomic appends
+ * for writes ≤ PIPE_BUF (4 KiB); single-writer-per-run holds for the agent
+ * pool's serialized turns, so larger frames are also safe in practice.
+ */
+export function appendRunFrame(runId: string, frame: unknown): { seq: number } {
+  const handle = _activeRuns.get(runId);
+  if (!handle) return { seq: -1 };
+  handle.frameCount += 1;
+  const seq = handle.frameCount;
+  const line = JSON.stringify({ seq, ts: nowIso(), frame }) + "\n";
+  try {
+    mkdirSync(runDir(runId), { recursive: true });
+    appendFileSync(framesFile(runId), line);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] frame append failed for ${runId}: ${msg}`);
+  }
+  return { seq };
+}
+
+/**
+ * Approval decision scope: Once (single call), Session (all calls in this
+ * conversation), Forever (all calls across all conversations), or Deny.
+ */
+export type ApprovalScope = "Once" | "Session" | "Forever" | "Deny";
+
+/**
+ * Approval decision record persisted to sidecar JSONL.
+ */
+export interface ApprovalDecisionRecord {
+  action_id: string;
+  tool_name: string;
+  decision: "approve" | "deny" | "timeout";
+  scope: ApprovalScope;
+  reason: string;
+  timestamp: string;
+  user_id?: string;
+  recorded_at: string;
+}
+
+export interface ApprovalScopeCacheEntry {
+  scope: Extract<ApprovalScope, "Session" | "Forever">;
+  timestamp: string;
+}
+
+interface ApprovalPolicyRecord {
+  tool_name: string;
+  scope: Extract<ApprovalScope, "Session" | "Forever">;
+  conversation_id: string | null;
+  timestamp: string;
+  run_id: string;
+  action_id: string;
+  user_id?: string;
+}
+
+/**
+ * Record an approval decision to the sidecar JSONL file.
+ * Append-only; no read-modify-write race.
+ */
+export function recordApprovalDecision(
+  runId: string,
+  entry: Omit<ApprovalDecisionRecord, "recorded_at">,
+): void {
+  try {
+    mkdirSync(runDir(runId), { recursive: true });
+    appendFileSync(
+      approvalDecisionsFile(runId),
+      JSON.stringify({ ...entry, recorded_at: nowIso() }) + "\n",
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-decision append failed for ${runId}: ${msg}`);
+  }
+}
+
+/**
+ * Persist reusable approval scopes. `Session` is keyed to the conversation;
+ * `Forever` is global. The append-only audit trail remains
+ * approval-decisions.jsonl under the run; this compact JSON file is the fast
+ * policy cache used at turn start.
+ */
+export function recordApprovalPolicy(
+  runId: string,
+  conversationId: string | null | undefined,
+  entry: {
+    action_id: string;
+    tool_name: string;
+    scope: Extract<ApprovalScope, "Session" | "Forever">;
+    timestamp: string;
+    user_id?: string;
+  },
+): void {
+  try {
+    const path = approvalsFile();
+    const existing = readApprovalPolicies(path);
+    const nextRecord: ApprovalPolicyRecord = {
+      tool_name: entry.tool_name,
+      scope: entry.scope,
+      conversation_id: entry.scope === "Session" ? conversationId ?? null : null,
+      timestamp: entry.timestamp,
+      run_id: runId,
+      action_id: entry.action_id,
+      ...(entry.user_id ? { user_id: entry.user_id } : {}),
+    };
+    const filtered = existing.filter((record) => {
+      if (record.tool_name !== nextRecord.tool_name) return true;
+      if (nextRecord.scope === "Forever") return record.scope !== "Forever";
+      return !(record.scope === "Session" && record.conversation_id === nextRecord.conversation_id);
+    });
+    mkdirSync(storageDir(), { recursive: true });
+    writeFileSync(path, JSON.stringify([...filtered, nextRecord], null, 2) + "\n");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-policy write failed for ${runId}: ${msg}`);
+  }
+}
+
+/**
+ * Load approval decisions from sidecar and build a scope cache.
+ * Returns a map of tool_name → { scope, timestamp } for Session/Forever decisions.
+ * Used at turn-start to auto-approve cached decisions without user round-trip.
+ */
+export function loadApprovalScopeCache(
+  runId: string,
+  conversationId: string | null = null,
+): Map<string, ApprovalScopeCacheEntry> {
+  const cache = new Map<string, ApprovalScopeCacheEntry>();
+  try {
+    for (const record of readApprovalPolicies(approvalsFile())) {
+      if (record.scope === "Forever" || record.conversation_id === conversationId) {
+        cache.set(record.tool_name, { scope: record.scope, timestamp: record.timestamp });
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-policy cache load failed: ${msg}`);
+  }
+  try {
+    const path = approvalDecisionsFile(runId);
+    if (!existsSync(path)) return cache;
+    
+    const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const record = JSON.parse(line) as unknown;
+        if (
+          typeof record === "object" &&
+          record !== null &&
+          "tool_name" in record &&
+          "decision" in record &&
+          "scope" in record &&
+          "timestamp" in record &&
+          typeof (record as Record<string, unknown>)["tool_name"] === "string" &&
+          typeof (record as Record<string, unknown>)["decision"] === "string" &&
+          typeof (record as Record<string, unknown>)["scope"] === "string" &&
+          typeof (record as Record<string, unknown>)["timestamp"] === "string"
+        ) {
+          const r = record as Record<string, unknown>;
+          const toolName = r["tool_name"] as string;
+          const decision = r["decision"] as string;
+          const scope = r["scope"] as string;
+          const timestamp = r["timestamp"] as string;
+          
+          // Only cache approve decisions with Session/Forever scope
+          if (decision === "approve" && (scope === "Session" || scope === "Forever")) {
+            cache.set(toolName, { scope, timestamp });
+          }
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] approval-scope cache load failed for ${runId}: ${msg}`);
+  }
+  return cache;
+}
+
+function readApprovalPolicies(path: string): ApprovalPolicyRecord[] {
+  if (!existsSync(path)) return [];
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!Array.isArray(parsed)) return [];
+  const records: ApprovalPolicyRecord[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null) continue;
+    const rec = item as Record<string, unknown>;
+    const toolName = rec["tool_name"];
+    const scope = rec["scope"];
+    const timestamp = rec["timestamp"];
+    const runId = rec["run_id"];
+    const actionId = rec["action_id"];
+    const conversationId = rec["conversation_id"];
+    const userId = rec["user_id"];
+    if (
+      typeof toolName !== "string" ||
+      (scope !== "Session" && scope !== "Forever") ||
+      typeof timestamp !== "string" ||
+      typeof runId !== "string" ||
+      typeof actionId !== "string" ||
+      (conversationId !== null && typeof conversationId !== "string") ||
+      (userId !== undefined && typeof userId !== "string")
+    ) {
+      continue;
+    }
+    records.push({
+      tool_name: toolName,
+      scope,
+      conversation_id: conversationId,
+      timestamp,
+      run_id: runId,
+      action_id: actionId,
+      ...(userId ? { user_id: userId } : {}),
+    });
+  }
+  return records;
+}
+
+function approvalsFile(): string {
+  return join(storageDir(), "approvals.json");
+}
+
+function approvalDecisionsFile(runId: string): string {
+  return join(runDir(runId), "approval-decisions.jsonl");
 }
 
 export function recordRunStep(
@@ -569,6 +915,122 @@ export function listActiveRunIds(): string[] {
 }
 
 /**
+ * lcp-r0m: return active (status="running") runs scoped to a conversation.
+ * Used by the REST /messages handler to filter out in-flight assistant
+ * messages so they don't race the WS delta stream on the same serverId.
+ *
+ * Why this exists: the WS path streams pure deltas under a stable
+ * cm-stream-<otid> id. If REST /messages returns the corresponding
+ * cumulative assistant_message mid-stream, the client's merge appends
+ * the snapshot onto the accumulated deltas and produces incoherent text
+ * (the 2026-05-19 "StandStanding by..." repro). Filtering here keeps the
+ * two transports from racing on the same serverId.
+ *
+ * On the next REST hydrate after turn_done, the run finalizes and drops
+ * out of _activeRuns, so the message naturally appears in subsequent
+ * /messages calls.
+ */
+export function listActiveRunsForConversation(
+  agentId: string,
+  conversationId: string,
+): RunHandle[] {
+  const out: RunHandle[] = [];
+  for (const handle of _activeRuns.values()) {
+    if (handle.record.status !== "running") continue;
+    if (handle.record.agent_id !== agentId) continue;
+    if (handle.record.conversation_id !== conversationId) continue;
+    out.push(handle);
+  }
+  return out;
+}
+
+/**
+ * lcp-r0m: collect the set of message_ids that are mid-flight (i.e.,
+ * currently being written by an active run) for the given (agent,
+ * conversation) pair, given the caller's view of the current on-disk
+ * id list.
+ *
+ * Computed as: every id in `currentDiskIds` that is NOT in any active
+ * run's `messageIdsAtTurnStart` snapshot. That set is exactly the
+ * messages letta-code has appended SINCE the active turn started — the
+ * cumulative assistant_message snapshot that the WS delta stream is
+ * still delivering, plus any tool-result rows landing under the same
+ * turn. The REST /messages handler drops these from its projection so
+ * mobile's snapshot-vs-delta merge doesn't collide ("StandStanding by
+ * ..." repro, 2026-05-19).
+ *
+ * Why we read from a caller-supplied id set rather than calling
+ * listMessages ourselves: the REST handler has already paid for the
+ * disk read; doing it twice would double the cost on every list call.
+ *
+ * The previous shape of this helper returned ids from each run's
+ * `record.message_ids`, but those are only populated by
+ * `recordRunMessage` at TURN END (inside finalizeTurnLifecycle) — i.e.
+ * after the race window has already closed. The mid-turn race needs an
+ * in-flight signal, which is what the pre-turn snapshot provides.
+ *
+ * On no active runs OR no snapshot recorded yet, returns an empty set
+ * (i.e. nothing is in-flight, the caller's filter is a no-op).
+ */
+export function inFlightMessageIds(
+  agentId: string,
+  conversationId: string,
+  currentDiskIds?: Iterable<string>,
+): Set<string> {
+  const out = new Set<string>();
+  const handles = listActiveRunsForConversation(agentId, conversationId);
+  if (handles.length === 0) return out;
+  // No caller-supplied id set: legacy callers (and one test) used to read
+  // record.message_ids. Preserve that fallback so a missing argument
+  // gives a defined behavior (empty set + warning would be too loud).
+  if (!currentDiskIds) {
+    for (const handle of handles) {
+      for (const mid of handle.record.message_ids) {
+        if (typeof mid === "string" && mid.length > 0) out.add(mid);
+      }
+    }
+    return out;
+  }
+  // Combine all active runs' pre-turn snapshots — a message id is
+  // in-flight if it's present on disk now AND wasn't present at the
+  // start of ANY active run.
+  const preStartUnion = new Set<string>();
+  for (const handle of handles) {
+    for (const mid of handle.messageIdsAtTurnStart) preStartUnion.add(mid);
+  }
+  for (const id of currentDiskIds) {
+    if (!preStartUnion.has(id)) out.add(id);
+  }
+  return out;
+}
+
+/**
+ * lcp-r0m: collect the otid set currently being streamed by any active
+ * run for the (agent, conversation) pair. The REST /messages handler
+ * filters disk records whose otid is in this set so a mid-turn hydrate
+ * doesn't return the cumulative assistant_message that the WS stream is
+ * still delivering as deltas (the "StandStanding by..." merge collision).
+ *
+ * Unlike inFlightMessageIds — which only populates at finalize via
+ * recordRunMessage and is therefore empty DURING the actual race — this
+ * is populated from every streamed frame in real time via
+ * `recordRunOtid` inside applyFrameRunSideEffects. The race window
+ * closes the instant the first frame for an otid lands.
+ */
+export function inFlightOtids(
+  agentId: string,
+  conversationId: string,
+): Set<string> {
+  const out = new Set<string>();
+  for (const handle of listActiveRunsForConversation(agentId, conversationId)) {
+    for (const o of handle.inFlightOtids) {
+      out.add(o);
+    }
+  }
+  return out;
+}
+
+/**
  * lcp-nwd: build an inverse messageId -> runId index for a given scope.
  * Used by the message wire projection so each returned LettaMessage
  * carries the run_id that attributed it, enabling mobile's chat-UI
@@ -580,10 +1042,22 @@ export function listActiveRunIds(): string[] {
  *
  * When the same messageId appears in multiple runs' message_ids
  * (rare — would imply two runs both claimed the same persisted
- * message), the LAST writer wins to match the "first run that
- * attributed it" semantics most callers want. listRuns returns
- * desc-by-created-at; we iterate accordingly so older wins overall.
+ * message), the OLDEST run wins. We iterate `listRuns(..., order:
+ * "asc")` — oldest-first — and use `if (!out[mid]) out[mid] = r.id`,
+ * so the oldest run that claimed a given messageId keeps the
+ * attribution. Once a run has attributed a persisted message, later
+ * runs cannot steal that attribution. This matches the "first run
+ * that attributed it" intuition most callers want.
  */
+/**
+ * lcp-cen: hard cap on `listRuns` for the attribution walk. Long-lived
+ * agents that exceed this start losing OLDEST runs from the lookup
+ * (because `order: "asc"` walks oldest-first but the result is capped
+ * at this size). The cap-hit warning below surfaces the problem so it
+ * doesn't fail silently as "old messages suddenly render ungrouped".
+ */
+const BUILD_MESSAGE_RUN_MAP_CAP = 10_000;
+
 export function buildMessageRunMap(
   { agentId, conversationId }: { agentId?: string | undefined; conversationId?: string | undefined } = {},
 ): Record<string, string> {
@@ -591,9 +1065,28 @@ export function buildMessageRunMap(
   const runs = listRuns({
     ...(agentId !== undefined ? { agentId } : {}),
     ...(conversationId !== undefined ? { conversationId } : {}),
-    limit: 10_000,
+    limit: BUILD_MESSAGE_RUN_MAP_CAP,
     order: "asc",
   });
+  if (runs.length >= BUILD_MESSAGE_RUN_MAP_CAP) {
+    // lcp-cen: structured warning. Converts a silent-incorrectness bug
+    // (attribution-incomplete past the cap) into a loud-incorrectness
+    // bug so operators see it in logs / metrics scrape before users
+    // see ungrouped chat blocks. Logged once per call site invocation;
+    // dedup belongs in a memoization layer (separate concern).
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        module: "runs",
+        event: "buildMessageRunMap.cap_hit",
+        agent_id: agentId ?? null,
+        conversation_id: conversationId ?? null,
+        cap: BUILD_MESSAGE_RUN_MAP_CAP,
+        message:
+          "attribution-incomplete: increase cap or paginate; oldest runs past the cap will not be reflected in the run_id projection",
+      }),
+    );
+  }
   for (const r of runs) {
     for (const mid of r.message_ids ?? []) {
       if (typeof mid === "string" && !out[mid]) out[mid] = r.id;

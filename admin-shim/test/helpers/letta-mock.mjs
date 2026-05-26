@@ -27,6 +27,7 @@
  *
  * Trace selection (first match wins):
  *   - LETTA_MOCK_FORCE_TRACE  → use exactly this fixture for every turn
+ *   - LETTA_MOCK_STOP_REASON  → rewrite stop_reason frames to this value
  *   - input.content contains "bash" / "shell" / "echo" → bash-tool
  *   - input.content contains "read" / "file" → read-tool
  *   - input.content contains "list" / "bullet" / "step" → multi-step
@@ -75,6 +76,7 @@ function pickTrace(content) {
   if (forced) return forced;
   const t = (content ?? "").toLowerCase();
   // Order matters — most specific first.
+  if (/(approval card|a2ui|show .*card|render.*approval|approve.*scope)/.test(t)) return "a2ui-card";
   if (/(interleav|step-a|one at a time|three.*step)/.test(t)) return "interleaved-tools";
   if (/(both.*tool|two.*tool|bash.*and.*read|multi.*tool)/.test(t)) return "multi-tool-bash-read";
   if (/(tool.*then|then explain|long explanation|paragraph)/.test(t) && /(bash|shell|echo)/.test(t)) {
@@ -88,6 +90,14 @@ function pickTrace(content) {
   return "plain";
 }
 
+// Monotonic per-turn run id. Captured traces all carry the same
+// `local-run-1`, but real letta-code generates a fresh run id per turn —
+// and the SDK Session filters out frames whose run_id appears in the
+// previous turn's `lastCompletedRunIds`, so reusing the same id silently
+// drops every frame on turn 2+ of an SDK-transport session. Bumping per
+// turn matches the real CLI and keeps multi-turn SDK tests viable.
+let currentTurnRunId = "local-run-1";
+
 /** @param {any} frame */
 function rewrite(frame) {
   // Stamp the active agent/conv/session onto every frame so consumers
@@ -100,6 +110,17 @@ function rewrite(frame) {
   if (f.event && typeof f.event === "object") {
     if (f.event.agent_id) f.event.agent_id = agentId;
     if (f.event.conversation_id) f.event.conversation_id = conversationId;
+    if (typeof f.event.run_id === "string" && f.event.run_id.startsWith("local-run-")) {
+      f.event.run_id = currentTurnRunId;
+    }
+    const forcedStopReason = process.env["LETTA_MOCK_STOP_REASON"];
+    if (
+      typeof forcedStopReason === "string" &&
+      forcedStopReason.length > 0 &&
+      f.event.message_type === "stop_reason"
+    ) {
+      f.event.stop_reason = forcedStopReason;
+    }
   }
   return f;
 }
@@ -121,8 +142,15 @@ if (process.env["LETTA_MOCK_MODEL"]) {
 }
 emit(initFrame);
 
+/** @type {any[] | null} */
+let pendingApprovalFrames = null;
+
+let turnCounter = 0;
+
 /** @param {string} content */
 function emitTurn(content) {
+  turnCounter += 1;
+  currentTurnRunId = `local-run-${turnCounter}`;
   const traceName = pickTrace(content);
   const frames = loadTrace(traceName);
   // Skip the init frame from the trace (we already emitted one). All other
@@ -130,14 +158,68 @@ function emitTurn(content) {
   // tests can observe the time ordering.
   const delay = Number(process.env["LETTA_MOCK_DELAY_MS"] ?? 0);
   let i = 1;
+  const approvalGate = process.env["LETTA_MOCK_APPROVAL_GATE"] === "1";
   const tick = () => {
     if (i >= frames.length) return;
-    emit(rewrite(frames[i]));
+    const frame = rewrite(frames[i]);
+    emit(frame);
     i += 1;
+    if (
+      approvalGate &&
+      frame?.type === "stream_event" &&
+      frame?.event?.message_type === "stop_reason" &&
+      frame?.event?.stop_reason === "requires_approval"
+    ) {
+      pendingApprovalFrames = frames.slice(i).map(rewrite);
+      return;
+    }
     if (delay > 0) setTimeout(tick, delay);
     else tick();
   };
   tick();
+}
+
+/** @param {unknown} reason */
+function emitApprovalDenial(reason) {
+  const now = new Date().toISOString();
+  emit({
+    type: "stream_event",
+    event: {
+      id: `approval-denied-${Date.now()}`,
+      date: now,
+      agent_id: agentId,
+      conversation_id: conversationId,
+      message_type: "assistant_message",
+      content: [{ type: "text", text: `Tool call denied: ${reason}` }],
+      run_id: "local-run-denied",
+      seq_id: 1,
+    },
+    session_id: sessionId,
+    uuid: `approval-denied-${Date.now()}`,
+    timestamp: now,
+  });
+  emit({
+    type: "stream_event",
+    event: { message_type: "stop_reason", stop_reason: "end_turn", run_id: "local-run-denied", seq_id: 2 },
+    session_id: sessionId,
+    uuid: `approval-denied-stop-${Date.now()}`,
+    timestamp: now,
+  });
+  emit({
+    type: "result",
+    subtype: "success",
+    session_id: sessionId,
+    duration_ms: 1,
+    duration_api_ms: 0,
+    num_turns: 1,
+    result: `Tool call denied: ${reason}`,
+    agent_id: agentId,
+    conversation_id: conversationId,
+    run_ids: [],
+    usage: null,
+    uuid: `result-denied-${Date.now()}`,
+    timestamp: now,
+  });
 }
 
 /**
@@ -169,6 +251,23 @@ rl.on("line", (line) => {
   if (!line.trim()) return;
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
+  if (msg?.type === "approval" || msg?.type === "approval_response") {
+    const approved = msg?.message?.approve === true || msg?.message?.approvals?.[0]?.approve === true;
+    const directApproval = msg?.approvals?.[0];
+    const approvedViaDirect = directApproval?.type === "tool" || directApproval?.approve === true;
+    const deniedViaDirect = directApproval?.approve === false;
+    const finalApproved = approved || approvedViaDirect;
+    const reason = directApproval?.reason ?? msg?.message?.reason ?? msg?.message?.approvals?.[0]?.reason ?? "approval_response";
+    const frames = pendingApprovalFrames;
+    pendingApprovalFrames = null;
+    if (!frames) return;
+    if (finalApproved && !deniedViaDirect) {
+      for (const frame of frames) emit(frame);
+    } else {
+      emitApprovalDenial(String(reason));
+    }
+    return;
+  }
   if (msg?.type !== "user") return;
   emitTurn(flattenContentToText(msg?.message?.content));
 });
