@@ -175,6 +175,22 @@ export interface ChannelHost {
    * letta-code exposes a stable approval API.
    */
   handleUserAction?: (action: A2uiUserAction) => Promise<A2uiUserActionAck> | A2uiUserActionAck;
+  /** Mobile WS resume-cursor capability metadata, surfaced in welcome/health. */
+  mobileConversationCursorCapabilities?: () => Record<string, unknown>;
+  /** Stamp a per-conversation monotonic cursor onto an outbound mobile frame. */
+  stampConversationFrame?: (conversationId: string, frame: Record<string, unknown>) => Record<string, unknown>;
+  /** Replay buffered frames after a per-conversation cursor. */
+  resumeConversation?: (conversationId: string, afterSeq: unknown) => {
+    ok: boolean;
+    cursorExpired: boolean;
+    conversationId: string;
+    afterSeq: number;
+    oldestSeq: number | null;
+    lastSeq: number;
+    frames: Record<string, unknown>[];
+  };
+  /** Record the highest per-conversation cursor acknowledged by a client. */
+  ackConversation?: (conversationId: string, ackSeq: unknown) => Record<string, unknown>;
 }
 
 /**
