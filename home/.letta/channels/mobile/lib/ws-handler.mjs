@@ -32,6 +32,15 @@ import {
 } from "./protocol.mjs";
 import { recordDeviceConnect } from "./state.mjs";
 
+const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
+  mobile_ws: true,
+  ws_endpoint: "/shim/v1/mobile",
+  canonical_live_transport: "ws",
+  rest_role: "cold_start_reconcile_repair",
+  sse_role: "legacy_non_canonical_for_mobile_ws_sessions",
+  exclusivity: "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+});
+
 function safeSend(ws, frame, log) {
   try {
     ws.send(JSON.stringify(frame));
@@ -72,11 +81,27 @@ export function handleConnection(ws, request, host) {
   // tracking is gone. activeRunId (below, scoped per-turn) carries the
   // run-tracking state that other code still needs.
 
+  const safeClose = (code, reason) => {
+    try {
+      ws.close(code, reason);
+    } catch (err) {
+      log(`close failed session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const safeUnsubscribe = (label, unsubscribe) => {
+    try {
+      unsubscribe();
+    } catch (err) {
+      log(`${label} unsubscribe failed session=${sessionId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       log(`idle timeout — closing ${sessionId}`);
-      try { ws.close(1000, "idle timeout"); } catch {}
+      safeClose(1000, "idle timeout");
     }, host.config?.idleTimeoutMs ?? 120_000);
     if (idleTimer.unref) idleTimer.unref();
   };
@@ -109,11 +134,11 @@ export function handleConnection(ws, request, host) {
     if (pingTimer) clearInterval(pingTimer);
     if (idleTimer) clearTimeout(idleTimer);
     for (const sub of activeSubscriptions.values()) {
-      try { sub.unsubscribe(); } catch {}
+      safeUnsubscribe("run subscription", () => sub.unsubscribe());
     }
     activeSubscriptions.clear();
     if (cronEventsUnsubscribe) {
-      try { cronEventsUnsubscribe(); } catch {}
+      safeUnsubscribe("cron events", cronEventsUnsubscribe);
       cronEventsUnsubscribe = null;
     }
   };
@@ -121,7 +146,7 @@ export function handleConnection(ws, request, host) {
   const sendError = (code, message, { close = true } = {}) => {
     safeSend(ws, makeFrame("error", { code, message }), log);
     if (close) {
-      try { ws.close(4000, code); } catch {}
+      safeClose(4000, code);
     }
   };
 
@@ -225,7 +250,9 @@ export function handleConnection(ws, request, host) {
           // host's emit(). Propagate to wire envelopes so live clients track
           // it in lockstep with what subscribe(run_id, cursor) would replay.
           const seq = typeof outFrame.seq === "number" ? outFrame.seq : null;
-          const base = { agent_id, conversation_id, turn_id: turnId, run_id: runId ?? null, seq };
+          // lcp-wqy: forward the reshaped frame's `date` so mobile renders
+          // a real timestamp instead of the CLI's sentinel epoch (Jan 1).
+          const base = { agent_id, conversation_id, turn_id: turnId, run_id: runId ?? null, seq, date: outFrame.date ?? new Date().toISOString() };
           const HIGH_WATER = host.config?.bufferHighWaterBytes ?? 1_000_000;
           if (ws.bufferedAmount > HIGH_WATER) {
             droppedFrameCount += 1;
@@ -304,6 +331,15 @@ export function handleConnection(ws, request, host) {
 
   ws.on("message", async (raw) => {
     resetIdle();
+    // lcp-rfb: bump pool adapter's lastUsedAt on every inbound frame so the
+    // housekeep idle-evict timer stays fresh while a mobile client is connected.
+    if (helloSeen && lastClientConversationId && lastClientAgentId && typeof host.touchAdapter === "function") {
+      try {
+        host.touchAdapter(lastClientConversationId, lastClientAgentId);
+      } catch (err) {
+        log?.warn?.(`[mobile-ws] touchAdapter failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     const frame = parseFrame(raw.toString("utf8"));
     if (!frame) {
       sendError(ERROR_CODES.PROTOCOL_VIOLATION, "unparseable frame");
@@ -388,6 +424,11 @@ export function handleConnection(ws, request, host) {
           server_id: host.getServerId(),
           session_id: sessionId,
           device_id: deviceId,
+          capabilities: {
+            mobile_transport: MOBILE_TRANSPORT_CONTRACT,
+          },
+          canonical_live_transport: "ws",
+          transport_contract: MOBILE_TRANSPORT_CONTRACT,
           a2ui_negotiated: Boolean(a2uiCapability),
           a2ui: a2uiCapability ? {
             version: a2uiCapability.version,
@@ -547,6 +588,7 @@ export function handleConnection(ws, request, host) {
                 turn_id: turnId,
                 run_id: runId ?? null,
                 seq,
+                date: outFrame.date ?? new Date().toISOString(),
               };
               // Backpressure: if the socket can't drain frames fast enough,
               // pause emission. ws's bufferedAmount is the unsent byte count;
@@ -835,7 +877,7 @@ export function handleConnection(ws, request, host) {
         // subscribe calls.
         const existing = activeSubscriptions.get(runId);
         if (existing) {
-          try { existing.unsubscribe(); } catch {}
+          safeUnsubscribe(`run ${runId}`, () => existing.unsubscribe());
           activeSubscriptions.delete(runId);
         }
         const handle = host.subscribeToRun(runId, cursor, {
@@ -1010,7 +1052,7 @@ export function handleConnection(ws, request, host) {
         break;
       case "bye":
         log(`client said bye session=${sessionId}`);
-        try { ws.close(1000, "bye"); } catch {}
+        safeClose(1000, "bye");
         break;
       default:
         // Unknown frame types: ignore per forward-compat rule.
