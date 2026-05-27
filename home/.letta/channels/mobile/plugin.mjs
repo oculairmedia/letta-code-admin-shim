@@ -78,6 +78,16 @@ function createMobileAdapter(account, host) {
         subscribeToRun: host.subscribeToRun
           ? (runId, cursor, cbs) => host.subscribeToRun(runId, cursor, cbs)
           : undefined,
+        mobileConversationCursorCapabilities: host.mobileConversationCursorCapabilities,
+        stampConversationFrame: host.stampConversationFrame
+          ? (conversationId, frame) => host.stampConversationFrame(conversationId, frame)
+          : undefined,
+        resumeConversation: host.resumeConversation
+          ? (conversationId, afterSeq) => host.resumeConversation(conversationId, afterSeq)
+          : undefined,
+        ackConversation: host.ackConversation
+          ? (conversationId, ackSeq) => host.ackConversation(conversationId, ackSeq)
+          : undefined,
         // lcp-2gx: cron CRUD over WS + crons_updated push.
         handleCronList: host.handleCronList,
         handleCronAdd: host.handleCronAdd,

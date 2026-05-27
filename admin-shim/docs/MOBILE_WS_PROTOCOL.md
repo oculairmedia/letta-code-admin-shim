@@ -2072,10 +2072,10 @@ For each conversation:
 ### 12.3 Per-conversation monotonic `seq`
 
 Every server→client WS frame for a conversation carries a per-conversation
-monotonic `seq` field in addition to the per-run `seq` already used for
+monotonic `conv_seq` field in addition to the per-run `seq` already used for
 `subscribe`/`subscribe_done` (§11). The two cursors coexist:
 
-- `seq` (per-conv) — new field added by this section. Increments by 1
+- `conv_seq` (per-conv) — field added by `lcp-2hf.1`. Increments by 1
   for every frame the shim emits for conversation `X` over WS,
   regardless of which run produced it.
 - `frame.seq` inside `subscribe_frame` — unchanged. Per-run cursor for
@@ -2084,16 +2084,24 @@ monotonic `seq` field in addition to the per-run `seq` already used for
 Client semantics:
 
 - The single `ConversationStateHolder` (§12.4) records `last_conv_seq`
-  per conversation. On WS reconnect, it sends a future `resync_conversation`
-  frame (P1 deliverable) carrying `last_conv_seq` and receives a
-  backfill of any frames it missed during the disconnect window.
-- A frame with `seq <= last_conv_seq` is a duplicate; drop it.
-- A gap (`seq > last_conv_seq + 1`) triggers a single REST cold-start
-  refetch and resets `last_conv_seq` to the highest seq observed.
+  per conversation. On WS reconnect, it sends `resume_conversation`
+  (`{ conversation_id, after_seq }`) or includes `{ resume: { conversation_id,
+  after_seq } }` in `hello`. The shim replays durable JSONL-backed frames
+  with `conv_seq > after_seq`, then emits `conversation_resume_done`.
+- A frame with `conv_seq <= last_conv_seq` is a duplicate; drop it.
+- A gap (`conv_seq > last_conv_seq + 1`) triggers a single REST cold-start
+  refetch and resets `last_conv_seq` to the highest `conv_seq` observed.
+- If the buffer no longer contains the requested cursor window, the shim
+  emits `error{code:"cursor_expired", conversation_id, after_seq, oldest_seq,
+  last_seq}` and keeps the socket open for REST hydrate fallback.
 
-`seq` is server-assigned. Clients MUST NOT mint or modify it. Persisted
-to disk alongside the conversation row so it survives shim restarts;
-the persistence model is owned by `lib/store.ts` (P1 deliverable).
+`conv_seq` is server-assigned. Clients MUST NOT mint or modify it. The shim
+persists the high-water mark under the local backend's
+`mobile-conversation-cursors/` sidecar directory so counters survive shim
+restart. Replay frames are also appended to per-conversation JSONL logs in
+that directory, so ordinary shim restarts do not create silent cursor gaps.
+The in-memory buffer is only a hot cache; expired/pruned durable cursors fall
+back to REST hydrate via `cursor_expired`.
 
 ### 12.4 Client-side: one `ConversationStateHolder`
 

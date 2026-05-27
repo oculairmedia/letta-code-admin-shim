@@ -60,6 +60,7 @@ import {
   type ListRunsParams,
 } from "./lib/runs.js";
 import { bridgeSendMessage, getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
+import { mobileConversationCursorCapabilities } from "./lib/mobile-conversation-cursors.js";
 import {
   getCronSchedulerStatus,
   startCronScheduler,
@@ -174,6 +175,7 @@ const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
   rest_role: "cold_start_reconcile_repair",
   sse_role: "legacy_non_canonical_for_mobile_ws_sessions",
   exclusivity: "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  ...mobileConversationCursorCapabilities(),
 });
 console.log(`server_id: ${SERVER_ID}`);
 

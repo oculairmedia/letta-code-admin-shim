@@ -31,6 +31,12 @@ import {
 } from "./a2ui-stream-splitter.js";
 import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
 import {
+  ackConversation,
+  mobileConversationCursorCapabilities,
+  resumeConversation,
+  stampConversationFrame,
+} from "./mobile-conversation-cursors.js";
+import {
   findUnmappedTailUserMessageId,
   getAgentRecord,
   listMessages,
@@ -1127,6 +1133,10 @@ interface MobileChannelHost {
   /** lcp-rfb: bump adapter lastUsedAt so inbound WS frames prevent idle eviction. */
   touchAdapter: (conversationId: string, agentId: string) => void;
   handleUserAction: typeof handleUserAction;
+  mobileConversationCursorCapabilities: typeof mobileConversationCursorCapabilities;
+  stampConversationFrame: typeof stampConversationFrame;
+  resumeConversation: typeof resumeConversation;
+  ackConversation: typeof ackConversation;
   subscribeToRun: typeof subscribeToRun;
   handleCronList: typeof handleCronList;
   handleCronAdd: typeof handleCronAdd;
@@ -1232,6 +1242,10 @@ async function createMobileChannelAdapter(
     cancelRun: (runId: string) => cancelRun(runId),
     touchAdapter: (convId: string, agId: string) => getAgentPool().touch(convId, agId),
     handleUserAction,
+    mobileConversationCursorCapabilities,
+    stampConversationFrame,
+    resumeConversation,
+    ackConversation,
     subscribeToRun,
     handleCronList,
     handleCronAdd,

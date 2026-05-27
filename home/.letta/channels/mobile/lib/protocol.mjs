@@ -23,7 +23,7 @@ export const CLIENT_FRAMES = Object.freeze([
   "hello", // { token, device_id, client_version, a2ui_version?, supported_catalogs?, supported_widgets?, theme_hints? }
   "send_message", // { agent_id, conversation_id, text, otid? }
   "cancel", // { run_id }   — cancel an in-flight turn
-  "ack", // { target_id }
+  "ack", // { target_id } or { conversation_id, ack_seq }
   "bye", // (no extras)
   "pong", // (no extras, reply to server ping)
   "user_action", // { run_id?, turn_id?, surface_id?, name, context, action_id? }
@@ -39,6 +39,9 @@ export const CLIENT_FRAMES = Object.freeze([
                   // envelope, then continues live-tailing new appends. When
                   // the run reaches a terminal state and the tail catches up,
                   // server emits `subscribe_done`.
+  "resume_conversation", // { conversation_id, after_seq }
+                  // lcp-2hf.1: replay mobile WS frames with conv_seq > after_seq.
+                  // May also be supplied as hello.resume for reconnect bootstraps.
   "cron_list", // { request_id?, agent_id?, conversation_id? } — read crons.json
   "cron_add", // { request_id?, agent_id, conversation_id?, name, description,
               //   prompt, recurring, cron? | every? | at?, timezone? }
@@ -87,6 +90,7 @@ export const SERVER_FRAMES = Object.freeze([
                   // reached a terminal state (completed/failed/cancelled/
                   // expired) AND the tail has caught up. `last_seq` is the
                   // largest seq the server has emitted for this subscription.
+  "conversation_resume_done", // { conversation_id, after_seq, last_seq, replayed }
   "cron_list_response", // { request_id?, success, tasks?, error? }
   "cron_add_response", // { request_id?, success, task?, error?, warning? }
   "cron_get_response", // { request_id?, success, task?, error? }
@@ -104,6 +108,7 @@ export const ERROR_CODES = Object.freeze({
   AGENT_NOT_FOUND: "agent_not_found",
   CONVERSATION_NOT_FOUND: "conversation_not_found",
   RUN_NOT_FOUND: "run_not_found",
+  CURSOR_EXPIRED: "cursor_expired",
   INTERNAL: "internal_error",
 });
 

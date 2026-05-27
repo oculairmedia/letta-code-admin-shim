@@ -150,6 +150,81 @@ export function handleConnection(ws, request, host) {
     }
   };
 
+  const mobileTransportContract = () => ({
+    ...MOBILE_TRANSPORT_CONTRACT,
+    ...(typeof host.mobileConversationCursorCapabilities === "function"
+      ? host.mobileConversationCursorCapabilities()
+      : {}),
+  });
+
+  const stampConversationFrame = (conversationId, frame) => {
+    if (typeof conversationId === "string" && conversationId.length > 0 && typeof host.stampConversationFrame === "function") {
+      return host.stampConversationFrame(conversationId, frame);
+    }
+    return frame;
+  };
+
+  const sendConversationFrame = (conversationId, type, fields = {}) => {
+    const frame = stampConversationFrame(conversationId, makeFrame(type, fields));
+    safeSend(ws, frame, log);
+    return frame;
+  };
+
+  const normalizeCursorSeq = (value) => {
+    const n = typeof value === "number" ? value : Number(value ?? 0);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  };
+
+  const isResumeResult = (value) => value
+    && typeof value === "object"
+    && typeof value.cursorExpired === "boolean"
+    && typeof value.conversationId === "string"
+    && typeof value.afterSeq === "number"
+    && (typeof value.oldestSeq === "number" || value.oldestSeq === null)
+    && typeof value.lastSeq === "number"
+    && Array.isArray(value.frames);
+
+  const emitConversationResume = (conversationId, afterSeq) => {
+    if (typeof host.resumeConversation !== "function") {
+      sendError(ERROR_CODES.INTERNAL, "conversation resume handler not wired", { close: false });
+      return;
+    }
+    let result;
+    try {
+      result = host.resumeConversation(conversationId, normalizeCursorSeq(afterSeq));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`conversation resume failed conversation=${conversationId}: ${msg}`);
+      sendError(ERROR_CODES.INTERNAL, "conversation resume failed", { close: false });
+      return;
+    }
+    if (!isResumeResult(result)) {
+      log(`conversation resume returned invalid result conversation=${conversationId}`);
+      sendError(ERROR_CODES.INTERNAL, "conversation resume returned invalid result", { close: false });
+      return;
+    }
+    if (result.cursorExpired) {
+      safeSend(ws, makeFrame("error", {
+        code: ERROR_CODES.CURSOR_EXPIRED,
+        message: `conversation cursor expired for ${conversationId}`,
+        conversation_id: conversationId,
+        after_seq: result.afterSeq,
+        oldest_seq: result.oldestSeq,
+        last_seq: result.lastSeq,
+      }), log);
+      return;
+    }
+    for (const replayFrame of result.frames) {
+      safeSend(ws, replayFrame, log);
+    }
+    safeSend(ws, makeFrame("conversation_resume_done", {
+      conversation_id: conversationId,
+      after_seq: result.afterSeq,
+      last_seq: result.lastSeq,
+      replayed: result.frames.length,
+    }), log);
+  };
+
   const deriveTurnOutcome = (turnResult, observedStopReason) => {
     const status = turnResult?.cancelled
       ? "cancelled"
@@ -226,13 +301,13 @@ export function handleConnection(ws, request, host) {
     const emitTurnStarted = () => {
       if (turnStartedEmitted || closed) return;
       turnStartedEmitted = true;
-      safeSend(ws, makeFrame("turn_started", {
-        agent_id,
-        conversation_id,
-        turn_id: turnId,
-        run_id: activeRunId ?? null,
-        source: "a2ui_user_action",
-      }), log);
+          sendConversationFrame(conversation_id, "turn_started", {
+            agent_id,
+            conversation_id,
+            turn_id: turnId,
+            run_id: activeRunId ?? null,
+            source: "a2ui_user_action",
+          });
       emitInjectedOutcome();
     };
     try {
@@ -270,22 +345,22 @@ export function handleConnection(ws, request, host) {
           // reported 2026-05-19. Only stamped on assistant_message and
           // reasoning_message; other frame types don't participate in the merge.
           if (mt === "assistant_message") {
-            safeSend(ws, makeFrame("assistant_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), seq_id: seq, content: outFrame.content ?? "", otid: outFrame.otid ?? null }), log);
+            sendConversationFrame(conversation_id, "assistant_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), seq_id: seq, content: outFrame.content ?? "", otid: outFrame.otid ?? null });
           } else if (mt === "reasoning_message") {
-            safeSend(ws, makeFrame("reasoning_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), seq_id: seq, reasoning: outFrame.reasoning ?? "", signature: outFrame.signature ?? null }), log);
+            sendConversationFrame(conversation_id, "reasoning_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), seq_id: seq, reasoning: outFrame.reasoning ?? "", signature: outFrame.signature ?? null });
           } else if (mt === "tool_call_message") {
-            safeSend(ws, makeFrame("tool_call_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), tool_call: outFrame.tool_call ?? null, tool_calls: outFrame.tool_calls ?? null }), log);
+            sendConversationFrame(conversation_id, "tool_call_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), tool_call: outFrame.tool_call ?? null, tool_calls: outFrame.tool_calls ?? null });
           } else if (mt === "tool_return_message") {
-            safeSend(ws, makeFrame("tool_return_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), tool_call_id: outFrame.tool_call_id ?? null, status: outFrame.status ?? "success", tool_return: outFrame.tool_return ?? null, stdout: outFrame.stdout ?? null, stderr: outFrame.stderr ?? null }), log);
+            sendConversationFrame(conversation_id, "tool_return_message", { ...base, ...(upstreamId ? { id: upstreamId } : {}), tool_call_id: outFrame.tool_call_id ?? null, status: outFrame.status ?? "success", tool_return: outFrame.tool_return ?? null, stdout: outFrame.stdout ?? null, stderr: outFrame.stderr ?? null });
           } else if (mt === "stop_reason") {
             const stopReason = outFrame.stop_reason ?? "end_turn";
             if (observedStopReason === null) observedStopReason = stopReason;
             if (stopReason === "error") sendTerminalError("upstream reported stop_reason=error");
-            safeSend(ws, makeFrame("stop_reason", { turn_id: turnId, run_id: runId ?? null, seq, stop_reason: stopReason }), log);
+            sendConversationFrame(conversation_id, "stop_reason", { agent_id, conversation_id, turn_id: turnId, run_id: runId ?? null, seq, stop_reason: stopReason });
           } else if (mt === "usage_statistics") {
-            safeSend(ws, makeFrame("usage_statistics", { turn_id: turnId, run_id: runId ?? null, seq, prompt_tokens: outFrame.prompt_tokens, completion_tokens: outFrame.completion_tokens, total_tokens: outFrame.total_tokens, cached_input_tokens: outFrame.cached_input_tokens, reasoning_tokens: outFrame.reasoning_tokens }), log);
+            sendConversationFrame(conversation_id, "usage_statistics", { agent_id, conversation_id, turn_id: turnId, run_id: runId ?? null, seq, prompt_tokens: outFrame.prompt_tokens, completion_tokens: outFrame.completion_tokens, total_tokens: outFrame.total_tokens, cached_input_tokens: outFrame.cached_input_tokens, reasoning_tokens: outFrame.reasoning_tokens });
           } else if (mt === "a2ui_frame") {
-            safeSend(ws, makeFrame("a2ui_frame", { turn_id: turnId, run_id: runId ?? null, seq, otid: outFrame.otid ?? null, ok: outFrame.ok !== false, a2ui: outFrame.a2ui ?? null, ...(outFrame.parse_error ? { parse_error: outFrame.parse_error } : {}), ...(outFrame.validation_error ? { validation_error: outFrame.validation_error } : {}) }), log);
+            sendConversationFrame(conversation_id, "a2ui_frame", { agent_id, conversation_id, turn_id: turnId, run_id: runId ?? null, seq, otid: outFrame.otid ?? null, ok: outFrame.ok !== false, a2ui: outFrame.a2ui ?? null, ...(outFrame.parse_error ? { parse_error: outFrame.parse_error } : {}), ...(outFrame.validation_error ? { validation_error: outFrame.validation_error } : {}) });
           }
         },
         {
@@ -300,7 +375,9 @@ export function handleConnection(ws, request, host) {
       if (!closed) {
         const { status, errorCode, errorMessage } = deriveTurnOutcome(turnResult, observedStopReason);
         if (status === "failed" && errorMessage) sendTerminalError(errorMessage);
-        safeSend(ws, makeFrame("turn_done", {
+        sendConversationFrame(conversation_id, "turn_done", {
+          agent_id,
+          conversation_id,
           turn_id: turnId,
           run_id: activeRunId ?? null,
           status,
@@ -309,7 +386,7 @@ export function handleConnection(ws, request, host) {
           error_code: errorCode,
           error_message: errorMessage,
           source: "a2ui_user_action",
-        }), log);
+        });
       }
     } catch (err) {
       log(`a2ui synthetic action turn failed: ${err.stack ?? err.message}`);
@@ -322,7 +399,7 @@ export function handleConnection(ws, request, host) {
       }
       if (!closed) {
         safeSend(ws, makeFrame("error", { code: ERROR_CODES.INTERNAL, message: err.message ?? "send failed", turn_id: turnId, run_id: activeRunId ?? null }), log);
-        safeSend(ws, makeFrame("turn_done", { turn_id: turnId, run_id: activeRunId ?? null, status: "failed", lossy: droppedFrameCount > 0, drop_count: droppedFrameCount, error_code: ERROR_CODES.INTERNAL, error_message: err.message ?? "send failed", source: "a2ui_user_action" }), log);
+        sendConversationFrame(conversation_id, "turn_done", { agent_id, conversation_id, turn_id: turnId, run_id: activeRunId ?? null, status: "failed", lossy: droppedFrameCount > 0, drop_count: droppedFrameCount, error_code: ERROR_CODES.INTERNAL, error_message: err.message ?? "send failed", source: "a2ui_user_action" });
       }
     } finally {
       inFlight = false;
@@ -418,6 +495,7 @@ export function handleConnection(ws, request, host) {
       });
       helloSeen = true;
       log(`hello accepted device=${deviceId} session=${sessionId}`);
+      const transportContract = mobileTransportContract();
       safeSend(
         ws,
         makeFrame("welcome", {
@@ -425,10 +503,10 @@ export function handleConnection(ws, request, host) {
           session_id: sessionId,
           device_id: deviceId,
           capabilities: {
-            mobile_transport: MOBILE_TRANSPORT_CONTRACT,
+            mobile_transport: transportContract,
           },
           canonical_live_transport: "ws",
-          transport_contract: MOBILE_TRANSPORT_CONTRACT,
+          transport_contract: transportContract,
           a2ui_negotiated: Boolean(a2uiCapability),
           a2ui: a2uiCapability ? {
             version: a2uiCapability.version,
@@ -449,6 +527,21 @@ export function handleConnection(ws, request, host) {
           }),
           log,
         );
+      }
+      const helloResume = frame.resume;
+      if (helloResume && typeof helloResume === "object" && !Array.isArray(helloResume)) {
+        const resumeConversationId = typeof helloResume.conversation_id === "string" ? helloResume.conversation_id : null;
+        if (resumeConversationId) {
+          emitConversationResume(resumeConversationId, helloResume.after_seq ?? helloResume.last_conv_seq ?? 0);
+        }
+      } else if (Array.isArray(helloResume)) {
+        for (const item of helloResume) {
+          if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+          const resumeConversationId = typeof item.conversation_id === "string" ? item.conversation_id : null;
+          if (resumeConversationId) {
+            emitConversationResume(resumeConversationId, item.after_seq ?? item.last_conv_seq ?? 0);
+          }
+        }
       }
       startPings();
       // lcp-2gx: subscribe to crons_updated push events for the lifetime of
@@ -557,15 +650,15 @@ export function handleConnection(ws, request, host) {
         const emitTurnStarted = () => {
           if (turnStartedEmitted || closed) return;
           turnStartedEmitted = true;
-          safeSend(
-            ws,
-            makeFrame("turn_started", {
+          sendConversationFrame(
+            conversation_id,
+            "turn_started",
+            {
               agent_id,
               conversation_id,
               turn_id: turnId,
               run_id: activeRunId ?? null,
-            }),
-            log,
+            },
           );
         };
         let turnResult = null;
@@ -614,30 +707,30 @@ export function handleConnection(ws, request, host) {
               // lcp-pro: expose `seq` as `seq_id` on delta-shaped frames; see
               // matching comment in the upper send_message dispatch path.
               if (mt === "assistant_message") {
-                safeSend(ws, makeFrame("assistant_message", {
+                sendConversationFrame(conversation_id, "assistant_message", {
                   ...base,
                   ...(upstreamId ? { id: upstreamId } : {}),
                   seq_id: seq,
                   content: outFrame.content ?? "",
                   otid: outFrame.otid ?? null,
-                }), log);
+                });
               } else if (mt === "reasoning_message") {
-                safeSend(ws, makeFrame("reasoning_message", {
+                sendConversationFrame(conversation_id, "reasoning_message", {
                   ...base,
                   ...(upstreamId ? { id: upstreamId } : {}),
                   seq_id: seq,
                   reasoning: outFrame.reasoning ?? "",
                   signature: outFrame.signature ?? null,
-                }), log);
+                });
               } else if (mt === "tool_call_message") {
-                safeSend(ws, makeFrame("tool_call_message", {
+                sendConversationFrame(conversation_id, "tool_call_message", {
                   ...base,
                   ...(upstreamId ? { id: upstreamId } : {}),
                   tool_call: outFrame.tool_call ?? null,
                   tool_calls: outFrame.tool_calls ?? null,
-                }), log);
+                });
               } else if (mt === "tool_return_message") {
-                safeSend(ws, makeFrame("tool_return_message", {
+                sendConversationFrame(conversation_id, "tool_return_message", {
                   ...base,
                   ...(upstreamId ? { id: upstreamId } : {}),
                   tool_call_id: outFrame.tool_call_id ?? null,
@@ -645,19 +738,23 @@ export function handleConnection(ws, request, host) {
                   tool_return: outFrame.tool_return ?? null,
                   stdout: outFrame.stdout ?? null,
                   stderr: outFrame.stderr ?? null,
-                }), log);
+                });
               } else if (mt === "stop_reason") {
                 const stopReason = outFrame.stop_reason ?? "end_turn";
                 if (observedStopReason === null) observedStopReason = stopReason;
                 if (stopReason === "error") sendTerminalError("upstream reported stop_reason=error");
-                safeSend(ws, makeFrame("stop_reason", {
+                sendConversationFrame(conversation_id, "stop_reason", {
+                  agent_id,
+                  conversation_id,
                   turn_id: turnId,
                   run_id: runId ?? null,
                   seq,
                   stop_reason: stopReason,
-                }), log);
+                });
               } else if (mt === "usage_statistics") {
-                safeSend(ws, makeFrame("usage_statistics", {
+                sendConversationFrame(conversation_id, "usage_statistics", {
+                  agent_id,
+                  conversation_id,
                   turn_id: turnId,
                   run_id: runId ?? null,
                   seq,
@@ -666,14 +763,16 @@ export function handleConnection(ws, request, host) {
                   total_tokens: outFrame.total_tokens,
                   cached_input_tokens: outFrame.cached_input_tokens,
                   reasoning_tokens: outFrame.reasoning_tokens,
-                }), log);
+                });
               } else if (mt === "a2ui_frame") {
                 // Phase 4: A2UI frame extracted from the assistant text
                 // stream. Body carries the parsed A2UI v0.9 message (or
                 // null + diagnostics when parse/validation failed). The
                 // renderer applies the message to its surface state; the
                 // shim doesn't track surface state itself.
-                safeSend(ws, makeFrame("a2ui_frame", {
+                sendConversationFrame(conversation_id, "a2ui_frame", {
+                  agent_id,
+                  conversation_id,
                   turn_id: turnId,
                   run_id: runId ?? null,
                   seq,
@@ -682,7 +781,7 @@ export function handleConnection(ws, request, host) {
                   a2ui: outFrame.a2ui ?? null,
                   ...(outFrame.parse_error ? { parse_error: outFrame.parse_error } : {}),
                   ...(outFrame.validation_error ? { validation_error: outFrame.validation_error } : {}),
-                }), log);
+                });
               }
               // ping / unknown types: drop silently. Forward-compat rule.
             },
@@ -717,7 +816,9 @@ export function handleConnection(ws, request, host) {
           if (!closed) {
             const { status, errorCode, errorMessage } = deriveTurnOutcome(turnResult, observedStopReason);
             if (status === "failed" && errorMessage) sendTerminalError(errorMessage);
-            safeSend(ws, makeFrame("turn_done", {
+            sendConversationFrame(conversation_id, "turn_done", {
+              agent_id,
+              conversation_id,
               turn_id: turnId,
               run_id: activeRunId ?? null,
               status,
@@ -725,7 +826,7 @@ export function handleConnection(ws, request, host) {
               drop_count: droppedFrameCount,
               error_code: errorCode,
               error_message: errorMessage,
-            }), log);
+            });
           }
         } catch (err) {
           if (err instanceof ProtocolError) {
@@ -751,7 +852,9 @@ export function handleConnection(ws, request, host) {
                 turn_id: turnId,
                 run_id: activeRunId ?? null,
               }), log);
-              safeSend(ws, makeFrame("turn_done", {
+              sendConversationFrame(conversation_id, "turn_done", {
+                agent_id,
+                conversation_id,
                 turn_id: turnId,
                 run_id: activeRunId ?? null,
                 status: "failed",
@@ -759,7 +862,7 @@ export function handleConnection(ws, request, host) {
                 drop_count: droppedFrameCount,
                 error_code: errCode,
                 error_message: errMessage,
-              }), log);
+              });
             }
           }
         } finally {
@@ -897,6 +1000,15 @@ export function handleConnection(ws, request, host) {
           },
         });
         activeSubscriptions.set(runId, handle);
+        break;
+      }
+      case "resume_conversation": {
+        const conversationId = typeof frame.conversation_id === "string" ? frame.conversation_id : null;
+        if (!conversationId) {
+          sendError(ERROR_CODES.PROTOCOL_VIOLATION, "resume_conversation requires conversation_id", { close: false });
+          break;
+        }
+        emitConversationResume(conversationId, frame.after_seq ?? frame.last_conv_seq ?? 0);
         break;
       }
       case "a2ui_frame":
@@ -1045,7 +1157,15 @@ export function handleConnection(ws, request, host) {
         break;
       }
       case "ack":
-        // Phase 1: log and move on. Phase 2 wires this into the sync cursor.
+        if (typeof frame.conversation_id === "string" && typeof host.ackConversation === "function") {
+          try {
+            host.ackConversation(frame.conversation_id, normalizeCursorSeq(frame.ack_seq ?? frame.conv_seq ?? frame.seq ?? 0));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log(`conversation ack failed conversation=${frame.conversation_id}: ${msg}`);
+            sendError(ERROR_CODES.INTERNAL, "conversation ack failed", { close: false });
+          }
+        }
         break;
       case "pong":
         // Liveness signal — resetIdle above already noted it.
