@@ -135,6 +135,15 @@ test("detectConsecutiveUserMessageIndices: keeps latest user in an interior run"
   assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2]);
 });
 
+test("detectConsecutiveUserMessageIndices: removes a single stale trailing user before next turn", () => {
+  const records = [
+    { id: "u0", role: "user" },
+    { id: "a0", role: "assistant" },
+    { id: "u1", role: "user" },
+  ];
+  assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2]);
+});
+
 test("healConsecutiveUserMessages: removes trailing failed user messages and audits", async () => {
   const stateDir = makeTempStateDir();
   try {

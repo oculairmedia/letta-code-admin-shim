@@ -341,10 +341,11 @@ export async function healConversation(
  * Detect user-message runs that would break provider role alternation.
  *
  * Interior runs keep the latest user record before the following assistant,
- * which preserves the last user intent while restoring alternation. A trailing
- * run with no assistant response is removed entirely: the shim does not inline
- * retry healed turns, so leaving a final user message would make the next user
- * turn append another user and immediately recreate the invalid shape.
+ * which preserves the last user intent while restoring alternation. Any
+ * trailing user run with no assistant response is removed entirely, even when
+ * it contains only one message: the next live turn will append a new user
+ * record, so a stale trailing user would immediately recreate the invalid
+ * user → user shape before the provider can respond.
  */
 export function detectConsecutiveUserMessageIndices(records: unknown[]): number[] {
   const toRemove = new Set<number>();
@@ -366,9 +367,7 @@ export function detectConsecutiveUserMessageIndices(records: unknown[]): number[
     flushInteriorRun();
   }
 
-  if (userRun.length > 1) {
-    for (const idx of userRun) toRemove.add(idx);
-  }
+  for (const idx of userRun) toRemove.add(idx);
 
   return [...toRemove].sort((a, b) => a - b);
 }

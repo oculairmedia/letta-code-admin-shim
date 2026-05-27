@@ -665,6 +665,24 @@ class AgentPool {
     input: string | unknown[],
     opts: RunTurnOptions = {},
   ): Promise<AdapterRunTurnResult> {
+    try {
+      const preflightCandidates = detectConsecutiveUserMessageIndices(
+        await listMessages(conversationId, agentId),
+      ).length;
+      if (preflightCandidates > 0) {
+        logLine(`preflight role-alternation heal triggered conv=${conversationId} userMessages=${preflightCandidates}`);
+        await this.evict(conversationId, agentId);
+        const report = await healConsecutiveUserMessages(conversationId, agentId);
+        logLine(
+          `preflight role-alternation heal complete conv=${conversationId} ` +
+          `removed=${report.messagesRemoved} [${report.removed.slice(0, 5).join(", ")}${report.removed.length > 5 ? ", ..." : ""}]`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logLine(`preflight role-alternation heal failed conv=${conversationId}: ${msg}`);
+    }
+
     const adapter = await this.get(conversationId, agentId);
     const result = await adapter.runTurn(input, opts);
     if (!result.errorPayload) return result;
