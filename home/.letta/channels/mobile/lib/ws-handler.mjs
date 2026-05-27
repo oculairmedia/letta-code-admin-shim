@@ -170,12 +170,39 @@ export function handleConnection(ws, request, host) {
     return frame;
   };
 
+  const normalizeCursorSeq = (value) => {
+    const n = typeof value === "number" ? value : Number(value ?? 0);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  };
+
+  const isResumeResult = (value) => value
+    && typeof value === "object"
+    && typeof value.cursorExpired === "boolean"
+    && typeof value.conversationId === "string"
+    && typeof value.afterSeq === "number"
+    && (typeof value.oldestSeq === "number" || value.oldestSeq === null)
+    && typeof value.lastSeq === "number"
+    && Array.isArray(value.frames);
+
   const emitConversationResume = (conversationId, afterSeq) => {
     if (typeof host.resumeConversation !== "function") {
       sendError(ERROR_CODES.INTERNAL, "conversation resume handler not wired", { close: false });
       return;
     }
-    const result = host.resumeConversation(conversationId, afterSeq);
+    let result;
+    try {
+      result = host.resumeConversation(conversationId, normalizeCursorSeq(afterSeq));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(`conversation resume failed conversation=${conversationId}: ${msg}`);
+      sendError(ERROR_CODES.INTERNAL, "conversation resume failed", { close: false });
+      return;
+    }
+    if (!isResumeResult(result)) {
+      log(`conversation resume returned invalid result conversation=${conversationId}`);
+      sendError(ERROR_CODES.INTERNAL, "conversation resume returned invalid result", { close: false });
+      return;
+    }
     if (result.cursorExpired) {
       safeSend(ws, makeFrame("error", {
         code: ERROR_CODES.CURSOR_EXPIRED,
@@ -1131,7 +1158,13 @@ export function handleConnection(ws, request, host) {
       }
       case "ack":
         if (typeof frame.conversation_id === "string" && typeof host.ackConversation === "function") {
-          host.ackConversation(frame.conversation_id, frame.ack_seq ?? frame.conv_seq ?? frame.seq ?? 0);
+          try {
+            host.ackConversation(frame.conversation_id, normalizeCursorSeq(frame.ack_seq ?? frame.conv_seq ?? frame.seq ?? 0));
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log(`conversation ack failed conversation=${frame.conversation_id}: ${msg}`);
+            sendError(ERROR_CODES.INTERNAL, "conversation ack failed", { close: false });
+          }
         }
         break;
       case "pong":
