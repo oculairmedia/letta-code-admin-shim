@@ -39,16 +39,49 @@ import { fileURLToPath } from "node:url";
 
 const TARGET_PATH = process.env["LETTA_CLI_PATH_REAL"] ?? "";
 
-const BUG_LITERAL =
+const SETTLE_BUG_LITERAL =
   `this.store.settleInterruptedToolCalls(conversationId, {\n` +
   `        reason: TURN_DID_NOT_COMPLETE\n` +
   `      });`;
 
-const FIX_LITERAL =
+const SETTLE_FIX_LITERAL =
   `this.store.settleInterruptedToolCalls(conversationId, {\n` +
   `        agentId: body?.agent_id ?? this.store?.resolveAgentIdForConversation?.(conversationId),\n` +
   `        reason: TURN_DID_NOT_COMPLETE\n` +
   `      });`;
+
+// lcp-9pn: letta-code 0.26.2 can construct Anthropic/Bedrock thinking
+// settings as `{ type: "disabled", budget_tokens: N }` when callers pass both
+// `--no-reasoner`/`enable_reasoner=false` and `max_reasoning_tokens`. Anthropic
+// rejects that strict schema with:
+//   thinking.disabled.budget_tokens: Extra inputs are not permitted
+// Only enabled thinking accepts budget_tokens; adaptive/disabled must omit it.
+const THINKING_SETTINGS_BUG_LITERAL =
+  `thinking = {\n` +
+  `        type: updateArgs?.enable_reasoner === false ? "disabled" : "enabled",\n` +
+  `        ...typeof updateArgs?.max_reasoning_tokens === "number" && {\n` +
+  `          budget_tokens: updateArgs.max_reasoning_tokens\n` +
+  `        }\n` +
+  `      };`;
+
+const THINKING_SETTINGS_FIX_LITERAL =
+  `thinking = {\n` +
+  `        type: updateArgs?.enable_reasoner === false ? "disabled" : "enabled",\n` +
+  `        ...updateArgs?.enable_reasoner !== false && typeof updateArgs?.max_reasoning_tokens === "number" && {\n` +
+  `          budget_tokens: updateArgs.max_reasoning_tokens\n` +
+  `        }\n` +
+  `      };`;
+
+const THINKING_REQUEST_GUARD_ANCHOR =
+  `  if (options3?.metadata) {\n` +
+  `    const userId = options3.metadata.user_id;`;
+
+const THINKING_REQUEST_GUARD_INSERT =
+  `  if (params.thinking && params.thinking.type !== "enabled" && "budget_tokens" in params.thinking) {\n` +
+  `    delete params.thinking.budget_tokens;\n` +
+  `  }\n` +
+  `  if (options3?.metadata) {\n` +
+  `    const userId = options3.metadata.user_id;`;
 
 let appliedOnce = false;
 
@@ -69,21 +102,46 @@ export async function load(url, context, nextLoad) {
         : null;
   if (raw === null) return result;
 
-  if (!raw.includes(BUG_LITERAL)) {
+  let patched = raw;
+  let appliedPatches = 0;
+
+  if (patched.includes(SETTLE_BUG_LITERAL)) {
+    patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
+    appliedPatches += 1;
+  } else {
     if (!appliedOnce) {
       process.stderr.write(
         `[letta-code-patch] WARN: settle-bug literal not found in ${path} — ` +
         `running unpatched (letta-code likely upgraded past 0.26.1)\n`,
       );
-      appliedOnce = true;
     }
-    return result;
   }
 
-  const patched = raw.replace(BUG_LITERAL, FIX_LITERAL);
+  if (patched.includes(THINKING_SETTINGS_BUG_LITERAL)) {
+    patched = patched.replaceAll(THINKING_SETTINGS_BUG_LITERAL, THINKING_SETTINGS_FIX_LITERAL);
+    appliedPatches += 1;
+  } else if (!appliedOnce) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: thinking-settings literal not found in ${path} — ` +
+      `running without lcp-9pn settings guard\n`,
+    );
+  }
+
+  if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
+    patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
+    appliedPatches += 1;
+  } else if (!appliedOnce) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: thinking-request guard anchor not found in ${path} — ` +
+      `running without lcp-9pn request guard\n`,
+    );
+  }
+
+  if (appliedPatches === 0) return result;
+
   if (!appliedOnce) {
     process.stderr.write(
-      `[letta-code-patch] applied executeConversationTurn settle agentId fix to ${path}\n`,
+      `[letta-code-patch] applied ${appliedPatches} runtime patch(es) to ${path}\n`,
     );
     appliedOnce = true;
   }
