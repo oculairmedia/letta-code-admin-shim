@@ -68,6 +68,39 @@ async function setupAuthed(
   return { shim, conn, agentId, convId };
 }
 
+async function waitForFrameAfter(
+  conn: MobileWsHandle,
+  afterIndex: number,
+  type: string,
+  timeoutMs: number,
+): Promise<MobileWsHandle["frames"][number]> {
+  const existing = conn.frames.slice(afterIndex).find((f) => f.type === type);
+  if (existing) return existing;
+  return await new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      conn.ws.off("message", onMessage);
+      conn.ws.off("close", onClose);
+    };
+    const onMessage = (): void => {
+      const match = conn.frames.slice(afterIndex).find((f) => f.type === type);
+      if (!match) return;
+      cleanup();
+      resolve(match);
+    };
+    const onClose = (code: number): void => {
+      cleanup();
+      reject(new Error(`socket closed (code=${code}) before next ${type}`));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`waitForFrameAfter(${type}) timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    conn.ws.on("message", onMessage);
+    conn.ws.once("close", onClose);
+  });
+}
+
 // ─── 1. Handshake happy path ───────────────────────────────────────────
 
 test("ws: hello/welcome handshake — server_id, session_id, device_id in welcome", async (t) => {
@@ -196,15 +229,25 @@ test("ws: live frames carry conv_seq and resume_conversation replays after curso
   assert.deepEqual(replayed.map((f) => f["conv_seq"]), liveSeqs.slice(1));
 
   conn.send({ type: "ack", conversation_id: convId, ack_seq: liveSeqs[liveSeqs.length - 1] });
+  const staleResumeStart = conn.frames.length;
   conn.send({ type: "resume_conversation", conversation_id: convId, after_seq: liveSeqs[0] });
-  const doneAfterAck = await conn.waitFor("conversation_resume_done", { timeoutMs: WS_TIMEOUT_MS }) as unknown as {
+  const staleResumeError = await waitForFrameAfter(conn, staleResumeStart, "error", WS_TIMEOUT_MS) as unknown as {
+    code?: string;
+    conversation_id?: string;
+  };
+  assert.equal(staleResumeError.code, "cursor_expired");
+  assert.equal(staleResumeError.conversation_id, convId);
+
+  const freshResumeStart = conn.frames.length;
+  conn.send({ type: "resume_conversation", conversation_id: convId, after_seq: liveSeqs[liveSeqs.length - 1] });
+  const doneAfterAck = await waitForFrameAfter(conn, freshResumeStart, "conversation_resume_done", WS_TIMEOUT_MS) as unknown as {
     conversation_id?: string;
     replayed?: number;
     last_seq?: number;
   };
   assert.equal(doneAfterAck.conversation_id, convId);
   assert.equal(doneAfterAck.last_seq, liveSeqs[liveSeqs.length - 1]);
-  assert.equal(doneAfterAck.replayed, liveSeqs.length - 1, "ack should not delete durable replay needed by other devices");
+  assert.equal(doneAfterAck.replayed, 0, "acked cursors should not replay already acknowledged frames");
 });
 
 test("ws: tokenless A2UI hello does not crash when mobile auth is unconfigured", async (t) => {

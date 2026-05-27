@@ -139,6 +139,35 @@ export interface ChannelAccount {
   [key: string]: unknown;
 }
 
+export interface MobileConversationCursorCapabilities {
+  resume_cursor_supported: true;
+  conversation_seq_field: "conv_seq";
+  resume_frame: "resume_conversation";
+  ack_frame: "ack";
+  cursor_expired_error: "cursor_expired";
+  replay_ttl_ms: number;
+  replay_max_frames: number;
+  replay_storage: "durable_jsonl";
+}
+
+export interface MobileConversationCursorSidecar {
+  version: 1;
+  conversation_id: string;
+  last_assigned_seq: number;
+  last_ack_seq: number;
+  updated_at: string;
+}
+
+export interface MobileConversationResumeResult {
+  ok: boolean;
+  cursorExpired: boolean;
+  conversationId: string;
+  afterSeq: number;
+  oldestSeq: number | null;
+  lastSeq: number;
+  frames: ReadonlyArray<Record<string, unknown>>;
+}
+
 // ─── Host surface the plugin receives in createAdapter ────────────────
 
 /**
@@ -176,21 +205,13 @@ export interface ChannelHost {
    */
   handleUserAction?: (action: A2uiUserAction) => Promise<A2uiUserActionAck> | A2uiUserActionAck;
   /** Mobile WS resume-cursor capability metadata, surfaced in welcome/health. */
-  mobileConversationCursorCapabilities?: () => Record<string, unknown>;
+  mobileConversationCursorCapabilities?: () => MobileConversationCursorCapabilities;
   /** Stamp a per-conversation monotonic cursor onto an outbound mobile frame. */
   stampConversationFrame?: (conversationId: string, frame: Record<string, unknown>) => Record<string, unknown>;
   /** Replay buffered frames after a per-conversation cursor. */
-  resumeConversation?: (conversationId: string, afterSeq: unknown) => {
-    ok: boolean;
-    cursorExpired: boolean;
-    conversationId: string;
-    afterSeq: number;
-    oldestSeq: number | null;
-    lastSeq: number;
-    frames: Record<string, unknown>[];
-  };
+  resumeConversation?: (conversationId: string, afterSeq: unknown) => MobileConversationResumeResult;
   /** Record the highest per-conversation cursor acknowledged by a client. */
-  ackConversation?: (conversationId: string, ackSeq: unknown) => Record<string, unknown>;
+  ackConversation?: (conversationId: string, ackSeq: unknown) => MobileConversationCursorSidecar;
 }
 
 /**

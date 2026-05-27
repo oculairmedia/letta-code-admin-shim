@@ -7,10 +7,10 @@ import { _internals as storeInternals } from "./store.js";
 const DEFAULT_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_FRAMES = 1_000;
 
-const TTL_MS = Number(process.env["SHIM_MOBILE_CONV_REPLAY_TTL_MS"] ?? DEFAULT_TTL_MS);
-const MAX_FRAMES = Number(process.env["SHIM_MOBILE_CONV_REPLAY_MAX_FRAMES"] ?? DEFAULT_MAX_FRAMES);
+const TTL_MS = readPositiveEnvInt("SHIM_MOBILE_CONV_REPLAY_TTL_MS", DEFAULT_TTL_MS);
+const MAX_FRAMES = readPositiveEnvInt("SHIM_MOBILE_CONV_REPLAY_MAX_FRAMES", DEFAULT_MAX_FRAMES);
 
-interface CursorSidecar {
+export interface CursorSidecar {
   version: 1;
   conversation_id: string;
   last_assigned_seq: number;
@@ -39,9 +39,20 @@ export interface ConversationResumeResult {
   frames: Record<string, unknown>[];
 }
 
+export interface MobileConversationCursorCapabilities {
+  resume_cursor_supported: true;
+  conversation_seq_field: "conv_seq";
+  resume_frame: "resume_conversation";
+  ack_frame: "ack";
+  cursor_expired_error: "cursor_expired";
+  replay_ttl_ms: number;
+  replay_max_frames: number;
+  replay_storage: "durable_jsonl";
+}
+
 const states = new Map<string, CursorState>();
 
-export function mobileConversationCursorCapabilities(): Record<string, unknown> {
+export function mobileConversationCursorCapabilities(): MobileConversationCursorCapabilities {
   return {
     resume_cursor_supported: true,
     conversation_seq_field: "conv_seq",
@@ -78,7 +89,7 @@ export function resumeConversation(conversationId: string, afterSeqInput: unknow
   const state = getState(conversationId);
   pruneReplay(state);
   const lastSeq = state.sidecar.last_assigned_seq;
-  const replay = readReplayFrames(conversationId);
+  const replay = readReplayFrames(conversationId, state.sidecar.last_ack_seq);
   const oldestSeq = replay.length > 0 ? replay[0]!.convSeq : null;
   const cursorExpired = afterSeq < lastSeq && (oldestSeq === null || afterSeq < oldestSeq - 1);
   if (cursorExpired) {
@@ -122,6 +133,15 @@ function normalizeSeq(value: unknown): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
+function readPositiveEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+  console.warn(`[mobile-conversation-cursors] ignoring invalid ${name}=${JSON.stringify(raw)}; using ${fallback}`);
+  return fallback;
+}
+
 function sidecarPath(conversationId: string): string {
   return join(
     storeInternals.storageDir(),
@@ -142,13 +162,16 @@ function readSidecar(conversationId: string): CursorSidecar {
   const path = sidecarPath(conversationId);
   if (existsSync(path)) {
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<CursorSidecar>;
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (!isRecord(parsed)) {
+        throw new Error("sidecar root is not an object");
+      }
       return {
         version: 1,
         conversation_id: conversationId,
-        last_assigned_seq: normalizeSeq(parsed.last_assigned_seq),
-        last_ack_seq: normalizeSeq(parsed.last_ack_seq),
-        updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : new Date().toISOString(),
+        last_assigned_seq: normalizeSeq(parsed["last_assigned_seq"]),
+        last_ack_seq: normalizeSeq(parsed["last_ack_seq"]),
+        updated_at: typeof parsed["updated_at"] === "string" ? parsed["updated_at"] : new Date().toISOString(),
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -190,7 +213,7 @@ function appendReplayFrame(conversationId: string, entry: ReplayEntry): void {
   appendFileSync(path, JSON.stringify({ seq: entry.convSeq, ts: new Date(entry.tsMs).toISOString(), frame: entry.frame }) + "\n");
 }
 
-function readReplayFrames(conversationId: string): ReplayEntry[] {
+function readReplayFrames(conversationId: string, lastAckSeq: number): ReplayEntry[] {
   const path = replayPath(conversationId);
   if (!existsSync(path)) return [];
   let body = "";
@@ -202,18 +225,24 @@ function readReplayFrames(conversationId: string): ReplayEntry[] {
     return [];
   }
   const entries: ReplayEntry[] = [];
+  const cutoff = Date.now() - TTL_MS;
   for (const line of body.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
-      const parsed = JSON.parse(trimmed) as { seq?: unknown; ts?: unknown; frame?: unknown };
-      const convSeq = normalizeSeq(parsed.seq);
-      if (convSeq <= 0 || !isRecord(parsed.frame)) continue;
-      const tsMs = typeof parsed.ts === "string" ? Date.parse(parsed.ts) : NaN;
+      const parsed: unknown = JSON.parse(trimmed);
+      if (!isRecord(parsed)) continue;
+      const convSeq = normalizeSeq(parsed["seq"]);
+      const frame = parsed["frame"];
+      if (convSeq <= 0 || !isRecord(frame)) continue;
+      const ts = parsed["ts"];
+      const tsMs = typeof ts === "string" ? Date.parse(ts) : NaN;
+      const normalizedTsMs = Number.isFinite(tsMs) ? tsMs : 0;
+      if (normalizedTsMs < cutoff || convSeq <= lastAckSeq) continue;
       entries.push({
         convSeq,
-        tsMs: Number.isFinite(tsMs) ? tsMs : 0,
-        frame: parsed.frame,
+        tsMs: normalizedTsMs,
+        frame,
       });
     } catch {
       // Match the run frame-log reader: ignore malformed/partial trailing lines.
