@@ -683,6 +683,10 @@ test("GET /v1/conversations reflects last_message_at bumps after a turn (lcp-5ky
     role: "user",
     content: "pre-seed for bump test",
   });
+  seedMessage(shim.stateDir, agentId, "default", {
+    role: "assistant",
+    content: "pre-seed assistant reply",
+  });
 
   const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: 8000 });
   t.after(() => conn.close());

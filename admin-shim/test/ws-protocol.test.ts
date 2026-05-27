@@ -568,6 +568,10 @@ test("ws: otid in send_message propagates to disk sidecar via the otid bind", as
     role: "user",
     content: "prior user message",
   });
+  seedMessage(shim.stateDir, agentId, "default", {
+    role: "assistant",
+    content: "prior assistant reply",
+  });
   const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
 
@@ -605,7 +609,9 @@ test("ws: literal `default` conv id with multiple agents routes to the CLIENT-su
   seedConversation(shim.stateDir, agentA);
   seedConversation(shim.stateDir, agentB);
   const seededA = seedMessage(shim.stateDir, agentA, "default", { role: "user", content: "A's prior message" });
+  seedMessage(shim.stateDir, agentA, "default", { role: "assistant", content: "A's prior reply" });
   seedMessage(shim.stateDir, agentB, "default", { role: "user", content: "B's prior message" });
+  seedMessage(shim.stateDir, agentB, "default", { role: "assistant", content: "B's prior reply" });
 
   const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());
@@ -642,6 +648,10 @@ test("ws: external conv id (conv-default-<agentId>) resolves like SSE — otid s
   const seededId = seedMessage(shim.stateDir, agentId, "default", {
     role: "user",
     content: "prior user message",
+  });
+  seedMessage(shim.stateDir, agentId, "default", {
+    role: "assistant",
+    content: "prior assistant reply",
   });
   const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
   t.after(() => conn.close());

@@ -320,6 +320,10 @@ test("streaming: otid bind — POSTed otid is recorded in _otid-map.json sidecar
     role: "user",
     content: "earlier user prompt",
   });
+  seedMessage(shim.stateDir, agentId, "default", {
+    role: "assistant",
+    content: "earlier assistant reply",
+  });
   const convId = externalConvId(agentId);
 
   const myOtid = "cm-otid-roundtrip";
