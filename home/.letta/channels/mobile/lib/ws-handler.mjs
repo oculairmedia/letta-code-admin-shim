@@ -39,6 +39,13 @@ const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
   rest_role: "cold_start_reconcile_repair",
   sse_role: "legacy_non_canonical_for_mobile_ws_sessions",
   exclusivity: "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  keepalive: {
+    protocol: "ws_ping_pong",
+    client_ping_supported: true,
+    server_ping_interval_ms: 30_000,
+    server_pong_timeout_ms: 10_000,
+    timeout_close_code: 4001,
+  },
 });
 
 function safeSend(ws, frame, log) {

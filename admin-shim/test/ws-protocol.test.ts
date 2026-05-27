@@ -121,6 +121,13 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
           rest_role?: string;
           sse_role?: string;
           exclusivity?: string;
+          keepalive?: {
+            protocol?: string;
+            client_ping_supported?: boolean;
+            server_ping_interval_ms?: number;
+            server_pong_timeout_ms?: number;
+            timeout_close_code?: number;
+          };
         };
         capabilities?: {
           mobile_transport?: {
@@ -145,6 +152,11 @@ test("ws: hello/welcome handshake — server_id, session_id, device_id in welcom
     welcome.transport_contract?.exclusivity,
     "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
   );
+  assert.equal(welcome.transport_contract?.keepalive?.protocol, "ws_ping_pong");
+  assert.equal(welcome.transport_contract?.keepalive?.client_ping_supported, true);
+  assert.equal(welcome.transport_contract?.keepalive?.server_ping_interval_ms, 30_000);
+  assert.equal(welcome.transport_contract?.keepalive?.server_pong_timeout_ms, 10_000);
+  assert.equal(welcome.transport_contract?.keepalive?.timeout_close_code, 4001);
   assert.equal(welcome.capabilities?.mobile_transport?.canonical_live_transport, "ws");
 });
 
@@ -796,6 +808,78 @@ test("ws: server emits periodic ping frames", async (t) => {
   // Wait long enough for at least 2 pings.
   const ping = await conn.waitFor("ping", { timeoutMs: 3_000 });
   assert.equal(ping.type, "ping");
+});
+
+test("ws: server emits protocol-level ping control frames", async (t) => {
+  const shim = await startShim({
+    env: {
+      SHIM_MOBILE_WS_PING_INTERVAL_MS: "100",
+      SHIM_MOBILE_WS_PONG_TIMEOUT_MS: "500",
+    },
+  });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      conn.ws.off("ping", onPing);
+      reject(new Error("timed out waiting for protocol ping"));
+    }, 2_000);
+    const onPing = (): void => {
+      clearTimeout(timer);
+      conn.ws.off("ping", onPing);
+      resolve();
+    };
+    conn.ws.on("ping", onPing);
+  });
+});
+
+test("ws: client protocol ping receives protocol pong", async (t) => {
+  const { conn } = await setupAuthed(t);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      conn.ws.off("pong", onPong);
+      reject(new Error("timed out waiting for protocol pong"));
+    }, 2_000);
+    const onPong = (data: Buffer): void => {
+      if (data.toString("utf8") !== "client-keepalive") return;
+      clearTimeout(timer);
+      conn.ws.off("pong", onPong);
+      resolve();
+    };
+    conn.ws.on("pong", onPong);
+    conn.ws.ping(Buffer.from("client-keepalive"));
+  });
+});
+
+test("ws: missing protocol pong closes with keepalive code", async (t) => {
+  const shim = await startShim({
+    env: {
+      SHIM_MOBILE_WS_PING_INTERVAL_MS: "100",
+      SHIM_MOBILE_WS_PONG_TIMEOUT_MS: "150",
+    },
+  });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    timeoutMs: WS_TIMEOUT_MS,
+    autoPong: false,
+  });
+  t.after(() => conn.close());
+
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out waiting for keepalive close")), 4_000);
+    conn.ws.once("close", (code: number) => {
+      clearTimeout(timer);
+      try {
+        assert.equal(code, 4001);
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
 });
 
 // ─── 13. bye triggers clean close ───────────────────────────────────

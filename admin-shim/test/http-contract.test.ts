@@ -54,6 +54,13 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
         rest_role?: string;
         sse_role?: string;
         exclusivity?: string;
+        keepalive?: {
+          protocol?: string;
+          client_ping_supported?: boolean;
+          server_ping_interval_ms?: number;
+          server_pong_timeout_ms?: number;
+          timeout_close_code?: number;
+        };
       };
     };
   };
@@ -72,6 +79,11 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
     b.capabilities?.mobile_transport?.exclusivity,
     "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
   );
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.protocol, "ws_ping_pong");
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.client_ping_supported, true);
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.server_ping_interval_ms, 30_000);
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.server_pong_timeout_ms, 10_000);
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.timeout_close_code, 4001);
 });
 
 test("GET /shim/v1/capabilities exposes canonical mobile transport contract", async (t) => {
@@ -93,6 +105,13 @@ test("GET /shim/v1/capabilities exposes canonical mobile transport contract", as
       rest_role?: string;
       sse_role?: string;
       exclusivity?: string;
+      keepalive?: {
+        protocol?: string;
+        client_ping_supported?: boolean;
+        server_ping_interval_ms?: number;
+        server_pong_timeout_ms?: number;
+        timeout_close_code?: number;
+      };
     };
   };
   assert.equal(res.status, 200);
@@ -110,6 +129,11 @@ test("GET /shim/v1/capabilities exposes canonical mobile transport contract", as
     b.mobile_transport?.exclusivity,
     "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
   );
+  assert.equal(b.mobile_transport?.keepalive?.protocol, "ws_ping_pong");
+  assert.equal(b.mobile_transport?.keepalive?.client_ping_supported, true);
+  assert.equal(b.mobile_transport?.keepalive?.server_ping_interval_ms, 30_000);
+  assert.equal(b.mobile_transport?.keepalive?.server_pong_timeout_ms, 10_000);
+  assert.equal(b.mobile_transport?.keepalive?.timeout_close_code, 4001);
 });
 
 test("GET /v1/health (no trailing slash) is also served", async (t) => {
