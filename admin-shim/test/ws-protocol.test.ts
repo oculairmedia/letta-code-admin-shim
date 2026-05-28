@@ -882,6 +882,31 @@ test("ws: missing protocol pong closes with keepalive code", async (t) => {
   });
 });
 
+test("ws: protocol pong satisfies app-layer idle timeout", async (t) => {
+  const shim = await startShim({
+    env: {
+      SHIM_MOBILE_WS_PING_INTERVAL_MS: "75",
+      SHIM_MOBILE_WS_PONG_TIMEOUT_MS: "500",
+    },
+  });
+  t.after(() => shim.stop());
+
+  const accountsPath = join(shim.homeDir, ".letta", "channels", "mobile", "accounts.json");
+  const accounts = JSON.parse(readFileSync(accountsPath, "utf8")) as {
+    accounts: Array<{ config: { idleTimeoutMs: number; pingIntervalMs: number } }>;
+  };
+  accounts.accounts[0]!.config.idleTimeoutMs = 180;
+  accounts.accounts[0]!.config.pingIntervalMs = 10_000;
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(accountsPath, JSON.stringify(accounts, null, 2));
+
+  const conn = await openMobileWs(shim.url!, { token: shim.mobileToken, timeoutMs: WS_TIMEOUT_MS });
+  t.after(() => conn.close());
+
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  assert.equal(conn.closed, false, "protocol pong should refresh the plugin idle timer");
+});
+
 // ─── 13. bye triggers clean close ───────────────────────────────────
 
 test("ws: client `bye` produces a 1000 close from the server", async (t) => {

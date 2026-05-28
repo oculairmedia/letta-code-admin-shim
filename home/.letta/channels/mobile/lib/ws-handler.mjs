@@ -113,6 +113,19 @@ export function handleConnection(ws, request, host) {
     if (idleTimer.unref) idleTimer.unref();
   };
 
+  const touchAdapterForLiveness = () => {
+    // lcp-rfb/lcp-fwo: any inbound app frame OR protocol-level WS keepalive
+    // proves the mobile client is still present. Keep both this socket's idle
+    // timer and the backing SDK adapter's lastUsedAt fresh while connected.
+    if (helloSeen && lastClientConversationId && lastClientAgentId && typeof host.touchAdapter === "function") {
+      try {
+        host.touchAdapter(lastClientConversationId, lastClientAgentId);
+      } catch (err) {
+        log?.warn?.(`[mobile-ws] touchAdapter failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  };
+
   const startPings = () => {
     const interval = host.config?.pingIntervalMs ?? 25_000;
     pingTimer = setInterval(() => {
@@ -415,15 +428,7 @@ export function handleConnection(ws, request, host) {
 
   ws.on("message", async (raw) => {
     resetIdle();
-    // lcp-rfb: bump pool adapter's lastUsedAt on every inbound frame so the
-    // housekeep idle-evict timer stays fresh while a mobile client is connected.
-    if (helloSeen && lastClientConversationId && lastClientAgentId && typeof host.touchAdapter === "function") {
-      try {
-        host.touchAdapter(lastClientConversationId, lastClientAgentId);
-      } catch (err) {
-        log?.warn?.(`[mobile-ws] touchAdapter failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    touchAdapterForLiveness();
     const frame = parseFrame(raw.toString("utf8"));
     if (!frame) {
       sendError(ERROR_CODES.PROTOCOL_VIOLATION, "unparseable frame");
@@ -1190,6 +1195,16 @@ export function handleConnection(ws, request, host) {
   ws.on("close", () => {
     log(`closed session=${sessionId} device=${device?.device_id ?? "(unauthed)"}`);
     stopAll();
+  });
+
+  ws.on("ping", () => {
+    resetIdle();
+    touchAdapterForLiveness();
+  });
+
+  ws.on("pong", () => {
+    resetIdle();
+    touchAdapterForLiveness();
   });
 
   ws.on("error", (err) => {
