@@ -208,6 +208,63 @@ test("GET /v1/agents orders by mtime descending", async (t) => {
   assert.equal(ids[1], "agent-mtime-old");
 });
 
+test("POST /v1/agents creates an agent by writing the store record (vibesync-tr3e/razp)", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const before = await getJson(`${shim.url}/v1/agents/count`);
+  assert.equal(before.body, 0);
+
+  const res = await fetch(`${shim.url}/v1/agents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "agent-created-001",
+      name: "reviewer@proj",
+      system: "You are the reviewer role.",
+      model: "lmstudio/sonnet-4-5",
+      tags: ["vibesync", "role:reviewer"],
+      memory_blocks: [{ label: "scope", value: "review only" }],
+    }),
+  });
+  assert.equal(res.status, 201);
+  const created = (await res.json()) as {
+    id: string;
+    name: string;
+    system: string;
+    llm_config?: { model?: string };
+    memory?: { blocks: Array<{ label: string }> };
+  };
+  assert.equal(created.id, "agent-created-001");
+  assert.equal(created.name, "reviewer@proj");
+  assert.equal(created.system, "You are the reviewer role.");
+
+  // It must now be visible via the read paths (same store).
+  const count = await getJson(`${shim.url}/v1/agents/count`);
+  assert.equal(count.body, 1);
+  const detail = await getJson(`${shim.url}/v1/agents/agent-created-001`);
+  assert.equal(detail.res.status, 200);
+  const d = detail.body as { id: string; memory: { blocks: Array<{ label: string }> } };
+  assert.equal(d.id, "agent-created-001");
+  const labels = d.memory.blocks.map((b) => b.label).sort();
+  assert.ok(labels.includes("scope"), `expected scope block, got ${labels.join(",")}`);
+  assert.ok(labels.includes("system_prompt"), `expected system_prompt block, got ${labels.join(",")}`);
+});
+
+test("POST /v1/agents rejects a duplicate id with 409", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const mk = () =>
+    fetch(`${shim.url}/v1/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "agent-dup-1", name: "x" }),
+    });
+  assert.equal((await mk()).status, 201);
+  assert.equal((await mk()).status, 409);
+});
+
 test("GET /v1/agents honors limit and offset", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
