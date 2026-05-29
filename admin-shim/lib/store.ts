@@ -313,6 +313,15 @@ export function getAgentRecord(agentId: string): OnDiskAgentRecord | null {
   } as OnDiskAgentRecord;
 }
 
+export async function writeAgentRecord(record: OnDiskAgentRecord): Promise<void> {
+  const path = join(storageDir(), "agents", `${b64url(record.id)}.json`);
+  const diskRecord: Record<string, unknown> = { ...record };
+  delete diskRecord["_mtimeMs"];
+  delete diskRecord["_ctimeMs"];
+  await atomicWriteJson(path, diskRecord);
+  _listAgentsCached.invalidate();
+}
+
 function conversationKey(conversationId: string, agentId: string): string {
   return conversationId === "default"
     ? `default:${agentId}`

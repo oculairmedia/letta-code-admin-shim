@@ -37,6 +37,7 @@ import {
   readOtidMap,
   readSystemPrompt,
   resolveConversationId,
+  writeAgentRecord,
   _internals as storeInternals,
   type OnDiskAgentRecord,
   type OnDiskConversation,
@@ -67,17 +68,14 @@ import {
   stopCronScheduler,
 } from "./lib/cron-scheduler.js";
 import { getTask as getCronTask, listTasks as listCronTasks } from "./lib/crons.js";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
 const HOST = process.env["SHIM_HOST"] || "0.0.0.0";
-<<<<<<< HEAD
-=======
 const MOBILE_WS_KEEPALIVE_PING_INTERVAL_MS = Number(process.env["SHIM_MOBILE_WS_PING_INTERVAL_MS"] || 30_000);
 const MOBILE_WS_KEEPALIVE_PONG_TIMEOUT_MS = Number(process.env["SHIM_MOBILE_WS_PONG_TIMEOUT_MS"] || 10_000);
 const MOBILE_WS_KEEPALIVE_CLOSE_CODE = 4001;
 const MOBILE_WS_KEEPALIVE_TERMINATE_GRACE_MS = 5_000;
->>>>>>> e0e83cd (feat(shim): add POST /v1/agents create endpoint (vibesync-tr3e/razp))
 
 // lcp-sdk.10: the SDK transport requires letta-code to be spawned with
 // `--backend local`. The SDK doesn't pass that flag, so we route through
@@ -182,9 +180,84 @@ const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
   rest_role: "cold_start_reconcile_repair",
   sse_role: "legacy_non_canonical_for_mobile_ws_sessions",
   exclusivity: "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  keepalive: {
+    protocol: "ws_ping_pong",
+    client_ping_supported: true,
+    server_ping_interval_ms: MOBILE_WS_KEEPALIVE_PING_INTERVAL_MS,
+    server_pong_timeout_ms: MOBILE_WS_KEEPALIVE_PONG_TIMEOUT_MS,
+    timeout_close_code: MOBILE_WS_KEEPALIVE_CLOSE_CODE,
+  },
   ...mobileConversationCursorCapabilities(),
 });
 console.log(`server_id: ${SERVER_ID}`);
+
+function installMobileWsProtocolKeepalive(ws: WebSocket): void {
+  let awaitingPong = false;
+  let pingSentAt = 0;
+  let terminateTimer: NodeJS.Timeout | null = null;
+
+  const clearTerminateTimer = (): void => {
+    if (terminateTimer) {
+      clearTimeout(terminateTimer);
+      terminateTimer = null;
+    }
+  };
+
+  const cleanup = (): void => {
+    clearInterval(interval);
+    clearTerminateTimer();
+  };
+
+  const closeForPongTimeout = (): void => {
+    cleanup();
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) {
+      try {
+        ws.close(MOBILE_WS_KEEPALIVE_CLOSE_CODE, "pong timeout");
+      } catch (err) {
+        console.warn(`[mobile-channel] ws keepalive close failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    terminateTimer = setTimeout(() => {
+      if (ws.readyState !== WebSocket.CLOSED) {
+        try { ws.terminate(); } catch {}
+      }
+    }, MOBILE_WS_KEEPALIVE_TERMINATE_GRACE_MS);
+    terminateTimer.unref();
+  };
+
+  const sendPing = (): void => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (awaitingPong && now - pingSentAt >= MOBILE_WS_KEEPALIVE_PONG_TIMEOUT_MS) {
+      closeForPongTimeout();
+      return;
+    }
+    if (awaitingPong) return;
+    awaitingPong = true;
+    pingSentAt = now;
+    try {
+      ws.ping();
+    } catch (err) {
+      console.warn(`[mobile-channel] ws keepalive ping failed: ${err instanceof Error ? err.message : String(err)}`);
+      closeForPongTimeout();
+    }
+  };
+
+  const interval = setInterval(sendPing, MOBILE_WS_KEEPALIVE_PING_INTERVAL_MS);
+  interval.unref();
+
+  ws.on("pong", () => {
+    awaitingPong = false;
+    pingSentAt = 0;
+  });
+  ws.on("ping", (data: Buffer) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.pong(data); } catch {}
+    }
+  });
+  ws.once("close", cleanup);
+  ws.once("error", cleanup);
+}
 
 function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, {
@@ -274,8 +347,6 @@ async function handleAgentDetail(_req: IncomingMessage, res: ServerResponse, age
   json(res, 200, agentToLettaState(a, { messages, blocks }));
 }
 
-<<<<<<< HEAD
-=======
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -454,7 +525,6 @@ async function handleAgentCreate(req: IncomingMessage, res: ServerResponse): Pro
   json(res, 201, agentToLettaState(created, { messages, blocks: outBlocks }));
 }
 
->>>>>>> e0e83cd (feat(shim): add POST /v1/agents create endpoint (vibesync-tr3e/razp))
 async function handleAgentMessages(
   _req: IncomingMessage,
   res: ServerResponse,
@@ -639,16 +709,46 @@ function vanillaModel({ handle, name, contextWindow = 200000, maxTokens = 16384 
   };
 }
 
-function handleModels(_req: IncomingMessage, res: ServerResponse): void {
-  // Surface the model(s) we have wired through the lmstudio provider — and
-  // a couple of common handles so mobile's model picker has options.
-  json(res, 200, [
-    vanillaModel({ handle: "lmstudio/opus-4-7", name: "opus-4-7" }),
-    vanillaModel({ handle: "lmstudio/sonnet-4-5", name: "sonnet-4-5" }),
-    vanillaModel({ handle: "lmstudio/opus-4-7-reasoning-high", name: "opus-4-7-reasoning-high" }),
-    vanillaModel({ handle: "lmstudio/gpt-5.4", name: "gpt-5.4" }),
-    vanillaModel({ handle: "lmstudio/gpt-5.4-mini", name: "gpt-5.4-mini", contextWindow: 400000 }),
-  ]);
+// Offline fallback used only when the upstream provider's /models endpoint is
+// unreachable, so mobile's picker always has at least these options.
+const STATIC_FALLBACK_MODELS: VanillaModelOptions[] = [
+  { handle: "lmstudio/opus-4-8", name: "opus-4-8" },
+  { handle: "lmstudio/opus-4-7", name: "opus-4-7" },
+  { handle: "lmstudio/sonnet-4-5", name: "sonnet-4-5" },
+  { handle: "lmstudio/gpt-5.5", name: "gpt-5.5", contextWindow: 1050000 },
+  { handle: "lmstudio/gpt-5.3-codex-spark", name: "gpt-5.3-codex-spark", contextWindow: 400000 },
+];
+
+async function handleModels(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // Source of truth is the provider letta-code routes inference through (the
+  // Max proxy at LMSTUDIO_BASE_URL). Pull its live /models list so the picker
+  // always reflects whatever the proxy actually serves — no hardcoded drift.
+  // Reasoning variants (`*-reasoning-*`) are collapsed away; reasoning is
+  // surfaced per-model via the enable_reasoner/reasoning_effort fields instead.
+  const baseUrl = process.env["LMSTUDIO_BASE_URL"] || "http://localhost:8082/v1";
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(`${baseUrl}/models`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) throw new Error(`upstream /models returned ${resp.status}`);
+    const data = (await resp.json()) as { data?: Array<Record<string, unknown>> };
+    const entries = Array.isArray(data?.data) ? data.data : [];
+    const models = entries
+      .filter((m) => typeof m["id"] === "string" && !(m["id"] as string).includes("-reasoning-"))
+      .map((m) => {
+        const id = m["id"] as string;
+        const opts: VanillaModelOptions = { handle: `lmstudio/${id}`, name: id };
+        if (typeof m["context_length"] === "number") opts.contextWindow = m["context_length"] as number;
+        if (typeof m["max_completion_tokens"] === "number") opts.maxTokens = m["max_completion_tokens"] as number;
+        return vanillaModel(opts);
+      });
+    if (models.length > 0) return json(res, 200, models);
+    throw new Error("upstream /models returned no usable entries");
+  } catch (err) {
+    console.warn(`[handleModels] falling back to static list: ${err instanceof Error ? err.message : String(err)}`);
+    return json(res, 200, STATIC_FALLBACK_MODELS.map(vanillaModel));
+  }
 }
 
 interface BuiltinToolDefinition {
@@ -1361,6 +1461,7 @@ const server = createServer((req, res) => {
 
   const agentDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/?$/);
   if (agentDetail && req.method === "GET") return handleAgentDetail(req, res, agentDetail[1]!);
+  if (agentDetail && req.method === "PATCH") return handleAgentUpdate(req, res, agentDetail[1]!);
 
   const agentMessages = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/messages\/?$/);
   if (agentMessages && req.method === "GET") return handleAgentMessages(req, res, url, agentMessages[1]!);
@@ -1556,7 +1657,7 @@ server.listen(PORT, HOST, () => {
 // /shim/v1/mobile is the WebSocket endpoint for the letta-mobile channel
 // transport (Phase 1 of the mobile-as-channel epic). Other paths get a
 // 404 on upgrade so unknown WS targets don't hang.
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, autoPong: false });
 type MobileAdapter = Awaited<ReturnType<typeof getMobileChannelAdapter>>;
 let mobileAdapter: MobileAdapter = null;
 
@@ -1585,6 +1686,7 @@ server.on("upgrade", async (req: IncomingMessage, socket: Duplex, head: Buffer) 
     return;
   }
   wss.handleUpgrade(req, socket as never, head, (ws) => {
+    installMobileWsProtocolKeepalive(ws);
     mobileAdapter!.acceptConnection(ws, req);
   });
 });
