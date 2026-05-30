@@ -243,17 +243,44 @@ function isLocalMessage(value: unknown): value is LocalMessage {
 }
 
 /**
+ * lcp-nlud: letta-code's session-log v3 format wraps every message in an
+ * envelope row — `{ type: "message", id, parentId, timestamp, message: {
+ * id, role, content, metadata, ... } }` — and prefixes the file with a
+ * `{ type: "session", version: 3, ... }` header row. The real LocalMessage
+ * (role/content/metadata) lives under `.message`. Older transcripts store
+ * the message flat at the top level. Unwrap the envelope here so both
+ * shapes feed the same `isLocalMessage` filter and `content`->`parts`
+ * mapping below.
+ *
+ * Without this, listMessages dropped every v3 record (no top-level `role`)
+ * and a conversation with only synthetic settle tool-returns appended by
+ * turn-settlement (which DOES write flat records) surfaced as nothing but
+ * those settle frames — hiding the entire real history from mobile.
+ *
+ * The non-message header row (`type: "session"`) has no inner `message`,
+ * so it falls through unchanged and `isLocalMessage` rejects it (no role),
+ * exactly as before.
+ */
+function unwrapSessionEnvelope(value: unknown): unknown {
+  if (isRecord(value) && value["type"] === "message" && isRecord(value["message"])) {
+    return value["message"];
+  }
+  return value;
+}
+
+/**
  * Post-migration messages.jsonl uses `content` instead of `parts`. Mirror
  * the field onto `parts` so the rest of the shim (translate.ts, sidecar
  * stampers, etc.) doesn't need to know about the on-disk schema bump.
  * Idempotent: legacy records with `parts` already set pass through.
  */
 function normalizeMessage(value: unknown): unknown {
-  if (!isRecord(value)) return value;
-  if (!Array.isArray(value["parts"]) && Array.isArray(value["content"])) {
-    return { ...value, parts: value["content"] };
+  const unwrapped = unwrapSessionEnvelope(value);
+  if (!isRecord(unwrapped)) return unwrapped;
+  if (!Array.isArray(unwrapped["parts"]) && Array.isArray(unwrapped["content"])) {
+    return { ...unwrapped, parts: unwrapped["content"] };
   }
-  return value;
+  return unwrapped;
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
