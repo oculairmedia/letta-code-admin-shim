@@ -185,14 +185,55 @@ async function readJsonOrNullAsync(path: string): Promise<unknown> {
   }
 }
 
+/**
+ * lcp-e5hb: single-pass JSONL parser. The previous implementation did
+ * `split("\n").map(trim).filter(Boolean).map(JSON.parse)`, allocating two
+ * throwaway arrays over every line of files that reach multiple MB / 1500+
+ * lines on the hot read path. This walks the buffer once, slicing on
+ * newlines and trimming via char codes without intermediate arrays.
+ *
+ * It also makes parsing per-line tolerant: a single malformed line (e.g. a
+ * truncated final record from a crash mid-append — see turn-settlement's
+ * appendJsonl) is skipped instead of throwing and discarding the ENTIRE
+ * file's contents, which is what the old all-or-nothing try/catch did. That
+ * matches the tolerance turn-settlement.ts already documented and assumed.
+ */
+function parseJsonl(raw: string): unknown[] {
+  const out: unknown[] = [];
+  const len = raw.length;
+  let start = 0;
+  while (start < len) {
+    let end = raw.indexOf("\n", start);
+    if (end === -1) end = len;
+    // Trim leading/trailing whitespace (space, tab, CR) by char code so we
+    // only allocate a substring for non-blank lines.
+    let s = start;
+    let e = end;
+    while (s < e) {
+      const c = raw.charCodeAt(s);
+      if (c === 32 || c === 9 || c === 13) s += 1;
+      else break;
+    }
+    while (e > s) {
+      const c = raw.charCodeAt(e - 1);
+      if (c === 32 || c === 9 || c === 13) e -= 1;
+      else break;
+    }
+    if (e > s) {
+      try {
+        out.push(JSON.parse(raw.slice(s, e)) as unknown);
+      } catch {
+        // Skip a single malformed line rather than dropping the whole file.
+      }
+    }
+    start = end + 1;
+  }
+  return out;
+}
+
 async function readJsonlOrEmptyAsync(path: string): Promise<unknown[]> {
   try {
-    const raw = await fsReadFile(path, "utf8");
-    return raw
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as unknown);
+    return parseJsonl(await fsReadFile(path, "utf8"));
   } catch {
     return [];
   }
@@ -200,12 +241,7 @@ async function readJsonlOrEmptyAsync(path: string): Promise<unknown[]> {
 
 function readJsonlOrEmpty(path: string): unknown[] {
   try {
-    const raw = readFileSync(path, "utf8");
-    return raw
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as unknown);
+    return parseJsonl(readFileSync(path, "utf8"));
   } catch {
     return [];
   }
@@ -532,6 +568,86 @@ export async function getAgentIdForConversation(externalId: string): Promise<str
   return (await resolveConversationId(externalId))?.agentId ?? null;
 }
 
+// lcp-h5ns: stat-gated cache of the normalized+filtered LocalMessage[] for
+// each conversation's messages.jsonl. Mobile polls GET /messages repeatedly
+// between turns; previously every poll re-read and JSON-parsed the whole file
+// (up to ~5MB / 1500+ lines) just to slice the tail. messages.jsonl only
+// changes at end-of-turn (append from the pool / turn-settlement) or during a
+// heal (atomic temp+rename rewrite), and BOTH bump the file's size and/or
+// mtime. So we key the cache on (size, mtimeMs): an unchanged file is served
+// from memory after a single `stat`, and any change triggers exactly one full
+// reparse — never more work than before.
+//
+// We deliberately do NOT attempt byte-range tail-append reads: the healer
+// rewrites the file in place (conversation-healer.atomicWriteJsonl), so a
+// larger size doesn't guarantee the existing prefix is unchanged. Gating on
+// (size, mtimeMs) + full reparse-on-change is correct against both append and
+// rewrite while still collapsing the hot poll path to a stat.
+interface MessagesCacheEntry {
+  size: number;
+  mtimeMs: number;
+  filtered: LocalMessage[];
+}
+const messagesCache = new Map<string, MessagesCacheEntry>();
+// Bound memory: large transcripts parse to tens of MB of heap each. Keep only
+// the most-recently-read conversations hot; mobile works a handful at a time.
+const MESSAGES_CACHE_MAX = 24;
+
+function touchMessagesCache(path: string, entry: MessagesCacheEntry): void {
+  // Map preserves insertion order — delete+set moves the key to most-recent.
+  messagesCache.delete(path);
+  messagesCache.set(path, entry);
+  if (messagesCache.size > MESSAGES_CACHE_MAX) {
+    const oldest = messagesCache.keys().next().value;
+    if (oldest !== undefined) messagesCache.delete(oldest);
+  }
+}
+
+function normalizeAndFilter(items: unknown[]): LocalMessage[] {
+  // Normalize content -> parts (and unwrap v3 envelopes, lcp-nlud) BEFORE
+  // filtering so post-migration records pass isLocalMessage.
+  return items.map(normalizeMessage).filter(isLocalMessage);
+}
+
+async function loadFilteredMessages(path: string): Promise<LocalMessage[]> {
+  let st;
+  try {
+    st = await fsStat(path);
+  } catch {
+    messagesCache.delete(path);
+    return [];
+  }
+  const cached = messagesCache.get(path);
+  if (cached && cached.size === st.size && cached.mtimeMs === st.mtimeMs) {
+    touchMessagesCache(path, cached);
+    return cached.filtered;
+  }
+  // Stat (taken BEFORE the read) is what we store: if the file changes after
+  // this read, its next stat differs from `st` and we reparse — conservative,
+  // never stale.
+  const filtered = normalizeAndFilter(await readJsonlOrEmptyAsync(path));
+  touchMessagesCache(path, { size: st.size, mtimeMs: st.mtimeMs, filtered });
+  return filtered;
+}
+
+function loadFilteredMessagesSync(path: string): LocalMessage[] {
+  let st;
+  try {
+    st = statSync(path);
+  } catch {
+    messagesCache.delete(path);
+    return [];
+  }
+  const cached = messagesCache.get(path);
+  if (cached && cached.size === st.size && cached.mtimeMs === st.mtimeMs) {
+    touchMessagesCache(path, cached);
+    return cached.filtered;
+  }
+  const filtered = normalizeAndFilter(readJsonlOrEmpty(path));
+  touchMessagesCache(path, { size: st.size, mtimeMs: st.mtimeMs, filtered });
+  return filtered;
+}
+
 export async function listMessages(
   conversationId: string,
   agentId: string,
@@ -539,16 +655,16 @@ export async function listMessages(
 ): Promise<LocalMessage[]> {
   const key = conversationKey(conversationId, agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
-  const items = await readJsonlOrEmptyAsync(join(dir, "messages.jsonl"));
-  // Normalize content -> parts BEFORE filtering so post-migration records
-  // pass isLocalMessage (which still requires a non-empty parts array).
-  let scoped: LocalMessage[] = items.map(normalizeMessage).filter(isLocalMessage);
+  const all = await loadFilteredMessages(join(dir, "messages.jsonl"));
+  let scoped: LocalMessage[] = all;
   if (before) {
-    const idx = scoped.findIndex((m) => m.id === before);
-    if (idx >= 0) scoped = scoped.slice(0, idx);
+    const idx = all.findIndex((m) => m.id === before);
+    if (idx >= 0) scoped = all.slice(0, idx);
   }
   if (limit && limit > 0) scoped = scoped.slice(-limit);
-  return scoped;
+  // Never hand back the cached array itself — callers must not be able to
+  // mutate cache state. (slice() above already copies; cover the pass-through.)
+  return scoped === all ? all.slice() : scoped;
 }
 
 /**
@@ -562,8 +678,7 @@ export function listMessagesSync(
 ): LocalMessage[] {
   const key = conversationKey(conversationId, agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
-  const items = readJsonlOrEmpty(join(dir, "messages.jsonl"));
-  return items.map(normalizeMessage).filter(isLocalMessage);
+  return loadFilteredMessagesSync(join(dir, "messages.jsonl")).slice();
 }
 
 export function readSystemPrompt(conversationId: string, agentId: string): unknown {
@@ -595,10 +710,29 @@ function otidSidecarPath(conversationId: string, agentId: string): string {
   return join(storageDir(), "conversations", b64url(key), "_otid-map.json");
 }
 
+// lcp-66pv: in-memory cache of the _real-times.json sidecar, mirroring the
+// otidMapCache write-through pattern below. Every GET /messages reads this
+// (readMessageTimestamps) and the conversations list reads it via
+// maxRealMessageTime — but it only changes when stampNewMessages writes at
+// end-of-turn. stampNewMessages obtains the map via readMessageTimestamps,
+// mutates it in place, and persists, so the cached object stays consistent
+// with disk; on write failure the entry is evicted so the next read re-loads
+// authoritative state. The only writer of this file is stampNewMessages.
+const realTimesCache = new Map<string, TimestampSidecar>();
+
+function realTimesCacheKey(conversationId: string, agentId: string): string {
+  return `${conversationId}|${agentId}`;
+}
+
 export async function readMessageTimestamps(conversationId: string, agentId: string): Promise<TimestampSidecar> {
+  const cacheKey = realTimesCacheKey(conversationId, agentId);
+  const cached = realTimesCache.get(cacheKey);
+  if (cached) return cached;
   const path = timestampSidecarPath(conversationId, agentId);
   const raw = await readJsonOrNullAsync(path);
-  return isStringRecord(raw) ? raw : {};
+  const map: TimestampSidecar = isStringRecord(raw) ? raw : {};
+  realTimesCache.set(cacheKey, map);
+  return map;
 }
 
 // lcp-dfz: derive the effective last_message_at from the sidecar. letta-code's
@@ -759,6 +893,10 @@ export async function stampNewMessages(
     try {
       await atomicWriteJson(path, current);
     } catch (err) {
+      // lcp-66pv: the in-place mutation above already updated the cached map;
+      // if persistence failed, evict so the next read re-loads authoritative
+      // (un-mutated) state from disk rather than serving the un-persisted map.
+      realTimesCache.delete(realTimesCacheKey(conversationId, agentId));
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[store] stamp sidecar write failed for ${conversationId}: ${msg}`);
     }
