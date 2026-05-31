@@ -59,6 +59,10 @@ import {
   listRuns,
   type ListRunsParams,
 } from "./lib/runs.js";
+import {
+  discoverOpenAICompatibleModels,
+  FALLBACK_MODEL_CATALOG,
+} from "./lib/model-catalog.js";
 import { bridgeSendMessage, getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
 import { mobileConversationCursorCapabilities } from "./lib/mobile-conversation-cursors.js";
 import {
@@ -451,16 +455,29 @@ function vanillaModel({ handle, name, contextWindow = 200000, maxTokens = 16384 
   };
 }
 
-function handleModels(_req: IncomingMessage, res: ServerResponse): void {
-  // Surface the model(s) we have wired through the lmstudio provider — and
-  // a couple of common handles so mobile's model picker has options.
-  json(res, 200, [
-    vanillaModel({ handle: "lmstudio/opus-4-7", name: "opus-4-7" }),
-    vanillaModel({ handle: "lmstudio/sonnet-4-5", name: "sonnet-4-5" }),
-    vanillaModel({ handle: "lmstudio/opus-4-7-reasoning-high", name: "opus-4-7-reasoning-high" }),
-    vanillaModel({ handle: "lmstudio/gpt-5.4", name: "gpt-5.4" }),
-    vanillaModel({ handle: "lmstudio/gpt-5.4-mini", name: "gpt-5.4-mini", contextWindow: 400000 }),
-  ]);
+const STATIC_FALLBACK_MODELS: VanillaModelOptions[] = [
+  ...Object.values(FALLBACK_MODEL_CATALOG["lmstudio"] ?? {}).map((model) => ({
+    handle: `lmstudio/${model.id}`,
+    name: model.id,
+    contextWindow: model.contextWindow,
+    ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+  })),
+    { handle: "lmstudio/opus-4-8", name: "opus-4-8", contextWindow: 1000000, maxTokens: 16384 },
+    { handle: "lmstudio/sonnet-4-5", name: "sonnet-4-5" },
+    { handle: "lmstudio/gpt-5.5", name: "gpt-5.5", contextWindow: 1050000, maxTokens: 128000 },
+    { handle: "lmstudio/gpt-5.3-codex-spark", name: "gpt-5.3-codex-spark", contextWindow: 400000, maxTokens: 128000 },
+];
+
+async function handleModels(_req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const baseUrl = process.env["LMSTUDIO_BASE_URL"] || "http://localhost:8082/v1";
+  const discovered = await discoverOpenAICompatibleModels(baseUrl);
+  const modelOptions = discovered
+    .filter((id) => !id.includes("-reasoning-"))
+    .map((id) => ({ handle: `lmstudio/${id}`, name: id }));
+  const fallbackOptions = STATIC_FALLBACK_MODELS.filter((fallback) =>
+    !modelOptions.some((model) => model.handle === fallback.handle),
+  );
+  json(res, 200, [...modelOptions, ...fallbackOptions].map(vanillaModel));
 }
 
 interface BuiltinToolDefinition {
