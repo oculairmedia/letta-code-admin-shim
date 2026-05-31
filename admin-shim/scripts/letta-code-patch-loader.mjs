@@ -1,3 +1,5 @@
+// Node.js ESM loader hook that applies runtime patches to letta-code's bundled CLI.
+// Fixes settle-on-turn agent-id bug, thinking settings schema violations, and model_settings inheritance edge cases.
 /**
  * lcp-ith — runtime patch for letta-code's `executeConversationTurn`
  * settle-on-turn bug.
@@ -67,8 +69,10 @@ const THINKING_SETTINGS_BUG_LITERAL =
 const THINKING_SETTINGS_FIX_LITERAL =
   `thinking = {\n` +
   `        type: updateArgs?.enable_reasoner === false ? "disabled" : "enabled",\n` +
-  `        ...updateArgs?.enable_reasoner !== false && typeof updateArgs?.max_reasoning_tokens === "number" && {\n` +
-  `          budget_tokens: updateArgs.max_reasoning_tokens\n` +
+  `        ...updateArgs?.enable_reasoner !== false && {\n` +
+  `          budget_tokens: typeof updateArgs?.max_reasoning_tokens === "number"\n` +
+  `            ? updateArgs.max_reasoning_tokens\n` +
+  `            : Math.floor(Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000))\n` +
   `        }\n` +
   `      };`;
 
@@ -83,7 +87,223 @@ const THINKING_REQUEST_GUARD_INSERT =
   `  if (options3?.metadata) {\n` +
   `    const userId = options3.metadata.user_id;`;
 
+// lcp-7kk: universal chokepoint guard.
+//
+// The per-builder guard above (lcp-9pn) only covers ONE of the several bundled
+// `buildAnthropicParams` copies — the anchor it keys on (`const userId =
+// options3.metadata.user_id` at a specific indent) matches a single copy. The
+// live `local_backend_error` turns send `thinking: { type:"disabled",
+// budget_tokens: N }` from a path that copy never sees, so Anthropic rejects
+// every continuation with:
+//   thinking.disabled.budget_tokens: Extra inputs are not permitted
+//
+// Rather than chase which of N minified builder copies produced the param, we
+// normalize at the real Anthropic send chokepoints: request paths use
+// `(client.)(beta.)messages.create({ ...params, ... }, ...)`, while tool-runner
+// streaming paths use `(client.)beta.messages.stream({ ...params }, ...)`. The
+// bundle's send-path variable is `params` (not `requestParams`). We route
+// `params` through a normalizer that strips every non-`type` key from a
+// non-enabled `thinking` block and adds a conservative budget to enabled
+// thinking when upstream forgot one. The `messages.create/stream({ ` prefixes
+// scope the rewrite to Anthropic SDK sends only — the positional
+// `conversations.messages.create(id, body, ...)` Letta calls don't match.
+const THINKING_CHOKEPOINT_TOKEN = `messages.create({ ...params,`;
+const THINKING_CHOKEPOINT_REPLACEMENT = `messages.create({ ...globalThis.__lcpFixThinking(params),`;
+const THINKING_STREAM_CHOKEPOINT_TOKEN = `messages.stream({ ...params`;
+const THINKING_STREAM_CHOKEPOINT_REPLACEMENT = `messages.stream({ ...globalThis.__lcpFixThinking(params)`;
+
+// Injected once at the top of letta.js. Idempotent and surgical, matching
+// Anthropic's strict thinking schema:
+//   - "disabled" permits ZERO sibling keys → reduce to { type:"disabled" }.
+//     (This is the exact shape that triggers the live error:
+//      thinking.disabled.budget_tokens: Extra inputs are not permitted)
+//   - "adaptive" permits `display` but NOT `budget_tokens` → drop only
+//     budget_tokens, keep display.
+//   - "enabled" requires budget_tokens. Some subagent-spawn paths construct
+//     `{ type:"enabled" }` with no budget, which Anthropic rejects with
+//     `thinking.enabled.budget_tokens: Field required`; add a conservative
+//     default at the same chokepoint.
+// Returns the original object when nothing needs changing (no allocation, no
+// behavior change for healthy requests).
+const THINKING_HELPER_DEFINITION =
+  `globalThis.__lcpFixThinking = globalThis.__lcpFixThinking || function (p) {\n` +
+  `  try {\n` +
+  `    const t = p && p.thinking;\n` +
+  `    if (t && typeof t === "object" && typeof t.type === "string") {\n` +
+  `      if (t.type === "enabled" && typeof t.budget_tokens !== "number") {\n` +
+  `        const configured = Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000);\n` +
+  `        const budget = Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 10000;\n` +
+  `        return { ...p, thinking: { ...t, budget_tokens: budget } };\n` +
+  `      }\n` +
+  `      if (t.type === "disabled" && Object.keys(t).length > 1) {\n` +
+  `        return { ...p, thinking: { type: "disabled" } };\n` +
+  `      }\n` +
+  `      if (t.type !== "enabled" && "budget_tokens" in t) {\n` +
+  `        const { budget_tokens, ...rest } = t;\n` +
+  `        return { ...p, thinking: rest };\n` +
+  `      }\n` +
+  `    }\n` +
+  `  } catch {}\n` +
+  `  return p;\n` +
+  `};\n`;
+
+// lcp-0u15: local backend can persist `agent.model_settings.thinking` before
+// the request reaches the Anthropic SDK chokepoint. Subagents inherit those
+// settings through LocalStore/effectiveAgentForConversation; if a model preset
+// contributed only `{ type: "enabled" }`, the later provider turn fails with
+// `thinking.enabled.budget_tokens: Field required`. Normalize model_settings at
+// storage and merge boundaries as the same schema-safe fallback used for SDK
+// requests.
+const MODEL_SETTINGS_HELPER_DEFINITION =
+  `globalThis.__lcpFixModelSettings = globalThis.__lcpFixModelSettings || function (m) {\n` +
+  `  try {\n` +
+  `    const t = m && m.thinking;\n` +
+  `    if (t && typeof t === "object" && typeof t.type === "string") {\n` +
+  `      if (t.type === "enabled" && typeof t.budget_tokens !== "number") {\n` +
+  `        const configured = Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000);\n` +
+  `        const budget = Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 10000;\n` +
+  `        return { ...m, thinking: { ...t, budget_tokens: budget } };\n` +
+  `      }\n` +
+  `      if (t.type === "disabled" && Object.keys(t).length > 1) {\n` +
+  `        return { ...m, thinking: { type: "disabled" } };\n` +
+  `      }\n` +
+  `      if (t.type !== "enabled" && "budget_tokens" in t) {\n` +
+  `        const { budget_tokens, ...rest } = t;\n` +
+  `        return { ...m, thinking: rest };\n` +
+  `      }\n` +
+  `    }\n` +
+  `  } catch {}\n` +
+  `  return m;\n` +
+  `};\n`;
+
+const MODEL_SETTINGS_RETURN_TOKEN = `  return modelSettings;\n}`;
+const MODEL_SETTINGS_RETURN_REPLACEMENT = `  return globalThis.__lcpFixModelSettings(modelSettings);\n}`;
+
+const EFFECTIVE_AGENT_SETTINGS_TOKEN =
+  `    model_settings: {\n` +
+  `      ...agent2.model_settings,\n` +
+  `      ...conversationModelSettings2 ?? {},\n` +
+  `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
+  `    }`;
+
+const EFFECTIVE_AGENT_SETTINGS_REPLACEMENT =
+  `    model_settings: globalThis.__lcpFixModelSettings({\n` +
+  `      ...agent2.model_settings,\n` +
+  `      ...conversationModelSettings2 ?? {},\n` +
+  `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
+  `    })`;
+
 let appliedOnce = false;
+
+/**
+ * @param {string} raw
+ * @param {string} path
+ * @param {boolean} warn
+ * @returns {{ source: string; appliedPatches: number }}
+ */
+function patchLettaCodeSource(raw, path, warn) {
+  let patched = raw;
+  let appliedPatches = 0;
+
+  if (patched.includes(SETTLE_BUG_LITERAL)) {
+    patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
+    appliedPatches += 1;
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: settle-bug literal not found in ${path} — ` +
+      `running unpatched (letta-code likely upgraded past 0.26.1)\n`,
+    );
+  }
+
+  if (patched.includes(THINKING_SETTINGS_BUG_LITERAL)) {
+    patched = patched.replaceAll(THINKING_SETTINGS_BUG_LITERAL, THINKING_SETTINGS_FIX_LITERAL);
+    appliedPatches += 1;
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: thinking-settings literal not found in ${path} — ` +
+      `running without lcp-9pn settings guard\n`,
+    );
+  }
+
+  if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
+    patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
+    appliedPatches += 1;
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: thinking-request guard anchor not found in ${path} — ` +
+      `running without lcp-9pn request guard\n`,
+    );
+  }
+
+  // lcp-7kk: universal chokepoint normalizer for every Anthropic request.
+  let appliedThinkingChokepoint = false;
+  if (patched.includes(THINKING_CHOKEPOINT_TOKEN)) {
+    patched = patched.replaceAll(THINKING_CHOKEPOINT_TOKEN, THINKING_CHOKEPOINT_REPLACEMENT);
+    appliedPatches += 1;
+    appliedThinkingChokepoint = true;
+  }
+  if (patched.includes(THINKING_STREAM_CHOKEPOINT_TOKEN)) {
+    patched = patched.replaceAll(THINKING_STREAM_CHOKEPOINT_TOKEN, THINKING_STREAM_CHOKEPOINT_REPLACEMENT);
+    appliedPatches += 1;
+    appliedThinkingChokepoint = true;
+  }
+  if (appliedThinkingChokepoint) {
+    patched = injectHelperAfterShebang(patched, THINKING_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: thinking chokepoint token not found in ${path} — ` +
+      `running without lcp-7kk request normalizer\n`,
+    );
+  }
+
+  let appliedModelSettingsGuard = false;
+  if (patched.includes(MODEL_SETTINGS_RETURN_TOKEN)) {
+    patched = patched.replaceAll(MODEL_SETTINGS_RETURN_TOKEN, MODEL_SETTINGS_RETURN_REPLACEMENT);
+    appliedPatches += 1;
+    appliedModelSettingsGuard = true;
+  }
+  if (patched.includes(EFFECTIVE_AGENT_SETTINGS_TOKEN)) {
+    patched = patched.replaceAll(EFFECTIVE_AGENT_SETTINGS_TOKEN, EFFECTIVE_AGENT_SETTINGS_REPLACEMENT);
+    appliedPatches += 1;
+    appliedModelSettingsGuard = true;
+  }
+  if (appliedModelSettingsGuard) {
+    patched = injectHelperAfterShebang(patched, MODEL_SETTINGS_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: model_settings thinking guard token not found in ${path} — ` +
+      `running without lcp-0u15 settings normalizer\n`,
+    );
+  }
+
+  return { source: patched, appliedPatches };
+}
+
+/**
+ * @param {string} raw
+ * @returns {string}
+ */
+export function patchLettaCodeSourceForTest(raw) {
+  return patchLettaCodeSource(raw, "<test>", false).source;
+}
+
+// Insert injected source after a leading `#!` shebang (which must remain line 1
+// for Node to strip it). ESM hoists `import` declarations, so a statement placed
+// before them is legal — the only hard constraint is the shebang position.
+/**
+ * @param {string} source
+ * @param {string} helper
+ * @returns {string}
+ */
+function injectHelperAfterShebang(source, helper) {
+  if (source.startsWith("#!")) {
+    const nl = source.indexOf("\n");
+    if (nl >= 0) {
+      return source.slice(0, nl + 1) + helper + source.slice(nl + 1);
+    }
+  }
+  return helper + source;
+}
 
 /** @type {import("node:module").LoadHook} */
 export async function load(url, context, nextLoad) {
@@ -102,40 +322,7 @@ export async function load(url, context, nextLoad) {
         : null;
   if (raw === null) return result;
 
-  let patched = raw;
-  let appliedPatches = 0;
-
-  if (patched.includes(SETTLE_BUG_LITERAL)) {
-    patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
-    appliedPatches += 1;
-  } else {
-    if (!appliedOnce) {
-      process.stderr.write(
-        `[letta-code-patch] WARN: settle-bug literal not found in ${path} — ` +
-        `running unpatched (letta-code likely upgraded past 0.26.1)\n`,
-      );
-    }
-  }
-
-  if (patched.includes(THINKING_SETTINGS_BUG_LITERAL)) {
-    patched = patched.replaceAll(THINKING_SETTINGS_BUG_LITERAL, THINKING_SETTINGS_FIX_LITERAL);
-    appliedPatches += 1;
-  } else if (!appliedOnce) {
-    process.stderr.write(
-      `[letta-code-patch] WARN: thinking-settings literal not found in ${path} — ` +
-      `running without lcp-9pn settings guard\n`,
-    );
-  }
-
-  if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
-    patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
-    appliedPatches += 1;
-  } else if (!appliedOnce) {
-    process.stderr.write(
-      `[letta-code-patch] WARN: thinking-request guard anchor not found in ${path} — ` +
-      `running without lcp-9pn request guard\n`,
-    );
-  }
+  const { source: patched, appliedPatches } = patchLettaCodeSource(raw, path, !appliedOnce);
 
   if (appliedPatches === 0) return result;
 
