@@ -60,9 +60,29 @@ const sdkArgs = process.argv.slice(2);
 const hasBackend = sdkArgs.includes("--backend");
 const args = hasBackend ? sdkArgs : ["--backend", "local", ...sdkArgs];
 
+// vibesync-0u15: the patch loader must reach NESTED subagents too, not
+// just the parent CLI. The parent gets the loader via the explicit
+// `--import registerUrl` argv below — but child node processes that
+// letta.js spawns for Agent/Task subagents do NOT inherit explicit argv.
+// They DO inherit NODE_OPTIONS. Without the loader in the subagent
+// process, its Anthropic request goes out with `thinking:{type:"enabled"}`
+// and no `budget_tokens`, which Anthropic rejects with
+// `thinking.enabled.budget_tokens: Field required` — the exact error
+// that fails every nested subagent dispatch. Propagate the loader via
+// NODE_OPTIONS so every descendant node process applies the same
+// schema-safe thinking fix. Preserve any pre-existing NODE_OPTIONS.
+const importFlag = `--import=${registerUrl}`;
+const existingNodeOptions = process.env["NODE_OPTIONS"] ?? "";
+const childEnv = {
+  ...process.env,
+  NODE_OPTIONS: existingNodeOptions.includes(importFlag)
+    ? existingNodeOptions
+    : `${existingNodeOptions} ${importFlag}`.trim(),
+};
+
 const child = spawn("node", ["--import", registerUrl, realCli, ...args], {
   stdio: "inherit",
-  env: process.env,
+  env: childEnv,
 });
 
 // Forward signals so the SDK's session.abort() (which sends SIGTERM

@@ -108,6 +108,30 @@ function sdkErrorPayload(
  */
 const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 180_000);
 
+/**
+ * vibesync-uuas: permission mode for the spawned letta-code session.
+ *
+ * letta-code is approval-by-default. At permissionMode "default" the
+ * agent's tool calls (notably the Agent/Task tool used by rig dispatch
+ * to spawn role subagents) halt the run with stop_reason
+ * "requires_approval" and wait for an approver. On the headless rig
+ * dispatch path there is NO approver attached (no A2UI / mobile client),
+ * so the run terminates having done no work — the formula step closes
+ * green with empty output. This is the silent-failure the shim's own
+ * chat.ts contract comment ("permission_mode=unrestricted (mobile's
+ * default for this shim)") says should NOT happen.
+ *
+ * Restore that contract: default the spawned session to
+ * "bypassPermissions" so tools run without an approval round-trip.
+ * Override with SHIM_PERMISSION_MODE when a deployment genuinely wants
+ * interactive approval (e.g. an A2UI/mobile-only shim where the
+ * canUseTool synthesis in _handleCanUseTool should drive approval
+ * cards). Valid values mirror the SDK's PermissionMode union.
+ */
+const DEFAULT_PERMISSION_MODE = (
+  process.env["SHIM_PERMISSION_MODE"] ?? "bypassPermissions"
+) as "default" | "acceptEdits" | "plan" | "bypassPermissions";
+
 export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   conversationId: string;
   agentId: string;
@@ -159,6 +183,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const target = this.conversationId === "default" ? this.agentId : this.conversationId;
     const session = resumeSession(target, {
       includePartialMessages: true,
+      // vibesync-uuas: spawn at bypassPermissions by default so tool
+      // calls (esp. the Agent/Task tool used by rig dispatch to spawn
+      // role subagents) execute without halting on requires_approval.
+      // At "default" the headless rig path deadlocks: no approver is
+      // attached, the run ends on stop_reason="requires_approval", and
+      // the formula step closes with empty output. Overridable via
+      // SHIM_PERMISSION_MODE for interactive/A2UI-approval deployments.
+      permissionMode: DEFAULT_PERMISSION_MODE,
       // lcp-sdk.5: interactive approval gate. letta-code is approval-by-default
       // for tool calls (the CLI emits approval_request_message frames and
       // halts on requires_approval stop_reason on the direct path). On the
