@@ -38,7 +38,9 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
   appendFileSync,
 } from "node:fs";
@@ -154,6 +156,12 @@ export interface ListRunsParams {
   limit?: number | undefined;
   order?: "asc" | "desc" | undefined;
   ascending?: boolean | undefined;
+  /**
+   * lcp-98cm: also walk the `_archive` subdir of compacted (old, terminal)
+   * runs. Off by default so the hot path stays bounded; opt in only for
+   * full-history reports that must see every run ever recorded.
+   */
+  includeArchived?: boolean | undefined;
 }
 
 /** Argument bag for listRunSteps. */
@@ -214,6 +222,33 @@ function runsRoot(): string {
   return join(storageDir(), "runs");
 }
 
+// lcp-98cm: terminal runs older than the retention window are MOVED (atomic
+// rename, never deleted) into this subdir so the live runs root stays small
+// and `listRuns`' readdir cost stops growing without bound. getRun still
+// resolves archived runs by id; no run history is lost.
+const ARCHIVE_DIR_NAME = "_archive";
+
+function archiveRoot(): string {
+  return join(runsRoot(), ARCHIVE_DIR_NAME);
+}
+
+function archivedRunFile(runId: string): string {
+  return join(archiveRoot(), runId, "run.json");
+}
+
+/**
+ * lcp-98cm: resolve a run's directory for READ / maintenance paths. Returns
+ * the live dir if the run still lives there, else the archive dir if it was
+ * compacted, else the live dir as the default. Write hot paths (frame/step
+ * append) deliberately do NOT call this — an in-flight run is always live, so
+ * they stay on runDir() without an extra stat per write.
+ */
+function resolveRunDir(runId: string): string {
+  if (existsSync(runFile(runId))) return runDir(runId);
+  if (existsSync(archivedRunFile(runId))) return join(archiveRoot(), runId);
+  return runDir(runId);
+}
+
 function runDir(runId: string): string {
   return join(runsRoot(), runId);
 }
@@ -261,13 +296,53 @@ function isRunRecord(value: unknown): value is RunRecord {
 }
 
 function readRunFromDisk(runId: string): RunRecord | null {
-  const parsed = readJsonOrNull(runFile(runId));
+  // Live dir first, then the lcp-98cm archive — a direct lookup must still
+  // resolve runs that compaction has moved out of the live root.
+  let parsed = readJsonOrNull(runFile(runId));
+  if (!isRunRecord(parsed)) parsed = readJsonOrNull(archivedRunFile(runId));
   return isRunRecord(parsed) ? parsed : null;
 }
 
+// lcp-r6lb: per-file parse cache for run.json. listRuns readdirs the runs
+// root and reads EVERY run.json on each call — and buildMessageRunMap (hit on
+// every GET /messages) drives that walk over what is now ~1700+ run files,
+// filtering by conversation_id only AFTER parsing each. A run.json changes
+// only while its run is in flight (status/usage/message_ids updates) and then
+// never again; finalized runs are immutable. So we cache the parsed record
+// keyed on (mtimeMs, size): an unchanged file is reused after a single stat,
+// turning the hot walk from ~1700 reads+JSON.parses into ~1700 stats with no
+// parsing. Correct against in-flight updates because every writeRunRecord
+// rewrites the file (changing mtime/size), which invalidates the entry.
+interface RunFileCacheEntry {
+  mtimeMs: number;
+  size: number;
+  run: RunRecord | null;
+}
+const runFileCache = new Map<string, RunFileCacheEntry>();
+const RUN_FILE_CACHE_MAX = 4096;
+
 function readRunAt(path: string): RunRecord | null {
+  let st;
+  try {
+    st = statSync(path);
+  } catch {
+    runFileCache.delete(path);
+    return null;
+  }
+  const cached = runFileCache.get(path);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+    return cached.run;
+  }
   const parsed = readJsonOrNull(path);
-  return isRunRecord(parsed) ? parsed : null;
+  const run = isRunRecord(parsed) ? parsed : null;
+  // LRU-ish bound: drop the oldest insertion when over cap. Runs are sharded
+  // one-per-dir and grow unbounded over the agent's lifetime, so cap the map.
+  if (runFileCache.size >= RUN_FILE_CACHE_MAX) {
+    const oldest = runFileCache.keys().next().value;
+    if (oldest !== undefined) runFileCache.delete(oldest);
+  }
+  runFileCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, run });
+  return run;
 }
 
 function isStep(value: unknown): value is Step {
@@ -475,7 +550,8 @@ export function recordA2uiUserAction(entry: {
  * file without duplicating the storageDir + runDir logic.
  */
 export function getFramesFilePath(runId: string): string {
-  return framesFile(runId);
+  // Read path (subscribe replay/tail) — resolve archived runs too.
+  return join(resolveRunDir(runId), "frames.jsonl");
 }
 
 /**
@@ -767,6 +843,91 @@ export function finalizeRun(
   writeJsonAtomic(runFile(handle.id), handle.record);
   _activeRuns.delete(handle.id);
   _cancelHandlers.delete(handle.id);
+  maybeCompactRuns();
+}
+
+// ── lcp-98cm: runs-directory compaction ───────────────────────────────
+//
+// One dir per run keeps finalize concurrency-safe but lets the runs root
+// grow without bound (1700+ dirs already), inflating every listRuns readdir.
+// compactRuns MOVES terminal runs older than the retention window into the
+// `_archive` subdir via atomic rename — lossless (run.json + steps + frames
+// move together), reversible, and resolvable by getRun. The live root stays
+// bounded so the hot read path's readdir cost stops scaling with total runs.
+//
+// Attribution horizon: archived runs drop out of the default listRuns walk,
+// so buildMessageRunMap groups by the most-recent ~retain runs (well beyond
+// any window mobile renders live). Full-history callers pass includeArchived.
+const DEFAULT_RUN_RETENTION = (() => {
+  const n = Number(process.env["SHIM_RUNS_RETENTION"] ?? 1000);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1000;
+})();
+const COMPACT_BATCH = 250;
+const COMPACT_THROTTLE_MS = 5 * 60 * 1000;
+let lastCompactAt = 0;
+
+export function compactRuns(
+  { retain = DEFAULT_RUN_RETENTION, max = Infinity }: { retain?: number; max?: number } = {},
+): { archived: number; scanned: number } {
+  const root = runsRoot();
+  if (!existsSync(root)) return { archived: 0, scanned: 0 };
+  const live: Array<{ id: string; createdAt: string; terminal: boolean }> = [];
+  for (const name of readdirSync(root)) {
+    if (name === ARCHIVE_DIR_NAME) continue;
+    const r = readRunAt(join(root, name, "run.json"));
+    if (!r) continue;
+    live.push({
+      id: r.id,
+      createdAt: r.created_at ?? "",
+      // Never archive an in-flight run: status must be terminal AND the run
+      // must not hold a live in-memory handle.
+      terminal: r.status !== "running" && !_activeRuns.has(r.id),
+    });
+  }
+  const scanned = live.length;
+  if (scanned <= retain) return { archived: 0, scanned };
+  // Oldest first; keep the newest `retain` in the live root.
+  live.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const candidates = live.slice(0, scanned - retain);
+  let archived = 0;
+  try {
+    mkdirSync(archiveRoot(), { recursive: true });
+  } catch {
+    return { archived: 0, scanned };
+  }
+  for (const c of candidates) {
+    if (archived >= max) break;
+    if (!c.terminal) continue;
+    const from = runDir(c.id);
+    const to = join(archiveRoot(), c.id);
+    if (existsSync(to)) continue; // already archived (idempotent re-run)
+    try {
+      renameSync(from, to);
+      runFileCache.delete(join(from, "run.json"));
+      archived += 1;
+    } catch {
+      // Best-effort: a concurrent finalize or a vanished dir is fine to skip.
+    }
+  }
+  return { archived, scanned };
+}
+
+// Throttled, non-blocking auto-trigger fired from finalizeRun. Compaction does
+// directory renames, so we defer it off the turn-finalize path with
+// setImmediate and rate-limit it. Disable with SHIM_RUNS_COMPACT=0.
+function maybeCompactRuns(): void {
+  if (process.env["SHIM_RUNS_COMPACT"] === "0") return;
+  const now = Date.now();
+  if (now - lastCompactAt < COMPACT_THROTTLE_MS) return;
+  lastCompactAt = now;
+  setImmediate(() => {
+    try {
+      compactRuns({ retain: DEFAULT_RUN_RETENTION, max: COMPACT_BATCH });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[runs] compaction pass failed: ${msg}`);
+    }
+  });
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -792,22 +953,31 @@ export function listRuns({
   limit = 50,
   order = "desc",
   ascending,
+  includeArchived = false,
 }: ListRunsParams = {}): Run[] {
   const root = runsRoot();
   if (!existsSync(root)) return [];
   const out: RunRecord[] = [];
-  for (const name of readdirSync(root)) {
-    const r = readRunAt(join(root, name, "run.json"));
-    if (!r) continue;
-    if (agentId && r.agent_id !== agentId) continue;
-    if (Array.isArray(agentIds) && agentIds.length && !agentIds.includes(r.agent_id ?? "")) continue;
-    if (conversationId && r.conversation_id !== conversationId) continue;
-    if (active === true && r.status !== "running") continue;
-    if (active === false && r.status === "running") continue;
-    if (typeof background === "boolean" && r.background !== background) continue;
-    if (Array.isArray(statuses) && statuses.length && !statuses.includes(r.status ?? "")) continue;
-    if (stopReason && r.stop_reason !== stopReason) continue;
-    out.push(r);
+  const walk = (dir: string, runFilePath: (name: string) => string): void => {
+    for (const name of readdirSync(dir)) {
+      // Never descend the archive subdir during the live walk (lcp-98cm).
+      if (dir === root && name === ARCHIVE_DIR_NAME) continue;
+      const r = readRunAt(runFilePath(name));
+      if (!r) continue;
+      if (agentId && r.agent_id !== agentId) continue;
+      if (Array.isArray(agentIds) && agentIds.length && !agentIds.includes(r.agent_id ?? "")) continue;
+      if (conversationId && r.conversation_id !== conversationId) continue;
+      if (active === true && r.status !== "running") continue;
+      if (active === false && r.status === "running") continue;
+      if (typeof background === "boolean" && r.background !== background) continue;
+      if (Array.isArray(statuses) && statuses.length && !statuses.includes(r.status ?? "")) continue;
+      if (stopReason && r.stop_reason !== stopReason) continue;
+      out.push(r);
+    }
+  };
+  walk(root, (name) => join(root, name, "run.json"));
+  if (includeArchived && existsSync(archiveRoot())) {
+    walk(archiveRoot(), (name) => join(archiveRoot(), name, "run.json"));
   }
   const cmpAsc = (a: RunRecord, b: RunRecord): number =>
     (a.created_at ?? "").localeCompare(b.created_at ?? "");
@@ -831,7 +1001,7 @@ export function listRunSteps(
   runId: string,
   { before, after, limit, order }: ListRunStepsParams = {},
 ): Step[] {
-  const path = stepsFile(runId);
+  const path = join(resolveRunDir(runId), "steps.jsonl");
   if (!existsSync(path)) return [];
   const items: Step[] = readFileSync(path, "utf8")
     .split("\n")
@@ -898,10 +1068,12 @@ export function cancelRun(
 }
 
 export function deleteRun(runId: string): boolean {
-  const path = runFile(runId);
-  if (!existsSync(path)) return false;
+  // Resolve archived runs too so delete works regardless of compaction state.
+  const dir = resolveRunDir(runId);
+  if (!existsSync(join(dir, "run.json"))) return false;
   try {
-    rmSync(runDir(runId), { recursive: true, force: true });
+    runFileCache.delete(join(dir, "run.json"));
+    rmSync(dir, { recursive: true, force: true });
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1058,7 +1230,41 @@ export function inFlightOtids(
  */
 const BUILD_MESSAGE_RUN_MAP_CAP = 10_000;
 
+// lcp-spok: short-TTL memo of buildMessageRunMap. The /messages handler calls
+// this on every poll; mobile polls in bursts (warmup + observer + retries)
+// that land within a second of each other. A 1s TTL collapses a burst to one
+// computation while bounding staleness. Staleness during an ACTIVE turn is
+// harmless: the only attribution that changes mid-turn is message_ids growing
+// on the in-flight run, and the /messages handler already filters in-flight
+// messages out of the projection (inFlightMessageIds), so they aren't grouped
+// until the turn settles anyway.
+const BUILD_MESSAGE_RUN_MAP_TTL_MS = 1000;
+interface RunMapMemoEntry {
+  at: number;
+  map: Record<string, string>;
+}
+const runMapMemo = new Map<string, RunMapMemoEntry>();
+const RUN_MAP_MEMO_MAX = 256;
+
 export function buildMessageRunMap(
+  opts: { agentId?: string | undefined; conversationId?: string | undefined } = {},
+): Record<string, string> {
+  const key = `${opts.agentId ?? ""}|${opts.conversationId ?? ""}`;
+  const now = Date.now();
+  const memo = runMapMemo.get(key);
+  if (memo && now - memo.at < BUILD_MESSAGE_RUN_MAP_TTL_MS) {
+    return memo.map;
+  }
+  const map = buildMessageRunMapUncached(opts);
+  if (runMapMemo.size >= RUN_MAP_MEMO_MAX) {
+    const oldest = runMapMemo.keys().next().value;
+    if (oldest !== undefined) runMapMemo.delete(oldest);
+  }
+  runMapMemo.set(key, { at: now, map });
+  return map;
+}
+
+function buildMessageRunMapUncached(
   { agentId, conversationId }: { agentId?: string | undefined; conversationId?: string | undefined } = {},
 ): Record<string, string> {
   const out: Record<string, string> = {};

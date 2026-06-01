@@ -17,14 +17,14 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import type { WebSocket as WsWebSocket, RawData } from "ws";
+import type { ClientOptions, WebSocket as WsWebSocket, RawData } from "ws";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ADMIN_SHIM_ROOT = join(__dirname, "..", "..");
 const shimRequire = createRequire(join(ADMIN_SHIM_ROOT, "package.json"));
 // `ws` is CJS-friendly via require; load it through admin-shim's node_modules
 // so we don't accidentally pull a copy from a parent project.
-type WsCtor = new (url: string) => WsWebSocket;
+type WsCtor = new (url: string, options?: ClientOptions) => WsWebSocket;
 const WebSocket = shimRequire("ws") as WsCtor;
 
 /**
@@ -47,6 +47,7 @@ export interface OpenMobileWsOptions {
   timeoutMs?: number;
   skipHello?: boolean;
   helloExtras?: Record<string, unknown>;
+  autoPong?: boolean;
 }
 
 export interface MobileWsHandle {
@@ -69,9 +70,10 @@ export async function openMobileWs(httpUrl: string, {
   timeoutMs = 5000,
   skipHello = false,
   helloExtras = {},
+  autoPong = true,
 }: OpenMobileWsOptions = {}): Promise<MobileWsHandle> {
   const wsUrl = httpUrl.replace(/^http/, "ws") + path;
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(wsUrl, { autoPong });
 
   const frames: MobileWsFrame[] = [];
   const handle: MobileWsHandle = {

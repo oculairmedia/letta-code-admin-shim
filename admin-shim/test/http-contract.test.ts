@@ -54,6 +54,13 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
         rest_role?: string;
         sse_role?: string;
         exclusivity?: string;
+        keepalive?: {
+          protocol?: string;
+          client_ping_supported?: boolean;
+          server_ping_interval_ms?: number;
+          server_pong_timeout_ms?: number;
+          timeout_close_code?: number;
+        };
       };
     };
   };
@@ -72,6 +79,11 @@ test("GET /v1/health/ returns ok with server identity", async (t) => {
     b.capabilities?.mobile_transport?.exclusivity,
     "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
   );
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.protocol, "ws_ping_pong");
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.client_ping_supported, true);
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.server_ping_interval_ms, 30_000);
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.server_pong_timeout_ms, 10_000);
+  assert.equal(b.capabilities?.mobile_transport?.keepalive?.timeout_close_code, 4001);
 });
 
 test("GET /shim/v1/capabilities exposes canonical mobile transport contract", async (t) => {
@@ -93,6 +105,13 @@ test("GET /shim/v1/capabilities exposes canonical mobile transport contract", as
       rest_role?: string;
       sse_role?: string;
       exclusivity?: string;
+      keepalive?: {
+        protocol?: string;
+        client_ping_supported?: boolean;
+        server_ping_interval_ms?: number;
+        server_pong_timeout_ms?: number;
+        timeout_close_code?: number;
+      };
     };
   };
   assert.equal(res.status, 200);
@@ -110,6 +129,11 @@ test("GET /shim/v1/capabilities exposes canonical mobile transport contract", as
     b.mobile_transport?.exclusivity,
     "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
   );
+  assert.equal(b.mobile_transport?.keepalive?.protocol, "ws_ping_pong");
+  assert.equal(b.mobile_transport?.keepalive?.client_ping_supported, true);
+  assert.equal(b.mobile_transport?.keepalive?.server_ping_interval_ms, 30_000);
+  assert.equal(b.mobile_transport?.keepalive?.server_pong_timeout_ms, 10_000);
+  assert.equal(b.mobile_transport?.keepalive?.timeout_close_code, 4001);
 });
 
 test("GET /v1/health (no trailing slash) is also served", async (t) => {
@@ -206,6 +230,63 @@ test("GET /v1/agents orders by mtime descending", async (t) => {
   const ids = arr.map((a) => a.id);
   assert.equal(ids[0], "agent-mtime-new", `expected newest first, got ${ids.join(",")}`);
   assert.equal(ids[1], "agent-mtime-old");
+});
+
+test("POST /v1/agents creates an agent by writing the store record (vibesync-tr3e/razp)", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const before = await getJson(`${shim.url}/v1/agents/count`);
+  assert.equal(before.body, 0);
+
+  const res = await fetch(`${shim.url}/v1/agents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: "agent-created-001",
+      name: "reviewer@proj",
+      system: "You are the reviewer role.",
+      model: "lmstudio/sonnet-4-5",
+      tags: ["vibesync", "role:reviewer"],
+      memory_blocks: [{ label: "scope", value: "review only" }],
+    }),
+  });
+  assert.equal(res.status, 201);
+  const created = (await res.json()) as {
+    id: string;
+    name: string;
+    system: string;
+    llm_config?: { model?: string };
+    memory?: { blocks: Array<{ label: string }> };
+  };
+  assert.equal(created.id, "agent-created-001");
+  assert.equal(created.name, "reviewer@proj");
+  assert.equal(created.system, "You are the reviewer role.");
+
+  // It must now be visible via the read paths (same store).
+  const count = await getJson(`${shim.url}/v1/agents/count`);
+  assert.equal(count.body, 1);
+  const detail = await getJson(`${shim.url}/v1/agents/agent-created-001`);
+  assert.equal(detail.res.status, 200);
+  const d = detail.body as { id: string; memory: { blocks: Array<{ label: string }> } };
+  assert.equal(d.id, "agent-created-001");
+  const labels = d.memory.blocks.map((b) => b.label).sort();
+  assert.ok(labels.includes("scope"), `expected scope block, got ${labels.join(",")}`);
+  assert.ok(labels.includes("system_prompt"), `expected system_prompt block, got ${labels.join(",")}`);
+});
+
+test("POST /v1/agents rejects a duplicate id with 409", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const mk = () =>
+    fetch(`${shim.url}/v1/agents`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "agent-dup-1", name: "x" }),
+    });
+  assert.equal((await mk()).status, 201);
+  assert.equal((await mk()).status, 409);
 });
 
 test("GET /v1/agents honors limit and offset", async (t) => {
