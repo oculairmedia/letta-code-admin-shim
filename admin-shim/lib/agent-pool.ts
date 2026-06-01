@@ -451,6 +451,12 @@ export async function finalizeTurnLifecycle(args: {
     const mt = "message_type" in ev ? ev.message_type : undefined;
     return mt === "stop_reason";
   });
+  const stopReason: string | null = (() => {
+    if (!stopFrame) return null;
+    const ev = frameEvent(stopFrame);
+    if ("stop_reason" in ev && typeof ev.stop_reason === "string") return ev.stop_reason;
+    return null;
+  })();
   // lcp-12w: synthesize an error toolResult for any tool_call this turn
   // emitted but never returned. Cheap no-op on clean turns; only writes
   // when an interruption left tool_use orphans on disk. Pairs with the
@@ -458,12 +464,19 @@ export async function finalizeTurnLifecycle(args: {
   // boundary) — defense in depth. Reason is sourced from the caller's
   // local lifecycle state; "stream_dropped" is the catch-all for cases
   // where no result frame arrived and none of the explicit flags fired.
-  const cleanFinish = !cancelled && !finishedTimeout && !finishedExit && Boolean(stopFrame);
+  const cleanFinish =
+    !cancelled &&
+    !finishedTimeout &&
+    !finishedExit &&
+    Boolean(stopFrame) &&
+    stopReason !== "requires_approval" &&
+    stopReason !== "error";
   if (!cleanFinish) {
     const settleReason: SettlementReason =
       cancelled ? "cancelled"
       : finishedTimeout ? "turn_timeout"
       : finishedExit ? "worker_exit"
+      : stopReason === "requires_approval" ? "requires_approval"
       : "stream_dropped";
     try {
       const settled = await settleDanglingToolCallsFromFrames({
@@ -490,12 +503,6 @@ export async function finalizeTurnLifecycle(args: {
     const mt = "message_type" in ev ? ev.message_type : undefined;
     return mt === "usage_statistics";
   });
-  const stopReason: string | null = (() => {
-    if (!stopFrame) return null;
-    const ev = frameEvent(stopFrame);
-    if ("stop_reason" in ev && typeof ev.stop_reason === "string") return ev.stop_reason;
-    return null;
-  })();
   const usage: UsageStatisticsEvent | LettaStreamFrame | null = usageFrame
     ? (usageFrame.type === "stream_event"
         ? (usageFrame.event as UsageStatisticsEvent)
