@@ -94,6 +94,28 @@ export function detectDanglingToolUses(errorPayload: unknown): string[] {
 }
 
 /**
+ * Match provider errors for the inverse corrupt-tool shape: a serialized
+ * `tool_result` has no corresponding `tool_use` in the immediately preceding
+ * assistant message. Once such a stale toolResult is on disk, every later turn
+ * fails before the model can respond.
+ */
+export function detectUnexpectedToolResults(errorPayload: unknown): string[] {
+  const text = extractErrorText(errorPayload);
+  if (!text) return [];
+  if (!/unexpected[^]+?tool_use_id[^]+?tool_result/i.test(text)) return [];
+  const matches = text.match(/toolu_[A-Za-z0-9_-]+/g) ?? [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const id of matches) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+/**
  * Match provider errors for role-alternation violations. Anthropic-compatible
  * APIs reject transcripts that serialize as user → user without an assistant
  * turn between them; once that shape is on disk, every later turn fails before
@@ -195,16 +217,17 @@ export async function healConversation(
   const toolResultSites = new Map<string, number[]>(); // toolResult message indices for this id
 
   records.forEach((m, idx) => {
-    if (!isRecord(m)) return;
-    if (m["role"] === "assistant") {
-      const parts = pickPartsArray(m);
+    const message = localMessagePayload(m);
+    if (!message) return;
+    if (message["role"] === "assistant") {
+      const parts = pickPartsArray(message);
       for (const p of parts) {
         if (isToolCallPart(p) && danglingIds.includes(p.id)) {
           push(toolCallSites, p.id, idx);
         }
       }
-    } else if (m["role"] === "toolResult") {
-      const tcid = m["toolCallId"];
+    } else if (message["role"] === "toolResult") {
+      const tcid = message["toolCallId"];
       if (typeof tcid === "string" && danglingIds.includes(tcid)) {
         push(toolResultSites, tcid, idx);
       }
@@ -238,9 +261,10 @@ export async function healConversation(
     const sites = toolCallSites.get(id) ?? [];
     for (const idx of sites) {
       const m = edited[idx];
-      if (!isRecord(m)) continue;
-      const partsKey = Array.isArray(m["parts"]) ? "parts" : "content";
-      const parts = pickPartsArray(m);
+      const message = localMessagePayload(m);
+      if (!message) continue;
+      const partsKey = Array.isArray(message["parts"]) ? "parts" : "content";
+      const parts = pickPartsArray(message);
       const nextParts: LocalMessagePart[] = [];
       let touched = false;
       for (const p of parts) {
@@ -257,7 +281,7 @@ export async function healConversation(
         }
       }
       if (touched) {
-        edited[idx] = { ...m, [partsKey]: nextParts };
+        edited[idx] = replaceLocalMessagePayload(m, { ...message, [partsKey]: nextParts });
         editedMessageIds.add(idx);
       }
     }
@@ -276,8 +300,9 @@ export async function healConversation(
   for (const id of report.settled) {
     const sites = toolCallSites.get(id) ?? [];
     if (sites.length === 0) continue;
-    const parent = edited[sites[sites.length - 1]!];
-    if (!isRecord(parent)) continue;
+    const parentRecord = edited[sites[sites.length - 1]!];
+    const parent = localMessagePayload(parentRecord);
+    if (!parent) continue;
     // Try to recover the tool name from the parent's toolCall part.
     let toolName = "<unknown>";
     for (const p of pickPartsArray(parent)) {
@@ -360,7 +385,8 @@ export function detectConsecutiveUserMessageIndices(records: unknown[]): number[
 
   for (let i = 0; i < records.length; i += 1) {
     const record = records[i];
-    if (isRecord(record) && record["role"] === "user") {
+    const message = localMessagePayload(record);
+    if (message && message["role"] === "user") {
       userRun.push(i);
       continue;
     }
@@ -384,8 +410,8 @@ export async function healConsecutiveUserMessages(
   const records = await readJsonlOrEmpty(messagesPath);
   const removeIndices = detectConsecutiveUserMessageIndices(records);
   const removedLabels = removeIndices.map((idx) => {
-    const record = records[idx];
-    if (isRecord(record) && typeof record["id"] === "string") return record["id"];
+    const record = localMessagePayload(records[idx]);
+    if (record && typeof record["id"] === "string") return record["id"];
     return `user-index-${idx}`;
   });
 
@@ -414,6 +440,86 @@ export async function healConsecutiveUserMessages(
   return report;
 }
 
+/**
+ * Remove stale toolResult records whose parent toolCall is no longer adjacent
+ * in the provider request. This handles the inverse of `healConversation()`:
+ * instead of an orphan tool_use, the persisted transcript contains an orphan
+ * tool_result that Anthropic-compatible providers reject as unexpected.
+ */
+export async function healUnexpectedToolResults(
+  conversationId: string,
+  agentId: string,
+  toolResultIds: string[],
+  opts: HealOptions = {},
+): Promise<HealReport> {
+  const messagesPath = conversationFilePath(conversationId, agentId, "messages.jsonl", opts.stateDir);
+  const records = await readJsonlOrEmpty(messagesPath);
+  const wanted = new Set(toolResultIds);
+  const removeIndices: number[] = [];
+  const removed: string[] = [];
+  const edited = records.map((record) => record);
+  const editedMessageIds = new Set<number>();
+
+  records.forEach((record, idx) => {
+    const message = localMessagePayload(record);
+    if (!message) return;
+    if (message["role"] === "toolResult") {
+      const toolCallId = message["toolCallId"];
+      if (typeof toolCallId !== "string" || !wanted.has(toolCallId)) return;
+      removeIndices.push(idx);
+      removed.push(toolCallId);
+      return;
+    }
+    if (message["role"] !== "assistant") return;
+    const partsKey = Array.isArray(message["parts"]) ? "parts" : "content";
+    const parts = pickPartsArray(message);
+    let touched = false;
+    const nextParts: LocalMessagePart[] = [];
+    for (const part of parts) {
+      if (isToolCallPart(part) && wanted.has(part.id)) {
+        touched = true;
+        removed.push(part.id);
+        nextParts.push({
+          type: "text",
+          text: `[healed: removed stale tool call ${part.name ?? "<unknown>"} (id=${part.id})]`,
+        } as LocalMessagePart);
+      } else {
+        nextParts.push(part);
+      }
+    }
+    if (touched) {
+      edited[idx] = replaceLocalMessagePayload(record, { ...message, [partsKey]: nextParts });
+      editedMessageIds.add(idx);
+    }
+  });
+
+  const uniqueRemoved = [...new Set(removed)];
+  const unresolved = toolResultIds.filter((id) => !uniqueRemoved.includes(id));
+  const report: HealReport = {
+    requested: [...toolResultIds],
+    removed: uniqueRemoved,
+    settled: [],
+    unresolved,
+    messagesEdited: editedMessageIds.size,
+    messagesRemoved: removeIndices.length,
+    messagesAppended: 0,
+  };
+  if (removeIndices.length === 0 && editedMessageIds.size === 0) return report;
+
+  const removeSet = new Set(removeIndices);
+  const nextRecords = edited.filter((_record, idx) => !removeSet.has(idx));
+  await atomicWriteJsonl(messagesPath, nextRecords);
+  await writeHealAudit({
+    conversationId,
+    agentId,
+    runId: opts.runId,
+    stateDir: opts.stateDir,
+    report,
+    now: opts.now ?? Date.now(),
+  });
+  return report;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 function push(map: Map<string, number[]>, key: string, value: number): void {
@@ -424,6 +530,20 @@ function push(map: Map<string, number[]>, key: string, value: number): void {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function localMessagePayload(value: unknown): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const nested = value["message"];
+  if (isRecord(nested)) return nested;
+  return value;
+}
+
+function replaceLocalMessagePayload(record: unknown, nextPayload: Record<string, unknown>): unknown {
+  if (isRecord(record) && isRecord(record["message"])) {
+    return { ...record, message: nextPayload };
+  }
+  return nextPayload;
 }
 
 function pickPartsArray(m: Record<string, unknown>): LocalMessagePart[] {
@@ -525,8 +645,9 @@ export async function allIdsHaveToolResults(
   const messages = await listMessages(conversationId, agentId);
   const have = new Set<string>();
   for (const m of messages) {
-    if (m.role === "toolResult" && typeof m.toolCallId === "string") {
-      have.add(m.toolCallId);
+    const message = localMessagePayload(m);
+    if (message?.["role"] === "toolResult" && typeof message["toolCallId"] === "string") {
+      have.add(message["toolCallId"]);
     }
   }
   return ids.every((id) => have.has(id));

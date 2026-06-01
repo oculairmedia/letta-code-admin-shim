@@ -29,6 +29,7 @@ import {
   type Session,
   type SDKErrorMessage,
   type SDKMessage,
+  type PermissionMode,
   type SDKResultMessage,
 } from "@letta-ai/letta-code-sdk";
 // CanUseToolResponse is part of letta-code's protocol package, re-exported via
@@ -102,11 +103,58 @@ function sdkErrorPayload(
 }
 
 /**
- * Default the SDK turn-watchdog to the same envelope the direct adapter uses.
- * Both honor `SHIM_POOL_TURN_TIMEOUT` so an operator switching transports
- * doesn't get surprised by different stuck-turn semantics.
+ * Turn watchdog configuration.
+ *
+ * lcp-5o2: was a single absolute-budget timer at 180s. Real agent turns
+ * commonly exceed that on multi-tool investigations or long streamed
+ * responses, producing false-positive 'turn timed out' toasts on the
+ * mobile client even when the turn completes successfully. Replaced with
+ * a silence watchdog: the timer resets on every emitted frame, and only
+ * fires if the stream has been silent for `SHIM_POOL_TURN_SILENCE_MS`.
+ * An absolute ceiling `SHIM_POOL_TURN_TIMEOUT` still exists as a
+ * defense-in-depth backstop against pathological stuck turns that
+ * somehow keep dribbling output forever.
+ *
+ * Defaults:
+ *   SHIM_POOL_TURN_SILENCE_MS = 120_000 (2 minutes of no frames → timeout)
+ *   SHIM_POOL_TURN_TIMEOUT    = 1_800_000 (30 minute absolute ceiling)
+ *
+ * The previous default (180s absolute) is now the silence budget rather
+ * than the total budget, so most legitimate turns will reset the timer
+ * regularly via frame emission and never trip.
+ *
+ * Both envs are honored by both adapters (this one and the direct
+ * adapter) so operators get consistent semantics regardless of which
+ * transport is in use.
  */
-const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 180_000);
+const TURN_SILENCE_MS = Number(process.env["SHIM_POOL_TURN_SILENCE_MS"] ?? 120_000);
+const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 1_800_000);
+
+/**
+ * vibesync-uuas: permission mode for the spawned letta-code session.
+ *
+ * letta-code is approval-by-default. At permissionMode "default" the
+ * agent's tool calls (notably the Agent/Task tool used by rig dispatch
+ * to spawn role subagents) halt the run with stop_reason
+ * "requires_approval" and wait for an approver. On the headless rig
+ * dispatch path there is NO approver attached (no A2UI / mobile client),
+ * so the run terminates having done no work — the formula step closes
+ * green with empty output. This is the silent-failure the shim's own
+ * chat.ts contract comment ("permission_mode=unrestricted (mobile's
+ * default for this shim)") says should NOT happen.
+ *
+ * Restore that contract: default the spawned session to
+ * "bypassPermissions" so tools run without an approval round-trip.
+ * Override with SHIM_PERMISSION_MODE when a deployment genuinely wants
+ * interactive approval (e.g. an A2UI/mobile-only shim where the
+ * canUseTool synthesis in _handleCanUseTool should drive approval
+ * cards). Valid values mirror the SDK's PermissionMode union.
+ */
+const DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions";
+
+function currentPermissionMode(): PermissionMode {
+  return (process.env["SHIM_PERMISSION_MODE"] ?? DEFAULT_PERMISSION_MODE) as PermissionMode;
+}
 
 export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   conversationId: string;
@@ -159,6 +207,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const target = this.conversationId === "default" ? this.agentId : this.conversationId;
     const session = resumeSession(target, {
       includePartialMessages: true,
+      // vibesync-uuas: spawn at bypassPermissions by default so tool
+      // calls (esp. the Agent/Task tool used by rig dispatch to spawn
+      // role subagents) execute without halting on requires_approval.
+      // At "default" the headless rig path deadlocks: no approver is
+      // attached, the run ends on stop_reason="requires_approval", and
+      // the formula step closes with empty output. Overridable via
+      // SHIM_PERMISSION_MODE for interactive/A2UI-approval deployments.
+      permissionMode: currentPermissionMode(),
       // lcp-sdk.5: interactive approval gate. letta-code is approval-by-default
       // for tool calls (the CLI emits approval_request_message frames and
       // halts on requires_approval stop_reason on the direct path). On the
@@ -301,21 +357,43 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       ensureA2uiBlockAttached(this.agentId);
     }
 
-    // Watchdog: same envelope the direct adapter uses. On timeout, flag
-    // and signal abort; the stream loop breaks at the next yield.
-    let watchdog: NodeJS.Timeout | null = setTimeout(() => {
+    // lcp-5o2: silence watchdog + absolute ceiling instead of a single
+    // total-budget timer. silenceTimer resets on every emitted frame; if
+    // the stream stays silent for TURN_SILENCE_MS we declare timeout. The
+    // absolute ceiling is a backstop for pathological turns that keep
+    // emitting one frame per minute forever.
+    const fireTimeout = (reason: string) => {
+      if (timedOut) return;
       timedOut = true;
+      console.warn(`[sdk-adapter] turn watchdog fired (${reason}) for ${this.conversationId}`);
       void session.abort().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[sdk-adapter] watchdog abort failed for ${this.conversationId}: ${msg}`);
       });
-    }, TURN_TIMEOUT_MS);
+    };
+
+    let silenceTimer: NodeJS.Timeout | null = null;
+    const resetSilenceTimer = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => fireTimeout("silence"), TURN_SILENCE_MS);
+    };
+    resetSilenceTimer();
+
+    const absoluteTimer: NodeJS.Timeout = setTimeout(
+      () => fireTimeout("absolute"),
+      TURN_TIMEOUT_MS,
+    );
 
     try {
       await session.send(sendInput);
 
       for await (const msg of session.stream()) {
         if (cancelled) break;
+        // lcp-5o2: any incoming SDK message is proof of life; reset the
+        // silence watchdog whether or not the message produces a routable
+        // frame. We reset BEFORE frame conversion so even noisy / dropped
+        // messages still count as activity.
+        resetSilenceTimer();
         const frame = sdkMessageToLettaFrame(msg, this.sessionId, this.agentId, this.conversationId);
         if (frame) {
           // Mirror the direct adapter: heartbeat lastUsedAt on every frame
@@ -353,10 +431,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         if (timedOut) break;
       }
     } finally {
-      if (watchdog) {
-        clearTimeout(watchdog);
-        watchdog = null;
+      // lcp-5o2: clear both watchdog timers introduced with the silence
+      // watchdog refactor. Either or both may already have fired by now;
+      // clearTimeout is idempotent on fired timers.
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
       }
+      clearTimeout(absoluteTimer);
       this.lastUsedAt = Date.now();
       // lcp-sdk.5: clear per-turn approval context. Any canUseTool that
       // fires AFTER this (it shouldn't, since the stream ended) gets a
@@ -458,6 +540,18 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       // normal flow — log and default-allow rather than block forever.
       logLine(`canUseTool fired with no active turn (tool=${toolName}) — defaulting allow`);
       return { behavior: "allow" };
+    }
+
+    if (currentPermissionMode() === "bypassPermissions") {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `bypass-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: "Once",
+        reason: "permission_mode_bypassPermissions",
+        timestamp: new Date().toISOString(),
+      });
+      return { behavior: "allow", message: "permission_mode_bypassPermissions" };
     }
 
     // No A2UI client connected → default-allow. Matches the direct adapter's

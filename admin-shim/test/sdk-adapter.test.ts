@@ -366,10 +366,14 @@ test("sdk-adapter (lcp-sdk.5): canUseTool emits approval_request_message + resol
   const { join } = await import("node:path");
   const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-approval-"));
   const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  const prevPermission = process.env["SHIM_PERMISSION_MODE"];
   process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  process.env["SHIM_PERMISSION_MODE"] = "default";
   t.after(() => {
     if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
     else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    if (prevPermission === undefined) delete process.env["SHIM_PERMISSION_MODE"];
+    else process.env["SHIM_PERMISSION_MODE"] = prevPermission;
     rmSync(stateDir, { recursive: true, force: true });
   });
 
@@ -445,10 +449,14 @@ test("sdk-adapter (lcp-sdk.5): Session-scope decision caches and short-circuits 
   const { join } = await import("node:path");
   const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-approval-cache-"));
   const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  const prevPermission = process.env["SHIM_PERMISSION_MODE"];
   process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  process.env["SHIM_PERMISSION_MODE"] = "default";
   t.after(() => {
     if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
     else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    if (prevPermission === undefined) delete process.env["SHIM_PERMISSION_MODE"];
+    else process.env["SHIM_PERMISSION_MODE"] = prevPermission;
     rmSync(stateDir, { recursive: true, force: true });
   });
 

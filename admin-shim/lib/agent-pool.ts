@@ -36,8 +36,10 @@ import {
   detectConsecutiveUserMessageIndices,
   detectDanglingToolUses,
   detectRoleAlternationViolation,
+  detectUnexpectedToolResults,
   healConsecutiveUserMessages,
   healConversation,
+  healUnexpectedToolResults,
 } from "./conversation-healer.js";
 import {
   finalizeRun,
@@ -688,15 +690,37 @@ class AgentPool {
     if (!result.errorPayload) return result;
     let ids: string[];
     let roleAlternationViolation = false;
+    let unexpectedToolResultIds: string[] = [];
     try {
       ids = detectDanglingToolUses(result.errorPayload);
       roleAlternationViolation = detectRoleAlternationViolation(result.errorPayload);
+      unexpectedToolResultIds = detectUnexpectedToolResults(result.errorPayload);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logLine(`heal error detection threw: ${msg}`);
       return result;
     }
-    if (ids.length === 0 && !roleAlternationViolation) return result;
+    if (ids.length === 0 && !roleAlternationViolation && unexpectedToolResultIds.length === 0) return result;
+    if (ids.length === 0 && unexpectedToolResultIds.length > 0) {
+      logLine(
+        `unexpected-tool-result heal triggered conv=${conversationId} run=${result.run_id ?? "?"} ids=${unexpectedToolResultIds.length}` +
+        ` [${unexpectedToolResultIds.slice(0, 3).join(", ")}${unexpectedToolResultIds.length > 3 ? ", ..." : ""}]`,
+      );
+      await this.evict(conversationId, agentId);
+      try {
+        const report = await healUnexpectedToolResults(conversationId, agentId, unexpectedToolResultIds, {
+          runId: result.run_id ?? null,
+        });
+        logLine(
+          `unexpected-tool-result heal complete run=${result.run_id ?? "?"} ` +
+          `removed=${report.messagesRemoved} unresolved=${report.unresolved.length}`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`unexpected-tool-result heal failed run=${result.run_id ?? "?"}: ${msg}`);
+      }
+      return result;
+    }
     if (ids.length === 0 && roleAlternationViolation) {
       let candidateCount = 0;
       try {

@@ -20,8 +20,10 @@ import {
   detectConsecutiveUserMessageIndices,
   detectDanglingToolUses,
   detectRoleAlternationViolation,
+  detectUnexpectedToolResults,
   healConsecutiveUserMessages,
   healConversation,
+  healUnexpectedToolResults,
   allIdsHaveToolResults,
 } from "../lib/conversation-healer.js";
 
@@ -111,6 +113,13 @@ test("detectRoleAlternationViolation: matches Anthropic role alternation errors"
     true,
   );
   assert.equal(detectRoleAlternationViolation("rate limited; try again later"), false);
+});
+
+test("detectUnexpectedToolResults: pulls ids from Anthropic unexpected tool_result errors", () => {
+  const detail = "messages.1194.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_018HeuFFTYFRa5GiYWx8xfv1. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.";
+  assert.deepEqual(detectUnexpectedToolResults({ api_error: { detail } }), [
+    "toolu_018HeuFFTYFRa5GiYWx8xfv1",
+  ]);
 });
 
 test("detectConsecutiveUserMessageIndices: removes all trailing user runs", () => {
@@ -296,6 +305,72 @@ test("healConversation: appends synthetic toolResult when none exists for the da
     assert.equal(synth["isError"], true);
     const content = synth["content"] as Array<{ text: string }>;
     assert.match(content[0]?.text ?? "", /healed: tool execution interrupted/);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
+  }
+});
+
+test("healUnexpectedToolResults: removes stale toolResult records by toolCallId", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agentId = "agent-unexpected-tool-result-test";
+    seedAgent(stateDir, agentId);
+    const convDir = seedConv(stateDir, "default", agentId);
+
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: [{ type: "text", text: "hello" }] },
+      { id: "a0", role: "assistant", content: [{ type: "text", text: "hi" }, { type: "toolCall", id: "toolu_stale", name: "Bash", arguments: {} }] },
+      { id: "stale-tool-result", role: "toolResult", toolCallId: "toolu_stale", toolName: "Bash", content: [{ type: "text", text: "old result" }] },
+      { id: "u1", role: "user", content: [{ type: "text", text: "next" }] },
+    ]);
+
+    const report = await healUnexpectedToolResults("default", agentId, ["toolu_stale"], {
+      stateDir,
+      runId: "run-unexpected-tool-result-1",
+      now: 1779500000000,
+    });
+
+    assert.deepEqual(report.removed, ["toolu_stale"]);
+    assert.equal(report.messagesEdited, 1);
+    assert.equal(report.messagesRemoved, 1);
+    assert.deepEqual(
+      readMessages(convDir).map((m) => m["id"]),
+      ["u0", "a0", "u1"],
+    );
+    const assistant = readMessages(convDir)[1] as { content: Array<{ type: string; text?: string }> };
+    assert.match(assistant.content[1]?.text ?? "", /removed stale tool call Bash/);
+
+    const auditPath = join(stateDir, "..", "state", "runs", "run-unexpected-tool-result-1", "heal.jsonl");
+    assert.ok(existsSync(auditPath), `expected audit sidecar at ${auditPath}`);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
+  }
+});
+
+test("healUnexpectedToolResults: handles letta-code envelope records", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agentId = "agent-envelope-tool-result-test";
+    seedAgent(stateDir, agentId);
+    const convDir = seedConv(stateDir, "conv-envelope", agentId);
+
+    writeMessages(convDir, [
+      { type: "message", id: "env-u0", message: { id: "u0", role: "user", content: [{ type: "text", text: "hello" }] } },
+      { type: "message", id: "env-a0", message: { id: "a0", role: "assistant", content: [{ type: "text", text: "hi" }, { type: "toolCall", id: "toolu_envelope", name: "Bash", arguments: {} }] } },
+      { type: "message", id: "env-tr", message: { id: "tr", role: "toolResult", toolCallId: "toolu_envelope", toolName: "Bash", content: [{ type: "text", text: "old" }] } },
+    ]);
+
+    const report = await healUnexpectedToolResults("conv-envelope", agentId, ["toolu_envelope"], { stateDir });
+
+    assert.deepEqual(report.removed, ["toolu_envelope"]);
+    assert.deepEqual(
+      readMessages(convDir).map((m) => m["id"]),
+      ["env-u0", "env-a0"],
+    );
+    const assistant = readMessages(convDir)[1] as { message: { content: Array<{ type: string; text?: string }> } };
+    assert.match(assistant.message.content[1]?.text ?? "", /removed stale tool call Bash/);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });

@@ -76,6 +76,59 @@ const THINKING_SETTINGS_FIX_LITERAL =
   `        }\n` +
   `      };`;
 
+const THINKING_HELPERS =
+  `globalThis.__lcpFixThinking = globalThis.__lcpFixThinking || ((payload) => {\n` +
+  `  if (!payload || typeof payload !== "object" || !payload.thinking || typeof payload.thinking !== "object") return payload;\n` +
+  `  const next = { ...payload, thinking: { ...payload.thinking } };\n` +
+  `  if (next.thinking.type === "enabled" && typeof next.thinking.budget_tokens !== "number") {\n` +
+  `    next.thinking.budget_tokens = Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000);\n` +
+  `  }\n` +
+  `  if (next.thinking.type !== "enabled" && "budget_tokens" in next.thinking) {\n` +
+  `    delete next.thinking.budget_tokens;\n` +
+  `  }\n` +
+  `  return next;\n` +
+  `});\n` +
+  `globalThis.__lcpFixModelSettings = globalThis.__lcpFixModelSettings || ((payload) => {\n` +
+  `  if (!payload || typeof payload !== "object" || !payload.thinking || typeof payload.thinking !== "object") return payload;\n` +
+  `  const next = { ...payload, thinking: { ...payload.thinking } };\n` +
+  `  if (next.thinking.type === "enabled" && typeof next.thinking.budget_tokens !== "number") {\n` +
+  `    next.thinking.budget_tokens = Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000);\n` +
+  `  }\n` +
+  `  if (next.thinking.type !== "enabled" && "budget_tokens" in next.thinking) {\n` +
+  `    delete next.thinking.budget_tokens;\n` +
+  `  }\n` +
+  `  return next;\n` +
+  `});\n`;
+
+const ANTHROPIC_CREATE_LITERAL =
+  `client.messages.create({ ...params, stream: true }, requestOptions)`;
+
+const ANTHROPIC_CREATE_FIX_LITERAL =
+  `client.messages.create({ ...globalThis.__lcpFixThinking(params), stream: true }, requestOptions)`;
+
+const ANTHROPIC_STREAM_LITERAL =
+  `this.client.beta.messages.stream({ ...params }, options)`;
+
+const ANTHROPIC_STREAM_FIX_LITERAL =
+  `this.client.beta.messages.stream({ ...globalThis.__lcpFixThinking(params) }, options)`;
+
+const MODEL_SETTINGS_RETURN_LITERAL = `return modelSettings;`;
+const MODEL_SETTINGS_RETURN_FIX_LITERAL = `return globalThis.__lcpFixModelSettings(modelSettings);`;
+
+const EFFECTIVE_AGENT_MODEL_SETTINGS_LITERAL =
+  `model_settings: {\n` +
+  `      ...agent2.model_settings,\n` +
+  `      ...conversationModelSettings2 ?? {},\n` +
+  `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
+  `    }`;
+
+const EFFECTIVE_AGENT_MODEL_SETTINGS_FIX_LITERAL =
+  `model_settings: globalThis.__lcpFixModelSettings({\n` +
+  `      ...agent2.model_settings,\n` +
+  `      ...conversationModelSettings2 ?? {},\n` +
+  `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
+  `    })`;
+
 const THINKING_REQUEST_GUARD_ANCHOR =
   `  if (options3?.metadata) {\n` +
   `    const userId = options3.metadata.user_id;`;
