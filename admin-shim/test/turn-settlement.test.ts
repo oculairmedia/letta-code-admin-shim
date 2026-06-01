@@ -15,6 +15,8 @@ import { join } from "node:path";
 import {
   settleDanglingToolCallsFromFrames,
 } from "../lib/turn-settlement.js";
+import { finalizeTurnLifecycle } from "../lib/agent-pool.js";
+import { createRun } from "../lib/runs.js";
 import type { LettaStreamFrame } from "../lib/types/letta-stream.js";
 
 function b64url(s: string): string {
@@ -68,6 +70,19 @@ function approvalRequestFrame(toolName: string, toolCallId: string): LettaStream
     event: {
       message_type: "approval_request_message",
       tool_call: { name: toolName, arguments: "{}", tool_call_id: toolCallId },
+    },
+  } as unknown as LettaStreamFrame;
+}
+
+function stopReasonFrame(stopReason: string): LettaStreamFrame {
+  return {
+    type: "stream_event",
+    session_id: "sess-test",
+    uuid: `uuid-stop-${stopReason}`,
+    timestamp: new Date().toISOString(),
+    event: {
+      message_type: "stop_reason",
+      stop_reason: stopReason,
     },
   } as unknown as LettaStreamFrame;
 }
@@ -245,6 +260,7 @@ test("settle: reason text matches the SettlementReason variant", async () => {
       ["turn_timeout", /turn timeout/i],
       ["worker_exit", /worker exit/i],
       ["stream_dropped", /stream drop/i],
+      ["requires_approval", /approval was required/i],
     ];
     for (const [reason, pattern] of cases) {
       const fresh = makeTempStateDir();
@@ -264,6 +280,44 @@ test("settle: reason text matches the SettlementReason variant", async () => {
       assert.match(text, pattern, `expected ${pattern} for reason=${reason}, got ${text}`);
       rmSync(fresh, { recursive: true, force: true });
     }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("finalizeTurnLifecycle: requires_approval settles emitted tool calls before next turn", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agent = "agent-test-approval";
+    const convDir = seedConv(stateDir, "default", agent);
+    writeMessages(convDir, [
+      { id: "ui-msg-1", role: "user", parts: [{ type: "text", text: "run a tool" }] },
+    ]);
+    const before = new Set<string>(["ui-msg-1"]);
+    const runHandle = createRun({ agentId: agent, conversationId: "default" });
+
+    await finalizeTurnLifecycle({
+      runHandle,
+      frames: [
+        toolCallFrame("Bash", "toolu_needs_approval"),
+        stopReasonFrame("requires_approval"),
+      ],
+      conversationId: "default",
+      agentId: agent,
+      messageIdsBefore: before,
+      turnStartedAt: new Date("2026-06-01T00:00:00.000Z"),
+      cancelled: false,
+      finishedExit: false,
+      finishedTimeout: false,
+    });
+
+    const onDisk = readMessages(convDir);
+    const synth = onDisk.find((m) => String(m["id"]).startsWith(`synth-settle:${runHandle.id}:`));
+    assert.ok(synth, "requires_approval turn must settle the dangling tool call");
+    assert.equal(synth!["toolCallId"], "toolu_needs_approval");
+    assert.equal(synth!["isError"], true);
+    const text = (synth!["content"] as Array<{ text: string }>)[0]!.text;
+    assert.match(text, /approval was required/i);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

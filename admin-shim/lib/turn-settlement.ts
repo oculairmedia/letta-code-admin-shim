@@ -53,7 +53,8 @@ export type SettlementReason =
   | "cancelled"
   | "turn_timeout"
   | "worker_exit"
-  | "stream_dropped";
+  | "stream_dropped"
+  | "requires_approval";
 
 /**
  * Human-readable text written into the synthetic toolResult `content`
@@ -66,6 +67,7 @@ const REASON_TEXT: Record<SettlementReason, string> = {
   turn_timeout: "Tool execution interrupted by turn timeout",
   worker_exit: "Tool execution interrupted by worker exit",
   stream_dropped: "Tool execution interrupted by stream drop",
+  requires_approval: "Tool execution interrupted because approval was required",
 };
 
 export interface SettleInput {

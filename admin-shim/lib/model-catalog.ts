@@ -210,7 +210,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 1000000,
       maxTokens: 16384,
       family: "claude-opus",
-      capabilities: ["text"],
+      capabilities: ["text", "vision"],
       releaseDate: "2026-05-22",
     },
     "claude-opus-4-7": {
@@ -219,7 +219,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 1000000,
       maxTokens: 16384,
       family: "claude-opus",
-      capabilities: ["text"],
+      capabilities: ["text", "vision"],
       releaseDate: "2026-01-15",
     },
     "claude-opus-4-6": {
@@ -228,7 +228,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 200000,
       maxTokens: 16384,
       family: "claude-opus",
-      capabilities: ["text"],
+      capabilities: ["text", "vision"],
       releaseDate: "2025-11-01",
     },
     "claude-opus-4-5": {
@@ -237,7 +237,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 200000,
       maxTokens: 16384,
       family: "claude-opus",
-      capabilities: ["text"],
+      capabilities: ["text", "vision"],
       releaseDate: "2025-10-01",
     },
     "claude-sonnet-4-6": {
@@ -246,7 +246,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 200000,
       maxTokens: 8192,
       family: "claude-sonnet",
-      capabilities: ["text"],
+      capabilities: ["text", "vision"],
       releaseDate: "2025-11-01",
     },
     "claude-haiku-4-5": {
@@ -255,7 +255,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 200000,
       maxTokens: 4096,
       family: "claude-haiku",
-      capabilities: ["text"],
+      capabilities: ["text", "vision"],
       releaseDate: "2025-10-01",
     },
   },
