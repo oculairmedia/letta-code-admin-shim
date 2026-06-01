@@ -39,6 +39,13 @@ const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
   rest_role: "cold_start_reconcile_repair",
   sse_role: "legacy_non_canonical_for_mobile_ws_sessions",
   exclusivity: "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  keepalive: {
+    protocol: "ws_ping_pong",
+    client_ping_supported: true,
+    server_ping_interval_ms: 30_000,
+    server_pong_timeout_ms: 10_000,
+    timeout_close_code: 4001,
+  },
 });
 
 function safeSend(ws, frame, log) {
@@ -104,6 +111,19 @@ export function handleConnection(ws, request, host) {
       safeClose(1000, "idle timeout");
     }, host.config?.idleTimeoutMs ?? 120_000);
     if (idleTimer.unref) idleTimer.unref();
+  };
+
+  const touchAdapterForLiveness = () => {
+    // lcp-rfb/lcp-fwo: any inbound app frame OR protocol-level WS keepalive
+    // proves the mobile client is still present. Keep both this socket's idle
+    // timer and the backing SDK adapter's lastUsedAt fresh while connected.
+    if (helloSeen && lastClientConversationId && lastClientAgentId && typeof host.touchAdapter === "function") {
+      try {
+        host.touchAdapter(lastClientConversationId, lastClientAgentId);
+      } catch (err) {
+        log?.warn?.(`[mobile-ws] touchAdapter failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   };
 
   const startPings = () => {
@@ -408,15 +428,7 @@ export function handleConnection(ws, request, host) {
 
   ws.on("message", async (raw) => {
     resetIdle();
-    // lcp-rfb: bump pool adapter's lastUsedAt on every inbound frame so the
-    // housekeep idle-evict timer stays fresh while a mobile client is connected.
-    if (helloSeen && lastClientConversationId && lastClientAgentId && typeof host.touchAdapter === "function") {
-      try {
-        host.touchAdapter(lastClientConversationId, lastClientAgentId);
-      } catch (err) {
-        log?.warn?.(`[mobile-ws] touchAdapter failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    touchAdapterForLiveness();
     const frame = parseFrame(raw.toString("utf8"));
     if (!frame) {
       sendError(ERROR_CODES.PROTOCOL_VIOLATION, "unparseable frame");
@@ -1183,6 +1195,16 @@ export function handleConnection(ws, request, host) {
   ws.on("close", () => {
     log(`closed session=${sessionId} device=${device?.device_id ?? "(unauthed)"}`);
     stopAll();
+  });
+
+  ws.on("ping", () => {
+    resetIdle();
+    touchAdapterForLiveness();
+  });
+
+  ws.on("pong", () => {
+    resetIdle();
+    touchAdapterForLiveness();
   });
 
   ws.on("error", (err) => {
