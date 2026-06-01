@@ -126,6 +126,7 @@ function sdkErrorPayload(
  * adapter) so operators get consistent semantics regardless of which
  * transport is in use.
  */
+const DEFAULT_PERMISSION_MODE = process.env["SHIM_PERMISSION_MODE"] ?? "default";
 const TURN_SILENCE_MS = Number(process.env["SHIM_POOL_TURN_SILENCE_MS"] ?? 120_000);
 const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 1_800_000);
 
@@ -505,6 +506,18 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       // normal flow — log and default-allow rather than block forever.
       logLine(`canUseTool fired with no active turn (tool=${toolName}) — defaulting allow`);
       return { behavior: "allow" };
+    }
+
+    if (DEFAULT_PERMISSION_MODE === "bypassPermissions") {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `bypass-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: "Once",
+        reason: "permission_mode_bypassPermissions",
+        timestamp: new Date().toISOString(),
+      });
+      return { behavior: "allow", message: "permission_mode_bypassPermissions" };
     }
 
     // No A2UI client connected → default-allow. Matches the direct adapter's

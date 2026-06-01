@@ -67,10 +67,63 @@ const THINKING_SETTINGS_BUG_LITERAL =
 const THINKING_SETTINGS_FIX_LITERAL =
   `thinking = {\n` +
   `        type: updateArgs?.enable_reasoner === false ? "disabled" : "enabled",\n` +
-  `        ...updateArgs?.enable_reasoner !== false && typeof updateArgs?.max_reasoning_tokens === "number" && {\n` +
-  `          budget_tokens: updateArgs.max_reasoning_tokens\n` +
+  `        ...updateArgs?.enable_reasoner !== false && {\n` +
+  `          budget_tokens: typeof updateArgs?.max_reasoning_tokens === "number" ? updateArgs.max_reasoning_tokens : Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000)\n` +
   `        }\n` +
   `      };`;
+
+const THINKING_HELPERS =
+  `globalThis.__lcpFixThinking = globalThis.__lcpFixThinking || ((payload) => {\n` +
+  `  if (!payload || typeof payload !== "object" || !payload.thinking || typeof payload.thinking !== "object") return payload;\n` +
+  `  const next = { ...payload, thinking: { ...payload.thinking } };\n` +
+  `  if (next.thinking.type === "enabled" && typeof next.thinking.budget_tokens !== "number") {\n` +
+  `    next.thinking.budget_tokens = Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000);\n` +
+  `  }\n` +
+  `  if (next.thinking.type !== "enabled" && "budget_tokens" in next.thinking) {\n` +
+  `    delete next.thinking.budget_tokens;\n` +
+  `  }\n` +
+  `  return next;\n` +
+  `});\n` +
+  `globalThis.__lcpFixModelSettings = globalThis.__lcpFixModelSettings || ((payload) => {\n` +
+  `  if (!payload || typeof payload !== "object" || !payload.thinking || typeof payload.thinking !== "object") return payload;\n` +
+  `  const next = { ...payload, thinking: { ...payload.thinking } };\n` +
+  `  if (next.thinking.type === "enabled" && typeof next.thinking.budget_tokens !== "number") {\n` +
+  `    next.thinking.budget_tokens = Number(process.env.LETTA_CODE_THINKING_BUDGET_TOKENS || 10000);\n` +
+  `  }\n` +
+  `  if (next.thinking.type !== "enabled" && "budget_tokens" in next.thinking) {\n` +
+  `    delete next.thinking.budget_tokens;\n` +
+  `  }\n` +
+  `  return next;\n` +
+  `});\n`;
+
+const ANTHROPIC_CREATE_LITERAL =
+  `client.messages.create({ ...params, stream: true }, requestOptions)`;
+
+const ANTHROPIC_CREATE_FIX_LITERAL =
+  `client.messages.create({ ...globalThis.__lcpFixThinking(params), stream: true }, requestOptions)`;
+
+const ANTHROPIC_STREAM_LITERAL =
+  `this.client.beta.messages.stream({ ...params }, options)`;
+
+const ANTHROPIC_STREAM_FIX_LITERAL =
+  `this.client.beta.messages.stream({ ...globalThis.__lcpFixThinking(params) }, options)`;
+
+const MODEL_SETTINGS_RETURN_LITERAL = `return modelSettings;`;
+const MODEL_SETTINGS_RETURN_FIX_LITERAL = `return globalThis.__lcpFixModelSettings(modelSettings);`;
+
+const EFFECTIVE_AGENT_MODEL_SETTINGS_LITERAL =
+  `model_settings: {\n` +
+  `      ...agent2.model_settings,\n` +
+  `      ...conversationModelSettings2 ?? {},\n` +
+  `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
+  `    }`;
+
+const EFFECTIVE_AGENT_MODEL_SETTINGS_FIX_LITERAL =
+  `model_settings: globalThis.__lcpFixModelSettings({\n` +
+  `      ...agent2.model_settings,\n` +
+  `      ...conversationModelSettings2 ?? {},\n` +
+  `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
+  `    })`;
 
 const THINKING_REQUEST_GUARD_ANCHOR =
   `  if (options3?.metadata) {\n` +
@@ -84,6 +137,59 @@ const THINKING_REQUEST_GUARD_INSERT =
   `    const userId = options3.metadata.user_id;`;
 
 let appliedOnce = false;
+
+/** @param {string} raw */
+export function patchLettaCodeSourceForTest(raw) {
+  let patched = raw;
+  let needsHelpers = false;
+
+  if (patched.includes(SETTLE_BUG_LITERAL)) {
+    patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
+  }
+
+  if (patched.includes(THINKING_SETTINGS_BUG_LITERAL)) {
+    patched = patched.replaceAll(THINKING_SETTINGS_BUG_LITERAL, THINKING_SETTINGS_FIX_LITERAL);
+  }
+
+  if (patched.includes(ANTHROPIC_CREATE_LITERAL)) {
+    patched = patched.replaceAll(ANTHROPIC_CREATE_LITERAL, ANTHROPIC_CREATE_FIX_LITERAL);
+    needsHelpers = true;
+  }
+
+  if (patched.includes(ANTHROPIC_STREAM_LITERAL)) {
+    patched = patched.replaceAll(ANTHROPIC_STREAM_LITERAL, ANTHROPIC_STREAM_FIX_LITERAL);
+    needsHelpers = true;
+  }
+
+  if (patched.includes(MODEL_SETTINGS_RETURN_LITERAL)) {
+    patched = patched.replaceAll(MODEL_SETTINGS_RETURN_LITERAL, MODEL_SETTINGS_RETURN_FIX_LITERAL);
+    needsHelpers = true;
+  }
+
+  if (patched.includes(EFFECTIVE_AGENT_MODEL_SETTINGS_LITERAL)) {
+    patched = patched.replaceAll(EFFECTIVE_AGENT_MODEL_SETTINGS_LITERAL, EFFECTIVE_AGENT_MODEL_SETTINGS_FIX_LITERAL);
+    needsHelpers = true;
+  }
+
+  if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
+    patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
+  }
+
+  if (needsHelpers && !patched.includes("globalThis.__lcpFixThinking =")) {
+    if (patched.startsWith("#!")) {
+      const newline = patched.indexOf("\n");
+      if (newline !== -1) {
+        patched = `${patched.slice(0, newline + 1)}${THINKING_HELPERS}${patched.slice(newline + 1)}`;
+      } else {
+        patched = `${patched}\n${THINKING_HELPERS}`;
+      }
+    } else {
+      patched = `${THINKING_HELPERS}${patched}`;
+    }
+  }
+
+  return patched;
+}
 
 /** @type {import("node:module").LoadHook} */
 export async function load(url, context, nextLoad) {
@@ -102,13 +208,10 @@ export async function load(url, context, nextLoad) {
         : null;
   if (raw === null) return result;
 
-  let patched = raw;
-  let appliedPatches = 0;
+  const patched = patchLettaCodeSourceForTest(raw);
+  const appliedPatches = patched === raw ? 0 : 1;
 
-  if (patched.includes(SETTLE_BUG_LITERAL)) {
-    patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
-    appliedPatches += 1;
-  } else {
+  if (!raw.includes(SETTLE_BUG_LITERAL)) {
     if (!appliedOnce) {
       process.stderr.write(
         `[letta-code-patch] WARN: settle-bug literal not found in ${path} — ` +
@@ -117,20 +220,14 @@ export async function load(url, context, nextLoad) {
     }
   }
 
-  if (patched.includes(THINKING_SETTINGS_BUG_LITERAL)) {
-    patched = patched.replaceAll(THINKING_SETTINGS_BUG_LITERAL, THINKING_SETTINGS_FIX_LITERAL);
-    appliedPatches += 1;
-  } else if (!appliedOnce) {
+  if (!raw.includes(THINKING_SETTINGS_BUG_LITERAL) && !appliedOnce) {
     process.stderr.write(
       `[letta-code-patch] WARN: thinking-settings literal not found in ${path} — ` +
       `running without lcp-9pn settings guard\n`,
     );
   }
 
-  if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
-    patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
-    appliedPatches += 1;
-  } else if (!appliedOnce) {
+  if (!raw.includes(THINKING_REQUEST_GUARD_ANCHOR) && !appliedOnce) {
     process.stderr.write(
       `[letta-code-patch] WARN: thinking-request guard anchor not found in ${path} — ` +
       `running without lcp-9pn request guard\n`,
