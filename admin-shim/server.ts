@@ -60,6 +60,10 @@ import {
   listRuns,
   type ListRunsParams,
 } from "./lib/runs.js";
+import {
+  discoverOpenAICompatibleModels,
+  FALLBACK_MODEL_CATALOG,
+} from "./lib/model-catalog.js";
 import { bridgeSendMessage, getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
 import { mobileConversationCursorCapabilities } from "./lib/mobile-conversation-cursors.js";
 import {
@@ -709,46 +713,29 @@ function vanillaModel({ handle, name, contextWindow = 200000, maxTokens = 16384 
   };
 }
 
-// Offline fallback used only when the upstream provider's /models endpoint is
-// unreachable, so mobile's picker always has at least these options.
 const STATIC_FALLBACK_MODELS: VanillaModelOptions[] = [
-  { handle: "lmstudio/opus-4-8", name: "opus-4-8" },
-  { handle: "lmstudio/opus-4-7", name: "opus-4-7" },
-  { handle: "lmstudio/sonnet-4-5", name: "sonnet-4-5" },
-  { handle: "lmstudio/gpt-5.5", name: "gpt-5.5", contextWindow: 1050000 },
-  { handle: "lmstudio/gpt-5.3-codex-spark", name: "gpt-5.3-codex-spark", contextWindow: 400000 },
+  ...Object.values(FALLBACK_MODEL_CATALOG["lmstudio"] ?? {}).map((model) => ({
+    handle: `lmstudio/${model.id}`,
+    name: model.id,
+    contextWindow: model.contextWindow,
+    ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+  })),
+    { handle: "lmstudio/opus-4-8", name: "opus-4-8", contextWindow: 1000000, maxTokens: 16384 },
+    { handle: "lmstudio/sonnet-4-5", name: "sonnet-4-5" },
+    { handle: "lmstudio/gpt-5.5", name: "gpt-5.5", contextWindow: 1050000, maxTokens: 128000 },
+    { handle: "lmstudio/gpt-5.3-codex-spark", name: "gpt-5.3-codex-spark", contextWindow: 400000, maxTokens: 128000 },
 ];
 
 async function handleModels(_req: IncomingMessage, res: ServerResponse): Promise<void> {
-  // Source of truth is the provider letta-code routes inference through (the
-  // Max proxy at LMSTUDIO_BASE_URL). Pull its live /models list so the picker
-  // always reflects whatever the proxy actually serves — no hardcoded drift.
-  // Reasoning variants (`*-reasoning-*`) are collapsed away; reasoning is
-  // surfaced per-model via the enable_reasoner/reasoning_effort fields instead.
   const baseUrl = process.env["LMSTUDIO_BASE_URL"] || "http://localhost:8082/v1";
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const resp = await fetch(`${baseUrl}/models`, { signal: controller.signal });
-    clearTimeout(timeout);
-    if (!resp.ok) throw new Error(`upstream /models returned ${resp.status}`);
-    const data = (await resp.json()) as { data?: Array<Record<string, unknown>> };
-    const entries = Array.isArray(data?.data) ? data.data : [];
-    const models = entries
-      .filter((m) => typeof m["id"] === "string" && !(m["id"] as string).includes("-reasoning-"))
-      .map((m) => {
-        const id = m["id"] as string;
-        const opts: VanillaModelOptions = { handle: `lmstudio/${id}`, name: id };
-        if (typeof m["context_length"] === "number") opts.contextWindow = m["context_length"] as number;
-        if (typeof m["max_completion_tokens"] === "number") opts.maxTokens = m["max_completion_tokens"] as number;
-        return vanillaModel(opts);
-      });
-    if (models.length > 0) return json(res, 200, models);
-    throw new Error("upstream /models returned no usable entries");
-  } catch (err) {
-    console.warn(`[handleModels] falling back to static list: ${err instanceof Error ? err.message : String(err)}`);
-    return json(res, 200, STATIC_FALLBACK_MODELS.map(vanillaModel));
-  }
+  const discovered = await discoverOpenAICompatibleModels(baseUrl);
+  const modelOptions = discovered
+    .filter((id) => !id.includes("-reasoning-"))
+    .map((id) => ({ handle: `lmstudio/${id}`, name: id }));
+  const fallbackOptions = STATIC_FALLBACK_MODELS.filter((fallback) =>
+    !modelOptions.some((model) => model.handle === fallback.handle),
+  );
+  json(res, 200, [...modelOptions, ...fallbackOptions].map(vanillaModel));
 }
 
 interface BuiltinToolDefinition {
