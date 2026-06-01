@@ -37,6 +37,7 @@ import {
   readOtidMap,
   readSystemPrompt,
   resolveConversationId,
+  writeAgentRecord,
   _internals as storeInternals,
   type OnDiskAgentRecord,
   type OnDiskConversation,
@@ -71,10 +72,14 @@ import {
   stopCronScheduler,
 } from "./lib/cron-scheduler.js";
 import { getTask as getCronTask, listTasks as listCronTasks } from "./lib/crons.js";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
 const HOST = process.env["SHIM_HOST"] || "0.0.0.0";
+const MOBILE_WS_KEEPALIVE_PING_INTERVAL_MS = Number(process.env["SHIM_MOBILE_WS_PING_INTERVAL_MS"] || 30_000);
+const MOBILE_WS_KEEPALIVE_PONG_TIMEOUT_MS = Number(process.env["SHIM_MOBILE_WS_PONG_TIMEOUT_MS"] || 10_000);
+const MOBILE_WS_KEEPALIVE_CLOSE_CODE = 4001;
+const MOBILE_WS_KEEPALIVE_TERMINATE_GRACE_MS = 5_000;
 
 // lcp-sdk.10: the SDK transport requires letta-code to be spawned with
 // `--backend local`. The SDK doesn't pass that flag, so we route through
@@ -179,9 +184,84 @@ const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
   rest_role: "cold_start_reconcile_repair",
   sse_role: "legacy_non_canonical_for_mobile_ws_sessions",
   exclusivity: "after_ws_welcome_do_not_consume_sse_for_owned_conversations",
+  keepalive: {
+    protocol: "ws_ping_pong",
+    client_ping_supported: true,
+    server_ping_interval_ms: MOBILE_WS_KEEPALIVE_PING_INTERVAL_MS,
+    server_pong_timeout_ms: MOBILE_WS_KEEPALIVE_PONG_TIMEOUT_MS,
+    timeout_close_code: MOBILE_WS_KEEPALIVE_CLOSE_CODE,
+  },
   ...mobileConversationCursorCapabilities(),
 });
 console.log(`server_id: ${SERVER_ID}`);
+
+function installMobileWsProtocolKeepalive(ws: WebSocket): void {
+  let awaitingPong = false;
+  let pingSentAt = 0;
+  let terminateTimer: NodeJS.Timeout | null = null;
+
+  const clearTerminateTimer = (): void => {
+    if (terminateTimer) {
+      clearTimeout(terminateTimer);
+      terminateTimer = null;
+    }
+  };
+
+  const cleanup = (): void => {
+    clearInterval(interval);
+    clearTerminateTimer();
+  };
+
+  const closeForPongTimeout = (): void => {
+    cleanup();
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) {
+      try {
+        ws.close(MOBILE_WS_KEEPALIVE_CLOSE_CODE, "pong timeout");
+      } catch (err) {
+        console.warn(`[mobile-channel] ws keepalive close failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    terminateTimer = setTimeout(() => {
+      if (ws.readyState !== WebSocket.CLOSED) {
+        try { ws.terminate(); } catch {}
+      }
+    }, MOBILE_WS_KEEPALIVE_TERMINATE_GRACE_MS);
+    terminateTimer.unref();
+  };
+
+  const sendPing = (): void => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (awaitingPong && now - pingSentAt >= MOBILE_WS_KEEPALIVE_PONG_TIMEOUT_MS) {
+      closeForPongTimeout();
+      return;
+    }
+    if (awaitingPong) return;
+    awaitingPong = true;
+    pingSentAt = now;
+    try {
+      ws.ping();
+    } catch (err) {
+      console.warn(`[mobile-channel] ws keepalive ping failed: ${err instanceof Error ? err.message : String(err)}`);
+      closeForPongTimeout();
+    }
+  };
+
+  const interval = setInterval(sendPing, MOBILE_WS_KEEPALIVE_PING_INTERVAL_MS);
+  interval.unref();
+
+  ws.on("pong", () => {
+    awaitingPong = false;
+    pingSentAt = 0;
+  });
+  ws.on("ping", (data: Buffer) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try { ws.pong(data); } catch {}
+    }
+  });
+  ws.once("close", cleanup);
+  ws.once("error", cleanup);
+}
 
 function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, {
@@ -269,6 +349,184 @@ async function handleAgentDetail(_req: IncomingMessage, res: ServerResponse, age
   const messages = await listMessages("default", a.id);
   const blocks = readBlocksForAgent(a.id);
   json(res, 200, agentToLettaState(a, { messages, blocks }));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function updateModelSettingsFromLlmConfig(
+  settings: Record<string, unknown>,
+  llmConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...settings };
+  const mappedFields: ReadonlyArray<readonly [string, string]> = [
+    ["temperature", "temperature"],
+    ["max_tokens", "max_tokens"],
+    ["context_window", "context_window_limit"],
+    ["provider_name", "provider_type"],
+    ["model_endpoint_type", "provider_type"],
+  ];
+  for (const [source, target] of mappedFields) {
+    const value = llmConfig[source];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      next[target] = value;
+    }
+  }
+  return next;
+}
+
+function modelHandleFromUpdate(body: Record<string, unknown>, current: OnDiskAgentRecord): string | undefined {
+  const model = body["model"];
+  if (typeof model === "string" && model.length > 0) return model;
+
+  const llmConfig = body["llm_config"];
+  if (!isRecord(llmConfig)) return undefined;
+
+  const handle = llmConfig["handle"];
+  if (typeof handle === "string" && handle.length > 0) return handle;
+
+  const configModel = llmConfig["model"];
+  if (typeof configModel !== "string" || configModel.length === 0) return undefined;
+  const provider = llmConfig["provider_name"];
+  if (typeof provider === "string" && provider.length > 0 && !configModel.includes("/")) {
+    return `${provider}/${configModel}`;
+  }
+  if (!configModel.includes("/") && typeof current.model === "string" && current.model.includes("/")) {
+    return `${current.model.split("/", 1)[0]}/${configModel}`;
+  }
+  return configModel;
+}
+
+function applyAgentUpdate(current: OnDiskAgentRecord, body: Record<string, unknown>): OnDiskAgentRecord {
+  const next: OnDiskAgentRecord = { ...current };
+  const model = modelHandleFromUpdate(body, current);
+  if (model) next.model = model;
+
+  if (typeof body["name"] === "string") next.name = body["name"];
+  if (typeof body["description"] === "string" || body["description"] === null) next.description = body["description"];
+  if (typeof body["system"] === "string") next.system = body["system"];
+  if (Array.isArray(body["tags"]) && body["tags"].every((tag) => typeof tag === "string")) {
+    next.tags = body["tags"];
+  }
+
+  let modelSettings = isRecord(current.model_settings) ? { ...current.model_settings } : {};
+  if (isRecord(body["model_settings"])) {
+    modelSettings = { ...modelSettings, ...body["model_settings"] };
+  }
+  if (isRecord(body["llm_config"])) {
+    modelSettings = updateModelSettingsFromLlmConfig(modelSettings, body["llm_config"]);
+  }
+  if (Object.keys(modelSettings).length > 0) next.model_settings = modelSettings;
+
+  if (isRecord(body["compaction_settings"]) || body["compaction_settings"] === null) {
+    next.compaction_settings = body["compaction_settings"];
+  }
+  next["updated_at"] = new Date().toISOString();
+  return next;
+}
+
+async function handleAgentUpdate(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  const current = resolveAgentRecord(agentId);
+  if (!current) return notFound(res, `agent ${agentId}`);
+  const body = await readJsonBody(req);
+  const next = applyAgentUpdate(current, body);
+  await writeAgentRecord(next);
+  const updated = getAgentRecord(next.id) ?? next;
+  const messages = await listMessages("default", updated.id);
+  const blocks = readBlocksForAgent(updated.id);
+  json(res, 200, agentToLettaState(updated, { messages, blocks }));
+}
+
+// vibesync-tr3e / vibesync-razp: create an agent by writing the on-disk
+// record directly, instead of spawning letta-code's `createAgent` CLI path
+// (which the SDK invokes with `--system-custom`, rejected as ambiguous by
+// the bundled letta.js 0.26.3). The shim already owns the store shape — an
+// agent is just `<storageDir>/agents/<b64url(id)>.json` plus, for system
+// prompt / persona, a memfs `system/*.md` block that readBlocksForAgent
+// surfaces. This is the single store-owner path: vibesync (and any client)
+// POSTs here over HTTP rather than each spawning its own letta-code.
+//
+// Accepts a vanilla-ish CreateAgent body:
+//   { name?, system?|systemPrompt?, model?|llm_config.handle, tags?,
+//     description?, model_settings?, memory_blocks?:[{label,value}],
+//     persona?, id? }
+// Returns 201 with the vanilla AgentState shape.
+async function handleAgentCreate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+
+  const id =
+    (typeof body["id"] === "string" && body["id"]) ||
+    `agent-${cryptoRandomUUID()}`;
+  if (getAgentRecord(id)) {
+    return json(res, 409, { detail: `agent ${id} already exists` });
+  }
+
+  const now = new Date().toISOString();
+  const systemPrompt =
+    (typeof body["system"] === "string" && body["system"]) ||
+    (typeof body["systemPrompt"] === "string" && body["systemPrompt"]) ||
+    "";
+  const model = modelHandleFromUpdate(body, { id } as OnDiskAgentRecord);
+  const tags = Array.isArray(body["tags"]) && body["tags"].every((t) => typeof t === "string")
+    ? (body["tags"] as string[])
+    : [];
+
+  let modelSettings: Record<string, unknown> = {};
+  if (isRecord(body["model_settings"])) modelSettings = { ...body["model_settings"] };
+  if (isRecord(body["llm_config"])) {
+    modelSettings = updateModelSettingsFromLlmConfig(modelSettings, body["llm_config"]);
+  }
+
+  const record: OnDiskAgentRecord = {
+    id,
+    name: typeof body["name"] === "string" ? body["name"] : id,
+    description: typeof body["description"] === "string" ? body["description"] : null,
+    ...(systemPrompt ? { system: systemPrompt } : {}),
+    tags,
+    ...(model ? { model } : {}),
+    ...(Object.keys(modelSettings).length > 0 ? { model_settings: modelSettings } : {}),
+    created_at: now,
+    updated_at: now,
+    _mtimeMs: Date.now(),
+    _ctimeMs: Date.now(),
+  };
+  await writeAgentRecord(record);
+
+  // Persist system prompt + any supplied memory blocks as memfs system/*.md
+  // files so readBlocksForAgent surfaces them (the same place the local
+  // backend projects memory). persona convenience field maps to a persona
+  // block; system prompt maps to a `system_prompt` block.
+  const memSysDir = join(storeInternals.storageDir(), "memfs", id, "memory", "system");
+  try {
+    mkdirSync(memSysDir, { recursive: true });
+    if (systemPrompt) {
+      writeFileSync(join(memSysDir, "system_prompt.md"), systemPrompt);
+    }
+    if (typeof body["persona"] === "string" && body["persona"]) {
+      writeFileSync(join(memSysDir, "persona.md"), body["persona"]);
+    }
+    const blocks = body["memory_blocks"];
+    if (Array.isArray(blocks)) {
+      for (const b of blocks) {
+        if (!isRecord(b)) continue;
+        const label = b["label"];
+        const value = b["value"];
+        if (typeof label === "string" && label && typeof value === "string") {
+          // sanitize label into a filename
+          const safe = label.replace(/[^A-Za-z0-9_-]/g, "_");
+          writeFileSync(join(memSysDir, `${safe}.md`), value);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[shim] agent create memfs write failed for ${id}: ${(err as Error).message}`);
+  }
+
+  const created = getAgentRecord(id) ?? record;
+  const messages = await listMessages("default", created.id);
+  const outBlocks = readBlocksForAgent(created.id);
+  json(res, 201, agentToLettaState(created, { messages, blocks: outBlocks }));
 }
 
 async function handleAgentMessages(
@@ -1183,10 +1441,14 @@ const server = createServer((req, res) => {
   // makes the non-slash form work too, so accept both here.
   if (req.method === "GET" && (pathname === "/v1/agents/count" || pathname === "/v1/agents/count/")) return handleAgentsCount(req, res);
   if (req.method === "GET" && (pathname === "/v1/agents" || pathname === "/v1/agents/")) return handleAgentsList(req, res, url);
+  // vibesync-tr3e/razp: create an agent by writing the store record directly
+  // (no letta-code createAgent CLI spawn). Single store-owner provisioning path.
+  if (req.method === "POST" && (pathname === "/v1/agents" || pathname === "/v1/agents/")) return handleAgentCreate(req, res);
   if (req.method === "GET" && pathname === "/v1/models") return handleModels(req, res);
 
   const agentDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/?$/);
   if (agentDetail && req.method === "GET") return handleAgentDetail(req, res, agentDetail[1]!);
+  if (agentDetail && req.method === "PATCH") return handleAgentUpdate(req, res, agentDetail[1]!);
 
   const agentMessages = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/messages\/?$/);
   if (agentMessages && req.method === "GET") return handleAgentMessages(req, res, url, agentMessages[1]!);
@@ -1382,7 +1644,7 @@ server.listen(PORT, HOST, () => {
 // /shim/v1/mobile is the WebSocket endpoint for the letta-mobile channel
 // transport (Phase 1 of the mobile-as-channel epic). Other paths get a
 // 404 on upgrade so unknown WS targets don't hang.
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, autoPong: false });
 type MobileAdapter = Awaited<ReturnType<typeof getMobileChannelAdapter>>;
 let mobileAdapter: MobileAdapter = null;
 
@@ -1411,6 +1673,7 @@ server.on("upgrade", async (req: IncomingMessage, socket: Duplex, head: Buffer) 
     return;
   }
   wss.handleUpgrade(req, socket as never, head, (ws) => {
+    installMobileWsProtocolKeepalive(ws);
     mobileAdapter!.acceptConnection(ws, req);
   });
 });
