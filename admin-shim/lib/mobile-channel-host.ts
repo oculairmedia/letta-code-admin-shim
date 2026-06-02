@@ -169,6 +169,11 @@ function localPartsToText(parts: unknown): string {
     .join("");
 }
 
+/**
+ * Extract image content parts from a persisted tool-result's `parts` array.
+ * Accepts both nested Letta shape and flat Read-result image parts so
+ * synthesized tool_return_message frames can render images on mobile.
+ */
 function localPartsToImageParts(parts: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(parts)) return [];
   const out: Array<Record<string, unknown>> = [];
@@ -187,7 +192,10 @@ function localPartsToImageParts(parts: unknown): Array<Record<string, unknown>> 
       "image/png";
     const data = typeof part["data"] === "string" ? (part["data"] as string) : null;
     if (!data) continue;
-    out.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
+    out.push({
+      type: "image",
+      source: { type: "base64", media_type: mediaType, data },
+    });
   }
   return out;
 }
@@ -292,6 +300,8 @@ export async function bridgeSendMessage(
   // lcp-4vz + lcp-pgw: track tool_call_ids for inline + end-of-turn synthesis.
   const toolCallIdsSeen: string[] = [];
   const toolReturnIdsSeen = new Set<string>();
+  // Full tool_call objects keyed by id let later Read tool_return frames
+  // resolve arguments.file_path and attach image content parts.
   const toolCallsById = new Map<string, import("./types/wire.js").ToolCall>();
   // lcp-pgw: flag that flips true when a new tool_call arrives and resets
   // once the inline flush resolves it. Prevents re-reading disk on every
@@ -416,6 +426,7 @@ export async function bridgeSendMessage(
       if (mt === "tool_return_message") {
         const callId = (reshaped as { tool_call_id?: string | null }).tool_call_id;
         if (callId) toolReturnIdsSeen.add(callId);
+        // Attach Read image content parts so mobile renders image tool returns.
         reshaped = attachReadImageToToolReturn(
           reshaped as unknown as Parameters<typeof attachReadImageToToolReturn>[0],
           toolCallsById,
@@ -449,6 +460,7 @@ export async function bridgeSendMessage(
                 tool_call_id: callId, status,
                 func_response: returnText, stdout: null, stderr: null, type: "tool",
               };
+              // Preserve image parts from persisted Read results for mobile.
               const imageParts = localPartsToImageParts(entry.parts);
               const toolReturnValue: unknown = imageParts.length > 0
                 ? [...(returnText ? [{ type: "text", text: returnText }] : []), ...imageParts]
@@ -485,7 +497,7 @@ export async function bridgeSendMessage(
           toolCallIdsSeen.push(tc.tool_call_id);
           needsInlineFlush = true;
         }
-        for (const call of tcm.tool_calls ?? []) {
+        for (const call of [tc, ...(tcm.tool_calls ?? [])]) {
           if (call?.tool_call_id) toolCallsById.set(call.tool_call_id, call);
         }
       }
@@ -628,6 +640,7 @@ export async function bridgeSendMessage(
           stderr: null,
           type: "tool",
         };
+        // Carry image parts for synthesized end-of-turn Read image returns.
         const imageParts = localPartsToImageParts(entry.parts);
         const toolReturnValue: unknown = imageParts.length > 0
           ? [...(returnText ? [{ type: "text", text: returnText }] : []), ...imageParts]
