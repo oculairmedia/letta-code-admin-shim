@@ -246,6 +246,121 @@ const EFFECTIVE_AGENT_SETTINGS_REPLACEMENT =
   `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
   `    })`;
 
+// lcp-taqw: local model discovery can register vision-capable OpenAI-compatible
+// models with input:["text"] even when the model id clearly maps to a vision
+// family (Claude, Gemini, GPT, LLaVA, etc.). Later tool-result converters gate
+// Read(image) pixels behind `model.input.includes("image")`; when discovery
+// under-reports the capability, the converter emits only `(see attached image)`.
+// Patch the single registeredModelToPiModel() seam so every downstream provider
+// converter sees the same corrected input capabilities. Limit this to local
+// backend mode so remote/Constellation model declarations remain authoritative.
+const LOCAL_VISION_INPUT_HELPER_DEFINITION =
+  `globalThis.__lcpFixLocalVisionInput = globalThis.__lcpFixLocalVisionInput || function (providerName, modelId, input) {\n` +
+  `  try {\n` +
+  `    const current = Array.isArray(input) ? input : ["text"];\n` +
+  `    if (current.includes("image")) return current;\n` +
+  `    if (process.env.LETTA_LOCAL_BACKEND_EXPERIMENTAL !== "1" && !process.env.LETTA_LOCAL_BACKEND_DIR) return current;\n` +
+  `    const haystack = String(providerName || "") + "/" + String(modelId || "");\n` +
+  `    if (/llava|vision|\bvl\b|opus|sonnet|haiku|claude|gpt-|gpt5|gemini|grok/i.test(haystack)) {\n` +
+  `      return [...current, "image"];\n` +
+  `    }\n` +
+  `  } catch {}\n` +
+  `  return Array.isArray(input) ? input : ["text"];\n` +
+  `};\n`;
+
+const LOCAL_VISION_INPUT_TOKEN = `input: input.model.input,`;
+const LOCAL_VISION_INPUT_REPLACEMENT =
+  `input: globalThis.__lcpFixLocalVisionInput(input.providerName, input.model.id, input.model.input),`;
+
+// lcp-qi2f: the INBOUND user-image gate. toChatMessages(messages, supportsImages)
+// computes supportsImages = `model.input.includes("image")` at the request-build
+// site. For custom/discovered lmstudio handles (e.g. lmstudio/opus-4-8) the
+// resolved model.input may NOT include "image" even though the model is
+// vision-capable — so user-attached images are replaced with
+// "(image omitted: model does not support images)" before reaching the model.
+// The LOCAL_VISION_INPUT patch above fixes model.input at the construction
+// site, but this request-build site can read a model object that bypassed it.
+// Patch the gate directly to also honor the vision-model id check, reusing the
+// same helper (it accepts an input array and returns one including "image").
+const VISION_GATE_TOKEN = `toChatMessages(messages, model.input.includes("image"))`;
+const VISION_GATE_REPLACEMENT =
+  `toChatMessages(messages, globalThis.__lcpFixLocalVisionInput(undefined, model.id, model.input).includes("image"))`;
+
+// lcp-qi2f: the ACTUAL inbound-user-image gate. downgradeUnsupportedImages(
+// messages, model) replaces user image blocks with NON_VISION_USER_IMAGE_
+// PLACEHOLDER ("(image omitted: model does not support images)") whenever
+// `model.input.includes("image")` is false — a SEPARATE path from the
+// toChatMessages gate above, and the one that strips images Emmanuel attaches.
+// Rewrite its early-return guard to honor the vision-model id check via the
+// same helper. Anchored on the unique function signature so we only touch
+// this site.
+const DOWNGRADE_IMAGES_TOKEN =
+  `function downgradeUnsupportedImages(messages, model) {\n  if (model.input.includes("image")) {`;
+const DOWNGRADE_IMAGES_REPLACEMENT =
+  `function downgradeUnsupportedImages(messages, model) {\n  if (globalThis.__lcpFixLocalVisionInput(undefined, model.id, model.input).includes("image")) {`;
+
+// lcp-taqw: executeSingleDecision() emitted `tool_return_message` stream
+// chunks with getDisplayableToolReturn(toolResult.toolReturn). That helper is
+// intentionally text-only for UI display, so the local store appended a
+// toolResult containing just `[Image: file.png]` and then ignored the later raw
+// batch result as a duplicate. Preserve the raw multimodal tool return on the
+// stream chunk; projection layers can still stringify it for UI, while the next
+// model turn keeps the image block.
+const MULTIMODAL_TOOL_RETURN_TOKEN =
+  `tool_return: getDisplayableToolReturn(toolResult.toolReturn),`;
+const MULTIMODAL_TOOL_RETURN_REPLACEMENT = `tool_return: toolResult.toolReturn,`;
+
+// lcp-taqw: normalizeOutgoingApprovalMessages() validates tool returns before
+// sending approval turns back into the local backend. Its built-in
+// isToolReturnContent() only accepts local stored image blocks shaped
+// `{type:"image", mimeType, data}`, while Read(image) returns Anthropic-style
+// legacy blocks shaped `{type:"image", source:{type:"base64", media_type,
+// data}}`. Without preserving that legacy shape, coerceToolReturnContent()
+// falls back to normalizeToolReturnText(), which keeps only `[Image: file.png]`
+// and drops the pixels before applyApprovalResults() can persist them. Keep the
+// legacy shape here because applyApprovalResults()->toolResultContentFromUnknown
+// is the seam that converts legacy `source` blocks into local `mimeType/data`.
+const TOOL_RETURN_CONTENT_HELPER_DEFINITION =
+  `globalThis.__lcpCoerceToolReturnContent = globalThis.__lcpCoerceToolReturnContent || function (value) {\n` +
+  `  try {\n` +
+  `    if (typeof value === "string") return value;\n` +
+  `    if (Array.isArray(value)) {\n` +
+  `      const out = [];\n` +
+  `      for (const part of value) {\n` +
+  `        if (!part || typeof part !== "object") return normalizeToolReturnText(value);\n` +
+  `        if (part.type === "text" && typeof part.text === "string") {\n` +
+  `          out.push({ type: "text", text: part.text });\n` +
+  `          continue;\n` +
+  `        }\n` +
+  `        if (part.type === "image" && typeof part.data === "string" && typeof part.mimeType === "string") {\n` +
+  `          out.push({ type: "image", mimeType: part.mimeType, data: part.data });\n` +
+  `          continue;\n` +
+  `        }\n` +
+  `        const source = part.type === "image" && part.source && typeof part.source === "object" ? part.source : null;\n` +
+  `        if (source && source.type === "base64" && typeof source.media_type === "string" && typeof source.data === "string") {\n` +
+  `          out.push({ type: "image", source: { type: "base64", media_type: source.media_type, data: source.data } });\n` +
+  `          continue;\n` +
+  `        }\n` +
+  `        return normalizeToolReturnText(value);\n` +
+  `      }\n` +
+  `      return out;\n` +
+  `    }\n` +
+  `  } catch {}\n` +
+  `  return isToolReturnContent(value) ? value : normalizeToolReturnText(value);\n` +
+  `};\n`;
+
+const TOOL_RETURN_CONTENT_TOKEN =
+  `function coerceToolReturnContent(value) {\n` +
+  `  if (isToolReturnContent(value))\n` +
+  `    return value;\n` +
+  `  return normalizeToolReturnText(value);\n` +
+  `}`;
+
+const TOOL_RETURN_CONTENT_REPLACEMENT =
+  `function coerceToolReturnContent(value) {\n` +
+  `  return globalThis.__lcpCoerceToolReturnContent(value);\n` +
+  `}`;
+
 let appliedOnce = false;
 
 /**
@@ -326,6 +441,64 @@ function patchLettaCodeSource(raw, path, warn) {
     process.stderr.write(
       `[letta-code-patch] WARN: model_settings thinking guard token not found in ${path} — ` +
       `running without lcp-0u15 settings normalizer\n`,
+    );
+  }
+
+  if (patched.includes(LOCAL_VISION_INPUT_TOKEN)) {
+    patched = patched.replace(LOCAL_VISION_INPUT_TOKEN, LOCAL_VISION_INPUT_REPLACEMENT);
+    appliedPatches += 1;
+    patched = injectHelperAfterShebang(patched, LOCAL_VISION_INPUT_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: local vision input token not found in ${path} — ` +
+      `Read(image) may still be placeholdered by model.input gates\n`,
+    );
+  }
+
+  // lcp-qi2f: inbound user-image gate at the request-build site.
+  if (patched.includes(VISION_GATE_TOKEN)) {
+    patched = patched.replace(VISION_GATE_TOKEN, VISION_GATE_REPLACEMENT);
+    appliedPatches += 1;
+    // Ensure the helper is present even if the input-construction token above
+    // was absent (idempotent: the helper uses `|| function` guard).
+    patched = injectHelperAfterShebang(patched, LOCAL_VISION_INPUT_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: vision gate token (toChatMessages supportsImages) not found in ${path} — ` +
+      `inbound user images may still be omitted\n`,
+    );
+  }
+
+  // lcp-qi2f: downgradeUnsupportedImages — the real inbound user-image strip.
+  if (patched.includes(DOWNGRADE_IMAGES_TOKEN)) {
+    patched = patched.replace(DOWNGRADE_IMAGES_TOKEN, DOWNGRADE_IMAGES_REPLACEMENT);
+    appliedPatches += 1;
+    patched = injectHelperAfterShebang(patched, LOCAL_VISION_INPUT_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: downgradeUnsupportedImages token not found in ${path} — ` +
+      `inbound user images may still be omitted\n`,
+    );
+  }
+
+  if (patched.includes(MULTIMODAL_TOOL_RETURN_TOKEN)) {
+    patched = patched.replace(MULTIMODAL_TOOL_RETURN_TOKEN, MULTIMODAL_TOOL_RETURN_REPLACEMENT);
+    appliedPatches += 1;
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: multimodal tool-return token not found in ${path} — ` +
+      `Read(image) may still be reduced to display text before storage\n`,
+    );
+  }
+
+  if (patched.includes(TOOL_RETURN_CONTENT_TOKEN)) {
+    patched = patched.replace(TOOL_RETURN_CONTENT_TOKEN, TOOL_RETURN_CONTENT_REPLACEMENT);
+    appliedPatches += 1;
+    patched = injectHelperAfterShebang(patched, TOOL_RETURN_CONTENT_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: tool-return content coercion token not found in ${path} — ` +
+      `Read(image) approval turns may still be normalized to text only\n`,
     );
   }
 

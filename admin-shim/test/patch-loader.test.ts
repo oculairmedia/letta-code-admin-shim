@@ -18,6 +18,10 @@ declare global {
   var __lcpFixModelSettings:
     | ((payload: ModelSettingsPayload) => ModelSettingsPayload)
     | undefined;
+  var __lcpFixLocalVisionInput:
+    | ((providerName: string, modelId: string, input: string[]) => string[])
+    | undefined;
+  var __lcpCoerceToolReturnContent: ((value: unknown) => unknown) | undefined;
 }
 
 function readInjectedThinkingHelper(): unknown {
@@ -27,6 +31,16 @@ function readInjectedThinkingHelper(): unknown {
 function readInjectedModelSettingsHelper(): unknown {
   return (globalThis as typeof globalThis & { __lcpFixModelSettings?: unknown })
     .__lcpFixModelSettings;
+}
+
+function readInjectedLocalVisionInputHelper(): unknown {
+  return (globalThis as typeof globalThis & { __lcpFixLocalVisionInput?: unknown })
+    .__lcpFixLocalVisionInput;
+}
+
+function readInjectedToolReturnContentHelper(): unknown {
+  return (globalThis as typeof globalThis & { __lcpCoerceToolReturnContent?: unknown })
+    .__lcpCoerceToolReturnContent;
 }
 
 test("patch-loader normalizes thinking requests and model_settings inheritance", () => {
@@ -203,6 +217,133 @@ test("patch-loader: normalizes persisted model_settings thinking", () => {
     }
     globalThis.__lcpFixModelSettings = undefined;
   }
+});
+
+test("patch-loader: adds local vision input for discovered Claude-style models", () => {
+  const previousExperimental = process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
+  const input = [
+    "function registeredModelToPiModel(input) {",
+    "  return {",
+    "    id: input.model.id,",
+    "    input: input.model.input,",
+    "  };",
+    "}",
+  ].join("\n");
+
+  try {
+    process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"] = "1";
+    const patched = patchLettaCodeSourceForTest(input);
+
+    assert.match(patched, /globalThis\.__lcpFixLocalVisionInput =/);
+    assert.match(
+      patched,
+      /input: globalThis\.__lcpFixLocalVisionInput\(input\.providerName, input\.model\.id, input\.model\.input\),/,
+    );
+
+    const helperStart = patched.indexOf("globalThis.__lcpFixLocalVisionInput =");
+    const helperEnd = patched.indexOf("\nfunction registeredModelToPiModel", helperStart);
+    assert.notEqual(helperStart, -1);
+    assert.notEqual(helperEnd, -1);
+
+    const helperSource = patched.slice(helperStart, helperEnd);
+    globalThis.__lcpFixLocalVisionInput = undefined;
+    eval(helperSource);
+
+    const fixInput = readInjectedLocalVisionInputHelper();
+    if (typeof fixInput !== "function") {
+      assert.fail("expected __lcpFixLocalVisionInput helper to be installed");
+    }
+
+    assert.deepEqual(fixInput("lmstudio", "claude-opus-4-8", ["text"]), ["text", "image"]);
+    assert.deepEqual(fixInput("lmstudio", "plain-text-model", ["text"]), ["text"]);
+    assert.deepEqual(fixInput("lmstudio", "claude-opus-4-8", ["text", "image"]), ["text", "image"]);
+  } finally {
+    if (previousExperimental === undefined) {
+      delete process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
+    } else {
+      process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"] = previousExperimental;
+    }
+    globalThis.__lcpFixLocalVisionInput = undefined;
+  }
+});
+
+test("patch-loader: preserves raw multimodal Read tool returns on stream chunks", () => {
+  const input = [
+    "const toolResult = await executeTool(decision.approval.toolName, parsedArgs, {});",
+    "onChunk({",
+    "  message_type: \"tool_return_message\",",
+    "  tool_return: getDisplayableToolReturn(toolResult.toolReturn),",
+    "  status: toolResult.status,",
+    "});",
+    "return {",
+    "  type: \"tool\",",
+    "  tool_return: toolResult.toolReturn,",
+    "};",
+  ].join("\n");
+
+  const patched = patchLettaCodeSourceForTest(input);
+
+  assert.match(patched, /tool_return: toolResult\.toolReturn,/);
+  assert.doesNotMatch(patched, /tool_return: getDisplayableToolReturn\(toolResult\.toolReturn\),/);
+});
+
+test("patch-loader: converts legacy Read image tool returns before approval normalization", () => {
+  const input = [
+    "function normalizeToolReturnText(value) {",
+    "  if (Array.isArray(value)) return value.filter((part) => part.type === \"text\").map((part) => part.text).join(\"\\n\").trim();",
+    "  return typeof value === \"string\" ? value : JSON.stringify(value);",
+    "}",
+    "function isToolReturnContent(value) {",
+    "  if (typeof value === \"string\")",
+    "    return true;",
+    "  if (!Array.isArray(value))",
+    "    return false;",
+    "  return value.every((part) => !!part && typeof part === \"object\" && (\"type\" in part) && (part.type === \"text\" && (\"text\" in part) && typeof part.text === \"string\" || part.type === \"image\" && (\"data\" in part) && typeof part.data === \"string\" && (\"mimeType\" in part) && typeof part.mimeType === \"string\"));",
+    "}",
+    "function coerceToolReturnContent(value) {",
+    "  if (isToolReturnContent(value))",
+    "    return value;",
+    "  return normalizeToolReturnText(value);",
+    "}",
+  ].join("\n");
+
+  const patched = patchLettaCodeSourceForTest(input);
+
+  assert.match(patched, /globalThis\.__lcpCoerceToolReturnContent =/);
+  assert.match(patched, /return globalThis\.__lcpCoerceToolReturnContent\(value\);/);
+
+  const helperStart = patched.indexOf("globalThis.__lcpCoerceToolReturnContent =");
+  const helperEnd = patched.indexOf("\nfunction normalizeToolReturnText", helperStart);
+  assert.notEqual(helperStart, -1);
+  assert.notEqual(helperEnd, -1);
+
+  const helperSource = patched.slice(helperStart, helperEnd);
+  globalThis.__lcpCoerceToolReturnContent = undefined;
+  eval(helperSource);
+
+  const coerce = readInjectedToolReturnContentHelper();
+  if (typeof coerce !== "function") {
+    assert.fail("expected __lcpCoerceToolReturnContent helper to be installed");
+  }
+
+  assert.deepEqual(
+    coerce([
+      { type: "text", text: "[Image: strict-png.png]" },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "abc123" },
+      },
+    ]),
+    [
+      { type: "text", text: "[Image: strict-png.png]" },
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "abc123" },
+      },
+    ],
+  );
+
+  globalThis.__lcpCoerceToolReturnContent = undefined;
 });
 
 test("patch-loader leaves unrelated source untouched", () => {
