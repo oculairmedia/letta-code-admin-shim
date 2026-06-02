@@ -57,3 +57,12 @@ source of truth — don't restate the flag list here, just read the file.
 - Plugin authoring: `docs/CHANNEL_PLUGINS.md`.
 - Intentional wire-shape differences from vanilla Letta: `docs/DIVERGENCE.md`.
 - Test harness: `test/README.md`.
+
+## Regression testing policy
+
+Every feature, fix, or behavior change must add or update a regression test
+that would fail if that behavior regressed later. PRs without test coverage for
+new or changed behavior should be rejected in review. Keep the test near the
+contract it protects; for example, Read-image tool-return attachment is pinned
+in `test/streaming.test.ts` so future stream or tool-return refactors cannot
+silently drop the mobile image payload again.
