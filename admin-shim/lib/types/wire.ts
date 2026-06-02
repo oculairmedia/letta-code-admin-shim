@@ -180,6 +180,10 @@ export interface ToolReturn {
   type?: string;
 }
 
+export type ToolReturnContentPart = Record<string, unknown> & { type: string };
+
+export type ToolReturnPayload = string | ToolReturnContentPart[];
+
 /** @see Message.kt `ToolReturnMessage`
  *
  * id is `toolreturn-${tool_call_id}`. `tool_return` is the same payload as
@@ -191,7 +195,7 @@ export interface ToolReturn {
  */
 export interface ToolReturnMessage extends LettaMessageBase {
   message_type: "tool_return_message";
-  tool_return: string | null;
+  tool_return: ToolReturnPayload | null;
   status: string;
   tool_call_id: string | null;
   /** See {@link ToolReturn.stdout} — normalized to string[] via lcp-2zn. */

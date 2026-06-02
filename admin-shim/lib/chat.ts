@@ -15,6 +15,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
+import { extname } from "node:path";
 
 import { getAgentPool } from "./agent-pool.js";
 import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.js";
@@ -26,6 +28,7 @@ import type {
   StopReasonMessage,
   ToolCall,
   ToolReturn,
+  ToolReturnMessage,
   UsageStatisticsMessage,
 } from "./types/wire.js";
 
@@ -103,6 +106,101 @@ function extractText(body: unknown): string {
   }
   if (typeof messages === "string") return messages;
   return "";
+}
+
+type ImageContentPart = {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: string;
+    data: string;
+  };
+};
+
+type TextContentPart = { type: "text"; text: string };
+
+const IMAGE_MEDIA_TYPES_BY_EXT: Readonly<Record<string, string>> = {
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+function imageMediaTypeForPath(filePath: string): string | null {
+  return IMAGE_MEDIA_TYPES_BY_EXT[extname(filePath).toLowerCase()] ?? null;
+}
+
+function parseToolArguments(args: string | undefined): Record<string, unknown> | null {
+  if (!args) return null;
+  try {
+    const parsed = JSON.parse(args) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readImageContentPart(filePath: string): ImageContentPart | null {
+  const mediaType = imageMediaTypeForPath(filePath);
+  if (!mediaType) return null;
+  try {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: mediaType,
+        data: readFileSync(filePath).toString("base64"),
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function toolReturnText(frame: ToolReturnMessage): string {
+  if (typeof frame.tool_return === "string") return frame.tool_return;
+  const firstReturn = Array.isArray(frame.tool_returns) ? frame.tool_returns[0] : undefined;
+  return firstReturn?.func_response ?? "";
+}
+
+export function attachReadImageToToolReturn(
+  frame: ToolReturnMessage,
+  toolCallsById: ReadonlyMap<string, ToolCall>,
+): ToolReturnMessage {
+  const callId = typeof frame.tool_call_id === "string" ? frame.tool_call_id : null;
+  if (!callId) return frame;
+  const toolCall = toolCallsById.get(callId);
+  if (!toolCall || toolCall.name.toLowerCase() !== "read") return frame;
+
+  const args = parseToolArguments(toolCall.arguments);
+  const filePath = args && typeof args["file_path"] === "string" ? args["file_path"] : null;
+  if (!filePath) return frame;
+
+  const imagePart = readImageContentPart(filePath);
+  if (!imagePart) return frame;
+
+  const existingParts = Array.isArray(frame.tool_return)
+    ? frame.tool_return
+    : toolReturnText(frame)
+      ? ([{ type: "text", text: toolReturnText(frame) }] satisfies TextContentPart[])
+      : [];
+  const alreadyAttached = existingParts.some((part) => {
+    if (!part || typeof part !== "object") return false;
+    const source = (part as Record<string, unknown>)["source"];
+    return (part as Record<string, unknown>)["type"] === "image" &&
+      source &&
+      typeof source === "object" &&
+      (source as Record<string, unknown>)["data"] === imagePart.source.data;
+  });
+  if (alreadyAttached) return frame;
+
+  return {
+    ...frame,
+    tool_return: [...existingParts, imagePart],
+  };
 }
 
 function sseDataFrame(payload: unknown): string {
@@ -561,9 +659,21 @@ export async function handleSendMessage(
     pendingUsage = null;
   };
 
+  const toolCallsById = new Map<string, ToolCall>();
+
   const handleRawFrame = (raw: unknown): void => {
-    const reshaped = reshapeFrame(raw);
+    let reshaped = reshapeFrame(raw);
     if (!reshaped) return;
+    if (reshaped.message_type === "tool_call_message") {
+      for (const toolCall of reshaped.tool_calls ?? []) {
+        if (toolCall.tool_call_id) toolCallsById.set(toolCall.tool_call_id, toolCall);
+      }
+      if (reshaped.tool_call?.tool_call_id) {
+        toolCallsById.set(reshaped.tool_call.tool_call_id, reshaped.tool_call);
+      }
+    } else if (reshaped.message_type === "tool_return_message") {
+      reshaped = attachReadImageToToolReturn(reshaped, toolCallsById);
+    }
     frames.push(reshaped);
     if (!wantStream) return;
     if (res.writableEnded) return;
