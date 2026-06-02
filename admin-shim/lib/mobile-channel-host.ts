@@ -169,40 +169,11 @@ function localPartsToText(parts: unknown): string {
     .join("");
 }
 
-<<<<<<< HEAD
 /**
  * Extract image content parts from a persisted tool-result's `parts` array.
  * Accepts both nested Letta shape and flat Read-result image parts so
  * synthesized tool_return_message frames can render images on mobile.
  */
-=======
->>>>>>> b76ef29 (fix(shim): preserve Read image tool returns)
-function localPartsToImageParts(parts: unknown): Array<Record<string, unknown>> {
-  if (!Array.isArray(parts)) return [];
-  const out: Array<Record<string, unknown>> = [];
-  for (const p of parts) {
-    if (typeof p !== "object" || p === null) continue;
-    const part = p as Record<string, unknown>;
-    if (part["type"] !== "image") continue;
-    const existingSource = part["source"];
-    if (existingSource && typeof existingSource === "object") {
-      out.push(part);
-      continue;
-    }
-    const mediaType =
-      (typeof part["media_type"] === "string" && (part["media_type"] as string)) ||
-      (typeof part["mimeType"] === "string" && (part["mimeType"] as string)) ||
-      "image/png";
-    const data = typeof part["data"] === "string" ? (part["data"] as string) : null;
-    if (!data) continue;
-<<<<<<< HEAD
-    out.push({
-      type: "image",
-      source: { type: "base64", media_type: mediaType, data },
-    });
-=======
-    out.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
->>>>>>> b76ef29 (fix(shim): preserve Read image tool returns)
   }
   return out;
 }
@@ -307,139 +278,8 @@ export async function bridgeSendMessage(
   // lcp-4vz + lcp-pgw: track tool_call_ids for inline + end-of-turn synthesis.
   const toolCallIdsSeen: string[] = [];
   const toolReturnIdsSeen = new Set<string>();
-<<<<<<< HEAD
   // Full tool_call objects keyed by id let later Read tool_return frames
   // resolve arguments.file_path and attach image content parts.
-=======
->>>>>>> b76ef29 (fix(shim): preserve Read image tool returns)
-  const toolCallsById = new Map<string, import("./types/wire.js").ToolCall>();
-  // lcp-pgw: flag that flips true when a new tool_call arrives and resets
-  // once the inline flush resolves it. Prevents re-reading disk on every
-  // assistant_message delta — only on the first content frame after each
-  // tool execution completes.
-  let needsInlineFlush = false;
-  // Per-otid splitters: each logical assistant message gets its own splitter
-  // so trailing-tag hold-back doesn't leak across distinct assistant bubbles
-  // (rare on a single turn, but possible for multi-step turns).
-  const splittersByOtid = new Map<string, A2uiStreamSplitter>();
-  const a2uiEnabled = a2ui_capability != null;
-  const a2uiMetricsVerbosity = process.env["A2UI_METRICS_VERBOSITY"] ?? "normal";
-  const a2uiMetricsEnabled = a2uiMetricsVerbosity !== "off";
-  const a2uiMetrics: A2uiMetrics = {
-    total_frames: 0,
-    parse_ok: 0,
-    parse_err: 0,
-    validate_ok: 0,
-    validate_err: 0,
-    widget_types_seen: [],
-    splitter_overhead_ms: 0,
-  };
-  let a2uiFramesDelivered = 0;
-  const a2uiWidgetsSeen = new Set<string>();
-  const truncateA2uiRaw = (raw: string): string => raw.length > 200 ? `${raw.slice(0, 200)}…` : raw;
-  const mergeA2uiMetrics = (metrics: A2uiMetrics): void => {
-    a2uiMetrics.total_frames += metrics.total_frames;
-    a2uiMetrics.parse_ok += metrics.parse_ok;
-    a2uiMetrics.parse_err += metrics.parse_err;
-    a2uiMetrics.validate_ok += metrics.validate_ok;
-    a2uiMetrics.validate_err += metrics.validate_err;
-    a2uiMetrics.splitter_overhead_ms += metrics.splitter_overhead_ms;
-    for (const widget of metrics.widget_types_seen) a2uiWidgetsSeen.add(widget);
-  };
-  const logA2uiWarning = (payload: Record<string, unknown>): void => {
-    if (!a2uiMetricsEnabled) return;
-    console.error(JSON.stringify({ level: "warn", module: "a2ui", run_id: runHandle.id, agent_id: effectiveAgentId, ...payload }));
-  };
-  const newSplitter = (): A2uiStreamSplitter =>
-    new A2uiStreamSplitter({
-      validate: (message) => validateA2uiMessage(message, { expectedCatalogId: a2ui_capability?.catalogId }),
-      onMetrics: mergeA2uiMetrics,
-      onParseError: (raw, error) => {
-        logA2uiWarning({ event: "parse_error", error, raw: truncateA2uiRaw(raw) });
-      },
-      onValidationError: (raw, error, widgetType) => {
-        logA2uiWarning({ event: "validation_error", widget_type: widgetType, error, raw: truncateA2uiRaw(raw) });
-      },
-    });
-  const buildA2uiFrame = (
-    block: A2uiBlock,
-    otid: string | null,
-    runId: string | null,
-  ): A2uiFrameMessage => ({
-    message_type: "a2ui_frame",
-    run_id: runId,
-    otid,
-    a2ui: block.parsed,
-    raw: block.raw,
-    ok: block.ok,
-    parse_error: block.parseError,
-    validation_error: block.validationError,
-  });
-  const emitA2uiFrame = (frame: A2uiFrameMessage): void => {
-    a2uiFramesDelivered += 1;
-    onFrame(frame);
-  };
-
-  // Smoothing intentionally NOT done server-side. lcp-cv3 contract:
-  // forward every chunk as a pure delta. The mobile renderer (Android
-  // app/src/main/java/com/letta/mobile/ui/screens/chat/
-  // StreamingDisplayTextSmoother.kt) already implements char-velocity
-  // smoothing with a 60fps reveal loop — adding server-side batching
-  // would introduce first-chunk latency without UX win. A no-op
-  // StreamCoalescer module remains in lib/ for non-smoothing clients
-  // (future web channel etc.) to opt into; not wired into this path.
-  //
-  // lcp-dlj: content_parts wins over text when present and non-empty.
-  // letta-code's headless stdin accepts either shape on MessageCreate.content.
-  const userInput: string | unknown[] =
-    Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
-  // lcp-0vi: route through pool.runTurnWithHeal so a dangling-tool-use
-  // failure on this turn evicts the warm adapter + heals the transcript
-  // before returning. The caller sees the original turn result unchanged;
-  // the cleaned disk is picked up on the next user turn.
-  const turn = await pool.runTurnWithHeal(effectiveConvId, effectiveAgentId, userInput, {
-    a2uiCapability: a2ui_capability ?? null,
-    // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
-    // patches the SIGTERM hook onto it via setRunCancelHandler. The
-    // worker will NOT call onRunCreated when a handle is provided —
-    // the caller already knows the id (we fired onRunCreated above).
-    runHandle,
-    onFrame: (raw, meta) => {
-      let reshaped = reshapeFrame(raw);
-      if (!reshaped) return;
-      // Stamp the run_id on every reshaped frame for mobile-side correlation
-      // with /v1/runs/{id}. The pool exposes it via the meta callback arg.
-      // Bare-shape variants (StopReasonMessage, UsageStatisticsMessage) do
-      // not declare `run_id`, but the .mjs unconditionally added it at
-      // runtime; mirror that exactly by writing through a Record cast.
-      if (meta?.runId) (reshaped as unknown as Record<string, unknown>)["run_id"] = meta.runId;
-      const mt = reshaped.message_type;
-      if (mt === "stop_reason") {
-        // lcp-8ri: last-wins for the WS emission. Multi-step turns emit
-        // stop_reason per step (first is usually requires_approval, last
-        // is end_turn). The wire and run summary both reflect the terminal
-        // state; per-step records preserve intermediate approval stops for
-        // diagnostics.
-        pendingStop = reshaped;
-        return;
-      }
-      if (mt === "usage_statistics") {
-        if (pendingUsage === null) pendingUsage = reshaped;
-        return;
-      }
-      // lcp-4vz + lcp-pgw: inline tool_return synthesis. When a content
-      // frame arrives and there are unresolved tool calls, read disk for
-      // their results and emit tool_return frames BEFORE the current frame.
-      // This gives per-tool progressive resolution instead of end-of-turn
-      // batching. Gated by needsInlineFlush so we don't re-read disk on
-      // every assistant_message delta.
-      if (mt === "tool_return_message") {
-        const callId = (reshaped as { tool_call_id?: string | null }).tool_call_id;
-        if (callId) toolReturnIdsSeen.add(callId);
-<<<<<<< HEAD
-        // Attach Read image content parts so mobile renders image tool returns.
-=======
->>>>>>> b76ef29 (fix(shim): preserve Read image tool returns)
         reshaped = attachReadImageToToolReturn(
           reshaped as unknown as Parameters<typeof attachReadImageToToolReturn>[0],
           toolCallsById,
@@ -473,51 +313,7 @@ export async function bridgeSendMessage(
                 tool_call_id: callId, status,
                 func_response: returnText, stdout: null, stderr: null, type: "tool",
               };
-<<<<<<< HEAD
               // Preserve image parts from persisted Read results for mobile.
-=======
->>>>>>> b76ef29 (fix(shim): preserve Read image tool returns)
-              const imageParts = localPartsToImageParts(entry.parts);
-              const toolReturnValue: unknown = imageParts.length > 0
-                ? [...(returnText ? [{ type: "text", text: returnText }] : []), ...imageParts]
-                : returnText;
-              emit({
-                id: `toolreturn-${callId}`,
-                date: new Date().toISOString(),
-                name: (entry.toolName as string | undefined) ?? null,
-                message_type: "tool_return_message",
-                otid: null, sender_id: null, step_id: null,
-                is_err: isError ? true : null, seq_id: null,
-                run_id: runHandle.id,
-                tool_call_id: callId, status,
-                tool_return: toolReturnValue as ToolReturnMessage["tool_return"], stdout: null, stderr: null,
-                tool_returns: [tr],
-              } satisfies ToolReturnMessage);
-              toolReturnIdsSeen.add(callId);
-            }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error(`[mobile-channel] lcp-pgw: inline tool_return synthesis failed: ${msg}`);
-          }
-        }
-        needsInlineFlush = toolCallIdsSeen.some((id) => !toolReturnIdsSeen.has(id));
-      }
-      if (mt === "tool_call_message") {
-        const tcm = reshaped as {
-          tool_call?: import("./types/wire.js").ToolCall | null;
-          tool_calls?: import("./types/wire.js").ToolCall[] | null;
-        };
-        const tc = tcm.tool_call;
-        if (tc?.tool_call_id) {
-          toolCallsById.set(tc.tool_call_id, tc);
-          toolCallIdsSeen.push(tc.tool_call_id);
-          needsInlineFlush = true;
-        }
-<<<<<<< HEAD
-        for (const call of [tc, ...(tcm.tool_calls ?? [])]) {
-=======
-        for (const call of tcm.tool_calls ?? []) {
->>>>>>> b76ef29 (fix(shim): preserve Read image tool returns)
           if (call?.tool_call_id) toolCallsById.set(call.tool_call_id, call);
         }
       }
@@ -660,10 +456,7 @@ export async function bridgeSendMessage(
           stderr: null,
           type: "tool",
         };
-<<<<<<< HEAD
         // Carry image parts for synthesized end-of-turn Read image returns.
-=======
->>>>>>> b76ef29 (fix(shim): preserve Read image tool returns)
         const imageParts = localPartsToImageParts(entry.parts);
         const toolReturnValue: unknown = imageParts.length > 0
           ? [...(returnText ? [{ type: "text", text: returnText }] : []), ...imageParts]

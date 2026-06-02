@@ -109,6 +109,150 @@ function extractText(body: unknown): string {
   return "";
 }
 
+// Like extractText, but preserves multimodal content. Mobile sends image
+// attachments as `{type:"image", source:{type:"base64", media_type, data}}`
+// parts inside a message's `content` array. extractText() drops every non-text
+// part, so screenshots never reach the backend unless we preserve the ordered
+// content parts array for multimodal requests.
+type InboundContentPart = { type: string; [k: string]: unknown };
+
+type ImageContentPart = {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: string;
+    data: string;
+  };
+};
+
+type TextContentPart = { type: "text"; text: string };
+
+const IMAGE_MEDIA_TYPES_BY_EXT: Readonly<Record<string, string>> = {
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+function imageMediaTypeForPath(filePath: string): string | null {
+  return IMAGE_MEDIA_TYPES_BY_EXT[extname(filePath).toLowerCase()] ?? null;
+}
+
+function parseToolArguments(args: string | undefined): Record<string, unknown> | null {
+  if (!args) return null;
+  try {
+    const parsed = JSON.parse(args) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readImageContentPart(filePath: string): ImageContentPart | null {
+  const mediaType = imageMediaTypeForPath(filePath);
+  if (!mediaType) return null;
+  try {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: mediaType,
+        data: readFileSync(filePath).toString("base64"),
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function toolReturnText(frame: ToolReturnMessage): string {
+  if (typeof frame.tool_return === "string") return frame.tool_return;
+  const firstReturn = Array.isArray(frame.tool_returns) ? frame.tool_returns[0] : undefined;
+  return firstReturn?.func_response ?? "";
+}
+
+export function attachReadImageToToolReturn(
+  frame: ToolReturnMessage,
+  toolCallsById: ReadonlyMap<string, ToolCall>,
+): ToolReturnMessage {
+  const callId = typeof frame.tool_call_id === "string" ? frame.tool_call_id : null;
+  if (!callId) return frame;
+  const toolCall = toolCallsById.get(callId);
+  if (!toolCall || toolCall.name.toLowerCase() !== "read") return frame;
+
+  const args = parseToolArguments(toolCall.arguments);
+  const filePath = args && typeof args["file_path"] === "string" ? args["file_path"] : null;
+  if (!filePath) return frame;
+
+  const imagePart = readImageContentPart(filePath);
+  if (!imagePart) return frame;
+
+  const existingParts = Array.isArray(frame.tool_return)
+    ? frame.tool_return
+    : toolReturnText(frame)
+      ? ([{ type: "text", text: toolReturnText(frame) }] satisfies TextContentPart[])
+      : [];
+  const alreadyAttached = existingParts.some((part) => {
+    if (!part || typeof part !== "object") return false;
+    const source = (part as Record<string, unknown>)["source"];
+    return (part as Record<string, unknown>)["type"] === "image" &&
+      source &&
+      typeof source === "object" &&
+      (source as Record<string, unknown>)["data"] === imagePart.source.data;
+  });
+  if (alreadyAttached) return frame;
+
+  return {
+    ...frame,
+    tool_return: [...existingParts, imagePart],
+  };
+}
+
+function extractContent(body: unknown): string | InboundContentPart[] {
+  if (!body || typeof body !== "object") return extractText(body);
+  const rec = body as Record<string, unknown>;
+  if (typeof rec["input"] === "string" || typeof rec["text"] === "string") {
+    return extractText(body);
+  }
+  const messages = rec["messages"] ?? rec["message"];
+  if (!Array.isArray(messages)) return extractText(body);
+
+  const parts: InboundContentPart[] = [];
+  let sawImage = false;
+  for (const m of messages) {
+    if (typeof m === "string") {
+      if (m) parts.push({ type: "text", text: m });
+      continue;
+    }
+    if (!m || typeof m !== "object") continue;
+    const c = (m as Record<string, unknown>)["content"];
+    if (typeof c === "string") {
+      if (c) parts.push({ type: "text", text: c });
+      continue;
+    }
+    if (!Array.isArray(c)) continue;
+    for (const p of c) {
+      if (!p || typeof p !== "object") continue;
+      const pr = p as Record<string, unknown>;
+      const t = pr["type"];
+      if (t === "text") {
+        if (typeof pr["text"] === "string" && pr["text"]) {
+          parts.push({ type: "text", text: pr["text"] as string });
+        }
+      } else if (t === "image" || t === "image_url" || t === "input_image") {
+        sawImage = true;
+        parts.push(pr as InboundContentPart);
+      }
+    }
+  }
+
+  if (!sawImage) return extractText(body);
+  return parts;
+}
+
 function sseDataFrame(payload: unknown): string {
   // Mobile's SseParser only reads `data:` lines. Skip the `event:` line.
   // Every payload must have `message_type` at the top level or it's treated
@@ -152,22 +296,17 @@ function partsToText(parts: unknown): string {
   if (!Array.isArray(parts)) return "";
   return parts
     .filter((p: unknown) => {
-      // Original: `p?.type === "text"`. Same semantics: only objects whose
-      // `type` field equals "text" pass. Scalars / null / undefined / arrays
-      // without a `type:"text"` field are filtered out.
       if (p == null) return false;
       return (p as { type?: unknown }).type === "text";
     })
     .map((p: unknown) => {
-      // Original: `p.text || ""` — keep the `||` (falsy-coalesce) semantics,
-      // not `??`, so 0 / false / "" all coerce to "" the same way.
       const t = (p as { text?: unknown }).text;
-      // Cast through unknown so `||` keeps its JS short-circuit behavior;
-      // TS would otherwise object to `unknown || ""`.
       return (t || "") as string;
     })
     .join("");
 }
+
+
 
 type ImageContentPart = {
   type: "image";
@@ -262,6 +401,7 @@ export function attachReadImageToToolReturn(
     tool_return: [...existingParts, imagePart],
   };
 }
+
 
 /**
  * Map a raw letta-code stream-json frame to the Letta-server-shaped frame
@@ -570,7 +710,11 @@ export async function handleSendMessage(
   }
 
   const text = extractText(body);
-  if (!text) {
+  // Multimodal: when the message carries image parts, `content` is the full
+  // ordered parts array; otherwise it equals `text` (legacy string behavior).
+  const content = extractContent(body);
+  const hasImageParts = Array.isArray(content);
+  if (!text && !hasImageParts) {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ detail: "missing user text" }));
     return;
@@ -805,7 +949,7 @@ export async function handleSendMessage(
       // healed disk is picked up by the next pool.get() the next time a
       // user turn comes through; the caller still sees this turn's
       // failure exactly as before, just with the disk already cleaned.
-      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, text, {
+      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, content, {
         onFrame: handleRawFrameWithRun,
         onRunCreated: (id: string) => {
           activeRunId = id;
