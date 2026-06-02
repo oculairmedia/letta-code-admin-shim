@@ -569,10 +569,9 @@ export async function handleSendMessage(
     if (res.writableEnded) return;
 
     if (reshaped.message_type === "stop_reason") {
-      // lcp-8ri: last-wins for the wire. Multi-step turns emit stop_reason
-      // per step (first is requires_approval, last is end_turn). The run
-      // record wants first-wins (finalizeTurnLifecycle handles that). The
-      // wire should reflect the terminal state.
+      // lcp-8ri/lcp-gukg: last-wins for the wire and run summary. Multi-step
+      // turns emit stop_reason per step (first is requires_approval, last is
+      // end_turn); intermediate stops stay available in per-step run records.
       pendingStop = reshaped;
       return;
     }

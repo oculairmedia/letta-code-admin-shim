@@ -405,9 +405,10 @@ export function applyFrameRunSideEffects(
  *   1. Stamp the real wallclock time on newly-persisted messages
  *      (lcp-dfz path).
  *   2. Attribute any new message ids to this turn's shim run.
- *   3. Find the FIRST stop_reason + FIRST usage_statistics frames
- *      across the turn — LOCKED CONTRACTS #4 + #5, do not switch to
- *      .findLast or summing.
+ *   3. Find the final stop_reason + FIRST usage_statistics frames
+ *      across the turn. Usage remains first-frame (locked contract #4),
+ *      while the run summary stop_reason reflects the terminal state; per-step
+ *      records preserve intermediate requires_approval stops for diagnostics.
  *   4. Call finalizeRun unless the turn was already cancelled
  *      (cancelRun's path already wrote its terminal record; calling
  *      finalizeRun would be a no-op but skipping is cheaper).
@@ -446,11 +447,12 @@ export async function finalizeTurnLifecycle(args: {
     const msg = err instanceof Error ? err.message : String(err);
     logLine(`run message attribution failed for ${runHandle.id}: ${msg}`);
   }
-  const stopFrame = frames.find((f) => {
+  const stopFrames = frames.filter((f) => {
     const ev = frameEvent(f);
     const mt = "message_type" in ev ? ev.message_type : undefined;
     return mt === "stop_reason";
   });
+  const stopFrame = stopFrames[stopFrames.length - 1] ?? null;
   // lcp-12w: synthesize an error toolResult for any tool_call this turn
   // emitted but never returned. Cheap no-op on clean turns; only writes
   // when an interruption left tool_use orphans on disk. Pairs with the

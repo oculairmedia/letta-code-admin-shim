@@ -50,9 +50,10 @@
  *      summed across frames. Per-step usage in steps.jsonl IS per-step.
  *      See `runs.test.mjs` for the assertion.
  *
- *   5. FIRST-STEP `stop_reason`. The run-level `stop_reason` is the FIRST
- *      step's stop, not the final one. So e.g. a bash-tool turn can show
- *      `status: "completed"` together with `stop_reason: "requires_approval"`.
+ *   5. TERMINAL run-level `stop_reason`. The run summary records the final
+ *      effective stop reason for the completed turn. Intermediate step stops
+ *      such as auto-approved `requires_approval` are preserved in steps.jsonl,
+ *      not promoted to the run summary where mobile may treat them as active.
  *
  * None of these are enforced in the type system — they're behavioral
  * contracts. The types describe what the wire actually looks like, including
@@ -381,7 +382,7 @@ export interface RunUsage {
  *
  * Field semantics drift from vanilla in a few places, ALL documented:
  *   - `usage`: first frame, not sum (locked contract #4)
- *   - `stop_reason`: first step's stop, not final (locked contract #5)
+ *   - `stop_reason`: final effective turn stop (intermediate stops live in steps)
  *
  * Shim-specific extensions over Kotlin's `Run` (mobile ignores unknown
  * fields per kotlinx.serialization defaults):
@@ -406,7 +407,7 @@ export interface Run {
   request_config: RunRequestConfig | null;
   /** `"running" | "completed" | "failed" | "cancelled"` — see runs.mjs:188-210. */
   status: string | null;
-  /** FIRST step's stop_reason; can differ from the final step's. */
+  /** Final effective turn stop; intermediate step stops are recorded in steps. */
   stop_reason: string | null;
   total_duration_ns: number | null;
   ttft_ns: number | null;
