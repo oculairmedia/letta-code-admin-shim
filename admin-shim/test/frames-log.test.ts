@@ -26,7 +26,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { appendRunFrame, createRun, getFramesFilePath } from "../lib/runs.js";
+import { appendRunFrame, createRun, finalizeRun, getFramesFilePath } from "../lib/runs.js";
 
 interface FrameLine {
   seq: number;
@@ -94,6 +94,33 @@ test("appendRunFrame on unknown run returns {seq: -1} and writes nothing", async
     const { seq } = appendRunFrame("run-does-not-exist", { kind: "ghost" });
     assert.equal(seq, -1);
     assert.equal(existsSync(getFramesFilePath("run-does-not-exist")), false);
+  });
+});
+
+test("appendRunFrame still persists terminal tail frames just after finalizeRun", async () => {
+  await withBackendDir(() => {
+    const run = createRun({ agentId: "a", conversationId: "c" });
+    assert.equal(appendRunFrame(run.id, { message_type: "assistant_message", content: "done" }).seq, 1);
+
+    finalizeRun(run, { status: "completed", stopReason: "end_turn" });
+
+    const stop = appendRunFrame(run.id, { message_type: "stop_reason", stop_reason: "end_turn" });
+    const usage = appendRunFrame(run.id, {
+      message_type: "usage_statistics",
+      prompt_tokens: 1,
+      completion_tokens: 2,
+      total_tokens: 3,
+    });
+
+    assert.equal(stop.seq, 2);
+    assert.equal(usage.seq, 3);
+
+    const lines = readFrames(run.id);
+    assert.deepEqual(lines.map((l) => l.seq), [1, 2, 3]);
+    assert.deepEqual(
+      lines.map((l) => (l.frame as { message_type: string }).message_type),
+      ["assistant_message", "stop_reason", "usage_statistics"],
+    );
   });
 });
 

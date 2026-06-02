@@ -138,6 +138,42 @@ test("subscribe(run, 0) replays the whole frame log + emits subscribe_done", asy
   }
 });
 
+test("subscribe replay includes terminal stop_reason and usage tail frames", async () => {
+  const shim = await startShim();
+  try {
+    const runId = "run-terminal-1111-2222-3333-444444444444";
+    seedRun(shim, runId, [
+      { seq: 1, frame: { message_type: "assistant_message", content: "hi" } },
+      { seq: 2, frame: { message_type: "stop_reason", stop_reason: "end_turn" } },
+      {
+        seq: 3,
+        frame: {
+          message_type: "usage_statistics",
+          prompt_tokens: 1,
+          completion_tokens: 2,
+          total_tokens: 3,
+        },
+      },
+    ]);
+
+    const conn = await openMobileWs(shim.url!, { token: shim.mobileToken });
+    try {
+      const { frames, done } = await collectSubscribeReplay(conn, runId, 0);
+      assert.deepEqual(frames.map((f) => f.seq), [1, 2, 3]);
+      assert.deepEqual(
+        frames.map((f) => (f.frame as { message_type: string }).message_type),
+        ["assistant_message", "stop_reason", "usage_statistics"],
+      );
+      assert.equal(done.last_seq, 3);
+      assert.equal(done.status, "completed");
+    } finally {
+      conn.close();
+    }
+  } finally {
+    await shim.stop();
+  }
+});
+
 test("subscribe(run, seq) replays only frames with seq > cursor", async () => {
   const shim = await startShim();
   try {
