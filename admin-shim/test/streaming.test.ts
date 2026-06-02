@@ -22,9 +22,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { attachReadImageToToolReturn } from "../lib/chat.js";
+import type { ToolCall, ToolReturnMessage } from "../lib/types/wire.js";
 import {
   startShim,
   seedAgent,
@@ -197,6 +200,64 @@ test("streaming: multi-tool-bash-read emits TWO tool_call_messages in order", as
   const i0 = result.frames.indexOf(tools[0]!);
   const i1 = result.frames.indexOf(tools[1]!);
   assert.ok(i0 < i1, "Bash tool_call must precede Read tool_call");
+});
+
+test("streaming: Read image tool returns attach image content part for mobile", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "lcp-d780-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const imagePath = join(dir, "design-ref.png");
+  const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  writeFileSync(imagePath, imageBytes);
+
+  const toolCall: ToolCall = {
+    tool_call_id: "toolu_read_image",
+    name: "Read",
+    arguments: JSON.stringify({ file_path: imagePath }),
+  };
+  const frame: ToolReturnMessage = {
+    id: "toolreturn-toolu_read_image",
+    date: "2026-06-02T00:00:00.000Z",
+    name: null,
+    message_type: "tool_return_message",
+    otid: null,
+    sender_id: null,
+    step_id: null,
+    is_err: null,
+    seq_id: null,
+    run_id: "run-1",
+    tool_call_id: "toolu_read_image",
+    tool_return: "[Image: design-ref.png]",
+    status: "success",
+    stdout: null,
+    stderr: null,
+    tool_returns: [
+      {
+        tool_call_id: "toolu_read_image",
+        status: "success",
+        func_response: "[Image: design-ref.png]",
+        stdout: null,
+        stderr: null,
+      },
+    ],
+  };
+
+  const enriched = attachReadImageToToolReturn(frame, new Map([[toolCall.tool_call_id, toolCall]]));
+
+  assert.ok(Array.isArray(enriched.tool_return), "tool_return should become structured content parts");
+  assert.deepEqual(enriched.tool_return[0], { type: "text", text: "[Image: design-ref.png]" });
+  assert.deepEqual(enriched.tool_return[1], {
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: "image/png",
+      data: imageBytes.toString("base64"),
+    },
+  });
+  assert.equal(
+    enriched.tool_returns?.[0]?.func_response,
+    "[Image: design-ref.png]",
+    "string func_response fallback must remain for legacy clients",
+  );
 });
 
 // ─── 6. interleaved-tools: coalescer must not merge across tool calls ─
@@ -481,6 +542,31 @@ test("streaming: streaming:false returns a single JSON envelope, no SSE", async 
   assert.ok(Array.isArray(body.messages), "non-stream response includes `messages` array");
   assert.ok(body.stop_reason && body.stop_reason.message_type === "stop_reason");
   assert.ok(body.usage && typeof body.usage.total_tokens === "number");
+});
+
+test("streaming: streaming:false reports terminal stop_reason for multi-step tool turns", async (t) => {
+  const { messagesUrl } = await setupShim(t);
+  const res = await fetch(messagesUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messages: [{ role: "user", content: "use both tools: bash and read", otid: "cm-no-stream-tools" }],
+      streaming: false,
+    }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as {
+    stop_reason: { message_type: string; stop_reason: string };
+    usage: { step_count: number };
+  };
+
+  assert.equal(body.stop_reason.message_type, "stop_reason");
+  assert.equal(
+    body.stop_reason.stop_reason,
+    "end_turn",
+    "non-streaming summary must expose the terminal stop_reason, not an intermediate requires_approval",
+  );
+  assert.ok(body.usage.step_count > 1, "fixture must exercise a multi-step turn");
 });
 
 // ─── 15. Ping carries run_id once it's known ────────────────────────

@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { IncomingMessage } from "node:http";
 
-import { reshapeFrame } from "./chat.js";
+import { reshapeFrame, attachReadImageToToolReturn } from "./chat.js";
 import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
@@ -169,6 +169,29 @@ function localPartsToText(parts: unknown): string {
     .join("");
 }
 
+function localPartsToImageParts(parts: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(parts)) return [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const p of parts) {
+    if (typeof p !== "object" || p === null) continue;
+    const part = p as Record<string, unknown>;
+    if (part["type"] !== "image") continue;
+    const existingSource = part["source"];
+    if (existingSource && typeof existingSource === "object") {
+      out.push(part);
+      continue;
+    }
+    const mediaType =
+      (typeof part["media_type"] === "string" && (part["media_type"] as string)) ||
+      (typeof part["mimeType"] === "string" && (part["mimeType"] as string)) ||
+      "image/png";
+    const data = typeof part["data"] === "string" ? (part["data"] as string) : null;
+    if (!data) continue;
+    out.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
+  }
+  return out;
+}
+
 export async function bridgeSendMessage(
   { agent_id, conversation_id, text, content_parts, otid, a2ui_capability, background }: BridgeSendMessageArgs,
   onFrame: (frame: BridgeFrame) => void,
@@ -269,6 +292,7 @@ export async function bridgeSendMessage(
   // lcp-4vz + lcp-pgw: track tool_call_ids for inline + end-of-turn synthesis.
   const toolCallIdsSeen: string[] = [];
   const toolReturnIdsSeen = new Set<string>();
+  const toolCallsById = new Map<string, import("./types/wire.js").ToolCall>();
   // lcp-pgw: flag that flips true when a new tool_call arrives and resets
   // once the inline flush resolves it. Prevents re-reading disk on every
   // assistant_message delta — only on the first content frame after each
@@ -361,7 +385,7 @@ export async function bridgeSendMessage(
     // the caller already knows the id (we fired onRunCreated above).
     runHandle,
     onFrame: (raw, meta) => {
-      const reshaped = reshapeFrame(raw);
+      let reshaped = reshapeFrame(raw);
       if (!reshaped) return;
       // Stamp the run_id on every reshaped frame for mobile-side correlation
       // with /v1/runs/{id}. The pool exposes it via the meta callback arg.
@@ -392,6 +416,10 @@ export async function bridgeSendMessage(
       if (mt === "tool_return_message") {
         const callId = (reshaped as { tool_call_id?: string | null }).tool_call_id;
         if (callId) toolReturnIdsSeen.add(callId);
+        reshaped = attachReadImageToToolReturn(
+          reshaped as unknown as Parameters<typeof attachReadImageToToolReturn>[0],
+          toolCallsById,
+        ) as unknown as typeof reshaped;
       }
       if (needsInlineFlush && (mt === "tool_call_message" || mt === "assistant_message" || mt === "reasoning_message")) {
         const unresolvedNow = toolCallIdsSeen.filter((id) => !toolReturnIdsSeen.has(id));
@@ -421,6 +449,10 @@ export async function bridgeSendMessage(
                 tool_call_id: callId, status,
                 func_response: returnText, stdout: null, stderr: null, type: "tool",
               };
+              const imageParts = localPartsToImageParts(entry.parts);
+              const toolReturnValue: unknown = imageParts.length > 0
+                ? [...(returnText ? [{ type: "text", text: returnText }] : []), ...imageParts]
+                : returnText;
               emit({
                 id: `toolreturn-${callId}`,
                 date: new Date().toISOString(),
@@ -430,7 +462,7 @@ export async function bridgeSendMessage(
                 is_err: isError ? true : null, seq_id: null,
                 run_id: runHandle.id,
                 tool_call_id: callId, status,
-                tool_return: returnText, stdout: null, stderr: null,
+                tool_return: toolReturnValue as ToolReturnMessage["tool_return"], stdout: null, stderr: null,
                 tool_returns: [tr],
               } satisfies ToolReturnMessage);
               toolReturnIdsSeen.add(callId);
@@ -443,10 +475,18 @@ export async function bridgeSendMessage(
         needsInlineFlush = toolCallIdsSeen.some((id) => !toolReturnIdsSeen.has(id));
       }
       if (mt === "tool_call_message") {
-        const tc = (reshaped as { tool_call?: { tool_call_id?: string } | null }).tool_call;
+        const tcm = reshaped as {
+          tool_call?: import("./types/wire.js").ToolCall | null;
+          tool_calls?: import("./types/wire.js").ToolCall[] | null;
+        };
+        const tc = tcm.tool_call;
         if (tc?.tool_call_id) {
+          toolCallsById.set(tc.tool_call_id, tc);
           toolCallIdsSeen.push(tc.tool_call_id);
           needsInlineFlush = true;
+        }
+        for (const call of tcm.tool_calls ?? []) {
+          if (call?.tool_call_id) toolCallsById.set(call.tool_call_id, call);
         }
       }
       // Stable per-otid id so mobile's findByServerId merges chunks of
@@ -588,6 +628,10 @@ export async function bridgeSendMessage(
           stderr: null,
           type: "tool",
         };
+        const imageParts = localPartsToImageParts(entry.parts);
+        const toolReturnValue: unknown = imageParts.length > 0
+          ? [...(returnText ? [{ type: "text", text: returnText }] : []), ...imageParts]
+          : returnText;
         const frame: ToolReturnMessage = {
           id: `toolreturn-${callId}`,
           date: new Date().toISOString(),
@@ -601,7 +645,7 @@ export async function bridgeSendMessage(
           run_id: runHandle.id,
           tool_call_id: callId,
           status,
-          tool_return: returnText,
+          tool_return: toolReturnValue as ToolReturnMessage["tool_return"],
           stdout: null,
           stderr: null,
           tool_returns: [tr],
