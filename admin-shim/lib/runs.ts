@@ -361,6 +361,22 @@ function writeJsonAtomic(path: string, value: unknown): void {
 // run lifecycle event writes to both.
 const _activeRuns = new Map<string, RunHandle>(); // run_id → run handle (in-memory copy)
 const _cancelHandlers = new Map<string, (reason: string) => void>(); // run_id → onCancel
+const FINALIZED_APPEND_GRACE_MS = 30_000;
+const _finalizedAppendWindow = new Map<string, { handle: RunHandle; timeout: NodeJS.Timeout }>();
+
+function rememberFinalizedRunForAppend(runId: string, handle: RunHandle): void {
+  const prev = _finalizedAppendWindow.get(runId);
+  if (prev) clearTimeout(prev.timeout);
+  const timeout = setTimeout(() => {
+    _finalizedAppendWindow.delete(runId);
+  }, FINALIZED_APPEND_GRACE_MS);
+  timeout.unref?.();
+  _finalizedAppendWindow.set(runId, { handle, timeout });
+}
+
+function getAppendableRunHandle(runId: string): RunHandle | undefined {
+  return _activeRuns.get(runId) ?? _finalizedAppendWindow.get(runId)?.handle;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -563,9 +579,13 @@ export function getFramesFilePath(runId: string): string {
  * Atomicity: one appendFileSync per line. POSIX guarantees atomic appends
  * for writes ≤ PIPE_BUF (4 KiB); single-writer-per-run holds for the agent
  * pool's serialized turns, so larger frames are also safe in practice.
+ *
+ * lcp-xu4l: terminal stop/usage frames can arrive just after finalizeRun()
+ * removes the handle from `_activeRuns`. Keep a short post-finalize append
+ * window so reconnect/replay sees the full terminal tail in frames.jsonl.
  */
 export function appendRunFrame(runId: string, frame: unknown): { seq: number } {
-  const handle = _activeRuns.get(runId);
+  const handle = getAppendableRunHandle(runId);
   if (!handle) return { seq: -1 };
   handle.frameCount += 1;
   const seq = handle.frameCount;
@@ -841,6 +861,7 @@ export function finalizeRun(
     handle.record.usage = finalized;
   }
   writeJsonAtomic(runFile(handle.id), handle.record);
+  rememberFinalizedRunForAppend(handle.id, handle);
   _activeRuns.delete(handle.id);
   _cancelHandlers.delete(handle.id);
   maybeCompactRuns();
