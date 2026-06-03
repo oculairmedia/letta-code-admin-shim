@@ -316,6 +316,11 @@ export async function bridgeSendMessage(
               // Preserve image parts from persisted Read results for mobile.
           if (call?.tool_call_id) toolCallsById.set(call.tool_call_id, call);
         }
+        // lcp-d780: remember the full tool_call (incl. arguments.file_path)
+        // so a later tool_return_message can attach the Read image.
+        for (const call of [tc, ...(tcm.tool_calls ?? [])]) {
+          if (call?.tool_call_id) toolCallsById.set(call.tool_call_id, call);
+        }
       }
       // Stable per-otid id so mobile's findByServerId merges chunks of
       // the same logical message. Spec §2.2 + §4.2 prescribes the

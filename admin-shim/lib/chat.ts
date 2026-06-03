@@ -111,9 +111,12 @@ function extractText(body: unknown): string {
 
 // Like extractText, but preserves multimodal content. Mobile sends image
 // attachments as `{type:"image", source:{type:"base64", media_type, data}}`
-// parts inside a message's `content` array. extractText() drops every non-text
-// part, so screenshots never reach the backend unless we preserve the ordered
-// content parts array for multimodal requests.
+// parts inside a message's `content` array (see letta-mobile
+// MessageContentPart.toJsonArray). extractText() drops every non-text part,
+// so screenshots never reached the backend. When at least one image part is
+// present we return the full ordered parts array (which the adapter +
+// local backend already accept as `string | unknown[]`); otherwise we fall
+// back to the plain string so text-only sends behave exactly as before.
 type InboundContentPart = { type: string; [k: string]: unknown };
 
 type ImageContentPart = {
@@ -214,6 +217,7 @@ export function attachReadImageToToolReturn(
 function extractContent(body: unknown): string | InboundContentPart[] {
   if (!body || typeof body !== "object") return extractText(body);
   const rec = body as Record<string, unknown>;
+  // Legacy scalar inputs never carry images.
   if (typeof rec["input"] === "string" || typeof rec["text"] === "string") {
     return extractText(body);
   }
@@ -243,12 +247,15 @@ function extractContent(body: unknown): string | InboundContentPart[] {
           parts.push({ type: "text", text: pr["text"] as string });
         }
       } else if (t === "image" || t === "image_url" || t === "input_image") {
+        // Pass the native part through unchanged — the local backend speaks
+        // the same `{type:"image", source:{base64}}` shape letta-code emits.
         sawImage = true;
         parts.push(pr as InboundContentPart);
       }
     }
   }
 
+  // No image content -> keep legacy string behavior (and exact string shape).
   if (!sawImage) return extractText(body);
   return parts;
 }
