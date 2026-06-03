@@ -29,6 +29,7 @@ import type {
   ToolCall,
   ToolReturn,
   ToolReturnMessage,
+  ToolReturnPayload,
   UsageStatisticsMessage,
 } from "./types/wire.js";
 
@@ -302,22 +303,112 @@ function partsToText(parts: unknown): string {
   if (!Array.isArray(parts)) return "";
   return parts
     .filter((p: unknown) => {
-      // Original: `p?.type === "text"`. Same semantics: only objects whose
-      // `type` field equals "text" pass. Scalars / null / undefined / arrays
-      // without a `type:"text"` field are filtered out.
       if (p == null) return false;
       return (p as { type?: unknown }).type === "text";
     })
     .map((p: unknown) => {
-      // Original: `p.text || ""` — keep the `||` (falsy-coalesce) semantics,
-      // not `??`, so 0 / false / "" all coerce to "" the same way.
       const t = (p as { text?: unknown }).text;
-      // Cast through unknown so `||` keeps its JS short-circuit behavior;
-      // TS would otherwise object to `unknown || ""`.
       return (t || "") as string;
     })
     .join("");
 }
+
+
+
+type ImageContentPart = {
+  type: "image";
+  source: {
+    type: "base64";
+    media_type: string;
+    data: string;
+  };
+};
+
+type TextContentPart = { type: "text"; text: string };
+
+const IMAGE_MEDIA_TYPES_BY_EXT: Readonly<Record<string, string>> = {
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+function imageMediaTypeForPath(filePath: string): string | null {
+  return IMAGE_MEDIA_TYPES_BY_EXT[extname(filePath).toLowerCase()] ?? null;
+}
+
+function parseToolArguments(args: string | undefined): Record<string, unknown> | null {
+  if (!args) return null;
+  try {
+    const parsed = JSON.parse(args) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readImageContentPart(filePath: string): ImageContentPart | null {
+  const mediaType = imageMediaTypeForPath(filePath);
+  if (!mediaType) return null;
+  try {
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: mediaType,
+        data: readFileSync(filePath).toString("base64"),
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function toolReturnText(frame: ToolReturnMessage): string {
+  if (typeof frame.tool_return === "string") return frame.tool_return;
+  const firstReturn = Array.isArray(frame.tool_returns) ? frame.tool_returns[0] : undefined;
+  return firstReturn?.func_response ?? "";
+}
+
+export function attachReadImageToToolReturn(
+  frame: ToolReturnMessage,
+  toolCallsById: ReadonlyMap<string, ToolCall>,
+): ToolReturnMessage {
+  const callId = typeof frame.tool_call_id === "string" ? frame.tool_call_id : null;
+  if (!callId) return frame;
+  const toolCall = toolCallsById.get(callId);
+  if (!toolCall || toolCall.name.toLowerCase() !== "read") return frame;
+
+  const args = parseToolArguments(toolCall.arguments);
+  const filePath = args && typeof args["file_path"] === "string" ? args["file_path"] : null;
+  if (!filePath) return frame;
+
+  const imagePart = readImageContentPart(filePath);
+  if (!imagePart) return frame;
+
+  const existingParts = Array.isArray(frame.tool_return)
+    ? frame.tool_return
+    : toolReturnText(frame)
+      ? ([{ type: "text", text: toolReturnText(frame) }] satisfies TextContentPart[])
+      : [];
+  const alreadyAttached = existingParts.some((part) => {
+    const source = part["source"];
+    return part["type"] === "image" &&
+      source &&
+      typeof source === "object" &&
+      (source as Record<string, unknown>)["data"] === imagePart.source.data;
+  });
+  if (alreadyAttached) return frame;
+
+  return {
+    ...frame,
+    tool_return: [...existingParts, imagePart],
+  };
+}
+
 
 /**
  * Map a raw letta-code stream-json frame to the Letta-server-shaped frame
@@ -506,7 +597,7 @@ export function reshapeFrame(raw: unknown): LettaMessage | null {
       ...base,
       id: callId ? `toolreturn-${callId}` : base.id,
       message_type: "tool_return_message",
-      tool_return: (f["tool_return"] ?? null) as string | null,
+      tool_return: (f["tool_return"] ?? null) as ToolReturnPayload | null,
       status: (f["status"] ?? "success") as string,
       tool_call_id: (callId ?? null) as string | null,
       stdout: toStringArrayOrNull(f["stdout"]),

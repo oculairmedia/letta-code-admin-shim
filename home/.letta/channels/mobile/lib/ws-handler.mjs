@@ -140,6 +140,10 @@ export function handleConnection(ws, request, host) {
   const activeSubscriptions = new Map(); // key: run_id, value: { unsubscribe }
   // lcp-2gx: per-socket subscription to crons_updated push events.
   let cronEventsUnsubscribe = null;
+  // lcp-cq7x: per-socket registration for server-originated channel pushes.
+  // Installed only after hello auth succeeds so outbound sendMessage never
+  // targets unauthenticated sockets.
+  let pushClientUnregister = null;
 
   // lcp-p74.3: stopAll DELIBERATELY does not cancel the in-flight worker.
   // A mobile WS drop must NOT terminate the agent turn — the worker keeps
@@ -160,6 +164,10 @@ export function handleConnection(ws, request, host) {
     if (cronEventsUnsubscribe) {
       safeUnsubscribe("cron events", cronEventsUnsubscribe);
       cronEventsUnsubscribe = null;
+    }
+    if (pushClientUnregister) {
+      safeUnsubscribe("push client", pushClientUnregister);
+      pushClientUnregister = null;
     }
   };
 
@@ -556,6 +564,16 @@ export function handleConnection(ws, request, host) {
         }
       }
       startPings();
+      if (typeof host.registerPushClient === "function") {
+        pushClientUnregister = host.registerPushClient({
+          sessionId,
+          deviceId,
+          sendFrame: (outFrame) => {
+            if (closed) return;
+            safeSend(ws, outFrame, log);
+          },
+        });
+      }
       // lcp-2gx: subscribe to crons_updated push events for the lifetime of
       // this socket. Listener stays installed until stopAll() releases it.
       if (typeof host.subscribeCronEvents === "function") {
