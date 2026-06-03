@@ -1618,23 +1618,76 @@ server.listen(PORT, HOST, () => {
   // their idle window.
   if (process.env["SHIM_CRON_ENABLED"] !== "0") {
     startCronScheduler({
-      fireTask: (task, wrappedPrompt) =>
-        bridgeSendMessage(
-          {
-            agent_id: task.agent_id,
-            conversation_id:
-              task.conversation_id === "default" ? `conv-default-${task.agent_id}` : task.conversation_id,
-            text: wrappedPrompt,
-            // lcp-4tv: cron fires are operator-initiated, not user-initiated.
-            // Mark them background so /v1/runs?background=true surfaces them
-            // distinctly from regular mobile turns.
-            background: true,
-          },
-          // Cron-driven turns persist to disk via the bridge's internal
-          // `emit()`; mobile clients can later subscribe(run_id, cursor)
-          // to replay. No live WS client is necessarily attached.
-          () => {},
-        ).then(() => undefined),
+      fireTask: async (task, wrappedPrompt) => {
+        await ensureMobileAdapter();
+        const conversationId = task.conversation_id === "default"
+          ? `conv-default-${task.agent_id}`
+          : task.conversation_id;
+        const turnId = `turn-channel-push-${randomUUID()}`;
+        let runId: string | null = null;
+        const base = {
+          agent_id: task.agent_id,
+          conversation_id: conversationId,
+          turn_id: turnId,
+          source: "channel_push",
+        };
+        try {
+          await bridgeSendMessage(
+            {
+              agent_id: task.agent_id,
+              conversation_id: conversationId,
+              text: wrappedPrompt,
+              // lcp-4tv: cron fires are operator-initiated, not user-initiated.
+              // Mark them background so /v1/runs?background=true surfaces them
+              // distinctly from regular mobile turns.
+              background: true,
+            },
+            (frame) => {
+              const frameRecord = frame as unknown as Record<string, unknown>;
+              const frameRunId = typeof frameRecord["run_id"] === "string" ? frameRecord["run_id"] : runId;
+              pushMobileChannelFrame({
+                ...frame,
+                ...base,
+                run_id: frameRunId,
+              });
+            },
+            {
+              onRunCreated: (id) => {
+                runId = id;
+                pushMobileChannelFrame({
+                  type: "turn_started",
+                  ...base,
+                  run_id: id,
+                });
+              },
+            },
+          );
+          pushMobileChannelFrame({
+            type: "turn_done",
+            ...base,
+            run_id: runId,
+            status: "completed",
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          pushMobileChannelFrame({
+            type: "error",
+            ...base,
+            run_id: runId,
+            code: "internal_error",
+            message,
+          });
+          pushMobileChannelFrame({
+            type: "turn_done",
+            ...base,
+            run_id: runId,
+            status: "failed",
+            error_code: "internal_error",
+            error_message: message,
+          });
+          throw err;
+        }
+      },
     });
   }
 });
@@ -1648,6 +1701,23 @@ const wss = new WebSocketServer({ noServer: true, autoPong: false });
 type MobileAdapter = Awaited<ReturnType<typeof getMobileChannelAdapter>>;
 let mobileAdapter: MobileAdapter = null;
 
+async function ensureMobileAdapter(): Promise<MobileAdapter> {
+  if (!mobileAdapter) {
+    mobileAdapter = await getMobileChannelAdapter({
+      getServerId: () => SERVER_ID,
+    });
+  }
+  return mobileAdapter;
+}
+
+function pushMobileChannelFrame(frame: Record<string, unknown>): void {
+  const sender = mobileAdapter?.["sendMessage"];
+  if (typeof sender !== "function") return;
+  void sender(frame).catch((err: unknown) => {
+    console.warn(`[mobile-channel] channel push failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
 server.on("upgrade", async (req: IncomingMessage, socket: Duplex, head: Buffer) => {
   const url = new URL(req.url ?? "", `http://${req.headers.host || "localhost"}`);
   if (url.pathname !== "/shim/v1/mobile") {
@@ -1656,11 +1726,7 @@ server.on("upgrade", async (req: IncomingMessage, socket: Duplex, head: Buffer) 
     return;
   }
   try {
-    if (!mobileAdapter) {
-      mobileAdapter = await getMobileChannelAdapter({
-        getServerId: () => SERVER_ID,
-      });
-    }
+    await ensureMobileAdapter();
     if (!mobileAdapter) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
       socket.destroy();
