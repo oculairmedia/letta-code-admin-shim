@@ -586,6 +586,14 @@ export function coalesceAssistantFrames(frames: LettaMessage[]): LettaMessage[] 
   return out;
 }
 
+function findTerminalStopReason(frames: LettaMessage[]): StopReasonMessage | undefined {
+  for (let i = frames.length - 1; i >= 0; i--) {
+    const frame = frames[i];
+    if (frame?.message_type === "stop_reason") return frame;
+  }
+  return undefined;
+}
+
 /** Options accepted by the legacy per-request spawn arg builder. */
 /** Optional handler args supplied by the route. */
 export interface HandleSendMessageOptions {
@@ -739,10 +747,9 @@ export async function handleSendMessage(
     if (res.writableEnded) return;
 
     if (reshaped.message_type === "stop_reason") {
-      // lcp-8ri: last-wins for the wire. Multi-step turns emit stop_reason
-      // per step (first is requires_approval, last is end_turn). The run
-      // record wants first-wins (finalizeTurnLifecycle handles that). The
-      // wire should reflect the terminal state.
+      // lcp-8ri/lcp-gukg: last-wins for the wire and run summary. Multi-step
+      // turns emit stop_reason per step (first is requires_approval, last is
+      // end_turn); intermediate stops stay available in per-step run records.
       pendingStop = reshaped;
       return;
     }
@@ -794,7 +801,7 @@ export async function handleSendMessage(
         f.message_type === "tool_return_message" ||
         f.message_type === "reasoning_message",
     );
-    const stop = coalesced.find((f): f is StopReasonMessage => f.message_type === "stop_reason");
+    const stop = findTerminalStopReason(coalesced);
     const usageFrame = coalesced.find(
       (f): f is UsageStatisticsMessage => f.message_type === "usage_statistics",
     );

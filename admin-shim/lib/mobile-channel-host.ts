@@ -419,10 +419,9 @@ export async function bridgeSendMessage(
       if (mt === "stop_reason") {
         // lcp-8ri: last-wins for the WS emission. Multi-step turns emit
         // stop_reason per step (first is usually requires_approval, last
-        // is end_turn). The run-record contract wants first-wins but that
-        // is tracked separately in finalizeTurnLifecycle. The wire should
-        // reflect the terminal state so mobile doesn't think the turn is
-        // still pending approval.
+        // is end_turn). The wire and run summary both reflect the terminal
+        // state; per-step records preserve intermediate approval stops for
+        // diagnostics.
         pendingStop = reshaped;
         return;
       }

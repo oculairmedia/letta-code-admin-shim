@@ -763,11 +763,11 @@ test("runs: frames emitted during a turn carry the matching run_id", async (t) =
   }
 });
 
-test("runs: bash-tool turn has stop_reason from FIRST step (requires_approval)", async (t) => {
-  // The agent-pool's finalizeRun records the FIRST usage_statistics + the
-  // FIRST stop_reason frame in the turn (see lib/agent-pool.mjs ~L323).
-  // For a 2-step turn that means the run-level stop_reason captures the
-  // tool-call step's stop, not the final end_turn.
+test("runs: bash-tool turn summarizes final stop_reason but preserves approval step", async (t) => {
+  // lcp-gukg: run-level stop_reason must represent the final effective turn
+  // state so mobile does not treat a completed auto-approved tool turn as a
+  // still-pending approval. The intermediate approval stop remains available
+  // in steps.jsonl for diagnostics.
   const shim = await startShim();
   t.after(() => shim.stop());
 
@@ -778,7 +778,14 @@ test("runs: bash-tool turn has stop_reason from FIRST step (requires_approval)",
   const { body } = await getJson(`${shim.url}/v1/runs/${runId}`);
   const b = body as RunRecord;
   assert.equal(b.status, "completed");
-  assert.equal(b.stop_reason, "requires_approval");
+  assert.equal(b.stop_reason, "end_turn");
+
+  const stepsRes = await getJson(`${shim.url}/v1/runs/${runId}/steps`);
+  const steps = stepsRes.body as { stop_reason?: string | null }[];
+  assert.deepEqual(
+    new Set(steps.map((step) => step.stop_reason)),
+    new Set(["requires_approval", "end_turn"]),
+  );
 });
 
 // ─── lcp-nwd: message-list projections must carry run_id ──────────────

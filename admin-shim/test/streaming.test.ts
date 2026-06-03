@@ -544,6 +544,31 @@ test("streaming: streaming:false returns a single JSON envelope, no SSE", async 
   assert.ok(body.usage && typeof body.usage.total_tokens === "number");
 });
 
+test("streaming: streaming:false reports terminal stop_reason for multi-step tool turns", async (t) => {
+  const { messagesUrl } = await setupShim(t);
+  const res = await fetch(messagesUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      messages: [{ role: "user", content: "use both tools: bash and read", otid: "cm-no-stream-tools" }],
+      streaming: false,
+    }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as {
+    stop_reason: { message_type: string; stop_reason: string };
+    usage: { step_count: number };
+  };
+
+  assert.equal(body.stop_reason.message_type, "stop_reason");
+  assert.equal(
+    body.stop_reason.stop_reason,
+    "end_turn",
+    "non-streaming summary must expose the terminal stop_reason, not an intermediate requires_approval",
+  );
+  assert.ok(body.usage.step_count > 1, "fixture must exercise a multi-step turn");
+});
+
 // ─── 15. Ping carries run_id once it's known ────────────────────────
 
 test("streaming: opening ping carries no run_id (precedes onRunCreated), tail frames do", async (t) => {
