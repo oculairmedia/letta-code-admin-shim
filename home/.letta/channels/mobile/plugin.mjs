@@ -9,6 +9,32 @@
  */
 
 import { handleConnection } from "./lib/ws-handler.mjs";
+import { makeFrame } from "./lib/protocol.mjs";
+
+function stringField(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+function messageText(msg) {
+  const text = stringField(msg, ["text", "content", "body", "message"]);
+  if (text !== null) return text;
+  return "";
+}
+
+function withoutFrameEnvelope(obj) {
+  const {
+    message_type: _messageType,
+    type: _type,
+    v: _version,
+    ts: _timestamp,
+    ...rest
+  } = obj ?? {};
+  return rest;
+}
 
 function resolveToken(account) {
   const config = account?.config ?? {};
@@ -20,6 +46,64 @@ function resolveToken(account) {
 function createMobileAdapter(account, host) {
   const accountId = account.accountId ?? "default";
   const config = account?.config ?? {};
+  const clients = new Map();
+
+  const registerPushClient = ({ sessionId, deviceId, sendFrame }) => {
+    if (typeof sessionId !== "string" || typeof sendFrame !== "function") {
+      return () => {};
+    }
+    clients.set(sessionId, { deviceId: deviceId ?? null, sendFrame });
+    host.log?.(`[mobile:${accountId}] push client registered session=${sessionId} device=${deviceId ?? "?"}`);
+    return () => {
+      clients.delete(sessionId);
+      host.log?.(`[mobile:${accountId}] push client released session=${sessionId}`);
+    };
+  };
+
+  const broadcastFrame = (frame) => {
+    let delivered = 0;
+    for (const [sessionId, client] of clients.entries()) {
+      try {
+        client.sendFrame(frame);
+        delivered += 1;
+      } catch (err) {
+        host.log?.(`[mobile:${accountId}] channel push failed session=${sessionId}: ${err.message}`);
+      }
+    }
+    return delivered;
+  };
+
+  const pushTextMessage = (msg) => {
+    const conversationId = stringField(msg, ["conversation_id", "conversationId", "chatId", "roomId"]);
+    const agentId = stringField(msg, ["agent_id", "agentId"]);
+    const frameType = stringField(msg, ["type", "message_type"]);
+    const isStructuredFrame = frameType !== null && frameType !== "send" && frameType !== "message";
+    const messageId = stringField(msg, ["messageId", "message_id", "id"])
+      ?? `mobile-push-${Date.now()}`;
+    const fields = isStructuredFrame
+      ? withoutFrameEnvelope(msg)
+      : {
+          id: messageId,
+          agent_id: agentId,
+          conversation_id: conversationId,
+          turn_id: stringField(msg, ["turn_id", "turnId"]) ?? `turn-channel-push-${Date.now()}`,
+          run_id: stringField(msg, ["run_id", "runId"]),
+          content: messageText(msg),
+          date: stringField(msg, ["date", "created_at", "createdAt"])
+            ?? new Date().toISOString(),
+        };
+    const frame = makeFrame(isStructuredFrame ? frameType : "assistant_message", {
+      ...fields,
+      source: fields.source ?? "channel_push",
+      channel_id: fields.channel_id ?? "mobile",
+    });
+    const stamped = conversationId && typeof host.stampConversationFrame === "function"
+      ? host.stampConversationFrame(conversationId, frame)
+      : frame;
+    const delivered = broadcastFrame(stamped);
+    host.log?.(`[mobile:${accountId}] channel push delivered=${delivered} conversation=${conversationId ?? "?"}`);
+    return { messageId, delivered };
+  };
 
   const adapter = {
     id: `mobile:${accountId}`,
@@ -39,16 +123,15 @@ function createMobileAdapter(account, host) {
       return true;
     },
 
-    // The channel is fully inbound for Phase 1; outbound sends ride the
-    // WS established at acceptConnection time. We expose the standard
-    // adapter surface so letta-code's channel registry is happy, but the
-    // sendMessage hook is a no-op until Phase 3 introduces server-pushed
-    // events that target a connected device.
-    async sendMessage() {
-      return { messageId: `mobile-noop-${Date.now()}` };
+    // Outbound channel sends ride already-authenticated mobile WS sessions.
+    // This completes the channel contract for proactive server pushes (for
+    // example background relay completions) without introducing a separate
+    // mobile-only push primitive.
+    async sendMessage(msg = {}) {
+      return pushTextMessage(msg);
     },
-    async sendDirectReply() {
-      // intentionally no-op in Phase 1
+    async sendDirectReply(chatId, text, options = {}) {
+      return pushTextMessage({ ...options, chatId, text });
     },
     onMessage: undefined,
 
@@ -82,6 +165,7 @@ function createMobileAdapter(account, host) {
         stampConversationFrame: host.stampConversationFrame
           ? (conversationId, frame) => host.stampConversationFrame(conversationId, frame)
           : undefined,
+        registerPushClient,
         resumeConversation: host.resumeConversation
           ? (conversationId, afterSeq) => host.resumeConversation(conversationId, afterSeq)
           : undefined,
