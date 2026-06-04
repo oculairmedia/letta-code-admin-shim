@@ -86,6 +86,19 @@ export interface RunHandle {
   // lcp-02ri: runDir(id) is created at run creation, so the hot frame append
   // path can skip mkdirSync per streamed frame.
   frameDirReady: boolean;
+  // lcp-02ri.2: running byte length of frames.jsonl on disk for this run.
+  // appendFileSync gives no offset back, so we track the cumulative byte
+  // length ourselves (single-writer-per-run holds) to know the START byte
+  // offset of each appended line without re-stat'ing the file.
+  frameBytes: number;
+  // lcp-02ri.2: sparse seq -> startByteOffset checkpoints for this run.
+  // Records the byte offset at which the line for `seq` begins, every
+  // FRAME_INDEX_STRIDE frames (plus seq 1). High-cursor subscribe replay
+  // seeks to the nearest checkpoint <= cursor and parses forward from there
+  // instead of from byte 0, so replay work is proportional to the tail, not
+  // the whole log. Sorted by seq (append order == seq order). Mirrored to
+  // disk (frames.index.jsonl) so replay survives a process restart.
+  frameIndex: Array<{ seq: number; offset: number }>;
   // lcp-r0m: per-turn set of otids currently being streamed by this run.
   // Populated from frames during the stream (applyFrameRunSideEffects);
   // useful for any consumer that keys by otid (and a forward seam for
@@ -268,6 +281,13 @@ function framesFile(runId: string): string {
   return join(runDir(runId), "frames.jsonl");
 }
 
+// lcp-02ri.2: sparse seq->byteOffset checkpoint sidecar. Each line:
+// `{seq, offset}\n`, where `offset` is the START byte position of the
+// frames.jsonl line carrying that seq. Read path resolves archived runs too.
+function framesIndexFile(runId: string): string {
+  return join(resolveRunDir(runId), "frames.index.jsonl");
+}
+
 function userActionsFile(runId: string): string {
   return join(runDir(runId), "user-actions.jsonl");
 }
@@ -444,6 +464,8 @@ export function createRun({ agentId, conversationId, onCancel, background }: Cre
     firstTokenSet: false,
     frameCount: 0,
     frameDirReady: false,
+    frameBytes: 0,
+    frameIndex: [],
     inFlightOtids: new Set<string>(),
     messageIdsAtTurnStart: new Set<string>(),
   };
@@ -595,17 +617,150 @@ export function appendRunFrame(runId: string, frame: unknown): { seq: number } {
   handle.frameCount += 1;
   const seq = handle.frameCount;
   const line = JSON.stringify({ seq, ts: nowIso(), frame }) + "\n";
+  // lcp-02ri.2: the START byte offset of this line is the running total of
+  // every byte written so far. Captured BEFORE the append so it points at
+  // the first byte of this line, not the next one.
+  const startOffset = handle.frameBytes;
   try {
     if (!handle.frameDirReady) {
       mkdirSync(runDir(runId), { recursive: true });
       handle.frameDirReady = true;
     }
     appendFileSync(framesFile(runId), line);
+    // Only advance the byte cursor + record a checkpoint once the write
+    // actually landed — on a write failure we keep frameBytes pinned so the
+    // index never drifts ahead of the on-disk file.
+    handle.frameBytes = startOffset + Buffer.byteLength(line, "utf8");
+    maybeRecordFrameCheckpoint(runId, handle, seq, startOffset);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[runs] frame append failed for ${runId}: ${msg}`);
   }
   return { seq };
+}
+
+// lcp-02ri.2: checkpoint stride. Every Nth frame (plus seq 1) records a
+// seq->byteOffset pair. 256 keeps the in-memory index and the on-disk
+// sidecar tiny (one entry per 256 frames) while bounding the worst-case
+// forward parse on subscribe replay to <stride> frames past the seek point.
+const FRAME_INDEX_STRIDE = (() => {
+  const n = Number(process.env["SHIM_FRAME_INDEX_STRIDE"] ?? 256);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 256;
+})();
+
+/**
+ * lcp-02ri.2: record a sparse seq->byteOffset checkpoint for `seq` at
+ * `startOffset` when it falls on the stride boundary (or is the first
+ * frame). Updates the in-memory index AND appends to the on-disk
+ * frames.index.jsonl sidecar so replay after a process restart can seek too.
+ * Best-effort: an index write failure degrades replay to a from-0 scan, it
+ * never breaks frame persistence.
+ */
+function maybeRecordFrameCheckpoint(
+  runId: string,
+  handle: RunHandle,
+  seq: number,
+  startOffset: number,
+): void {
+  if (seq !== 1 && seq % FRAME_INDEX_STRIDE !== 0) return;
+  handle.frameIndex.push({ seq, offset: startOffset });
+  try {
+    appendFileSync(framesIndexFile(runId), JSON.stringify({ seq, offset: startOffset }) + "\n");
+  } catch {
+    // Sidecar is an optimization; if it can't be written replay falls back
+    // to the in-memory index (still active) or a from-0 scan (cold run).
+  }
+}
+
+/**
+ * lcp-02ri.2: find the nearest indexed checkpoint with seq <= cursor for a
+ * run, returning the byte offset to seek to before parsing forward. Returns
+ * `null` when no usable checkpoint exists (caller parses from byte 0).
+ *
+ * Resolution order:
+ *   1. In-memory index for an active (or recently-finalized) run — zero I/O.
+ *   2. On-disk frames.index.jsonl sidecar — one file read for cold runs that
+ *      were written by a prior process (or already finalized + evicted).
+ *
+ * If neither is present (e.g. a run written before this index existed), the
+ * caller falls back to a full scan from byte 0 — correct, just not faster.
+ *
+ * The returned offset always points at the START of a complete line whose
+ * seq is <= cursor, so the subscribe reader can parse forward and its
+ * existing `seq <= lastSeqSent` skip preserves exact emit semantics.
+ */
+export function findFrameOffsetForCursor(
+  runId: string,
+  cursor: number,
+): { seq: number; offset: number } | null {
+  if (!Number.isFinite(cursor) || cursor <= 0) return null;
+  const handle = getAppendableRunHandle(runId);
+  const inMem = handle?.frameIndex;
+  if (inMem && inMem.length > 0) {
+    return seekIndex(inMem, cursor);
+  }
+  const onDisk = readFrameIndexFromDisk(runId);
+  if (onDisk.length > 0) {
+    return seekIndex(onDisk, cursor);
+  }
+  return null;
+}
+
+/**
+ * Binary-search a seq-sorted checkpoint array for the greatest entry whose
+ * seq is <= cursor. Returns `null` when every checkpoint is past the cursor
+ * (i.e. the cursor sits before the first checkpoint — parse from 0).
+ */
+function seekIndex(
+  index: Array<{ seq: number; offset: number }>,
+  cursor: number,
+): { seq: number; offset: number } | null {
+  let lo = 0;
+  let hi = index.length - 1;
+  let best: { seq: number; offset: number } | null = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const entry = index[mid]!;
+    if (entry.seq <= cursor) {
+      best = entry;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best;
+}
+
+/**
+ * lcp-02ri.2: read + parse the on-disk frames.index.jsonl sidecar for a run.
+ * Returns a seq-ascending array of checkpoints (empty on any error / missing
+ * file). Tolerant of malformed trailing lines like the frame reader.
+ */
+function readFrameIndexFromDisk(runId: string): Array<{ seq: number; offset: number }> {
+  const path = framesIndexFile(runId);
+  if (!existsSync(path)) return [];
+  const out: Array<{ seq: number; offset: number }> = [];
+  try {
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        const obj = JSON.parse(t) as { seq?: unknown; offset?: unknown };
+        if (typeof obj.seq === "number" && typeof obj.offset === "number") {
+          out.push({ seq: obj.seq, offset: obj.offset });
+        }
+      } catch {
+        // skip malformed (partial trailing line during a write race)
+      }
+    }
+  } catch {
+    return [];
+  }
+  // appendFileSync preserves write order == seq order, but a defensive sort
+  // keeps seekIndex's binary search correct even if the file was concatenated
+  // oddly.
+  out.sort((a, b) => a.seq - b.seq);
+  return out;
 }
 
 /**
