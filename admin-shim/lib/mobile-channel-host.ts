@@ -13,7 +13,7 @@
  * the only place the shim binds to it.
  */
 
-import { appendFileSync, existsSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, statSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -920,36 +920,58 @@ export function subscribeToRun(
   let stopped = false;
   let watcher: FSWatcher | null = null;
   let polling = false;
+  let readOffset = 0;
+  let carry = "";
 
-  // Replay (and live-tail) is "read whole file, filter by seq > lastSeqSent,
-  // emit, advance lastSeqSent". Re-reading on every change is O(n) per
-  // append; fine for v1 since runs rarely exceed thousands of frames and
-  // appendFileSync guarantees lines are ordered + complete.
+  const processFrameLine = (line: string): void => {
+    if (stopped) return;
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let obj: { seq?: number; frame?: unknown };
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      return; // skip malformed (partial trailing line during a write race, etc.)
+    }
+    if (typeof obj.seq !== "number" || obj.seq <= lastSeqSent) return;
+    cbs.onFrame(obj.frame, obj.seq);
+    lastSeqSent = obj.seq;
+  };
+
+  // Replay once, then live-tail by byte offset. The previous implementation
+  // reread and reparsed the entire growing frames.jsonl on every fs.watch
+  // change, making each streamed token more expensive than the last.
   const readAndEmit = (): void => {
     if (stopped) return;
     let body: string;
     try {
-      body = readFileSync(path, "utf8");
+      const stat = statSync(path);
+      if (stat.size < readOffset) {
+        readOffset = 0;
+        carry = "";
+      }
+      if (stat.size === readOffset) return;
+      const fd = openSync(path, "r");
+      try {
+        const length = stat.size - readOffset;
+        const buffer = Buffer.allocUnsafe(length);
+        const bytesRead = readSync(fd, buffer, 0, length, readOffset);
+        readOffset += bytesRead;
+        body = buffer.subarray(0, bytesRead).toString("utf8");
+      } finally {
+        closeSync(fd);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       cbs.onError({ code: "internal_error", message: `frames.jsonl read failed: ${msg}` });
       stop();
       return;
     }
-    for (const line of body.split("\n")) {
-      if (stopped) return;
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let obj: { seq?: number; frame?: unknown };
-      try {
-        obj = JSON.parse(trimmed);
-      } catch {
-        continue; // skip malformed (partial trailing line during a write race, etc.)
-      }
-      if (typeof obj.seq !== "number" || obj.seq <= lastSeqSent) continue;
-      cbs.onFrame(obj.frame, obj.seq);
-      lastSeqSent = obj.seq;
-    }
+
+    const text = carry + body;
+    const lines = text.split("\n");
+    carry = lines.pop() ?? "";
+    for (const line of lines) processFrameLine(line);
   };
 
   const checkTerminalAndMaybeFinish = (): boolean => {
