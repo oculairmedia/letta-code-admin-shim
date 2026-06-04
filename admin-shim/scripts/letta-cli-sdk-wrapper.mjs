@@ -75,6 +75,9 @@ const importFlag = `--import=${registerUrl}`;
 const existingNodeOptions = process.env["NODE_OPTIONS"] ?? "";
 const childEnv = {
   ...process.env,
+  // Long-running delegated/subagent turns should not be killed by the local
+  // provider HTTP stream timeout; task lifecycle/stop controls own cancellation.
+  LETTA_CODE_LOCAL_PROVIDER_TIMEOUT_MS: process.env["LETTA_CODE_LOCAL_PROVIDER_TIMEOUT_MS"] ?? "false",
   NODE_OPTIONS: existingNodeOptions.includes(importFlag)
     ? existingNodeOptions
     : `${existingNodeOptions} ${importFlag}`.trim(),
