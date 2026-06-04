@@ -12,8 +12,12 @@
  */
 
 import {
+  closeSync,
   existsSync,
+  fstatSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   statSync,
 } from "node:fs";
@@ -679,6 +683,69 @@ export function listMessagesSync(
   const key = conversationKey(conversationId, agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
   return loadFilteredMessagesSync(join(dir, "messages.jsonl")).slice();
+}
+
+const TAIL_SCAN_CHUNK_BYTES = 64 * 1024;
+
+function readTailToolResultsSinceKnownSync(path: string, knownIds: Set<string>): LocalMessage[] {
+  if (knownIds.size === 0) return loadFilteredMessagesSync(path).filter((m) => m.role === "toolResult");
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const st = fstatSync(fd);
+    let offset = st.size;
+    let raw = "";
+    const found = new Map<string, LocalMessage>();
+    while (offset > 0) {
+      const len = Math.min(TAIL_SCAN_CHUNK_BYTES, offset);
+      offset -= len;
+      const buf = Buffer.allocUnsafe(len);
+      readSync(fd, buf, 0, len, offset);
+      raw = buf.toString("utf8") + raw;
+      const parseStart = offset > 0 ? raw.indexOf("\n") + 1 : 0;
+      if (parseStart === 0 && offset > 0) continue;
+      const segment = raw.slice(parseStart).trimEnd();
+      if (!segment) continue;
+      const lines = segment.split("\n");
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i]!.trim();
+        if (!line) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line) as unknown;
+        } catch {
+          continue;
+        }
+        const msg = normalizeMessage(parsed);
+        if (!isLocalMessage(msg)) continue;
+        if (knownIds.has(msg.id)) return [...found.values()].reverse();
+        if (msg.role === "toolResult") found.set(msg.id, msg);
+      }
+    }
+    return [...found.values()].reverse();
+  } catch {
+    return [];
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/**
+ * Return tool results appended after a caller-provided message-id snapshot.
+ *
+ * Mobile inline tool-return synthesis calls this from the synchronous frame
+ * callback immediately after a tool call. The common case is append-only:
+ * read from the tail backwards until the first pre-turn id instead of asking
+ * listMessagesSync to parse and filter the entire messages.jsonl transcript.
+ */
+export function listNewToolResultsSync(
+  conversationId: string,
+  agentId: string,
+  knownIds: Set<string>,
+): LocalMessage[] {
+  const key = conversationKey(conversationId, agentId);
+  const dir = join(storageDir(), "conversations", b64url(key));
+  return readTailToolResultsSinceKnownSync(join(dir, "messages.jsonl"), knownIds);
 }
 
 export function readSystemPrompt(conversationId: string, agentId: string): unknown {

@@ -16,13 +16,17 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { listMessages, _internals } from "../lib/store.js";
+import { listMessages, listNewToolResultsSync, _internals } from "../lib/store.js";
 
 const CONV = "conv-cache-test";
 const AGENT = "agent-cache-test";
 
 function flat(id: string, role: string, text: string) {
   return { id, role, content: [{ type: "text", text }] };
+}
+
+function toolResult(id: string, toolCallId: string, text: string) {
+  return { id, role: "toolResult", toolCallId, toolName: "Read", content: [{ type: "text", text }] };
 }
 
 function setup(): { path: string; restore: () => void } {
@@ -109,6 +113,28 @@ test("a truncated final line is tolerated; complete records still surface", asyn
       ["m1", "m2"],
       "the two complete records must survive a truncated final line",
     );
+  } finally {
+    restore();
+  }
+});
+
+test("new tool result lookup reads appended tail after a known message", () => {
+  const { path, restore } = setup();
+  try {
+    const historical = Array.from({ length: 20_000 }, (_, i) =>
+      flat(`old-${i}`, i % 2 === 0 ? "user" : "assistant", `historical-${i}`),
+    );
+    write(path, [
+      ...historical,
+      flat("boundary", "assistant", "last pre-turn message"),
+      toolResult("tr-1", "call-1", "first result"),
+      flat("after-tr-1", "assistant", "not a tool result"),
+      toolResult("tr-2", "call-2", "second result"),
+    ]);
+
+    const results = listNewToolResultsSync(CONV, AGENT, new Set(["boundary"]));
+    assert.deepEqual(results.map((m) => m.id), ["tr-1", "tr-2"]);
+    assert.deepEqual(results.map((m) => m.toolCallId), ["call-1", "call-2"]);
   } finally {
     restore();
   }
