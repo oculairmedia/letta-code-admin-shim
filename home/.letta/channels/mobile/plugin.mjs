@@ -179,6 +179,9 @@ function createMobileAdapter(account, host) {
         handleCronDelete: host.handleCronDelete,
         handleCronDeleteAll: host.handleCronDeleteAll,
         subscribeCronEvents: host.subscribeCronEvents,
+        handleSubagentList: host.handleSubagentList,
+        handleSubagentTodos: host.handleSubagentTodos,
+        subscribeSubagentEvents: host.subscribeSubagentEvents,
       });
     },
   };
