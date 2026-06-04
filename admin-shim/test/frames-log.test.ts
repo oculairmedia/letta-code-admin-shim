@@ -23,6 +23,7 @@ import {
   readFileSync,
   rmSync,
 } from "node:fs";
+import { statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -60,6 +61,15 @@ function readFrames(runId: string): FrameLine[] {
     .filter((l) => l.length > 0)
     .map((l) => JSON.parse(l) as FrameLine);
 }
+
+test("createRun prepares the run directory before frame appends", async () => {
+  await withBackendDir(() => {
+    const run = createRun({ agentId: "a", conversationId: "c" });
+    assert.ok(statSync(join(getFramesFilePath(run.id), "..")).isDirectory());
+    appendRunFrame(run.id, { kind: "test" });
+    assert.ok(statSync(join(getFramesFilePath(run.id), "..")).isDirectory());
+  });
+});
 
 test("appendRunFrame assigns monotonic seq starting at 1", async () => {
   await withBackendDir(() => {
