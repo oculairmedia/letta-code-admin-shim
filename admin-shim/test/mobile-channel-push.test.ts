@@ -19,6 +19,23 @@ interface MobileAdapter {
   sendDirectReply(chatId: string, text: string, options?: Record<string, unknown>): Promise<PushResult>;
 }
 
+interface SubagentEntry {
+  toolCallId: string;
+  description: string;
+  subagentType: string;
+  status: string;
+  taskId: string | null;
+  subagentAgentId: string | null;
+  startedAt: string;
+  updatedAt: string;
+}
+
+interface SubagentEvent {
+  reason: string;
+  subagent: SubagentEntry;
+  at: string;
+}
+
 interface ChannelPluginModule {
   channelPlugin: {
     createAdapter(account: Record<string, unknown>, host: Record<string, unknown>): Promise<MobileAdapter>;
@@ -38,7 +55,10 @@ class FakeWs extends EventEmitter {
   }
 }
 
-async function loadMobileAdapter(t: { after: (fn: () => unknown) => void }): Promise<MobileAdapter> {
+async function loadMobileAdapter(
+  t: { after: (fn: () => unknown) => void },
+  hostOverrides: Record<string, unknown> = {},
+): Promise<MobileAdapter> {
   const tmp = mkdtempSync(join(tmpdir(), "mobile-channel-push-"));
   const previousHome = process.env["HOME"];
   const previousLettaHome = process.env["LETTA_HOME"];
@@ -71,6 +91,7 @@ async function loadMobileAdapter(t: { after: (fn: () => unknown) => void }): Pro
         ...frame,
         conv_seq: ++convSeq,
       }),
+      ...hostOverrides,
     },
   );
 }
@@ -113,4 +134,70 @@ test("mobile channel: sendMessage pushes assistant frames to authenticated WS cl
   ws.close();
   const afterClose = await adapter.sendDirectReply("conv-1", "No live client.", { agent_id: "agent-1" });
   assert.equal(afterClose.delivered, 0, "closed clients should be released from the push registry");
+});
+
+test("mobile channel: hello wires subagent list and lifecycle push handlers", async (t) => {
+  const subscription: { listener: ((event: SubagentEvent) => void) | null } = { listener: null };
+  const activeSubagent: SubagentEntry = {
+    toolCallId: "toolu_subagent_1",
+    description: "Investigate failing mobile status bar",
+    subagentType: "general-purpose",
+    status: "running",
+    taskId: "task_1",
+    subagentAgentId: "agent-local-subagent",
+    startedAt: "2026-06-04T15:00:00.000Z",
+    updatedAt: "2026-06-04T15:00:00.000Z",
+  };
+  const adapter = await loadMobileAdapter(t, {
+    handleSubagentList: () => ({ subagents: [activeSubagent] }),
+    subscribeSubagentEvents: (cb: (event: SubagentEvent) => void) => {
+      subscription.listener = cb;
+      return () => {
+        subscription.listener = null;
+      };
+    },
+  });
+  const ws = new FakeWs();
+  adapter.acceptConnection(ws, {});
+
+  ws.emit("message", Buffer.from(JSON.stringify({
+    v: 1,
+    type: "hello",
+    id: "hello-subagents",
+    ts: new Date().toISOString(),
+    token: "token",
+    device_id: "device-subagents",
+    client_version: "test/1",
+  })));
+
+  assert.ok(subscription.listener, "hello should subscribe the socket to subagent lifecycle pushes");
+  ws.emit("message", Buffer.from(JSON.stringify({
+    v: 1,
+    type: "subagent_list",
+    id: "subagent-list",
+    request_id: "r-subagents",
+    ts: new Date().toISOString(),
+  })));
+
+  const list = ws.sent.find((frame) => frame.type === "subagent_list_response");
+  assert.ok(list, "subagent_list should be handled by the channel host");
+  assert.equal(list["success"], true);
+  assert.deepEqual(list["subagents"], [activeSubagent]);
+
+  const emitSubagent = subscription.listener;
+  assert.ok(emitSubagent, "listener should remain installed until close");
+  emitSubagent({
+    reason: "started",
+    subagent: activeSubagent,
+    at: "2026-06-04T15:00:01.000Z",
+  });
+
+  const pushed = ws.sent.find((frame) => frame.type === "subagents_updated");
+  assert.ok(pushed, "subagent lifecycle event should push subagents_updated");
+  assert.equal(pushed["reason"], "started");
+  assert.deepEqual(pushed["subagent"], activeSubagent);
+  assert.deepEqual(pushed["subagents_active"], [activeSubagent]);
+
+  ws.close();
+  assert.equal(subscription.listener, null, "closing the socket should unsubscribe subagent pushes");
 });
