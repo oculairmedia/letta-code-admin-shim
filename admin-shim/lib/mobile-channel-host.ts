@@ -29,7 +29,7 @@ import {
   type A2uiBlock,
   type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
-import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
+import { appendRunFrame, createRun, findFrameOffsetForCursor, getFramesFilePath, getRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
 import {
   ackConversation,
   mobileConversationCursorCapabilities,
@@ -902,6 +902,21 @@ export interface SubscribeToRunCallbacks {
   onError: (info: { code: string; message: string }) => void;
 }
 
+// lcp-02ri.2: process-wide counter of frame lines fed to processFrameLine.
+// High-cursor subscribe replay seeks to the nearest seq->byteOffset
+// checkpoint <= cursor instead of parsing from byte 0, so this counter must
+// stay proportional to the tail (cursor..end) rather than the whole log. The
+// scale regression test reads it to assert the seek actually skipped the head.
+let _framesParsedCount = 0;
+/** Test-only: read the cumulative count of frame lines parsed since reset. */
+export function __getFramesParsedCount(): number {
+  return _framesParsedCount;
+}
+/** Test-only: reset the parsed-line counter before a measured subscribe. */
+export function __resetFramesParsedCount(): void {
+  _framesParsedCount = 0;
+}
+
 export function subscribeToRun(
   runId: string,
   cursor: number,
@@ -924,6 +939,7 @@ export function subscribeToRun(
     if (stopped) return;
     const trimmed = line.trim();
     if (!trimmed) return;
+    _framesParsedCount += 1;
     let obj: { seq?: number; frame?: unknown };
     try {
       obj = JSON.parse(trimmed);
@@ -999,6 +1015,20 @@ export function subscribeToRun(
       }
       watcher = null;
     }
+  }
+
+  // lcp-02ri.2: high-cursor seek. When a client reconnects with a cursor
+  // near the tail of a long run, seek the read offset to the nearest indexed
+  // seq->byteOffset checkpoint <= cursor and parse forward from there instead
+  // of reading + JSON.parsing every frame from byte 0 only to discard those
+  // with seq <= cursor. Correctness is unchanged: the checkpoint's seq is
+  // <= cursor, and processFrameLine's `seq <= lastSeqSent` skip still drops
+  // every frame up to the cursor — this only avoids the wasted head bytes.
+  // No checkpoint <= cursor (cold pre-index run, or cursor before the first
+  // checkpoint) → readOffset stays 0 and we fall back to the full scan.
+  if (lastSeqSent > 0) {
+    const seek = findFrameOffsetForCursor(runId, lastSeqSent);
+    if (seek) readOffset = seek.offset;
   }
 
   // Initial replay + immediate terminal check (handles already-completed runs).
