@@ -83,6 +83,9 @@ export interface RunHandle {
   // record — seq is implicit in file line position; this is just a writer-side
   // counter to avoid re-stat'ing the file on every append.
   frameCount: number;
+  // lcp-02ri: runDir(id) is created at run creation, so the hot frame append
+  // path can skip mkdirSync per streamed frame.
+  frameDirReady: boolean;
   // lcp-r0m: per-turn set of otids currently being streamed by this run.
   // Populated from frames during the stream (applyFrameRunSideEffects);
   // useful for any consumer that keys by otid (and a forward seam for
@@ -440,6 +443,7 @@ export function createRun({ agentId, conversationId, onCancel, background }: Cre
     hrStart,
     firstTokenSet: false,
     frameCount: 0,
+    frameDirReady: false,
     inFlightOtids: new Set<string>(),
     messageIdsAtTurnStart: new Set<string>(),
   };
@@ -448,6 +452,7 @@ export function createRun({ agentId, conversationId, onCancel, background }: Cre
     _cancelHandlers.set(id, onCancel);
   }
   writeJsonAtomic(runFile(id), record);
+  handle.frameDirReady = true;
   return handle;
 }
 
@@ -591,7 +596,10 @@ export function appendRunFrame(runId: string, frame: unknown): { seq: number } {
   const seq = handle.frameCount;
   const line = JSON.stringify({ seq, ts: nowIso(), frame }) + "\n";
   try {
-    mkdirSync(runDir(runId), { recursive: true });
+    if (!handle.frameDirReady) {
+      mkdirSync(runDir(runId), { recursive: true });
+      handle.frameDirReady = true;
+    }
     appendFileSync(framesFile(runId), line);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

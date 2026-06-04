@@ -76,6 +76,11 @@ function logLine(msg: string): void {
   console.log(`[sdk-adapter] ${msg}`);
 }
 
+function sdkDebugEnabled(): boolean {
+  const value = process.env["DEBUG_SDK"];
+  return value === "1" || value === "true" || value === "yes";
+}
+
 function safeJson(value: unknown): string {
   try {
     return JSON.stringify(value, (_key: string, inner: unknown) => (
@@ -728,13 +733,16 @@ function sdkMessageToLettaFrame(
   //   3. If present: something downstream of here is dropping them. Hunt
   //      in chat.ts:reshapeFrame and emit() in mobile-channel-host.
   //
-  // Cheap if DEBUG_SDK is unset (logLine no-ops). Leave it.
-  try {
-    const inner = (msg as { event?: { message_type?: string } }).event?.message_type;
-    logLine(`SDK_MSG type=${msg.type}${inner ? ` inner=${inner}` : ""}`);
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    logLine(`SDK_MSG logging_failed=${detail}`);
+  // DEBUG_SDK-only: useful for diagnosing wire-frame gaps, but too noisy and
+  // expensive for default per-frame streaming.
+  if (sdkDebugEnabled()) {
+    try {
+      const inner = (msg as { event?: { message_type?: string } }).event?.message_type;
+      logLine(`SDK_MSG type=${msg.type}${inner ? ` inner=${inner}` : ""}`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      logLine(`SDK_MSG logging_failed=${detail}`);
+    }
   }
   switch (msg.type) {
     case "stream_event": {

@@ -32,6 +32,59 @@ const { sdkMessageToLettaFrame } = _internals;
 
 // ── Conversion: stream_event passes through with raw event preserved ────
 
+test("sdk-adapter: stream_event conversion does not log SDK_MSG by default", () => {
+  const prevDebug = process.env["DEBUG_SDK"];
+  delete process.env["DEBUG_SDK"];
+  const logs: string[] = [];
+  const prevLog = console.log;
+  console.log = (msg?: unknown) => { logs.push(String(msg)); };
+  try {
+    const msg: SDKStreamEventMessage = {
+      type: "stream_event",
+      event: { message_type: "assistant_message" },
+      uuid: "u-log-default",
+    } as SDKStreamEventMessage;
+    const frame = sdkMessageToLettaFrame(msg, "sess-1", "agent-x", "conv-x");
+    assert.equal(frame?.type, "stream_event");
+    assert.deepEqual(logs.filter((line) => line.includes("SDK_MSG")), []);
+  } finally {
+    console.log = prevLog;
+    if (prevDebug === undefined) {
+      delete process.env["DEBUG_SDK"];
+    } else {
+      process.env["DEBUG_SDK"] = prevDebug;
+    }
+  }
+});
+
+test("sdk-adapter: DEBUG_SDK preserves SDK_MSG logging", () => {
+  const prevDebug = process.env["DEBUG_SDK"];
+  process.env["DEBUG_SDK"] = "1";
+  const logs: string[] = [];
+  const prevLog = console.log;
+  console.log = (msg?: unknown) => { logs.push(String(msg)); };
+  try {
+    const msg: SDKStreamEventMessage = {
+      type: "stream_event",
+      event: { message_type: "assistant_message" },
+      uuid: "u-log-debug",
+    } as SDKStreamEventMessage;
+    const frame = sdkMessageToLettaFrame(msg, "sess-1", "agent-x", "conv-x");
+    assert.equal(frame?.type, "stream_event");
+    assert.ok(
+      logs.some((line) => line.includes("SDK_MSG type=stream_event inner=assistant_message")),
+      `expected SDK_MSG log, got ${JSON.stringify(logs)}`,
+    );
+  } finally {
+    console.log = prevLog;
+    if (prevDebug === undefined) {
+      delete process.env["DEBUG_SDK"];
+    } else {
+      process.env["DEBUG_SDK"] = prevDebug;
+    }
+  }
+});
+
 test("sdk-adapter: stream_event → wire stream_event with raw inner event", () => {
   const msg: SDKStreamEventMessage = {
     type: "stream_event",
