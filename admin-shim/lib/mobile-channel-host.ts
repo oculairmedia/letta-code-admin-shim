@@ -40,7 +40,7 @@ import {
   findUnmappedTailUserMessageId,
   getAgentRecord,
   listMessages,
-  listMessagesSync,
+  listNewToolResultsSync,
   resolveConversationId,
   writeOtidForLocalId,
 } from "./store.js";
@@ -452,10 +452,7 @@ export async function bridgeSendMessage(
         const unresolvedNow = toolCallIdsSeen.filter((id) => !toolReturnIdsSeen.has(id));
         if (unresolvedNow.length > 0) {
           try {
-            const diskMsgs = listMessagesSync(effectiveConvId, effectiveAgentId);
-            const newResults = diskMsgs.filter(
-              (m) => m.role === "toolResult" && !preTurnMessageIds.has(m.id),
-            );
+            const newResults = listNewToolResultsSync(effectiveConvId, effectiveAgentId, preTurnMessageIds);
             const byCallId = new Map(newResults.filter((m) => m.toolCallId).map((m) => [m.toolCallId!, m]));
             // lcp-j3r: positional fallback for synthetic tool_call_ids
             // (from the canUseTool path) that don't match any disk entry.
