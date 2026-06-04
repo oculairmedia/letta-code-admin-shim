@@ -31,6 +31,16 @@ import {
 } from "./a2ui-stream-splitter.js";
 import { appendRunFrame, createRun, findFrameOffsetForCursor, getFramesFilePath, getRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
 import {
+  getSubagent,
+  ingestParentFrame,
+  listActiveSubagents,
+  snapshotSubagents,
+  subscribeSubagentEvents,
+  type SubagentEntry,
+  type SubagentEvent,
+} from "./subagent-registry.js";
+import { readSubagentTodos, type TodoSnapshot } from "./subagent-todos.js";
+import {
   ackConversation,
   mobileConversationCursorCapabilities,
   resumeConversation,
@@ -268,6 +278,16 @@ export async function bridgeSendMessage(
   // lcp-p74.2: stamp the assigned seq onto the frame so live consumers track
   // their cursor in lockstep with what subscribe(run_id, cursor) would replay.
   const emit = (frame: BridgeFrame): void => {
+    // letta-mobile-73o2h.1: feed every reshaped frame to the active-subagent
+    // registry. It cheaply ignores non-Agent frames; Agent tool_call/return
+    // frames register/correlate a subagent dispatch -> subagent run/conv so
+    // mobile can enumerate + subscribe without scanning this frame stream.
+    try {
+      ingestParentFrame(frame, runHandle.id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] subagent-registry ingest failed: ${msg}`);
+    }
     const { seq } = appendRunFrame(runHandle.id, frame);
     if (seq > 0) {
       const asRec = frame as unknown as Record<string, unknown>;
@@ -1237,6 +1257,63 @@ export function handleCronDeleteAll(agentId: string): { success: boolean; count:
   return { success: true, count };
 }
 
+// ── Active-subagent registry WS handlers (letta-mobile-73o2h.1) ───────
+//
+// Backed by lib/subagent-registry.ts (correlation + lifecycle) and
+// lib/subagent-todos.ts (per-subagent TodoWrite snapshots). The registry
+// is populated by ingestParentFrame() inside bridgeSendMessage's emit().
+
+/**
+ * Enumerate subagents for the mobile bar. Defaults to active-only
+ * (status === "running"); pass `{ all: true }` to include terminal
+ * entries (history). Mobile never has to scan the parent frame stream.
+ */
+export function handleSubagentList(
+  { all = false }: { all?: boolean } = {},
+): { subagents: SubagentEntry[] } {
+  return { subagents: all ? snapshotSubagents() : listActiveSubagents() };
+}
+
+/**
+ * Read a single subagent's latest TodoWrite snapshot + lifecycle status.
+ * `toolCallId` is the correlation key mobile received from a
+ * subagent_list / subagents_updated frame.
+ *
+ * Returns `found: false` if the toolCallId is unknown. `todos` is the
+ * subagent's most-recent TodoWrite (empty until it calls TodoWrite, or if
+ * the subagent run/conversation hasn't been correlated yet).
+ */
+export function handleSubagentTodos(
+  toolCallId: string,
+): {
+  found: boolean;
+  subagent: SubagentEntry | null;
+  todos: TodoSnapshot["todos"];
+  todos_found: boolean;
+} {
+  const subagent = getSubagent(toolCallId);
+  if (!subagent) {
+    return { found: false, subagent: null, todos: [], todos_found: false };
+  }
+  let snapshot: TodoSnapshot = { todos: [], found: false };
+  if (subagent.subagentAgentId) {
+    snapshot = readSubagentTodos(
+      subagent.subagentAgentId,
+      subagent.subagentConversationId ?? "default",
+    );
+  }
+  return {
+    found: true,
+    subagent,
+    todos: snapshot.todos,
+    todos_found: snapshot.found,
+  };
+}
+
+/** Re-export the registry event subscription for the host wiring. */
+export { subscribeSubagentEvents };
+export type { SubagentEntry, SubagentEvent };
+
 /**
  * The `host` object the shim hands the channel plugin. Mirrors the
  * informal contract the plugin reads in `acceptConnection` (see
@@ -1270,6 +1347,11 @@ interface MobileChannelHost {
   handleCronDelete: typeof handleCronDelete;
   handleCronDeleteAll: typeof handleCronDeleteAll;
   subscribeCronEvents: typeof subscribeCronEvents;
+  // letta-mobile-73o2h.1: active-subagent registry surface for the
+  // mobile status bar (enumerate + per-subagent TodoWrite + lifecycle push).
+  handleSubagentList: typeof handleSubagentList;
+  handleSubagentTodos: typeof handleSubagentTodos;
+  subscribeSubagentEvents: typeof subscribeSubagentEvents;
 }
 
 /**
@@ -1379,6 +1461,9 @@ async function createMobileChannelAdapter(
     handleCronDelete,
     handleCronDeleteAll,
     subscribeCronEvents,
+    handleSubagentList,
+    handleSubagentTodos,
+    subscribeSubagentEvents,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();

@@ -2196,6 +2196,97 @@ active run. Tests in `admin-shim/test/ws-protocol.test.ts`
 
 ---
 
+## 13. Active-subagent registry (letta-mobile-73o2h.1)
+
+Lets the mobile app render a status bar of currently-active subagents and
+inspect each one's TodoWrite progress, **without scanning the parent run
+frame stream**.
+
+### 13.1 Correlation seam (how it works)
+
+A subagent dispatch rides the parent run's frame stream as a single
+`tool_call_message` with `tool_call.name === "Agent"`:
+
+- `tool_call.tool_call_id` → **correlation key** (mobile uses this everywhere)
+- `tool_call.arguments` (JSON) → `{ subagent_type, description, run_in_background, prompt }`
+
+For a **background** dispatch the matching `tool_return_message` (name
+`Agent`) carries the subagent's identity in its text body:
+
+```
+Task running in background with task ID: task_2
+Agent ID: agent-local-<uuid>
+Output file: /tmp/letta-background/task_2.log
+```
+
+From that the shim derives `task_id`, `subagentAgentId` (the subagent's
+OWN agent), and `logFile`. The subagent's TodoWrite lives in the
+subagent's separate conversation (`default:<subagentAgentId>`), read on
+demand. Terminal status: the background log's `[Task completed]` footer →
+`completed`; a still-running subagent past the stream-timeout window →
+`failed` (reason `stream_timeout`).
+
+The registry is populated by `ingestParentFrame()` inside
+`bridgeSendMessage`'s `emit()` — it cheaply ignores every non-`Agent`
+frame. Implementation: `admin-shim/lib/subagent-registry.ts` +
+`admin-shim/lib/subagent-todos.ts`.
+
+### 13.2 `subagent_list` → `subagent_list_response`
+
+Enumerate subagents. Active-only by default; `{ all: true }` includes
+terminal entries.
+
+```jsonc
+// client → server
+{ "type": "subagent_list", "request_id": "r1", "all": false }
+// server → client
+{ "type": "subagent_list_response", "request_id": "r1", "success": true,
+  "subagents": [ { "toolCallId": "toolu_…", "description": "…",
+                   "subagentType": "general-purpose", "status": "running",
+                   "taskId": "task_2", "subagentAgentId": "agent-local-…",
+                   "parentRunId": "run-…", "startedAt": "…" } ] }
+```
+
+### 13.3 `subagent_todos` → `subagent_todos_response`
+
+One subagent's latest TodoWrite snapshot + lifecycle, keyed by the parent
+Agent `tool_call_id`.
+
+```jsonc
+// client → server
+{ "type": "subagent_todos", "request_id": "r2", "tool_call_id": "toolu_…" }
+// server → client
+{ "type": "subagent_todos_response", "request_id": "r2", "success": true,
+  "found": true, "subagent": { … }, "todos_found": true,
+  "todos": [ { "content": "…", "status": "in_progress", "activeForm": "…" } ] }
+```
+
+`status` enum mirrors the TodoWrite tool: `pending | in_progress | completed`.
+
+### 13.4 `subagents_updated` (server push)
+
+Installed per-socket after `hello` (mirrors `crons_updated`). Pushed when a
+subagent starts or reaches a terminal state. Carries the changed
+`subagent`, the `reason`, and a fresh `subagents_active` list so the bar
+reduces by replacement:
+
+```jsonc
+{ "type": "subagents_updated", "reason": "started",
+  "subagent": { … }, "subagents_active": [ … ], "at": "…" }
+```
+
+### 13.5 Deferred (first cut)
+
+- **TodoWrite is a point-in-time snapshot** fetched on demand (and via the
+  push that fires on lifecycle changes), NOT a live tail of the subagent
+  conversation's append stream. A true live subscription is a follow-up.
+- Synchronous (non-background) `Agent` dispatches register, but their
+  subagent-conversation correlation depends on the same agent-local id
+  appearing in the return body; if a future return shape differs, the
+  `todos` read degrades gracefully to `todos_found: false`.
+
+---
+
 ## Related docs
 
 - `/opt/stacks/letta-code-parallel/docs/MOBILE_CHANNEL_DESIGN.md` —
