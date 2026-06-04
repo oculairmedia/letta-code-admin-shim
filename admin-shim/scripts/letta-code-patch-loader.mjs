@@ -361,6 +361,172 @@ const TOOL_RETURN_CONTENT_REPLACEMENT =
   `  return globalThis.__lcpCoerceToolReturnContent(value);\n` +
   `}`;
 
+// lcp-gukg: OpenCode-style recurring completion reminder for background tasks.
+//
+// Background subagent completion is delivered to the PARENT conversation as a
+// SINGLE injected <task-notification> (spawnBackgroundSubagentTask ->
+// addToMessageQueue({ kind:"task_notification", ... })). If that one push is
+// lost — the documented task_N id/log-path collision across reconnects, a
+// dropped queue pump, or a runtime swap between dispatch and completion — the
+// parent never learns the task ended and its turn hangs "thinking" forever.
+//
+// We install a recurring timer (default 20s, env LCP_TASK_REMINDER_INTERVAL_MS)
+// that, WHILE there are active silent background subagents, re-reads each task's
+// /tmp/letta-background/task_N.log for the authoritative [Task completed] /
+// [Task failed] footer (written BEFORE the notification is enqueued) and, for
+// any task that is actually terminal but still shows active in the parent's
+// view, (re-)delivers a synthesized <task-notification> and clears it. The
+// timer is idempotent (delivered task ids are tracked), self-arming/-disarming
+// (it stops when there is nothing active, so there is zero overhead in the
+// common case), and unref'd so it never holds the process open.
+//
+// Hook: we wrap the bundle's setMessageQueueAdder so that whenever the runtime
+// installs a real queue adder (the same seam the notification path delivers
+// through), the reminder loop is (idempotently) armed with live references to
+// the bundle's own getActiveBackgroundAgents / backgroundTasks /
+// addToMessageQueue / formatTaskNotification / completeSubagent functions.
+//
+// The pure decision core mirrors admin-shim/lib/task-reminder.ts line-for-line
+// (scanForTerminalTasks); that TS copy is what the unit tests exercise.
+const TASK_REMINDER_HELPER_DEFINITION =
+  `globalThis.__lcpTaskReminder = globalThis.__lcpTaskReminder || (function () {\n` +
+  `  const TASK_COMPLETED_MARKER = "[Task completed]";\n` +
+  `  const TASK_FAILED_MARKER = "[Task failed]";\n` +
+  `  const delivered = new Set();\n` +
+  `  let timer = null;\n` +
+  `  let deps = null;\n` +
+  `  function classifyTaskLog(logText) {\n` +
+  `    if (typeof logText !== "string") return null;\n` +
+  `    if (logText.includes(TASK_FAILED_MARKER)) return "failed";\n` +
+  `    if (logText.includes(TASK_COMPLETED_MARKER)) return "completed";\n` +
+  `    return null;\n` +
+  `  }\n` +
+  `  function scanForTerminalTasks(activeAgents, backgroundTasks, readLog) {\n` +
+  `    if (!activeAgents || activeAgents.length === 0) return [];\n` +
+  `    const bySubagent = new Map();\n` +
+  `    for (const [taskId, entry] of backgroundTasks) {\n` +
+  `      if (entry && typeof entry.subagentId === "string") {\n` +
+  `        bySubagent.set(entry.subagentId, { taskId, entry });\n` +
+  `      }\n` +
+  `    }\n` +
+  `    const pending = [];\n` +
+  `    const seenTaskIds = new Set();\n` +
+  `    for (const agent of activeAgents) {\n` +
+  `      const match = bySubagent.get(agent.id);\n` +
+  `      if (!match) continue;\n` +
+  `      const { taskId, entry } = match;\n` +
+  `      if (delivered.has(taskId) || seenTaskIds.has(taskId)) continue;\n` +
+  `      if (!entry.outputFile) continue;\n` +
+  `      const logText = readLog(entry.outputFile);\n` +
+  `      if (logText == null) continue;\n` +
+  `      const status = classifyTaskLog(logText);\n` +
+  `      if (status == null) continue;\n` +
+  `      seenTaskIds.add(taskId);\n` +
+  `      pending.push({\n` +
+  `        taskId,\n` +
+  `        subagentId: agent.id,\n` +
+  `        status,\n` +
+  `        description: entry.description || agent.description || "background task",\n` +
+  `        subagentType: entry.subagentType || "general-purpose",\n` +
+  `        outputFile: entry.outputFile,\n` +
+  `      });\n` +
+  `    }\n` +
+  `    return pending;\n` +
+  `  }\n` +
+  `  function intervalMs() {\n` +
+  `    const n = Number(process.env.LCP_TASK_REMINDER_INTERVAL_MS || 20000);\n` +
+  `    return Number.isFinite(n) && n >= 1000 ? Math.floor(n) : 20000;\n` +
+  `  }\n` +
+  `  function readLogFile(outputFile) {\n` +
+  `    try {\n` +
+  `      const req = typeof __require === "function" ? __require : (typeof require === "function" ? require : null);\n` +
+  `      if (!req) return null;\n` +
+  `      const fs4 = req("node:fs");\n` +
+  `      if (!fs4.existsSync(outputFile)) return null;\n` +
+  `      return fs4.readFileSync(outputFile, "utf8");\n` +
+  `    } catch { return null; }\n` +
+  `  }\n` +
+  `  function tick() {\n` +
+  `    try {\n` +
+  `      if (!deps) return;\n` +
+  `      const activeAgents = deps.getActiveBackgroundAgents() || [];\n` +
+  `      if (activeAgents.length === 0) { stop(); return; }\n` +
+  `      const pending = scanForTerminalTasks(activeAgents, deps.backgroundTasks, deps.readLog || readLogFile);\n` +
+  `      for (const task of pending) {\n` +
+  `        const summary = 'Agent "' + task.description + '" ' + (task.status === "completed" ? "completed" : "failed") + " (recovered)";\n` +
+  `        let text;\n` +
+  `        try {\n` +
+  `          text = deps.formatTaskNotification({\n` +
+  `            taskId: task.taskId,\n` +
+  `            status: task.status,\n` +
+  `            summary,\n` +
+  `            result: summary,\n` +
+  `            outputFile: task.outputFile,\n` +
+  `            usage: {},\n` +
+  `          });\n` +
+  `        } catch {\n` +
+  `          text = "<task-notification>\\n<task-id>" + task.taskId + "</task-id>\\n<status>" + task.status + "</status>\\n<summary>" + summary + "</summary>\\n<result>" + summary + "</result>\\n</task-notification>\\nFull transcript available at: " + task.outputFile;\n` +
+  `        }\n` +
+  `        try {\n` +
+  `          deps.addToMessageQueue({\n` +
+  `            kind: "task_notification",\n` +
+  `            text,\n` +
+  `            agentId: task.parentAgentId,\n` +
+  `            conversationId: task.parentConversationId,\n` +
+  `          });\n` +
+  `        } catch {}\n` +
+  `        delivered.add(task.taskId);\n` +
+  `        try { deps.completeSubagent(task.subagentId, { success: task.status === "completed" }); } catch {}\n` +
+  `        try { process.stderr.write("[letta-code-patch] lcp-gukg recovered terminal " + task.status + " for " + task.taskId + " (re-delivered task-notification)\\n"); } catch {}\n` +
+  `      }\n` +
+  `    } catch {}\n` +
+  `  }\n` +
+  `  function stop() {\n` +
+  `    if (timer) { try { clearInterval(timer); } catch {} timer = null; }\n` +
+  `  }\n` +
+  `  function ensureRunning(liveDeps) {\n` +
+  `    deps = liveDeps;\n` +
+  `    if (timer) return;\n` +
+  `    try {\n` +
+  `      const active = deps.getActiveBackgroundAgents() || [];\n` +
+  `      if (active.length === 0) return;\n` +
+  `    } catch { return; }\n` +
+  `    timer = setInterval(tick, intervalMs());\n` +
+  `    if (timer && typeof timer.unref === "function") timer.unref();\n` +
+  `  }\n` +
+  `  return {\n` +
+  `    ensureRunning,\n` +
+  `    tick,\n` +
+  `    stop,\n` +
+  `    _scanForTest: scanForTerminalTasks,\n` +
+  `    _classifyForTest: classifyTaskLog,\n` +
+  `    _delivered: delivered,\n` +
+  `  };\n` +
+  `})();\n`;
+
+// Wrap setMessageQueueAdder: whenever a real (non-null) adder is installed, arm
+// the reminder loop with live bundle refs. When the adder is cleared (null), we
+// leave the unref'd timer alone — it self-stops on the next tick that sees no
+// active background subagents.
+const TASK_REMINDER_HOOK_TOKEN =
+  `function setMessageQueueAdder(fn) {\n` +
+  `  queueAdder = fn;\n`;
+
+const TASK_REMINDER_HOOK_REPLACEMENT =
+  `function setMessageQueueAdder(fn) {\n` +
+  `  queueAdder = fn;\n` +
+  `  try {\n` +
+  `    if (fn && globalThis.__lcpTaskReminder) {\n` +
+  `      globalThis.__lcpTaskReminder.ensureRunning({\n` +
+  `        getActiveBackgroundAgents,\n` +
+  `        backgroundTasks,\n` +
+  `        addToMessageQueue,\n` +
+  `        formatTaskNotification,\n` +
+  `        completeSubagent,\n` +
+  `      });\n` +
+  `    }\n` +
+  `  } catch {}\n`;
+
 let appliedOnce = false;
 
 /**
@@ -499,6 +665,22 @@ function patchLettaCodeSource(raw, path, warn) {
     process.stderr.write(
       `[letta-code-patch] WARN: tool-return content coercion token not found in ${path} — ` +
       `Read(image) approval turns may still be normalized to text only\n`,
+    );
+  }
+
+  // lcp-gukg: recurring background-task completion reminder. Hooks the
+  // setMessageQueueAdder seam to arm a self-disarming poll that re-derives
+  // terminal status from the authoritative task_N.log footer and re-delivers a
+  // lost <task-notification>, so a missed completion push never leaves the
+  // parent turn hanging. Only installs if the hook token matches.
+  if (patched.includes(TASK_REMINDER_HOOK_TOKEN)) {
+    patched = patched.replace(TASK_REMINDER_HOOK_TOKEN, TASK_REMINDER_HOOK_REPLACEMENT);
+    appliedPatches += 1;
+    patched = injectHelperAfterShebang(patched, TASK_REMINDER_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: setMessageQueueAdder hook token not found in ${path} — ` +
+      `running without lcp-gukg background-task completion reminder\n`,
     );
   }
 
