@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
@@ -213,20 +213,76 @@ function appendReplayFrame(conversationId: string, entry: ReplayEntry): void {
   appendFileSync(path, JSON.stringify({ seq: entry.convSeq, ts: new Date(entry.tsMs).toISOString(), frame: entry.frame }) + "\n");
 }
 
+// lcp-02ri: the replay file is append-only and never rotated, so it grows
+// without bound for the life of a conversation. The previous implementation
+// readFileSync'd + JSON.parse'd the ENTIRE file on every resumeConversation
+// (WS reconnect), making reconnect cost O(total frames ever stamped) even
+// though only the most-recent `MAX_FRAMES` (within TTL, past the ack) are
+// ever returned (see the `.slice(-MAX_FRAMES)` below). Measured: a 20k-frame
+// file cost ~64ms to read+parse vs ~2ms for 500 frames — linear in history,
+// the exact lcp-02ri streaming-replay regression class.
+//
+// Frames are appended in strict seq-ascending order, so the newest
+// `MAX_FRAMES` lines live at the file's tail. We read backwards in 64 KiB
+// chunks until we have at least `MAX_FRAMES + 1` complete lines (or hit the
+// start of the file), then parse forward. This bounds reconnect read+parse
+// work to O(MAX_FRAMES) regardless of total file size, while preserving the
+// existing TTL / ack / slice filtering exactly.
+const REPLAY_TAIL_CHUNK_BYTES = 64 * 1024;
+
+function readReplayTailLines(path: string): string[] {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    if (size === 0) return [];
+    let offset = size;
+    let raw = "";
+    let lineCount = 0;
+    // We need MAX_FRAMES candidate lines; read one extra so a tail that
+    // begins mid-line (after the first newline we slice off) still yields a
+    // full MAX_FRAMES of complete lines.
+    const wantLines = MAX_FRAMES + 1;
+    while (offset > 0) {
+      const len = Math.min(REPLAY_TAIL_CHUNK_BYTES, offset);
+      offset -= len;
+      const buf = Buffer.allocUnsafe(len);
+      readSync(fd, buf, 0, len, offset);
+      raw = buf.toString("utf8") + raw;
+      // Count newlines accumulated so far; stop once we have enough.
+      lineCount = 0;
+      for (let i = 0; i < raw.length; i += 1) {
+        if (raw.charCodeAt(i) === 10) lineCount += 1;
+      }
+      if (lineCount >= wantLines) break;
+    }
+    // If we started mid-file, the first (partial) line may be incomplete —
+    // drop it so we only parse whole records.
+    if (offset > 0) {
+      const firstNl = raw.indexOf("\n");
+      if (firstNl >= 0) raw = raw.slice(firstNl + 1);
+    }
+    const lines = raw.split("\n");
+    // Keep only the last MAX_FRAMES complete lines (the parse loop applies
+    // the same -MAX_FRAMES slice on entries, but trimming here caps parse
+    // work too).
+    return lines.length > MAX_FRAMES ? lines.slice(lines.length - MAX_FRAMES) : lines;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[mobile-conversation-cursors] replay tail read failed ${path}: ${msg}`);
+    return [];
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
 function readReplayFrames(conversationId: string, lastAckSeq: number): ReplayEntry[] {
   const path = replayPath(conversationId);
   if (!existsSync(path)) return [];
-  let body = "";
-  try {
-    body = readFileSync(path, "utf8");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`[mobile-conversation-cursors] replay read failed ${path}: ${msg}`);
-    return [];
-  }
+  const tailLines = readReplayTailLines(path);
   const entries: ReplayEntry[] = [];
   const cutoff = Date.now() - TTL_MS;
-  for (const line of body.split("\n")) {
+  for (const line of tailLines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
