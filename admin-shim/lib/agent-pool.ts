@@ -56,6 +56,7 @@ import {
   settleDanglingToolCallsFromFrames,
   type SettlementReason,
 } from "./turn-settlement.js";
+import { refreshSelfTodoFromDisk } from "./self-todo.js";
 import type {
   LettaStreamFrame,
   LettaInnerEvent,
@@ -499,6 +500,24 @@ export async function finalizeTurnLifecycle(args: {
       const msg = err instanceof Error ? err.message : String(err);
       logLine(`turn-settlement failed run=${runHandle.id}: ${msg}`);
     }
+  }
+  // letta-mobile-jb4gu: turn-settlement self-todo emit. CLI/SDK-backend turns
+  // (the main Meridian conversation, any local-backend turn) have the letta
+  // CLI write messages.jsonl DIRECTLY — the shim never sees a tool_call frame
+  // for them, so ingestSelfTodoFrame never runs and the live self-todo
+  // snapshot stays null (no change event ever fires; the chip stays empty).
+  // finalizeTurnLifecycle is the UNIVERSAL post-turn chokepoint both adapters
+  // call, so re-read the self-todo plan from the just-settled messages.jsonl
+  // here and emit a change if it differs from the cached snapshot. The
+  // "only if changed" guard inside refreshSelfTodoFromDisk dedupes the mobile
+  // path (which already ingested the same list live), so this never double-
+  // emits. The emit feeds the server-level broadcast that delivers the chip to
+  // the push-client phone without a live conversation socket.
+  try {
+    refreshSelfTodoFromDisk(agentId, conversationId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logLine(`self-todo refresh failed conv=${conversationId}: ${msg}`);
   }
   const usageFrame = frames.find((f) => {
     const ev = frameEvent(f);

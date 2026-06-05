@@ -315,6 +315,111 @@ export function getSelfTodoSnapshot(conversationId: string): SelfTodoSnapshot | 
 }
 
 /**
+ * Stable, order-sensitive signature of a todo list used to dedupe snapshots.
+ * Two refreshes that yield the same list (same content/status/order) collapse
+ * to one emit; any add/remove/status/reorder produces a different signature.
+ */
+function todosSignature(todos: TodoItem[]): string {
+  return JSON.stringify(
+    todos.map((t) => [t.content ?? "", t.status ?? "", t.activeForm ?? ""]),
+  );
+}
+
+/**
+ * letta-mobile-jb4gu — turn-settlement self-todo emit (the missing TRIGGER
+ * for CLI/SDK-backend turns).
+ *
+ * THE PROBLEM THIS CLOSES: there are TWO ingress paths.
+ *  - MOBILE send_message turns flow through bridgeSendMessage -> emit() ->
+ *    ingestSelfTodoFrame, so the live snapshot is populated in-process and a
+ *    change event fires (the server broadcast then reaches the phone).
+ *  - CLI/SDK-backend turns (the main Meridian conversation, any local-backend
+ *    turn) have the letta CLI write the conversation messages.jsonl DIRECTLY
+ *    (letta-sdk-adapter.ts). The shim NEVER sees a frame for these turns, so
+ *    ingestSelfTodoFrame never runs, getSelfTodoSnapshot stays NULL, and no
+ *    self-todo change event ever fires — the chip stays empty even though
+ *    readSelfTodos(disk) returns the correct tasks.
+ *
+ * THE FIX: after a turn SETTLES (the universal post-turn chokepoint
+ * finalizeTurnLifecycle, called by BOTH adapters), re-read self-todos from
+ * messages.jsonl, compare to the last emitted snapshot for that conversation,
+ * and — only if it CHANGED — update the in-memory cache and fire the same
+ * emit() the server broadcast subscribes to. That populates getSelfTodoSnapshot
+ * AND delivers the change to the push-client phone.
+ *
+ * The "only if changed" guard is what makes this safe to call on EVERY turn
+ * end on BOTH paths: the mobile path already ingested the live frame and set
+ * the identical snapshot, so the post-turn disk read finds no change and emits
+ * nothing (no double-emit / no spam). It only fires when disk diverges from the
+ * cache — i.e. exactly the CLI/SDK case where live ingest never ran.
+ *
+ * Returns the freshly-emitted snapshot when a change was detected+emitted, or
+ * null when the disk read found no plan or matched the cached snapshot.
+ */
+export function refreshSelfTodoFromDisk(
+  agentId: string,
+  conversationId: string,
+): SelfTodoSnapshot | null {
+  if (typeof conversationId !== "string" || conversationId.length === 0) return null;
+  if (typeof agentId !== "string" || agentId.length === 0) return null;
+
+  let snapshot: TodoSnapshot;
+  try {
+    snapshot = readSelfTodos(agentId, conversationId);
+  } catch (err) {
+    if (process.env["SELF_TODO_DEBUG"]) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[self-todo] refreshFromDisk read failed conv=${conversationId} agent=${agentId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return null;
+  }
+
+  // No plan on disk for this conversation yet — nothing to emit. Leave any
+  // existing cache untouched (a transient unreadable read shouldn't clear it).
+  if (!snapshot.found || snapshot.todos.length === 0) {
+    if (process.env["SELF_TODO_DEBUG"]) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[self-todo] refreshFromDisk conv=${conversationId}: no plan on disk (found=${snapshot.found}, n=${snapshot.todos.length}), skip`,
+      );
+    }
+    return null;
+  }
+
+  const prev = _byConversation.get(conversationId);
+  const nextSig = todosSignature(snapshot.todos);
+  if (prev && todosSignature(prev.todos) === nextSig) {
+    // Identical to the last emitted snapshot (e.g. the mobile path already
+    // ingested this exact list live) — dedupe, do not re-emit.
+    if (process.env["SELF_TODO_DEBUG"]) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[self-todo] refreshFromDisk conv=${conversationId}: unchanged (${snapshot.todos.length} todos), skip emit`,
+      );
+    }
+    return null;
+  }
+
+  const next: SelfTodoSnapshot = {
+    conversationId,
+    agentId,
+    todos: snapshot.todos,
+  };
+  _byConversation.set(conversationId, next);
+  if (process.env["SELF_TODO_DEBUG"]) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[self-todo] refreshFromDisk conv=${conversationId} agent=${agentId}: CHANGED -> emit ${snapshot.todos.length} todos:`,
+      JSON.stringify(snapshot.todos.map((t) => ({ content: t.content, status: t.status }))),
+    );
+  }
+  emit(next);
+  return next;
+}
+
+/**
  * Read the main agent's latest plan snapshot for a conversation from disk
  * (the lc-local-backend transcript), used on (re)subscribe and by the
  * sheet's `todos(conversationId)` fetch path.
