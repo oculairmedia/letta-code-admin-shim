@@ -11,10 +11,18 @@
  * These tests set SHIM_MOBILE_CONV_REPLAY_MAX_FRAMES small BEFORE importing
  * the module (the cap is read once at module load) so the bound is easy to
  * assert deterministically.
+ *
+ * IMPORTANT: the module under test must be loaded with a DYNAMIC `import()`
+ * *after* the env var is set. ESM `import` declarations are hoisted and the
+ * imported module is evaluated before any top-level statement in this file
+ * runs — so a `process.env[...] = "50"` assignment placed above a static
+ * `import` would execute too late and the module would capture the default
+ * cap (1000) instead. That hoisting hazard previously made this test read
+ * MAX_FRAMES=1000 and assert against the wrong tail bound (lcp-a0rl).
  */
 
 // Must be set before the module under test is imported — the cap/TTL are
-// captured at module-load time.
+// captured at module-load time. Set it BEFORE the dynamic import below.
 process.env["SHIM_MOBILE_CONV_REPLAY_MAX_FRAMES"] = "50";
 
 import { test } from "node:test";
@@ -23,10 +31,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import {
-  stampConversationFrame,
-  resumeConversation,
-} from "../lib/mobile-conversation-cursors.js";
+const { stampConversationFrame, resumeConversation } = await import(
+  "../lib/mobile-conversation-cursors.js"
+);
 
 function withBackendDir<T>(fn: () => T): T {
   const dir = mkdtempSync(join(tmpdir(), "conv-cursors-"));

@@ -1,15 +1,30 @@
 name: test
 
+# admin-shim CI gate (lcp-a0rl).
+#
+# This workflow runs `npm run typecheck` (tsc --noEmit) and `npm test` for the
+# admin-shim on every push and pull request. Both jobs MUST be made REQUIRED
+# status checks via branch protection so broken tests/types cannot merge —
+# mirroring the vibesync gate and the "regression-test-per-feature is policy"
+# note. (Branch protection can't be configured from a workflow file; an admin
+# must mark `shim-tests` and `typecheck` as required checks on the protected
+# branches. This file provides the checks to require.)
+#
+# Context: until lcp-a0rl, `npm test` was FALSE-GREEN — `node --test` with a
+# command-line `--import tsx/esm` loader did not propagate the loader to the
+# per-file test child processes, so every file reported a phantom pass and
+# failures were swallowed (exit 0). The loader now rides on NODE_OPTIONS so it
+# is inherited by the spawned children; a failing test exits non-zero.
+
 on:
   push:
     branches: [master, main]
   pull_request:
-    branches: [master, main]
 
 jobs:
   shim-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +64,7 @@ jobs:
         working-directory: admin-shim
         run: npm run typecheck
 
-  # Channel plugin smokes run against a real `letta` binary, so they live
-  # behind a manual trigger for now. CI runs the mocked shim tests above
-  # which exercise the same protocol surface via captured stream traces.
+  # Channel plugin smokes + the SDK live-CLI session probe (lcp-lzap) run
+  # against a real `letta` binary, so they live behind a manual trigger / the
+  # SHIM_TEST_LIVE_CLI=1 opt-in. CI runs the mocked shim tests above which
+  # exercise the same protocol surface via captured stream traces.
