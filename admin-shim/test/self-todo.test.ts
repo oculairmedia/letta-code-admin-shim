@@ -72,6 +72,15 @@ function todoWriteMsg(id: string, todos: Array<{ content: string; status: string
   };
 }
 
+/** An assistant row carrying a session task-list tool call (TaskCreate/TaskUpdate). */
+function taskCallMsg(id: string, name: "TaskCreate" | "TaskUpdate", args: unknown) {
+  return {
+    id,
+    role: "assistant",
+    content: [{ type: "toolCall", id: `tc-${id}`, name, arguments: args }],
+  };
+}
+
 before(() => {
   __resetSelfTodo();
 });
@@ -199,4 +208,111 @@ test("self-todo: buildSelfTodoFrame matches the mobile tool_call_message contrac
   const arr = frame["tool_calls"] as Array<{ tool_call_id: string }>;
   assert.equal(arr.length, 1);
   assert.equal(arr[0]!.tool_call_id, tc.tool_call_id);
+});
+
+// ── letta-mobile-rp1vp: MAIN agent's session task list → self chip ──────
+
+test("self-todo: ingestSelfTodoFrame folds TaskCreate/TaskUpdate frames into the snapshot", () => {
+  const events: Array<{ todos: Array<{ content: string; status: string }> }> = [];
+  const unsub = subscribeSelfTodoEvents((e) =>
+    events.push({ todos: e.todos.map((t) => ({ content: t.content, status: t.status })) }),
+  );
+  const conv = "conv-default-agent-local-main-rp1vp";
+
+  // TaskCreate "Build" (task_1)
+  const created = ingestSelfTodoFrame(
+    {
+      message_type: "tool_call_message",
+      tool_call: {
+        tool_call_id: "tc-c1",
+        name: "TaskCreate",
+        arguments: JSON.stringify({ subject: "Build the shim", description: "x", activeForm: "Building the shim" }),
+      },
+    },
+    conv,
+    "agent-local-main-rp1vp",
+  );
+  assert.ok(created, "TaskCreate frame should produce a snapshot");
+  assert.equal(created!.todos.length, 1);
+  assert.equal(created!.todos[0]!.content, "Build the shim");
+  assert.equal(created!.todos[0]!.status, "pending");
+
+  // TaskUpdate task_1 -> in_progress (separate frame; must resolve via accumulator)
+  const updated = ingestSelfTodoFrame(
+    {
+      message_type: "tool_call_message",
+      tool_call: { tool_call_id: "tc-u1", name: "TaskUpdate", arguments: JSON.stringify({ taskId: "task_1", status: "in_progress" }) },
+    },
+    conv,
+    "agent-local-main-rp1vp",
+  );
+  assert.ok(updated, "TaskUpdate frame should produce a snapshot");
+  assert.equal(updated!.todos[0]!.status, "in_progress");
+
+  const live = getSelfTodoSnapshot(conv);
+  assert.equal(live!.todos[0]!.status, "in_progress");
+  // one event per ingested frame
+  assert.equal(events.length, 2);
+  assert.deepEqual(events[1]!.todos, [{ content: "Build the shim", status: "in_progress" }]);
+  unsub();
+});
+
+test("self-todo: ingest emits the SAME TodoWrite-shaped frame mobile parses for session tasks", () => {
+  const conv = "conv-default-agent-local-main-frame";
+  ingestSelfTodoFrame(
+    {
+      message_type: "tool_call_message",
+      tool_call: { tool_call_id: "c", name: "TaskCreate", arguments: JSON.stringify({ subject: "Ship it", activeForm: "Shipping it" }) },
+    },
+    conv,
+    "agent-local-main-frame",
+  );
+  const snap = getSelfTodoSnapshot(conv);
+  const frame = buildSelfTodoFrame(conv, snap!.agentId, snap!.todos);
+  // Still a TodoWrite-shaped frame — mobile side is unchanged.
+  const tc = frame["tool_call"] as { name: string; arguments: string };
+  assert.equal(tc.name, SELF_TODO_TOOL);
+  const parsed = JSON.parse(tc.arguments) as { todos: Array<{ content: string; activeForm: string }> };
+  assert.equal(parsed.todos[0]!.content, "Ship it");
+  assert.equal(parsed.todos[0]!.activeForm, "Shipping it");
+});
+
+test("self-todo: readSelfTodos reconstructs the session task list from disk when no TodoWrite exists", () => {
+  const agentId = "agent-local-session-disk";
+  const conversationId = "default";
+  writeMessages(conversationId, agentId, [
+    userMsg("u1", "plan it"),
+    taskCallMsg("a1", "TaskCreate", { subject: "step 1", description: "x", activeForm: "Stepping 1" }),
+    taskCallMsg("a2", "TaskCreate", { subject: "step 2", description: "x", activeForm: "Stepping 2" }),
+    taskCallMsg("a3", "TaskUpdate", { taskId: "task_1", status: "completed" }),
+    taskCallMsg("a4", "TaskUpdate", { taskId: "task_2", status: "in_progress" }),
+  ]);
+
+  const snap = readSelfTodos(agentId, conversationId);
+  assert.equal(snap.found, true, "session task list should be found on disk");
+  assert.equal(snap.todos.length, 2);
+  assert.deepEqual(snap.todos.map((t) => t.status), ["completed", "in_progress"]);
+  assert.deepEqual(snap.todos.map((t) => t.content), ["step 1", "step 2"]);
+});
+
+test("self-todo: readSelfTodos prefers TodoWrite over the session task list when both exist", () => {
+  const agentId = "agent-local-both";
+  const conversationId = "default";
+  writeMessages(conversationId, agentId, [
+    taskCallMsg("a1", "TaskCreate", { subject: "session task", activeForm: "Session tasking" }),
+    todoWriteMsg("a2", [{ content: "todowrite wins", status: "in_progress", activeForm: "Winning" }]),
+  ]);
+  const snap = readSelfTodos(agentId, conversationId);
+  assert.equal(snap.found, true);
+  assert.equal(snap.todos.length, 1);
+  assert.equal(snap.todos[0]!.content, "todowrite wins");
+});
+
+test("self-todo: ingestSelfTodoFrame still ignores non-plan tool calls (Bash)", () => {
+  const frame = {
+    message_type: "tool_call_message",
+    tool_call: { tool_call_id: "tc-b", name: "Bash", arguments: JSON.stringify({ command: "ls" }) },
+  };
+  assert.equal(ingestSelfTodoFrame(frame, "conv-nope", "agent-local-nope"), null);
+  assert.equal(getSelfTodoSnapshot("conv-nope"), null);
 });
