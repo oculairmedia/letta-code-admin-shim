@@ -136,14 +136,47 @@ function planCallsFromFrame(frame: unknown): ToolCall[] {
   if (!frame || typeof frame !== "object") return [];
   const f = frame as Record<string, unknown>;
   if (f["message_type"] !== "tool_call_message" && f["type"] !== "tool_call_message") return [];
+  // A live reshaped frame carries the SAME tool call in BOTH `tool_call`
+  // (singular) AND `tool_calls` (array) — reshapeFrame sets
+  // `tool_calls: tcs ?? (tc ? [tc] : null)`, so the singular is duplicated
+  // into the array. Mobile's `allToolCalls()` UNIONS the two (it does not
+  // concat blindly); we must do the same or every TaskCreate/TaskUpdate
+  // gets folded twice and the projected list doubles (the live-ingest
+  // corruption behind letta-mobile-jb4gu). Dedupe by tool_call_id (falling
+  // back to a structural key for synthetic calls that lack an id).
   const single = (f["tool_call"] ?? f["toolCall"] ?? null) as ToolCall | null;
-  const many = (f["tool_calls"] ?? f["toolCalls"] ?? null) as ToolCall[] | null;
+  const manyRaw = (f["tool_calls"] ?? f["toolCalls"] ?? null) as ToolCall[] | null;
+  const ordered: ToolCall[] = [];
+  if (Array.isArray(manyRaw)) ordered.push(...manyRaw);
+  // Only append the singular if the array didn't already include it.
+  if (single) ordered.push(single);
+  const seen = new Set<string>();
   const calls: ToolCall[] = [];
-  if (single) calls.push(single);
-  if (Array.isArray(many)) calls.push(...many);
-  return calls.map(normalizeToolCall).filter(
-    (call) => call && typeof call === "object" && SELF_TODO_FRAME_TOOLS.has(call.name),
-  );
+  for (const raw of ordered) {
+    if (!raw || typeof raw !== "object") continue;
+    const call = normalizeToolCall(raw);
+    if (!SELF_TODO_FRAME_TOOLS.has(call.name)) continue;
+    const key = dedupeKey(call);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    calls.push(call);
+  }
+  return calls;
+}
+
+/**
+ * Stable identity for a plan tool call so the singular `tool_call` and its
+ * twin inside `tool_calls[]` collapse to one fold. Prefer the real
+ * `tool_call_id`; for synthetic/id-less calls fall back to name+arguments
+ * (two distinct same-name calls in one frame with different args stay
+ * distinct, which is correct).
+ */
+function dedupeKey(call: ToolCall): string {
+  const id = call.tool_call_id;
+  if (typeof id === "string" && id.length > 0) return `id:${id}`;
+  const args =
+    typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? null);
+  return `na:${call.name}:${args}`;
 }
 
 function normalizeToolCall(call: ToolCall): ToolCall {
@@ -192,7 +225,31 @@ export function ingestSelfTodoFrame(
   conversationId: string | null,
   agentId: string | null,
 ): SelfTodoSnapshot | null {
+  if (process.env["SELF_TODO_DEBUG"]) {
+    const f = (frame ?? {}) as Record<string, unknown>;
+    const tc = (f["tool_call"] ?? f["toolCall"]) as Record<string, unknown> | undefined;
+    // eslint-disable-next-line no-console
+    console.error(
+      "[self-todo] ingest frame:",
+      JSON.stringify({
+        message_type: f["message_type"],
+        type: f["type"],
+        has_tool_call: f["tool_call"] != null,
+        has_toolCall: f["toolCall"] != null,
+        has_tool_calls: Array.isArray(f["tool_calls"]),
+        has_toolCalls: Array.isArray(f["toolCalls"]),
+        has_parts: Array.isArray(f["parts"]),
+        tc_name: tc?.["name"],
+        tc_args_type: tc ? typeof tc["arguments"] : undefined,
+        conv: conversationId,
+      }),
+    );
+  }
   const calls = planCallsFromFrame(frame);
+  if (process.env["SELF_TODO_DEBUG"]) {
+    // eslint-disable-next-line no-console
+    console.error("[self-todo] planCallsFromFrame ->", calls.length, "calls:", calls.map((c) => c.name));
+  }
   if (calls.length === 0) return null;
   const f = frame as Record<string, unknown>;
   // Prefer the explicit conversationId the host resolved for this turn;
