@@ -238,6 +238,23 @@ export function handleConnection(ws, request, host) {
     safeSend(ws, enveloped, log);
   };
 
+  // letta-mobile-jb4gu: hydrate the self chip the FIRST time this socket's
+  // conversation becomes known — i.e. on a plain connect (hello + first
+  // send_message / initial subscribe), not only on an explicit
+  // resume_conversation. The phone's normal open flow is hello + push-register
+  // WITHOUT a resume_conversation, so without this the disk-backed snapshot is
+  // never pushed and the chip stays empty. We register the conversation for
+  // live self-todo change pushes (selfTodoConversations) and emit the current
+  // snapshot once. Guarded by selfTodoConversations so we never double-push if
+  // resume_conversation (or a later send_message) also fires for the same
+  // conversation.
+  const hydrateSelfTodoForConversation = (conversationId, agentIdHint = null) => {
+    if (typeof conversationId !== "string" || conversationId.length === 0) return;
+    if (selfTodoConversations.has(conversationId)) return; // already hydrated/subscribed
+    selfTodoConversations.add(conversationId);
+    void pushSelfTodoSnapshot(conversationId, agentIdHint);
+  };
+
   const isResumeResult = (value) => value
     && typeof value === "object"
     && typeof value.cursorExpired === "boolean"
@@ -589,8 +606,8 @@ export function handleConnection(ws, request, host) {
         if (resumeConversationId) {
           emitConversationResume(resumeConversationId, helloResume.after_seq ?? helloResume.last_conv_seq ?? 0);
           // letta-mobile-gnyf7: re-hydrate the self chip on (re)subscribe.
-          selfTodoConversations.add(resumeConversationId);
-          void pushSelfTodoSnapshot(resumeConversationId);
+          // letta-mobile-jb4gu: guarded helper (single push per conversation).
+          hydrateSelfTodoForConversation(resumeConversationId);
         }
       } else if (Array.isArray(helloResume)) {
         for (const item of helloResume) {
@@ -598,8 +615,7 @@ export function handleConnection(ws, request, host) {
           const resumeConversationId = typeof item.conversation_id === "string" ? item.conversation_id : null;
           if (resumeConversationId) {
             emitConversationResume(resumeConversationId, item.after_seq ?? item.last_conv_seq ?? 0);
-            selfTodoConversations.add(resumeConversationId);
-            void pushSelfTodoSnapshot(resumeConversationId);
+            hydrateSelfTodoForConversation(resumeConversationId);
           }
         }
       }
@@ -682,7 +698,12 @@ export function handleConnection(ws, request, host) {
         lastClientConversationId = conversation_id;
         // letta-mobile-gnyf7: this socket is now watching this conversation,
         // so route its self-todo change pushes here.
-        selfTodoConversations.add(conversation_id);
+        // letta-mobile-jb4gu: on the FIRST send_message for this conversation
+        // (the normal connect flow, no resume_conversation) also push the
+        // current self-todo snapshot so the chip hydrates immediately. The
+        // helper registers the conversation AND guards against a double-push if
+        // resume_conversation already hydrated it.
+        hydrateSelfTodoForConversation(conversation_id, agent_id);
         // lcp-dlj: validate optional content_parts. If supplied, it must
         // be an array; size-cap the JSON-encoded frame at 10MB to bound
         // memory pressure from oversized base64 images. Mobile is
@@ -1121,8 +1142,9 @@ export function handleConnection(ws, request, host) {
         }
         emitConversationResume(conversationId, frame.after_seq ?? frame.last_conv_seq ?? 0);
         // letta-mobile-gnyf7: re-hydrate the self chip for the resumed conv.
-        selfTodoConversations.add(conversationId);
-        void pushSelfTodoSnapshot(conversationId);
+        // letta-mobile-jb4gu: guarded so we don't double-push if hello/connect
+        // already hydrated this conversation.
+        hydrateSelfTodoForConversation(conversationId);
         break;
       }
       case "a2ui_frame":
