@@ -295,17 +295,94 @@ test("self-todo: readSelfTodos reconstructs the session task list from disk when
   assert.deepEqual(snap.todos.map((t) => t.content), ["step 1", "step 2"]);
 });
 
-test("self-todo: readSelfTodos prefers TodoWrite over the session task list when both exist", () => {
+test("self-todo: readSelfTodos reads normal conversation:<conv-id> session tasks without subagent contamination", () => {
+  const mainAgentId = "agent-main-normal";
+  const mainConversationId = "conv-main-normal";
+  const subagentId = "agent-subagent-default";
+
+  writeMessages("default", subagentId, [
+    todoWriteMsg("sub-a1", [
+      { content: "Trace shim streaming hot path", status: "in_progress", activeForm: "Tracing shim streaming hot path" },
+    ]),
+  ]);
+  writeMessages(mainConversationId, mainAgentId, [
+    userMsg("main-u1", "make session tasks"),
+    taskCallMsg("main-a1", "TaskCreate", { subject: "Validate the self chip renders", activeForm: "Validating the self chip renders" }),
+    taskCallMsg("main-a2", "TaskCreate", { subject: "Confirm progress updates", activeForm: "Confirming progress updates" }),
+    taskCallMsg("main-a3", "TaskUpdate", { taskId: "task_1", status: "completed" }),
+    taskCallMsg("main-a4", "TaskUpdate", { taskId: "task_2", status: "in_progress" }),
+  ]);
+
+  const snap = readSelfTodos(mainAgentId, mainConversationId);
+  assert.equal(snap.found, true);
+  assert.deepEqual(snap.todos.map((t) => t.content), [
+    "Validate the self chip renders",
+    "Confirm progress updates",
+  ]);
+  assert.deepEqual(snap.todos.map((t) => t.status), ["completed", "in_progress"]);
+});
+
+test("self-todo: main conversation session tasks win over stale default TodoWrite for same agent", () => {
+  const agentId = "agent-main-with-stale-default";
+  const conversationId = "conv-main-with-session-tasks";
+
+  writeMessages("default", agentId, [
+    todoWriteMsg("default-a1", [
+      { content: "stale default TodoWrite", status: "in_progress", activeForm: "Reading stale default TodoWrite" },
+    ]),
+  ]);
+  writeMessages(conversationId, agentId, [
+    taskCallMsg("main-a1", "TaskCreate", { subject: "fresh normal conversation task", activeForm: "Reading fresh normal conversation task" }),
+  ]);
+
+  const snap = readSelfTodos(agentId, conversationId);
+  assert.equal(snap.found, true);
+  assert.deepEqual(snap.todos.map((t) => t.content), ["fresh normal conversation task"]);
+});
+
+test("self-todo: ingestSelfTodoFrame accepts run frame toolCalls and explicit effective ids", () => {
+  const conv = "conv-explicit-main";
+  const agentId = "agent-explicit-main";
+  const created = ingestSelfTodoFrame(
+    {
+      type: "tool_call_message",
+      toolCalls: [
+        { id: "call-create", name: "TaskCreate", arguments: { subject: "Validate the self chip renders", activeForm: "Validating the self chip renders" } },
+      ],
+    },
+    conv,
+    agentId,
+  );
+  assert.ok(created);
+  assert.equal(created!.conversationId, conv);
+  assert.equal(created!.agentId, agentId);
+  assert.equal(created!.todos[0]!.content, "Validate the self chip renders");
+
+  const updated = ingestSelfTodoFrame(
+    {
+      type: "tool_call_message",
+      toolCalls: [
+        { id: "call-update", name: "TaskUpdate", arguments: { taskId: "task_1", status: "in_progress" } },
+      ],
+    },
+    conv,
+    agentId,
+  );
+  assert.ok(updated);
+  assert.equal(getSelfTodoSnapshot(conv)!.todos[0]!.status, "in_progress");
+});
+
+test("self-todo: readSelfTodos prefers session tasks over TodoWrite when both exist in a main conversation", () => {
   const agentId = "agent-local-both";
-  const conversationId = "default";
+  const conversationId = "conv-local-both";
   writeMessages(conversationId, agentId, [
     taskCallMsg("a1", "TaskCreate", { subject: "session task", activeForm: "Session tasking" }),
-    todoWriteMsg("a2", [{ content: "todowrite wins", status: "in_progress", activeForm: "Winning" }]),
+    todoWriteMsg("a2", [{ content: "stale todowrite", status: "in_progress", activeForm: "Reading stale TodoWrite" }]),
   ]);
   const snap = readSelfTodos(agentId, conversationId);
   assert.equal(snap.found, true);
   assert.equal(snap.todos.length, 1);
-  assert.equal(snap.todos[0]!.content, "todowrite wins");
+  assert.equal(snap.todos[0]!.content, "session task");
 });
 
 test("self-todo: ingestSelfTodoFrame still ignores non-plan tool calls (Bash)", () => {

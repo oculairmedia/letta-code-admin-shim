@@ -135,15 +135,20 @@ const SELF_TODO_FRAME_TOOLS = new Set<string>([
 function planCallsFromFrame(frame: unknown): ToolCall[] {
   if (!frame || typeof frame !== "object") return [];
   const f = frame as Record<string, unknown>;
-  if (f["message_type"] !== "tool_call_message") return [];
-  const single = (f["tool_call"] ?? null) as ToolCall | null;
-  const many = (f["tool_calls"] ?? null) as ToolCall[] | null;
+  if (f["message_type"] !== "tool_call_message" && f["type"] !== "tool_call_message") return [];
+  const single = (f["tool_call"] ?? f["toolCall"] ?? null) as ToolCall | null;
+  const many = (f["tool_calls"] ?? f["toolCalls"] ?? null) as ToolCall[] | null;
   const calls: ToolCall[] = [];
   if (single) calls.push(single);
   if (Array.isArray(many)) calls.push(...many);
-  return calls.filter(
+  return calls.map(normalizeToolCall).filter(
     (call) => call && typeof call === "object" && SELF_TODO_FRAME_TOOLS.has(call.name),
   );
+}
+
+function normalizeToolCall(call: ToolCall): ToolCall {
+  const raw = call as ToolCall & { id?: string };
+  return raw.tool_call_id ? raw : { ...raw, tool_call_id: raw.id ?? "" };
 }
 
 /**
@@ -268,9 +273,10 @@ export function getSelfTodoSnapshot(conversationId: string): SelfTodoSnapshot | 
  * conversation used neither mechanism.
  */
 export function readSelfTodos(agentId: string, conversationId: string): TodoSnapshot {
-  const viaTodoWrite = readConversationTodos(agentId, conversationId);
-  if (viaTodoWrite.found) return viaTodoWrite;
-  // Fall back to the session task list (the MAIN agent's actual mechanism).
+  // Prefer the session task list for normal conversations. The MAIN agent's
+  // live plan is TaskCreate/TaskUpdate, while TodoWrite is primarily the
+  // subagent/default-conversation mechanism; letting TodoWrite win here can
+  // surface a stale default/subagent plan for an unrelated main conversation.
   try {
     const messages = listMessagesSync(conversationId, agentId);
     const session = reconstructSessionTasks(messages);
@@ -278,6 +284,8 @@ export function readSelfTodos(agentId: string, conversationId: string): TodoSnap
   } catch {
     /* unreadable store — fall through to not-found */
   }
+  const viaTodoWrite = readConversationTodos(agentId, conversationId);
+  if (viaTodoWrite.found) return viaTodoWrite;
   return viaTodoWrite;
 }
 
