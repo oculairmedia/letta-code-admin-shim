@@ -17,9 +17,10 @@
 
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Point the local-backend store at a throwaway dir BEFORE the store module
 // resolves any path (storageDir() reads this env at call time).
@@ -565,4 +566,90 @@ test("self-todo: reconstruct without tool results falls back to create-after-upd
   assert.equal(snap.todos.length, 2, "current list only (new A, new B)");
   assert.deepEqual(snap.todos.map((t) => t.content), ["new A", "new B"]);
   assert.deepEqual(snap.todos.map((t) => t.status), ["pending", "in_progress"]);
+});
+
+// ── letta-mobile-jb4gu PRIMARY: live ingest drives the channel-push frame ──
+//
+// This is the REAL-PATH proof the bead demands. The fixture is the EXACT
+// reshaped tool_call_message frame sequence captured verbatim from a live
+// run's runs/<id>/frames.jsonl (conv-16c2f589, the live Meridian
+// conversation) — i.e. precisely what the host's emit() wrapper appends and
+// passes to ingestSelfTodoFrame on a real TaskCreate/TaskUpdate turn. It is
+// NOT a hand-built fixture; prior agents were fooled by tests on synthetic
+// frames while the live frame shape differed.
+//
+// We feed each captured frame through the REAL ingestSelfTodoFrame with the
+// run's real (conversationId, agentId), and through the REAL
+// subscribeSelfTodoEvents + buildSelfTodoSnapshotFrame the server-level
+// channel broadcast wires (server.ts#wireSelfTodoChannelBroadcast). Asserts:
+//   1. ingest populates getSelfTodoSnapshot for the real conversation, and
+//   2. the change event produces the mobile tool_call_message(TodoWrite)
+//      frame the push-client phone consumes — keyed by the real conv id.
+test("self-todo: REAL captured run frames populate the live snapshot AND emit the channel-push frame", async () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const fixturePath = join(here, "fixtures", "live-self-todo-frames.jsonl");
+  const frames = readFileSync(fixturePath, "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+  assert.ok(frames.length >= 2, "fixture must carry the real plan frames");
+  // Sanity: the captured frames are genuine reshaped tool_call_message frames
+  // carrying the live dual-carriage tool_call + tool_calls shape.
+  const first = frames[0]!;
+  assert.equal(first["message_type"], "tool_call_message");
+  const firstCall = first["tool_call"] as { name?: string } | undefined;
+  assert.ok(
+    firstCall?.name === "TaskCreate" || firstCall?.name === "TaskUpdate" || firstCall?.name === "TodoWrite",
+    "fixture frame must be a real plan tool call",
+  );
+
+  // The real (conversationId, agentId) the host's emit() resolved for this run.
+  const conv = "conv-16c2f589-a3f9-438c-bb63-75023a4785ea";
+  const agent = "agent-597b5756-2915-4560-ba6b-91005f085166";
+
+  // Mirror server.ts#wireSelfTodoChannelBroadcast: subscribe ONCE and build
+  // the broadcast frame from each change event.
+  const { buildSelfTodoSnapshotFrame, subscribeSelfTodoEvents: hostSubscribe } = await import(
+    "../lib/mobile-channel-host.js"
+  );
+  const broadcastFrames: Array<Record<string, unknown>> = [];
+  const pending: Array<Promise<void>> = [];
+  const unsub = hostSubscribe((event) => {
+    pending.push(
+      buildSelfTodoSnapshotFrame(event.conversationId, event.agentId ?? null).then((frame) => {
+        if (frame) broadcastFrames.push(frame);
+      }),
+    );
+  });
+
+  try {
+    for (const frame of frames) {
+      // EXACTLY what mobile-channel-host emit() does on the live turn path.
+      ingestSelfTodoFrame(frame, conv, agent);
+    }
+    await Promise.all(pending);
+
+    // 1. Live in-memory snapshot is populated for the REAL conversation.
+    const live = getSelfTodoSnapshot(conv);
+    assert.ok(live, "getSelfTodoSnapshot(realConv) must be NON-NULL after the live ingest");
+    assert.ok(live!.todos.length > 0, "the live snapshot must carry the current task list");
+    assert.equal(live!.agentId, agent, "snapshot carries the resolved agent id");
+
+    // 2. Each change event yields the mobile channel-push frame, keyed by the
+    //    real conversation id, carrying the current list as a TodoWrite frame.
+    assert.ok(broadcastFrames.length > 0, "at least one channel-push frame must be produced");
+    const last = broadcastFrames[broadcastFrames.length - 1]!;
+    assert.equal(last["message_type"], "tool_call_message");
+    assert.equal(last["conversation_id"], conv, "push frame is keyed by the real conversation id");
+    const tc = last["tool_call"] as { name: string; arguments: string };
+    assert.equal(tc.name, SELF_TODO_TOOL, "mobile consumes a TodoWrite-shaped frame");
+    const parsed = JSON.parse(tc.arguments) as { todos: Array<{ content: string; status: string }> };
+    assert.deepEqual(
+      parsed.todos.map((t) => ({ content: t.content, status: t.status })),
+      live!.todos.map((t) => ({ content: t.content, status: t.status })),
+      "the pushed frame reflects the current live snapshot exactly",
+    );
+  } finally {
+    unsub();
+  }
 });
