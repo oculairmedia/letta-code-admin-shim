@@ -17,9 +17,10 @@
 
 import { test, before, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Point the local-backend store at a throwaway dir BEFORE the store module
 // resolves any path (storageDir() reads this env at call time).
@@ -36,6 +37,7 @@ import {
   getSelfTodoSnapshot,
   ingestSelfTodoFrame,
   readSelfTodos,
+  refreshSelfTodoFromDisk,
   subscribeSelfTodoEvents,
   SELF_TODO_TOOL,
 } from "../lib/self-todo.js";
@@ -565,4 +567,216 @@ test("self-todo: reconstruct without tool results falls back to create-after-upd
   assert.equal(snap.todos.length, 2, "current list only (new A, new B)");
   assert.deepEqual(snap.todos.map((t) => t.content), ["new A", "new B"]);
   assert.deepEqual(snap.todos.map((t) => t.status), ["pending", "in_progress"]);
+});
+
+// ── letta-mobile-jb4gu PRIMARY: live ingest drives the channel-push frame ──
+//
+// This is the REAL-PATH proof the bead demands. The fixture is the EXACT
+// reshaped tool_call_message frame sequence captured verbatim from a live
+// run's runs/<id>/frames.jsonl (conv-16c2f589, the live Meridian
+// conversation) — i.e. precisely what the host's emit() wrapper appends and
+// passes to ingestSelfTodoFrame on a real TaskCreate/TaskUpdate turn. It is
+// NOT a hand-built fixture; prior agents were fooled by tests on synthetic
+// frames while the live frame shape differed.
+//
+// We feed each captured frame through the REAL ingestSelfTodoFrame with the
+// run's real (conversationId, agentId), and through the REAL
+// subscribeSelfTodoEvents + buildSelfTodoSnapshotFrame the server-level
+// channel broadcast wires (server.ts#wireSelfTodoChannelBroadcast). Asserts:
+//   1. ingest populates getSelfTodoSnapshot for the real conversation, and
+//   2. the change event produces the mobile tool_call_message(TodoWrite)
+//      frame the push-client phone consumes — keyed by the real conv id.
+test("self-todo: REAL captured run frames populate the live snapshot AND emit the channel-push frame", async () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const fixturePath = join(here, "fixtures", "live-self-todo-frames.jsonl");
+  const frames = readFileSync(fixturePath, "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+  assert.ok(frames.length >= 2, "fixture must carry the real plan frames");
+  // Sanity: the captured frames are genuine reshaped tool_call_message frames
+  // carrying the live dual-carriage tool_call + tool_calls shape.
+  const first = frames[0]!;
+  assert.equal(first["message_type"], "tool_call_message");
+  const firstCall = first["tool_call"] as { name?: string } | undefined;
+  assert.ok(
+    firstCall?.name === "TaskCreate" || firstCall?.name === "TaskUpdate" || firstCall?.name === "TodoWrite",
+    "fixture frame must be a real plan tool call",
+  );
+
+  // The real (conversationId, agentId) the host's emit() resolved for this run.
+  const conv = "conv-16c2f589-a3f9-438c-bb63-75023a4785ea";
+  const agent = "agent-597b5756-2915-4560-ba6b-91005f085166";
+
+  // Mirror server.ts#wireSelfTodoChannelBroadcast: subscribe ONCE and build
+  // the broadcast frame from each change event.
+  const { buildSelfTodoSnapshotFrame, subscribeSelfTodoEvents: hostSubscribe } = await import(
+    "../lib/mobile-channel-host.js"
+  );
+  const broadcastFrames: Array<Record<string, unknown>> = [];
+  const pending: Array<Promise<void>> = [];
+  const unsub = hostSubscribe((event) => {
+    pending.push(
+      buildSelfTodoSnapshotFrame(event.conversationId, event.agentId ?? null).then((frame) => {
+        if (frame) broadcastFrames.push(frame);
+      }),
+    );
+  });
+
+  try {
+    for (const frame of frames) {
+      // EXACTLY what mobile-channel-host emit() does on the live turn path.
+      ingestSelfTodoFrame(frame, conv, agent);
+    }
+    await Promise.all(pending);
+
+    // 1. Live in-memory snapshot is populated for the REAL conversation.
+    const live = getSelfTodoSnapshot(conv);
+    assert.ok(live, "getSelfTodoSnapshot(realConv) must be NON-NULL after the live ingest");
+    assert.ok(live!.todos.length > 0, "the live snapshot must carry the current task list");
+    assert.equal(live!.agentId, agent, "snapshot carries the resolved agent id");
+
+    // 2. Each change event yields the mobile channel-push frame, keyed by the
+    //    real conversation id, carrying the current list as a TodoWrite frame.
+    assert.ok(broadcastFrames.length > 0, "at least one channel-push frame must be produced");
+    const last = broadcastFrames[broadcastFrames.length - 1]!;
+    assert.equal(last["message_type"], "tool_call_message");
+    assert.equal(last["conversation_id"], conv, "push frame is keyed by the real conversation id");
+    const tc = last["tool_call"] as { name: string; arguments: string };
+    assert.equal(tc.name, SELF_TODO_TOOL, "mobile consumes a TodoWrite-shaped frame");
+    const parsed = JSON.parse(tc.arguments) as { todos: Array<{ content: string; status: string }> };
+    assert.deepEqual(
+      parsed.todos.map((t) => ({ content: t.content, status: t.status })),
+      live!.todos.map((t) => ({ content: t.content, status: t.status })),
+      "the pushed frame reflects the current live snapshot exactly",
+    );
+  } finally {
+    unsub();
+  }
+});
+
+// ── letta-mobile-jb4gu FINAL: turn-settlement self-todo emit (CLI/SDK path) ──
+//
+// The missing TRIGGER for CLI/SDK-backend turns. Those turns have the letta
+// CLI write messages.jsonl DIRECTLY — the shim never sees a tool_call frame,
+// so ingestSelfTodoFrame never runs and getSelfTodoSnapshot stays NULL (the
+// live snapshot is never populated and no change event ever fires). The fix
+// hooks the universal post-turn chokepoint (finalizeTurnLifecycle, called by
+// BOTH adapters) to call refreshSelfTodoFromDisk(agentId, conversationId),
+// which re-reads the just-settled messages.jsonl, and — only if the plan
+// CHANGED vs the cached snapshot — populates getSelfTodoSnapshot AND fires the
+// same emit() the server broadcast subscribes to.
+//
+// This test models the CLI transcript on disk (TaskCreate sequence with the
+// harness-assigned task_<n> results, exactly as the CLI writes it), then runs
+// the settlement refresh and asserts:
+//   1. getSelfTodoSnapshot goes from NULL (no live ingest ran) to the current
+//      task list, and
+//   2. a self-todo change event fires carrying that list (so the landed
+//      server broadcast can deliver it to the push-client phone), and
+//   3. a second refresh with the SAME on-disk plan dedupes (no re-emit), while
+//   4. a subsequent on-disk change (a NEW TaskCreate) does re-emit.
+test("self-todo: turn-settlement refresh populates the NULL snapshot AND emits a change from a CLI-written messages.jsonl", () => {
+  const conv = "conv-settle-jb4gu-0001";
+  const agent = "agent-settle-jb4gu-0001";
+
+  // The CLI-written transcript: a fresh session task list (TaskCreate ×2 with
+  // the harness task_<n> results), then a TaskUpdate completing task_1 — the
+  // shape readSelfTodos/reconstructSessionTasks reads off disk. The shim never
+  // saw a frame for this turn (no ingestSelfTodoFrame call), so the live
+  // snapshot is null going in.
+  writeMessages(conv, agent, [
+    userMsg("u1", "plan it out"),
+    ...taskCreateWithResult("c1", { subject: "Validate the self chip renders", activeForm: "Validating the self chip" }, "task_1"),
+    ...taskCreateWithResult("c2", { subject: "Tap to open the sheet", activeForm: "Opening the sheet" }, "task_2"),
+    taskCallMsg("u2", "TaskUpdate", { taskId: "task_1", status: "completed" }),
+  ]);
+
+  // Precondition: no live ingest ran, so the in-memory snapshot is NULL —
+  // exactly the CLI/SDK bug the bead pinned down live.
+  assert.equal(getSelfTodoSnapshot(conv), null, "no live ingest ⇒ snapshot starts NULL");
+
+  // Capture change events exactly as server.ts#wireSelfTodoChannelBroadcast's
+  // subscriber would see them.
+  const events: Array<{ conversationId: string; agentId: string | null; todos: Array<{ content: string; status: string }> }> = [];
+  const unsub = subscribeSelfTodoEvents((e) => {
+    events.push({ conversationId: e.conversationId, agentId: e.agentId, todos: e.todos.map((t) => ({ content: t.content, status: t.status })) });
+  });
+
+  try {
+    // The settlement hook (finalizeTurnLifecycle → refreshSelfTodoFromDisk).
+    const refreshed = refreshSelfTodoFromDisk(agent, conv);
+
+    // 1. The previously-NULL snapshot is now populated from disk.
+    assert.ok(refreshed, "refresh returns the emitted snapshot when the plan changed");
+    const live = getSelfTodoSnapshot(conv);
+    assert.ok(live, "getSelfTodoSnapshot(conv) is NON-NULL after the settlement refresh");
+    assert.equal(live!.agentId, agent, "snapshot carries the settled agent id");
+    assert.equal(live!.conversationId, conv, "snapshot carries the settled conversation id");
+    assert.deepEqual(
+      live!.todos.map((t) => ({ content: t.content, status: t.status })),
+      [
+        { content: "Validate the self chip renders", status: "completed" },
+        { content: "Tap to open the sheet", status: "pending" },
+      ],
+      "the snapshot reflects the CLI-written task list (task_1 completed)",
+    );
+
+    // 2. A change event fired carrying that list (drives the server broadcast).
+    assert.equal(events.length, 1, "exactly one change event fired on first refresh");
+    assert.equal(events[0]!.conversationId, conv);
+    assert.equal(events[0]!.agentId, agent);
+    assert.deepEqual(events[0]!.todos, live!.todos.map((t) => ({ content: t.content, status: t.status })));
+
+    // 3. Re-running the settlement refresh with the SAME on-disk plan dedupes.
+    const again = refreshSelfTodoFromDisk(agent, conv);
+    assert.equal(again, null, "identical plan ⇒ no re-emit (dedupe guard)");
+    assert.equal(events.length, 1, "no second event for an unchanged plan");
+
+    // 4. A subsequent on-disk change DOES re-emit (next settled turn).
+    writeMessages(conv, agent, [
+      userMsg("u1", "plan it out"),
+      ...taskCreateWithResult("c1", { subject: "Validate the self chip renders", activeForm: "Validating the self chip" }, "task_1"),
+      ...taskCreateWithResult("c2", { subject: "Tap to open the sheet", activeForm: "Opening the sheet" }, "task_2"),
+      taskCallMsg("u2", "TaskUpdate", { taskId: "task_1", status: "completed" }),
+      ...taskCreateWithResult("c3", { subject: "Confirm progress and no crash", activeForm: "Confirming progress" }, "task_3"),
+    ]);
+    const third = refreshSelfTodoFromDisk(agent, conv);
+    assert.ok(third, "a NEW on-disk task re-emits");
+    assert.equal(events.length, 2, "exactly one more change event for the new task");
+    assert.deepEqual(
+      events[1]!.todos.map((t) => t.content),
+      ["Validate the self chip renders", "Tap to open the sheet", "Confirm progress and no crash"],
+      "the re-emitted snapshot includes the newly-created task",
+    );
+  } finally {
+    unsub();
+  }
+});
+
+// Guards: the refresh must NOT emit when there's no plan on disk, and must not
+// throw on a missing/unreadable store (settlement runs on EVERY turn end).
+test("self-todo: turn-settlement refresh is a safe no-op when the conversation has no plan", () => {
+  const conv = "conv-settle-jb4gu-empty";
+  const agent = "agent-settle-jb4gu-empty";
+  // A transcript with no Task*/TodoWrite calls at all.
+  writeMessages(conv, agent, [userMsg("u1", "just chatting"), { id: "a1", role: "assistant", content: [{ type: "text", text: "hi" }] }]);
+
+  let fired = 0;
+  const unsub = subscribeSelfTodoEvents(() => {
+    fired += 1;
+  });
+  try {
+    const out = refreshSelfTodoFromDisk(agent, conv);
+    assert.equal(out, null, "no plan ⇒ returns null");
+    assert.equal(getSelfTodoSnapshot(conv), null, "no plan ⇒ snapshot stays null");
+    assert.equal(fired, 0, "no plan ⇒ no change event");
+
+    // Unknown conversation (store has no file) — must not throw, must no-op.
+    const missing = refreshSelfTodoFromDisk("agent-nope", "conv-nope");
+    assert.equal(missing, null, "missing store ⇒ null, no throw");
+    assert.equal(fired, 0, "missing store ⇒ no event");
+  } finally {
+    unsub();
+  }
 });

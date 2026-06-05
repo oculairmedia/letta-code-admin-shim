@@ -303,6 +303,20 @@ export async function bridgeSendMessage(
     // reshapeFrame omits conversation_id (the ws-handler stamps it on emit),
     // so the resolved effectiveConvId is passed explicitly here.
     try {
+      if (process.env["SELF_TODO_DEBUG"]) {
+        const fr = frame as unknown as Record<string, unknown>;
+        const tc = (fr["tool_call"] ?? fr["toolCall"]) as Record<string, unknown> | undefined;
+        // eslint-disable-next-line no-console
+        console.error(
+          "[self-todo] emit() frame:",
+          JSON.stringify({
+            message_type: fr["message_type"],
+            tc_name: tc?.["name"],
+            effectiveConvId,
+            effectiveAgentId,
+          }),
+        );
+      }
       ingestSelfTodoFrame(frame, effectiveConvId, effectiveAgentId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

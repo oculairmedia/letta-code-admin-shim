@@ -64,7 +64,12 @@ import {
   discoverOpenAICompatibleModels,
   FALLBACK_MODEL_CATALOG,
 } from "./lib/model-catalog.js";
-import { bridgeSendMessage, getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
+import {
+  bridgeSendMessage,
+  buildSelfTodoSnapshotFrame,
+  getMobileChannelAdapter,
+  subscribeSelfTodoEvents,
+} from "./lib/mobile-channel-host.js";
 import { mobileConversationCursorCapabilities } from "./lib/mobile-conversation-cursors.js";
 import {
   getCronSchedulerStatus,
@@ -1611,6 +1616,17 @@ server.listen(PORT, HOST, () => {
   console.log(`letta-code admin shim listening on http://${HOST}:${actualPort}`);
   console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env["LETTA_LOCAL_BACKEND_DIR"] ?? "(default)"}`);
 
+  // letta-mobile-jb4gu: wire the server-level self-todo channel broadcast so
+  // a live TaskCreate/TaskUpdate turn pushes the self chip to registered
+  // push-clients regardless of which socket (if any) is mid-streaming the
+  // conversation. The subscription is registered eagerly (cheap), but the
+  // mobile adapter is NOT force-loaded here — it stays lazy (loaded on the
+  // first WS upgrade) so per-deployment account config (e.g. ping cadence) is
+  // read at connect time, not frozen at startup. The broadcast listener
+  // no-ops while mobileAdapter is null and starts delivering once the adapter
+  // is loaded.
+  wireSelfTodoChannelBroadcast();
+
   // lcp-0mw: claim the cron scheduler lease and start ticking. Set
   // SHIM_CRON_ENABLED=0 to opt out (tests do this so the suite doesn't
   // race a live scheduler). Default is on because cron is the shim's
@@ -1715,6 +1731,52 @@ function pushMobileChannelFrame(frame: Record<string, unknown>): void {
   if (typeof sender !== "function") return;
   void sender(frame).catch((err: unknown) => {
     console.warn(`[mobile-channel] channel push failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+}
+
+// letta-mobile-jb4gu: broadcast the MAIN agent's self-todo snapshot to the
+// registered mobile push-clients on every live ingest change.
+//
+// ROOT CAUSE this closes: the in-process self-todo live ingest DOES fire and
+// DOES populate getSelfTodoSnapshot (verified by replaying real run frames),
+// and ws-handler subscribes each socket to host.subscribeSelfTodoEvents. But
+// the phone is a PUSH/CONTROL client whose /shim/v1/mobile socket is
+// short-lived (hello -> push registered -> cancel -> closed). The mid-turn
+// self-todo change event therefore reaches NO per-socket subscriber if no
+// socket happens to be connected at that instant, and a later-reconnecting
+// push-client is never re-hydrated (push registration carries no conversation
+// id). So the chip stays empty even though the snapshot exists in-process.
+//
+// The fix mirrors the cron channel-push path: subscribe ONCE at the server
+// level and broadcast the snapshot frame to ALL registered push-clients via
+// the adapter's sendMessage (the same primitive cron fires reach the phone
+// through). The push-client phone is a registered client, so it receives the
+// self-todo tool_call_message and the chip updates without depending on a
+// conversation-streaming socket being live at the emit instant. Mobile keys
+// the self chip by conversation_id, so a broadcast is correctly filtered
+// client-side.
+let _selfTodoBroadcastWired = false;
+function wireSelfTodoChannelBroadcast(): void {
+  if (_selfTodoBroadcastWired) return;
+  _selfTodoBroadcastWired = true;
+  subscribeSelfTodoEvents((event) => {
+    if (!event || typeof event.conversationId !== "string" || event.conversationId.length === 0) {
+      return;
+    }
+    // Only broadcast when a push-capable adapter exists (the mobile channel is
+    // configured + an account is enabled). buildSelfTodoSnapshotFrame returns
+    // null when there is no plan to surface, so empty turns push nothing.
+    if (!mobileAdapter) return;
+    void buildSelfTodoSnapshotFrame(event.conversationId, event.agentId ?? null)
+      .then((frame) => {
+        if (!frame) return;
+        pushMobileChannelFrame(frame);
+      })
+      .catch((err: unknown) => {
+        console.warn(
+          `[mobile-channel] self-todo broadcast failed conversation=${event.conversationId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
   });
 }
 
