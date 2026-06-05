@@ -81,6 +81,30 @@ function taskCallMsg(id: string, name: "TaskCreate" | "TaskUpdate", args: unknow
   };
 }
 
+/**
+ * A TaskCreate call whose tool RESULT carries the harness-assigned
+ * `task_<n>` id — the authoritative list-reset signal (a `task_1` after a
+ * non-empty list begins a fresh working list). Returns the [call, result]
+ * message pair so a realistic transcript can interleave them.
+ */
+function taskCreateWithResult(
+  id: string,
+  args: { subject: string; activeForm?: string },
+  assignedTaskId: string,
+) {
+  const callId = `tc-${id}`;
+  return [
+    { id, role: "assistant", content: [{ type: "toolCall", id: callId, name: "TaskCreate", arguments: args }] },
+    {
+      id: `${id}-r`,
+      role: "toolResult",
+      toolCallId: callId,
+      toolName: "TaskCreate",
+      content: [{ type: "text", text: JSON.stringify({ taskId: assignedTaskId, ...args, status: "pending" }) }],
+    },
+  ];
+}
+
 before(() => {
   __resetSelfTodo();
 });
@@ -392,4 +416,153 @@ test("self-todo: ingestSelfTodoFrame still ignores non-plan tool calls (Bash)", 
   };
   assert.equal(ingestSelfTodoFrame(frame, "conv-nope", "agent-local-nope"), null);
   assert.equal(getSelfTodoSnapshot("conv-nope"), null);
+});
+
+// ── letta-mobile-jb4gu defect 1: LIVE reshaped-frame shape (dual carriage) ──
+//
+// The reshaped frame the host emits (and persists to runs/<id>/frames.jsonl)
+// carries the SAME tool call in BOTH `tool_call` (singular) AND
+// `tool_calls` (array) — reshapeFrame sets `tool_calls: tcs ?? (tc ? [tc] :
+// null)`. The pre-fix ingest folded BOTH, doubling every TaskCreate so a
+// 2-task list projected 4 items. This is the exact live shape captured from
+// runs/run-5ed0af20.../frames.jsonl.
+test("self-todo: live reshaped frame carrying tool_call AND tool_calls (same call) folds ONCE, not twice", () => {
+  const conv = "conv-live-dual-carriage";
+  const agentId = "agent-live-dual";
+
+  const createCall = {
+    tool_call_id: "toolu_live_1",
+    name: "TaskCreate",
+    arguments: JSON.stringify({
+      subject: "Self chip retest after #28",
+      description: "Validate self-todo chip now shows main-conversation tasks.",
+      activeForm: "Retesting self chip",
+    }),
+  };
+  // EXACT live shape: singular `tool_call` duplicated into `tool_calls[]`.
+  const snap = ingestSelfTodoFrame(
+    {
+      id: "toolcall-toolu_live_1",
+      message_type: "tool_call_message",
+      tool_call: createCall,
+      tool_calls: [createCall],
+    },
+    conv,
+    agentId,
+  );
+  assert.ok(snap, "live dual-carriage TaskCreate frame must produce a snapshot (not NULL)");
+  // The defect produced length 2 (the same task twice). Must be exactly 1.
+  assert.equal(snap!.todos.length, 1, "the duplicated tool_call/tool_calls entry must fold ONCE");
+  assert.equal(snap!.todos[0]!.content, "Self chip retest after #28");
+
+  // getSelfTodoSnapshot(conv) is NON-NULL after the live ingest.
+  const live = getSelfTodoSnapshot(conv);
+  assert.ok(live, "getSelfTodoSnapshot must be non-null after a live ingest");
+  assert.equal(live!.todos.length, 1);
+
+  // A second dual-carriage create extends the (still single) current list.
+  const create2 = {
+    tool_call_id: "toolu_live_2",
+    name: "TaskCreate",
+    arguments: JSON.stringify({ subject: "Confirm correct tasks (not stale)", activeForm: "Confirming correct tasks" }),
+  };
+  const snap2 = ingestSelfTodoFrame(
+    { message_type: "tool_call_message", tool_call: create2, tool_calls: [create2] },
+    conv,
+    agentId,
+  );
+  assert.equal(snap2!.todos.length, 2, "two distinct creates -> two tasks (no doubling)");
+  assert.deepEqual(snap2!.todos.map((t) => t.content), [
+    "Self chip retest after #28",
+    "Confirm correct tasks (not stale)",
+  ]);
+});
+
+// ── letta-mobile-jb4gu defect 2: live ingest must scope to the CURRENT list ──
+//
+// A TaskCreate that follows a TaskUpdate starts a NEW working list (the
+// harness `task_<n>` counter resets). The live accumulator must drop the
+// prior list instead of piling up across sessions.
+test("self-todo: live ingest resets the list when a new TaskCreate follows a TaskUpdate", () => {
+  const conv = "conv-live-reset";
+  const agentId = "agent-live-reset";
+  const frame = (name: "TaskCreate" | "TaskUpdate", id: string, args: unknown) => ({
+    message_type: "tool_call_message",
+    tool_call: { tool_call_id: id, name, arguments: JSON.stringify(args) },
+  });
+
+  // List A: one task, then mark it in_progress.
+  ingestSelfTodoFrame(frame("TaskCreate", "a1", { subject: "Old list task", activeForm: "Old listing" }), conv, agentId);
+  ingestSelfTodoFrame(frame("TaskUpdate", "a2", { taskId: "task_1", status: "in_progress" }), conv, agentId);
+
+  // List B (NEW): create-after-update resets. task_1 now refers to the new task.
+  ingestSelfTodoFrame(frame("TaskCreate", "b1", { subject: "Fresh list task one", activeForm: "Freshing one" }), conv, agentId);
+  const snapB2 = ingestSelfTodoFrame(
+    frame("TaskCreate", "b2", { subject: "Fresh list task two", activeForm: "Freshing two" }),
+    conv,
+    agentId,
+  );
+  assert.equal(snapB2!.todos.length, 2, "current list is the NEW 2-task list, not 3 (no pile-up)");
+  assert.deepEqual(snapB2!.todos.map((t) => t.content), [
+    "Fresh list task one",
+    "Fresh list task two",
+  ]);
+
+  // A TaskUpdate task_1 in the new list targets "Fresh list task one".
+  const updated = ingestSelfTodoFrame(frame("TaskUpdate", "b3", { taskId: "task_1", status: "completed" }), conv, agentId);
+  assert.equal(updated!.todos[0]!.content, "Fresh list task one");
+  assert.equal(updated!.todos[0]!.status, "completed");
+  assert.equal(getSelfTodoSnapshot(conv)!.todos.length, 2);
+});
+
+// ── letta-mobile-jb4gu defect 2: disk reconstruct returns ONLY the current list ──
+//
+// A realistic transcript folds MULTIPLE task-list sessions (each begins with
+// an assigned `task_1`). reconstructSessionTasks must surface ONLY the last
+// (current) list, honoring the authoritative reset signal from the
+// TaskCreate tool RESULT — not pile up all 6 tasks across 3 sessions.
+test("self-todo: reconstruct returns ONLY the current list across multiple reset sessions (not the whole history)", () => {
+  const agentId = "agent-local-multi-session";
+  const conversationId = "conv-multi-session";
+  writeMessages(conversationId, agentId, [
+    userMsg("u1", "plan it"),
+    // Session 1: task_1 only, then completed.
+    ...taskCreateWithResult("s1c1", { subject: "Old session one", activeForm: "Olding one" }, "task_1"),
+    taskCallMsg("s1u1", "TaskUpdate", { taskId: "task_1", status: "completed" }),
+    // Session 2 (RESET -> task_1): two tasks, worked.
+    ...taskCreateWithResult("s2c1", { subject: "Mid session one", activeForm: "Midding one" }, "task_1"),
+    ...taskCreateWithResult("s2c2", { subject: "Mid session two", activeForm: "Midding two" }, "task_2"),
+    taskCallMsg("s2u1", "TaskUpdate", { taskId: "task_1", status: "completed" }),
+    taskCallMsg("s2u2", "TaskUpdate", { taskId: "task_2", status: "in_progress" }),
+    // Session 3 (CURRENT, RESET -> task_1): the live working set.
+    ...taskCreateWithResult("s3c1", { subject: "Current session A", activeForm: "Currenting A" }, "task_1"),
+    ...taskCreateWithResult("s3c2", { subject: "Current session B", activeForm: "Currenting B" }, "task_2"),
+    taskCallMsg("s3u1", "TaskUpdate", { taskId: "task_1", status: "in_progress" }),
+  ]);
+
+  const snap = readSelfTodos(agentId, conversationId);
+  assert.equal(snap.found, true);
+  assert.equal(snap.todos.length, 2, "only the CURRENT 2-task list, not all 5 tasks ever created");
+  assert.deepEqual(snap.todos.map((t) => t.content), ["Current session A", "Current session B"]);
+  assert.deepEqual(snap.todos.map((t) => t.status), ["in_progress", "pending"]);
+});
+
+// Reconstruct heuristic fallback: even without tool results, a create that
+// follows an update resets the list (the live stream has no correlated
+// result for the disk fold).
+test("self-todo: reconstruct without tool results falls back to create-after-update reset", () => {
+  const agentId = "agent-local-heuristic";
+  const conversationId = "conv-heuristic";
+  writeMessages(conversationId, agentId, [
+    taskCallMsg("c1", "TaskCreate", { subject: "old A", activeForm: "Old A" }),
+    taskCallMsg("u1", "TaskUpdate", { taskId: "task_1", status: "completed" }),
+    // create-after-update => new list
+    taskCallMsg("c2", "TaskCreate", { subject: "new A", activeForm: "New A" }),
+    taskCallMsg("c3", "TaskCreate", { subject: "new B", activeForm: "New B" }),
+    taskCallMsg("u2", "TaskUpdate", { taskId: "task_2", status: "in_progress" }),
+  ]);
+  const snap = readSelfTodos(agentId, conversationId);
+  assert.equal(snap.todos.length, 2, "current list only (new A, new B)");
+  assert.deepEqual(snap.todos.map((t) => t.content), ["new A", "new B"]);
+  assert.deepEqual(snap.todos.map((t) => t.status), ["pending", "in_progress"]);
 });
