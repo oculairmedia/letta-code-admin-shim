@@ -8,8 +8,8 @@
   "scripts": {
     "start": "node dist/server.js",
     "dev": "tsx watch server.ts",
-    "test": "node --import tsx/esm --test --test-concurrency=1 --test-reporter=spec test/*.test.ts",
-    "test:watch": "node --import tsx/esm --test --test-concurrency=1 --watch test/*.test.ts",
+    "test": "NODE_OPTIONS=\"--import tsx/esm\" node --test --test-concurrency=1 --test-reporter=spec test/*.test.ts",
+    "test:watch": "NODE_OPTIONS=\"--import tsx/esm\" node --test --test-concurrency=1 --watch test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build"
