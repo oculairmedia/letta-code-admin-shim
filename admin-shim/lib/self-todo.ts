@@ -43,10 +43,21 @@
  */
 
 import { extractLatestTodos, readConversationTodos, type TodoItem, type TodoSnapshot } from "./subagent-todos.js";
+import {
+  TASK_CREATE_TOOL,
+  TASK_UPDATE_TOOL,
+  applyTaskCreate,
+  applyTaskUpdate,
+  newSessionTaskAccumulator,
+  projectSessionTasks,
+  reconstructSessionTasks,
+  type SessionTaskAccumulator,
+} from "./session-tasks.js";
+import { listMessagesSync } from "./store.js";
 import type { LocalMessage } from "./types/letta-stream.js";
 import type { ToolCall, ToolCallMessage } from "./types/wire.js";
 
-/** Tool name the main agent's self-plan rides on. */
+/** Tool name the (sub)agent's self-plan rides on (subagent path). */
 export const SELF_TODO_TOOL = "TodoWrite";
 
 /** A self-todo snapshot for one conversation. */
@@ -67,6 +78,11 @@ type Listener = (event: SelfTodoEvent) => void;
 
 // conversationId -> latest known self-todo snapshot.
 const _byConversation = new Map<string, SelfTodoSnapshot>();
+// conversationId -> live session task-list accumulator (letta-mobile-rp1vp).
+// The MAIN agent's plan rides TaskCreate/TaskUpdate, not TodoWrite; we fold
+// those events here so a TaskUpdate's `task_<n>` resolves against the
+// matching TaskCreate even though they arrive on separate frames.
+const _sessionTasksByConversation = new Map<string, SessionTaskAccumulator>();
 const _listeners = new Set<Listener>();
 
 function nowIso(): string {
@@ -98,24 +114,36 @@ export function subscribeSelfTodoEvents(listener: Listener): () => void {
 }
 
 /**
- * Extract the (first) TodoWrite tool call from a reshaped
- * `tool_call_message` frame. Mirrors mobile's `allToolCalls()` union over
- * `tool_call` (singular) + `tool_calls` (array). Returns null when the
- * frame is not a TodoWrite tool call.
+ * Tool names whose tool_call_message frames carry the main agent's plan:
+ *  - TodoWrite: the subagent/legacy self-plan mechanism.
+ *  - TaskCreate / TaskUpdate: the MAIN agent's session task list
+ *    (letta-mobile-rp1vp) — the harness `manage_todo` tool surfaces as
+ *    these two call names in the stream.
  */
-function todoWriteCallFromFrame(frame: unknown): ToolCall | null {
-  if (!frame || typeof frame !== "object") return null;
+const SELF_TODO_FRAME_TOOLS = new Set<string>([
+  SELF_TODO_TOOL,
+  TASK_CREATE_TOOL,
+  TASK_UPDATE_TOOL,
+]);
+
+/**
+ * Extract every plan-carrying tool call (TodoWrite / TaskCreate /
+ * TaskUpdate), IN ORDER, from a reshaped `tool_call_message` frame. Mirrors
+ * mobile's `allToolCalls()` union over `tool_call` (singular) + `tool_calls`
+ * (array). Returns [] when the frame carries none.
+ */
+function planCallsFromFrame(frame: unknown): ToolCall[] {
+  if (!frame || typeof frame !== "object") return [];
   const f = frame as Record<string, unknown>;
-  if (f["message_type"] !== "tool_call_message") return null;
+  if (f["message_type"] !== "tool_call_message") return [];
   const single = (f["tool_call"] ?? null) as ToolCall | null;
   const many = (f["tool_calls"] ?? null) as ToolCall[] | null;
   const calls: ToolCall[] = [];
   if (single) calls.push(single);
   if (Array.isArray(many)) calls.push(...many);
-  for (const call of calls) {
-    if (call && typeof call === "object" && call.name === SELF_TODO_TOOL) return call;
-  }
-  return null;
+  return calls.filter(
+    (call) => call && typeof call === "object" && SELF_TODO_FRAME_TOOLS.has(call.name),
+  );
 }
 
 /**
@@ -135,10 +163,16 @@ function todosFromCall(call: ToolCall): TodoItem[] {
 
 /**
  * Feed a reshaped bridge frame to the self-todo tracker. Cheaply ignores
- * everything that is not the main agent's TodoWrite tool call. On a
- * TodoWrite frame it records the latest snapshot for the frame's
- * `conversation_id` and broadcasts a change event so connected sockets can
- * push the fresh snapshot.
+ * everything that is not a plan-carrying tool call (TodoWrite for the
+ * subagent/legacy path; TaskCreate / TaskUpdate for the MAIN agent's
+ * session task list — letta-mobile-rp1vp). On a plan frame it records the
+ * latest snapshot for the frame's `conversation_id` and broadcasts a change
+ * event so connected sockets can push the fresh snapshot.
+ *
+ * For the session task list, TaskCreate/TaskUpdate events are FOLDED into a
+ * per-conversation accumulator so a TaskUpdate's `task_<n>` reference
+ * resolves against its earlier TaskCreate (the two ride separate frames).
+ * A TodoWrite frame still wins as a full-list snapshot.
  *
  * Returns the updated snapshot (or null if the frame was ignored).
  *
@@ -153,8 +187,8 @@ export function ingestSelfTodoFrame(
   conversationId: string | null,
   agentId: string | null,
 ): SelfTodoSnapshot | null {
-  const call = todoWriteCallFromFrame(frame);
-  if (!call) return null;
+  const calls = planCallsFromFrame(frame);
+  if (calls.length === 0) return null;
   const f = frame as Record<string, unknown>;
   // Prefer the explicit conversationId the host resolved for this turn;
   // fall back to a conversation_id the frame carries (it usually doesn't —
@@ -163,14 +197,51 @@ export function ingestSelfTodoFrame(
     (typeof conversationId === "string" && conversationId.length > 0 && conversationId) ||
     (typeof f["conversation_id"] === "string" ? (f["conversation_id"] as string) : null);
   if (!conv) return null;
+  const resolvedAgentId =
+    agentId ?? (typeof f["agent_id"] === "string" ? (f["agent_id"] as string) : null);
+
+  // Fold the frame's plan calls. TodoWrite carries the whole list (latest
+  // wins). TaskCreate/TaskUpdate mutate the per-conversation accumulator.
+  let todos: TodoItem[] | null = null;
+  let sessionTouched = false;
+  for (const call of calls) {
+    if (call.name === SELF_TODO_TOOL) {
+      todos = todosFromCall(call);
+    } else if (call.name === TASK_CREATE_TOOL) {
+      applyTaskCreate(getOrInitSessionTasks(conv), call.arguments);
+      sessionTouched = true;
+    } else if (call.name === TASK_UPDATE_TOOL) {
+      applyTaskUpdate(getOrInitSessionTasks(conv), call.arguments);
+      sessionTouched = true;
+    }
+  }
+  // A TodoWrite list (if any) wins; otherwise project the folded session
+  // task list. If only a TaskUpdate landed for an as-yet-unseen conv (no
+  // prior TaskCreate this session), the projection is empty — but we still
+  // record/emit so a later disk read can hydrate the chip.
+  if (todos === null) {
+    if (!sessionTouched) return null;
+    todos = projectSessionTasks(getOrInitSessionTasks(conv));
+  }
+
   const snapshot: SelfTodoSnapshot = {
     conversationId: conv,
-    agentId: agentId ?? (typeof f["agent_id"] === "string" ? (f["agent_id"] as string) : null),
-    todos: todosFromCall(call),
+    agentId: resolvedAgentId,
+    todos,
   };
   _byConversation.set(conv, snapshot);
   emit(snapshot);
   return snapshot;
+}
+
+/** Get (or lazily create) the live session-task accumulator for a conv. */
+function getOrInitSessionTasks(conversationId: string): SessionTaskAccumulator {
+  let acc = _sessionTasksByConversation.get(conversationId);
+  if (!acc) {
+    acc = newSessionTaskAccumulator();
+    _sessionTasksByConversation.set(conversationId, acc);
+  }
+  return acc;
 }
 
 /**
@@ -182,14 +253,32 @@ export function getSelfTodoSnapshot(conversationId: string): SelfTodoSnapshot | 
 }
 
 /**
- * Read the main agent's latest TodoWrite snapshot for a conversation from
- * disk (the lc-local-backend transcript), used on (re)subscribe and by the
- * sheet's `todos(conversationId)` fetch path. Reuses the generic
- * `readConversationTodos` extractor. Returns an empty, not-found snapshot if
- * the store is unreadable or no TodoWrite was ever called.
+ * Read the main agent's latest plan snapshot for a conversation from disk
+ * (the lc-local-backend transcript), used on (re)subscribe and by the
+ * sheet's `todos(conversationId)` fetch path.
+ *
+ * Resolution order (letta-mobile-rp1vp):
+ *  1. The newest TodoWrite call (legacy/subagent path) via the generic
+ *     `readConversationTodos` extractor — newest-wins, full list.
+ *  2. If no TodoWrite was ever called, reconstruct the MAIN agent's session
+ *     task list by folding every TaskCreate/TaskUpdate event in the
+ *     transcript (this is what the foreground agent actually uses).
+ *
+ * Returns an empty, not-found snapshot if the store is unreadable or the
+ * conversation used neither mechanism.
  */
 export function readSelfTodos(agentId: string, conversationId: string): TodoSnapshot {
-  return readConversationTodos(agentId, conversationId);
+  const viaTodoWrite = readConversationTodos(agentId, conversationId);
+  if (viaTodoWrite.found) return viaTodoWrite;
+  // Fall back to the session task list (the MAIN agent's actual mechanism).
+  try {
+    const messages = listMessagesSync(conversationId, agentId);
+    const session = reconstructSessionTasks(messages);
+    if (session.found) return { todos: session.todos, found: true };
+  } catch {
+    /* unreadable store — fall through to not-found */
+  }
+  return viaTodoWrite;
 }
 
 /**
@@ -244,8 +333,9 @@ export function buildSelfTodoFrame(
   return frame;
 }
 
-/** Test-only: drop every snapshot + listener. */
+/** Test-only: drop every snapshot, session-task accumulator + listener. */
 export function __resetSelfTodo(): void {
   _byConversation.clear();
+  _sessionTasksByConversation.clear();
   _listeners.clear();
 }
