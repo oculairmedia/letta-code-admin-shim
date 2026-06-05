@@ -867,6 +867,16 @@ export function getAgentPool(): AgentPool {
   return _pool;
 }
 
+/**
+ * Test-only: substitute the process-wide agent pool singleton with a fake
+ * (e.g. one whose `runTurnWithHeal` resolves immediately) so callers like
+ * `bridgeSendMessage` can be exercised without spinning a real worker. Pass
+ * `null` to restore the lazy default. Never used by production code.
+ */
+export function __setAgentPoolForTest(pool: AgentPool | null): void {
+  _pool = pool;
+}
+
 // Re-export cancelRun so cancel handlers don't have to import runs.mjs
 // directly. `cancelRun(runId)` triggers the onCancel hook registered in
 // runTurn, which SIGTERMs the worker and flips the Run's status to
