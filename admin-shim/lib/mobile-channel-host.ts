@@ -45,6 +45,7 @@ import {
   getSelfTodoSnapshot,
   ingestSelfTodoFrame,
   readSelfTodos,
+  refreshSelfTodoFromDisk,
   subscribeSelfTodoEvents,
   type SelfTodoEvent,
 } from "./self-todo.js";
@@ -773,6 +774,35 @@ export async function bridgeSendMessage(
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[mobile-channel] otid bind failed: ${errMsg}`);
     }
+  }
+
+  // letta-mobile-jb4gu: settle-hook on the PROVEN-firing turn-end path.
+  //
+  // The main agent's session-task calls (TaskCreate/TaskUpdate) are handled
+  // client-side and only land in messages.jsonl as tool RESULTS — they are
+  // NEVER emitted as tool_call frames through emit(), so live ingest
+  // (planCallsFromFrame -> 0) can never populate getSelfTodoSnapshot for
+  // them. The only way to surface them is a disk re-read after the turn
+  // settles.
+  //
+  // The pre-existing settle-hook (refreshSelfTodoFromDisk wired into
+  // finalizeTurnLifecycle) was PROVEN by SELF_TODO_DEBUG=1 on live turns to
+  // NEVER run on this driver's turns — finalizeTurnLifecycle is not on the
+  // bridgeSendMessage -> pool.runTurnWithHeal path these turns take. The
+  // emit() wrapper above (which logs '[self-todo] emit() frame') IS proven to
+  // fire for these same turns, so this point — directly after the awaited
+  // runTurnWithHeal returns (turn settled) — is on the proven-firing path.
+  //
+  // refreshSelfTodoFromDisk(agentId, conversationId) re-reads the conversation
+  // transcript, and on a change emits a self-todo event -> the landed server
+  // broadcast delivers the chip to the registered push-client. Its "only if
+  // changed" guard dedupes, so keeping the finalizeTurnLifecycle call (for
+  // other drivers) alongside this one is safe.
+  try {
+    refreshSelfTodoFromDisk(effectiveAgentId, effectiveConvId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[mobile-channel] self-todo refreshFromDisk failed: ${msg}`);
   }
 
   return turn;
