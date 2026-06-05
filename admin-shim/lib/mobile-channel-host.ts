@@ -41,6 +41,14 @@ import {
 } from "./subagent-registry.js";
 import { readSubagentTodos, type TodoSnapshot } from "./subagent-todos.js";
 import {
+  buildSelfTodoFrame,
+  getSelfTodoSnapshot,
+  ingestSelfTodoFrame,
+  readSelfTodos,
+  subscribeSelfTodoEvents,
+  type SelfTodoEvent,
+} from "./self-todo.js";
+import {
   ackConversation,
   mobileConversationCursorCapabilities,
   resumeConversation,
@@ -287,6 +295,18 @@ export async function bridgeSendMessage(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[mobile-channel] subagent-registry ingest failed: ${msg}`);
+    }
+    // letta-mobile-gnyf7: feed the MAIN agent's own TodoWrite frames to the
+    // self-todo tracker. Cheaply ignores non-TodoWrite frames; a TodoWrite
+    // tool_call_message records the latest per-conversation snapshot and
+    // broadcasts a change so connected sockets push the fresh self chip.
+    // reshapeFrame omits conversation_id (the ws-handler stamps it on emit),
+    // so the resolved effectiveConvId is passed explicitly here.
+    try {
+      ingestSelfTodoFrame(frame, effectiveConvId, effectiveAgentId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] self-todo ingest failed: ${msg}`);
     }
     const { seq } = appendRunFrame(runHandle.id, frame);
     if (seq > 0) {
@@ -1314,6 +1334,93 @@ export function handleSubagentTodos(
 export { subscribeSubagentEvents };
 export type { SubagentEntry, SubagentEvent };
 
+// ── Self-todo WS handlers (letta-mobile-gnyf7) ───────────────────────
+//
+// The MAIN/foreground agent's own TodoWrite plan. Backed by lib/self-todo.ts
+// (per-conversation in-memory snapshot + disk fallback). Unlike the subagent
+// registry, this is keyed by `conversationId` (the active conversation), not
+// a parent Agent tool_call_id. The mobile SelfTodoRepository consumes the
+// ordinary `tool_call_message` frame; these handlers (re)hydrate that frame
+// on (re)subscribe so the self chip appears even when the user wasn't
+// watching the live turn.
+
+/**
+ * Resolve the agent that owns a (possibly external) conversation id so the
+ * disk read can address its message store. Prefers the live snapshot's
+ * agentId, then the caller-supplied hint, then the on-disk conv→agent map.
+ */
+async function resolveSelfTodoAgent(
+  conversationId: string,
+  agentIdHint: string | null,
+): Promise<{ agentId: string; conversationId: string } | null> {
+  const snap = getSelfTodoSnapshot(conversationId);
+  if (snap?.agentId) return { agentId: snap.agentId, conversationId };
+  const resolved = await resolveConversationId(conversationId);
+  if (resolved) return { agentId: resolved.agentId, conversationId: resolved.conversationId };
+  if (agentIdHint) {
+    const effective = resolveAgentIdAlias(agentIdHint, (id) => getAgentRecord(id) != null);
+    return { agentId: effective, conversationId };
+  }
+  return null;
+}
+
+/**
+ * Read the main agent's latest TodoWrite snapshot for a conversation. Used
+ * by the sheet's `todos(conversationId)` fetch path and by the resubscribe
+ * push. Returns the live in-memory snapshot when present (most recent),
+ * otherwise reads the on-disk transcript.
+ */
+export async function handleSelfTodos(
+  conversationId: string,
+  agentIdHint: string | null = null,
+): Promise<{ found: boolean; conversation_id: string; agent_id: string | null; todos: TodoSnapshot["todos"]; todos_found: boolean }> {
+  if (typeof conversationId !== "string" || conversationId.length === 0) {
+    return { found: false, conversation_id: conversationId, agent_id: null, todos: [], todos_found: false };
+  }
+  const live = getSelfTodoSnapshot(conversationId);
+  if (live && live.todos.length > 0) {
+    return {
+      found: true,
+      conversation_id: conversationId,
+      agent_id: live.agentId,
+      todos: live.todos,
+      todos_found: true,
+    };
+  }
+  const target = await resolveSelfTodoAgent(conversationId, agentIdHint);
+  if (!target) {
+    return { found: false, conversation_id: conversationId, agent_id: null, todos: [], todos_found: false };
+  }
+  const snapshot = readSelfTodos(target.agentId, target.conversationId);
+  return {
+    found: true,
+    conversation_id: conversationId,
+    agent_id: target.agentId,
+    todos: snapshot.todos,
+    todos_found: snapshot.found,
+  };
+}
+
+/**
+ * Build the synthetic `tool_call_message` frame carrying a conversation's
+ * CURRENT self-todo snapshot, for the (re)subscribe push. Returns null when
+ * there is no plan to surface (so callers skip emitting an empty frame).
+ * The conversation_id on the returned frame is the EXTERNAL id the client
+ * sent, so mobile's per-conversation keying matches its own bookkeeping.
+ */
+export async function buildSelfTodoSnapshotFrame(
+  conversationId: string,
+  agentIdHint: string | null = null,
+): Promise<Record<string, unknown> | null> {
+  const result = await handleSelfTodos(conversationId, agentIdHint);
+  if (!result.todos_found || result.todos.length === 0) return null;
+  return buildSelfTodoFrame(conversationId, result.agent_id, result.todos);
+}
+
+/** Re-export the self-todo change subscription for the host wiring. */
+export { subscribeSelfTodoEvents };
+export type { SelfTodoEvent };
+
 /**
  * The `host` object the shim hands the channel plugin. Mirrors the
  * informal contract the plugin reads in `acceptConnection` (see
@@ -1352,6 +1459,11 @@ interface MobileChannelHost {
   handleSubagentList: typeof handleSubagentList;
   handleSubagentTodos: typeof handleSubagentTodos;
   subscribeSubagentEvents: typeof subscribeSubagentEvents;
+  // letta-mobile-gnyf7: MAIN agent's own TodoWrite plan (self chip). Read
+  // path for the sheet + (re)subscribe snapshot frame + live change push.
+  handleSelfTodos: typeof handleSelfTodos;
+  buildSelfTodoSnapshotFrame: typeof buildSelfTodoSnapshotFrame;
+  subscribeSelfTodoEvents: typeof subscribeSelfTodoEvents;
 }
 
 /**
@@ -1464,6 +1576,9 @@ async function createMobileChannelAdapter(
     handleSubagentList,
     handleSubagentTodos,
     subscribeSubagentEvents,
+    handleSelfTodos,
+    buildSelfTodoSnapshotFrame,
+    subscribeSelfTodoEvents,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();

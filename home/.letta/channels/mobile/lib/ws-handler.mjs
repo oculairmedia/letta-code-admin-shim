@@ -142,6 +142,11 @@ export function handleConnection(ws, request, host) {
   let cronEventsUnsubscribe = null;
   // letta-mobile-73o2h.1: per-socket subscription to subagents_updated push.
   let subagentEventsUnsubscribe = null;
+  // letta-mobile-gnyf7: per-socket subscription to self-todo change push.
+  let selfTodoEventsUnsubscribe = null;
+  // letta-mobile-gnyf7: conversations this socket has (re)subscribed to, so
+  // a self-todo change event only pushes to sockets watching that conv.
+  const selfTodoConversations = new Set();
   // lcp-cq7x: per-socket registration for server-originated channel pushes.
   // Installed only after hello auth succeeds so outbound sendMessage never
   // targets unauthenticated sockets.
@@ -170,6 +175,10 @@ export function handleConnection(ws, request, host) {
     if (subagentEventsUnsubscribe) {
       safeUnsubscribe("subagent events", subagentEventsUnsubscribe);
       subagentEventsUnsubscribe = null;
+    }
+    if (selfTodoEventsUnsubscribe) {
+      safeUnsubscribe("self-todo events", selfTodoEventsUnsubscribe);
+      selfTodoEventsUnsubscribe = null;
     }
     if (pushClientUnregister) {
       safeUnsubscribe("push client", pushClientUnregister);
@@ -207,6 +216,26 @@ export function handleConnection(ws, request, host) {
   const normalizeCursorSeq = (value) => {
     const n = typeof value === "number" ? value : Number(value ?? 0);
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  };
+
+  // letta-mobile-gnyf7: push the MAIN agent's CURRENT self-todo snapshot for
+  // a conversation as the ordinary `tool_call_message` frame mobile's
+  // SelfTodoRepository consumes. No-ops when the host handler isn't wired or
+  // there is no active plan to surface. Wrapped through stampConversationFrame
+  // so the frame gets the same v/ts/conversation envelope as live frames.
+  const pushSelfTodoSnapshot = async (conversationId, agentIdHint = null) => {
+    if (typeof conversationId !== "string" || conversationId.length === 0) return;
+    if (typeof host.buildSelfTodoSnapshotFrame !== "function") return;
+    let frame;
+    try {
+      frame = await host.buildSelfTodoSnapshotFrame(conversationId, agentIdHint);
+    } catch (err) {
+      log(`self-todo snapshot build failed conversation=${conversationId}: ${err?.message ?? err}`);
+      return;
+    }
+    if (!frame || closed) return;
+    const enveloped = stampConversationFrame(conversationId, makeFrame("tool_call_message", frame));
+    safeSend(ws, enveloped, log);
   };
 
   const isResumeResult = (value) => value
@@ -559,6 +588,9 @@ export function handleConnection(ws, request, host) {
         const resumeConversationId = typeof helloResume.conversation_id === "string" ? helloResume.conversation_id : null;
         if (resumeConversationId) {
           emitConversationResume(resumeConversationId, helloResume.after_seq ?? helloResume.last_conv_seq ?? 0);
+          // letta-mobile-gnyf7: re-hydrate the self chip on (re)subscribe.
+          selfTodoConversations.add(resumeConversationId);
+          void pushSelfTodoSnapshot(resumeConversationId);
         }
       } else if (Array.isArray(helloResume)) {
         for (const item of helloResume) {
@@ -566,6 +598,8 @@ export function handleConnection(ws, request, host) {
           const resumeConversationId = typeof item.conversation_id === "string" ? item.conversation_id : null;
           if (resumeConversationId) {
             emitConversationResume(resumeConversationId, item.after_seq ?? item.last_conv_seq ?? 0);
+            selfTodoConversations.add(resumeConversationId);
+            void pushSelfTodoSnapshot(resumeConversationId);
           }
         }
       }
@@ -614,6 +648,22 @@ export function handleConnection(ws, request, host) {
           }), log);
         });
       }
+      // letta-mobile-gnyf7: subscribe to self-todo change events so the self
+      // chip live-updates as the MAIN agent (re)writes its TodoWrite plan,
+      // even when this socket isn't actively streaming that conversation's
+      // turn. We re-emit the snapshot as the ordinary `tool_call_message`
+      // frame mobile's SelfTodoRepository consumes. Pushed only for
+      // conversations this socket has (re)subscribed to so a multiplexed
+      // socket doesn't leak another conversation's plan.
+      if (typeof host.subscribeSelfTodoEvents === "function") {
+        selfTodoEventsUnsubscribe = host.subscribeSelfTodoEvents((event) => {
+          if (closed) return;
+          const convId = event?.conversationId;
+          if (typeof convId !== "string" || convId.length === 0) return;
+          if (selfTodoConversations.size > 0 && !selfTodoConversations.has(convId)) return;
+          void pushSelfTodoSnapshot(convId, event.agentId ?? null);
+        });
+      }
       return;
     }
 
@@ -630,6 +680,9 @@ export function handleConnection(ws, request, host) {
         }
         lastClientAgentId = agent_id;
         lastClientConversationId = conversation_id;
+        // letta-mobile-gnyf7: this socket is now watching this conversation,
+        // so route its self-todo change pushes here.
+        selfTodoConversations.add(conversation_id);
         // lcp-dlj: validate optional content_parts. If supplied, it must
         // be an array; size-cap the JSON-encoded frame at 10MB to bound
         // memory pressure from oversized base64 images. Mobile is
@@ -1067,6 +1120,9 @@ export function handleConnection(ws, request, host) {
           break;
         }
         emitConversationResume(conversationId, frame.after_seq ?? frame.last_conv_seq ?? 0);
+        // letta-mobile-gnyf7: re-hydrate the self chip for the resumed conv.
+        selfTodoConversations.add(conversationId);
+        void pushSelfTodoSnapshot(conversationId);
         break;
       }
       case "a2ui_frame":

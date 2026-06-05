@@ -182,6 +182,13 @@ function createMobileAdapter(account, host) {
         handleSubagentList: host.handleSubagentList,
         handleSubagentTodos: host.handleSubagentTodos,
         subscribeSubagentEvents: host.subscribeSubagentEvents,
+        // letta-mobile-gnyf7: MAIN agent's own TodoWrite plan (self chip).
+        // qd5gq gotcha: a host method only reaches ws-handler if it is
+        // explicitly forwarded here — do NOT rely on the host object being
+        // passed through wholesale.
+        handleSelfTodos: host.handleSelfTodos,
+        buildSelfTodoSnapshotFrame: host.buildSelfTodoSnapshotFrame,
+        subscribeSelfTodoEvents: host.subscribeSelfTodoEvents,
       });
     },
   };

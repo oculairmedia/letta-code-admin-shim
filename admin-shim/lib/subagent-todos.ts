@@ -84,20 +84,43 @@ export function extractLatestTodos(messages: LocalMessage[]): TodoSnapshot {
 }
 
 /**
+ * Read an agent's latest TodoWrite snapshot from a given conversation's
+ * message store. This is the generic primitive: it resolves the
+ * `(conversationId, agentId)` message store via `listMessagesSync` and
+ * extracts the newest TodoWrite call's todos.
+ *
+ * Both the per-subagent reader (`readSubagentTodos`, which reads the
+ * subagent's own "default" conversation) and the MAIN/foreground agent's
+ * self-todo reader (letta-mobile-gnyf7, which reads the active
+ * conversation) build on this. Returns an empty, not-found snapshot if the
+ * store is unreadable or the agent never called TodoWrite in that
+ * conversation.
+ */
+export function readConversationTodos(
+  agentId: string,
+  conversationId: string,
+): TodoSnapshot {
+  try {
+    const messages = listMessagesSync(conversationId, agentId);
+    return extractLatestTodos(messages);
+  } catch {
+    return { todos: [], found: false };
+  }
+}
+
+/**
  * Read the subagent's latest TodoWrite snapshot from its conversation
  * store. `subagentAgentId` is the agent-local-<uuid> the registry
  * correlated; `conversationId` defaults to "default" (the subagent's
  * conversation). Returns an empty, not-found snapshot if the store is
  * unreadable or the subagent never called TodoWrite.
+ *
+ * Thin wrapper over `readConversationTodos` — preserved as the named entry
+ * point the subagent registry/host wiring already uses.
  */
 export function readSubagentTodos(
   subagentAgentId: string,
   conversationId = "default",
 ): TodoSnapshot {
-  try {
-    const messages = listMessagesSync(conversationId, subagentAgentId);
-    return extractLatestTodos(messages);
-  } catch {
-    return { todos: [], found: false };
-  }
+  return readConversationTodos(subagentAgentId, conversationId);
 }
