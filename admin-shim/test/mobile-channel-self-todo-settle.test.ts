@@ -28,11 +28,12 @@
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { bridgeSendMessage } from "../lib/mobile-channel-host.js";
+import { getFramesFilePath } from "../lib/runs.js";
 import {
   __resetSelfTodo,
   getSelfTodoSnapshot,
@@ -42,6 +43,7 @@ import {
 import {
   __setAgentPoolForTest,
   type AdapterRunTurnResult,
+  type RunTurnOptions,
 } from "../lib/agent-pool.js";
 
 /** The (unexported) AgentPool shape `__setAgentPoolForTest` accepts. */
@@ -71,6 +73,28 @@ function taskCallMsg(id: string, name: "TaskCreate" | "TaskUpdate", args: unknow
     role: "assistant",
     content: [{ type: "toolCall", id: `tc-${id}`, name, arguments: args }],
   };
+}
+
+interface PersistedFrameLine {
+  seq: number;
+  ts: string;
+  frame: Record<string, unknown>;
+}
+
+function readPersistedFrames(runId: string): PersistedFrameLine[] {
+  return readFileSync(getFramesFilePath(runId), "utf8")
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as PersistedFrameLine);
+}
+
+function assertMobileStamped(frame: Record<string, unknown>, expected: { agentId: string; conversationId: string; turnId: string; runId: string }): void {
+  assert.equal(frame["agent_id"], expected.agentId);
+  assert.equal(frame["conversation_id"], expected.conversationId);
+  assert.equal(frame["turn_id"], expected.turnId);
+  assert.equal(frame["run_id"], expected.runId);
+  assert.equal(typeof frame["id"], "string", `${String(frame["message_type"])} must carry id`);
+  assert.equal(typeof frame["ts"], "string", `${String(frame["message_type"])} must carry ts`);
 }
 
 beforeEach(() => {
@@ -176,6 +200,109 @@ test("bridgeSendMessage: settle hook is a no-op when the conversation has no pla
 
   assert.equal(events.length, 0, "no plan on disk -> no self-todo change event");
   assert.equal(getSelfTodoSnapshot(conversationId), null, "no plan on disk -> snapshot stays empty");
+});
+
+test("bridgeSendMessage: SDK transport frames are stamped before live emit and replay persistence", async () => {
+  const agentId = "agent-local-stamp-1";
+  const conversationId = "conv-stamp-sdk";
+  const turnId = "turn-stamp-sdk";
+  let runId = "";
+  const emitted: Array<Record<string, unknown>> = [];
+
+  const fakePool = {
+    runTurnWithHeal: async (
+      _conversationId: string,
+      _agentId: string,
+      _input: string | unknown[],
+      opts: RunTurnOptions = {},
+    ): Promise<AdapterRunTurnResult> => {
+      runId = opts.runHandle?.id ?? "";
+      assert.ok(runId, "bridgeSendMessage must pre-create a run handle");
+      opts.onFrame?.(
+        {
+          type: "stream_event",
+          event: {
+            message_type: "assistant_message",
+            id: "assistant-upstream-1",
+            date: "2026-06-06T01:02:03.000Z",
+            agent_id: agentId,
+            conversation_id: conversationId,
+            run_id: runId,
+            seq_id: 1,
+            otid: "assistant-upstream-1",
+            content: [{ type: "text", text: "hi" }],
+          },
+          session_id: agentId,
+          uuid: "assistant-upstream-1",
+          timestamp: "2026-06-06T01:02:03.000Z",
+        },
+        { runId },
+      );
+      opts.onFrame?.(
+        {
+          type: "stream_event",
+          event: { message_type: "stop_reason", stop_reason: "end_turn", run_id: runId, seq_id: 2 },
+          session_id: agentId,
+          uuid: "stop-upstream-1",
+          timestamp: "2026-06-06T01:02:04.000Z",
+        },
+        { runId },
+      );
+      opts.onFrame?.(
+        {
+          type: "stream_event",
+          event: {
+            message_type: "usage_statistics",
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+            context_tokens: 3,
+            id: "usage-upstream-1",
+            date: "2026-06-06T01:02:05.000Z",
+            agent_id: agentId,
+            conversation_id: conversationId,
+            run_id: runId,
+            seq_id: 3,
+          },
+          session_id: agentId,
+          uuid: "usage-upstream-1",
+          timestamp: "2026-06-06T01:02:05.000Z",
+        },
+        { runId },
+      );
+      return { frames: [], stderr: "", run_id: runId, done: true };
+    },
+  } as unknown as AgentPoolArg;
+  __setAgentPoolForTest(fakePool);
+
+  await bridgeSendMessage(
+    { agent_id: agentId, conversation_id: conversationId, text: "hi", turn_id: turnId },
+    (frame) => emitted.push(frame as unknown as Record<string, unknown>),
+  );
+
+  const relevantLive = emitted.filter((frame) =>
+    frame["message_type"] === "assistant_message" ||
+    frame["message_type"] === "stop_reason" ||
+    frame["message_type"] === "usage_statistics",
+  );
+  assert.deepEqual(
+    relevantLive.map((frame) => frame["message_type"]),
+    ["assistant_message", "stop_reason", "usage_statistics"],
+  );
+  for (const frame of relevantLive) {
+    assertMobileStamped(frame, { agentId, conversationId, turnId, runId });
+  }
+
+  const persisted = readPersistedFrames(runId).map((line) => line.frame);
+  assert.deepEqual(
+    persisted.map((frame) => frame["message_type"]),
+    ["assistant_message", "stop_reason", "usage_statistics"],
+  );
+  for (const frame of persisted) {
+    assertMobileStamped(frame, { agentId, conversationId, turnId, runId });
+  }
 });
 
 process.on("exit", () => {

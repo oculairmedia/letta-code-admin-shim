@@ -154,6 +154,7 @@ interface BridgeSendMessageArgs {
    */
   content_parts?: unknown[] | null;
   otid?: string | null;
+  turn_id?: string | null;
   a2ui_capability?: A2uiCapability | null;
   /**
    * lcp-4tv: marks the resulting Run as background. Cron-driven and
@@ -186,6 +187,39 @@ function localPartsToText(parts: unknown): string {
     )
     .map((p) => (typeof p.text === "string" ? p.text : ""))
     .join("");
+}
+
+interface MobileFrameStampContext {
+  agentId: string;
+  conversationId: string;
+  turnId: string;
+  runId: string;
+}
+
+function stringOr(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+
+function stampMobileBoundFrame(frame: BridgeFrame, ctx: MobileFrameStampContext): BridgeFrame {
+  const rec = frame as unknown as Record<string, unknown>;
+  const messageType = rec["message_type"];
+  if (messageType !== "assistant_message" && messageType !== "stop_reason" && messageType !== "usage_statistics") {
+    return frame;
+  }
+
+  const now = new Date().toISOString();
+  const idPrefix = typeof messageType === "string" ? messageType : "frame";
+  const stamped: Record<string, unknown> = {
+    ...rec,
+    id: stringOr(rec["id"], `${idPrefix}-${ctx.runId}`),
+    ts: stringOr(rec["ts"], stringOr(rec["date"], now)),
+    date: stringOr(rec["date"], stringOr(rec["ts"], now)),
+    agent_id: stringOr(rec["agent_id"], ctx.agentId),
+    conversation_id: stringOr(rec["conversation_id"], ctx.conversationId),
+    turn_id: stringOr(rec["turn_id"], ctx.turnId),
+    run_id: stringOr(rec["run_id"], ctx.runId),
+  };
+  return stamped as unknown as BridgeFrame;
 }
 
 /**
@@ -229,7 +263,7 @@ function localPartsToImageParts(parts: unknown): Array<Record<string, unknown>> 
 }
 
 export async function bridgeSendMessage(
-  { agent_id, conversation_id, text, content_parts, otid, a2ui_capability, background }: BridgeSendMessageArgs,
+  { agent_id, conversation_id, text, content_parts, otid, a2ui_capability, background, turn_id }: BridgeSendMessageArgs,
   onFrame: (frame: BridgeFrame) => void,
   { onRunCreated }: BridgeSendMessageHooks = {},
 ): Promise<unknown> {
@@ -280,6 +314,10 @@ export async function bridgeSendMessage(
     }
   }
 
+  const effectiveTurnId = typeof turn_id === "string" && turn_id.length > 0
+    ? turn_id
+    : `turn-${runHandle.id.replace(/^run-/, "")}`;
+
   // lcp-p74.1: every frame the host emits also lands in state/runs/<id>/frames.jsonl
   // so a disconnected mobile client can later subscribe(run_id, cursor) (lcp-p74.2)
   // and replay. Wrapping at the consumer-emit boundary captures the post-reshape
@@ -287,12 +325,18 @@ export async function bridgeSendMessage(
   // lcp-p74.2: stamp the assigned seq onto the frame so live consumers track
   // their cursor in lockstep with what subscribe(run_id, cursor) would replay.
   const emit = (frame: BridgeFrame): void => {
+    const stampedFrame = stampMobileBoundFrame(frame, {
+      agentId: effectiveAgentId,
+      conversationId: effectiveConvId,
+      turnId: effectiveTurnId,
+      runId: runHandle.id,
+    });
     // letta-mobile-73o2h.1: feed every reshaped frame to the active-subagent
     // registry. It cheaply ignores non-Agent frames; Agent tool_call/return
     // frames register/correlate a subagent dispatch -> subagent run/conv so
     // mobile can enumerate + subscribe without scanning this frame stream.
     try {
-      ingestParentFrame(frame, runHandle.id);
+      ingestParentFrame(stampedFrame, runHandle.id);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[mobile-channel] subagent-registry ingest failed: ${msg}`);
@@ -305,7 +349,7 @@ export async function bridgeSendMessage(
     // so the resolved effectiveConvId is passed explicitly here.
     try {
       if (process.env["SELF_TODO_DEBUG"]) {
-        const fr = frame as unknown as Record<string, unknown>;
+        const fr = stampedFrame as unknown as Record<string, unknown>;
         const tc = (fr["tool_call"] ?? fr["toolCall"]) as Record<string, unknown> | undefined;
         // eslint-disable-next-line no-console
         console.error(
@@ -318,14 +362,14 @@ export async function bridgeSendMessage(
           }),
         );
       }
-      ingestSelfTodoFrame(frame, effectiveConvId, effectiveAgentId);
+      ingestSelfTodoFrame(stampedFrame, effectiveConvId, effectiveAgentId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[mobile-channel] self-todo ingest failed: ${msg}`);
     }
-    const { seq } = appendRunFrame(runHandle.id, frame);
+    const { seq } = appendRunFrame(runHandle.id, stampedFrame);
     if (seq > 0) {
-      const asRec = frame as unknown as Record<string, unknown>;
+      const asRec = stampedFrame as unknown as Record<string, unknown>;
       asRec["seq"] = seq;
       // lcp-pro: alias `seq` as `seq_id` on delta-shaped frames so mobile's
       // `hasAlreadyIngestedStreamFrame` gate (which dedups by `seqId: Int?`)
@@ -337,12 +381,12 @@ export async function bridgeSendMessage(
       // may be null on synthetic frames (end-of-turn splitter flush, A2UI
       // host-synthesized frames) and a single source of truth keeps the
       // gate's monotonicity invariant unbroken across the whole turn.
-      const mt = (frame as { message_type?: unknown }).message_type;
+      const mt = (stampedFrame as { message_type?: unknown }).message_type;
       if (mt === "assistant_message" || mt === "reasoning_message") {
         asRec["seq_id"] = seq;
       }
     }
-    onFrame(frame);
+    onFrame(stampedFrame);
   };
 
   const pool = getAgentPool();

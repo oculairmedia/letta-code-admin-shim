@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { patchLettaCodeSourceForTest } from "../scripts/letta-code-patch-loader.mjs";
 
@@ -13,6 +16,27 @@ type ModelSettingsPayload = {
   thinking?: { type: string; budget_tokens?: number };
 };
 
+type GeneratedImageToolDefinition = {
+  schema: Record<string, unknown>;
+  description: string;
+  impl: (args: Record<string, unknown>) => Promise<GeneratedImageToolResult>;
+};
+
+type GeneratedImageToolResult = {
+  content: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; source: { type: "base64"; media_type: string; data: string } }
+  >;
+  details: {
+    path: string;
+    mime_type: string;
+    model: string;
+    size: string;
+    quality: string;
+    prompt: string;
+  };
+};
+
 declare global {
   var __lcpFixThinking: ((payload: ThinkingPayload) => ThinkingPayload) | undefined;
   var __lcpFixModelSettings:
@@ -22,6 +46,12 @@ declare global {
     | ((providerName: string, modelId: string, input: string[]) => string[])
     | undefined;
   var __lcpCoerceToolReturnContent: ((value: unknown) => unknown) | undefined;
+  var __lcpAddGenerateImageTool:
+    | ((
+      toolDefinitions: Record<string, unknown>,
+      defineToolFn: (input: GeneratedImageToolDefinition) => GeneratedImageToolDefinition,
+    ) => Record<string, unknown>)
+    | undefined;
 }
 
 function readInjectedThinkingHelper(): unknown {
@@ -41,6 +71,11 @@ function readInjectedLocalVisionInputHelper(): unknown {
 function readInjectedToolReturnContentHelper(): unknown {
   return (globalThis as typeof globalThis & { __lcpCoerceToolReturnContent?: unknown })
     .__lcpCoerceToolReturnContent;
+}
+
+function readInjectedGenerateImageToolHelper(): unknown {
+  return (globalThis as typeof globalThis & { __lcpAddGenerateImageTool?: unknown })
+    .__lcpAddGenerateImageTool;
 }
 
 test("patch-loader normalizes thinking requests and model_settings inheritance", () => {
@@ -345,6 +380,121 @@ test("patch-loader: converts legacy Read image tool returns before approval norm
 
   globalThis.__lcpCoerceToolReturnContent = undefined;
 });
+
+test("patch-loader: registers native generate_image tool in built-in registries", async (t) => {
+  const outputDir = mkdtempSync(join(tmpdir(), "lcp-vw2h-images-"));
+  t.after(() => rmSync(outputDir, { recursive: true, force: true }));
+
+  const previousFetch = globalThis.fetch;
+  const previousImageUrl = process.env["LETTA_IMAGE_GENERATION_URL"];
+  const b64 = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
+  const requests: Array<{ url: string; body: unknown }> = [];
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    requests.push({
+      url: input.toString(),
+      body: typeof init?.body === "string" ? JSON.parse(init.body) : init?.body,
+    });
+    return new Response(JSON.stringify({ data: [{ b64_json: b64 }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  process.env["LETTA_IMAGE_GENERATION_URL"] = "http://127.0.0.1:9999/v1/images/generations";
+
+  try {
+    const input = [
+      "#!/usr/bin/env node",
+      "function defineTool(input) { return input; }",
+      "const toolDefinitions = {};",
+      "  TOOL_DEFINITIONS = toolDefinitions;",
+      "});",
+      "var ANTHROPIC_DEFAULT_TOOLS = [",
+      "    \"TaskUpdate\",",
+      "    \"Write\"",
+      "  ];",
+      "var OPENAI_PASCAL_TOOLS = [",
+      "    \"ApplyPatch\",",
+      "    \"UpdatePlan\"",
+      "  ];",
+      "var ANTHROPIC_DEFAULT_TOOLS2 = [",
+      "  \"TaskUpdate\",",
+      "  \"Write\"",
+      "];",
+      "var OPENAI_PASCAL_TOOLS2 = [",
+      "  \"ApplyPatch\",",
+      "  \"UpdatePlan\"",
+      "];",
+    ].join("\n");
+
+    const patched = patchLettaCodeSourceForTest(input);
+
+    assert.match(patched, /globalThis\.__lcpAddGenerateImageTool =/);
+    assert.match(patched, /TOOL_DEFINITIONS = globalThis\.__lcpAddGenerateImageTool\(toolDefinitions, defineTool\);/);
+    assert.match(patched, /"Write",\n    "generate_image"/);
+    assert.match(patched, /"UpdatePlan",\n    "generate_image"/);
+    assert.match(patched, /"Write",\n  "generate_image"/);
+    assert.match(patched, /"UpdatePlan",\n  "generate_image"/);
+
+    const helperStart = patched.indexOf("globalThis.__lcpAddGenerateImageTool =");
+    const helperEnd = patched.indexOf("\nfunction defineTool", helperStart);
+    assert.notEqual(helperStart, -1);
+    assert.notEqual(helperEnd, -1);
+
+    const helperSource = patched.slice(helperStart, helperEnd);
+    globalThis.__lcpAddGenerateImageTool = undefined;
+    eval(helperSource);
+
+    const addTool = readInjectedGenerateImageToolHelper();
+    if (typeof addTool !== "function") {
+      assert.fail("expected __lcpAddGenerateImageTool helper to be installed");
+    }
+
+    const registry = addTool({}, (tool: GeneratedImageToolDefinition) => tool);
+    const generatedTool = registry["generate_image"];
+    if (!isGeneratedImageToolDefinition(generatedTool)) {
+      assert.fail("expected generate_image tool definition in registry");
+    }
+
+    const result = await generatedTool.impl({
+      prompt: "a small brass automaton sketch",
+      size: "1536x1024",
+      quality: "high",
+      output_dir: outputDir,
+    });
+
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0]?.body, {
+      model: "gpt-image-2",
+      prompt: "a small brass automaton sketch",
+      size: "1536x1024",
+      quality: "high",
+      n: 1,
+      response_format: "b64_json",
+    });
+    assert.ok(existsSync(result.details.path), "tool should save generated image bytes to disk");
+    assert.deepEqual(readFileSync(result.details.path), Buffer.from(b64, "base64"));
+    assert.deepEqual(result.content[1], {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: b64 },
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousImageUrl === undefined) {
+      delete process.env["LETTA_IMAGE_GENERATION_URL"];
+    } else {
+      process.env["LETTA_IMAGE_GENERATION_URL"] = previousImageUrl;
+    }
+    globalThis.__lcpAddGenerateImageTool = undefined;
+  }
+});
+
+function isGeneratedImageToolDefinition(value: unknown): value is GeneratedImageToolDefinition {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return Boolean(record["schema"]) &&
+    typeof record["description"] === "string" &&
+    typeof record["impl"] === "function";
+}
 
 test("patch-loader leaves unrelated source untouched", () => {
   const source = "export const untouched = true;\n";
