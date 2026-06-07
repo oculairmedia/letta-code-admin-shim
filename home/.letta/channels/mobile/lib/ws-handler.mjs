@@ -140,6 +140,8 @@ export function handleConnection(ws, request, host) {
   const activeSubscriptions = new Map(); // key: run_id, value: { unsubscribe }
   // lcp-2gx: per-socket subscription to crons_updated push events.
   let cronEventsUnsubscribe = null;
+  // lcp-indw: per-socket subscription to approval_resolved push events.
+  let approvalEventsUnsubscribe = null;
   // lcp-cq7x: per-socket registration for server-originated channel pushes.
   // Installed only after hello auth succeeds so outbound sendMessage never
   // targets unauthenticated sockets.
@@ -164,6 +166,10 @@ export function handleConnection(ws, request, host) {
     if (cronEventsUnsubscribe) {
       safeUnsubscribe("cron events", cronEventsUnsubscribe);
       cronEventsUnsubscribe = null;
+    }
+    if (approvalEventsUnsubscribe) {
+      safeUnsubscribe("approval events", approvalEventsUnsubscribe);
+      approvalEventsUnsubscribe = null;
     }
     if (pushClientUnregister) {
       safeUnsubscribe("push client", pushClientUnregister);
@@ -582,6 +588,22 @@ export function handleConnection(ws, request, host) {
           safeSend(ws, makeFrame("crons_updated", {
             reason: event.reason,
             tasks_active: event.tasks_active,
+            at: event.at,
+          }), log);
+        });
+      }
+      // lcp-indw: subscribe to approval_resolved push events for the lifetime
+      // of this socket so a SECOND connected client learns when the FIRST
+      // client (or a REST caller) resolves a pending approval. Listener stays
+      // installed until stopAll() releases it.
+      if (typeof host.subscribeApprovalEvents === "function") {
+        approvalEventsUnsubscribe = host.subscribeApprovalEvents((event) => {
+          if (closed) return;
+          safeSend(ws, makeFrame("approval_resolved", {
+            run_id: event.run_id,
+            tool_call_id: event.tool_call_id,
+            status: event.status,
+            decided_by: event.decided_by,
             at: event.at,
           }), log);
         });

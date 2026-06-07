@@ -21,6 +21,7 @@ import type { IncomingMessage } from "node:http";
 
 import { reshapeFrame, attachReadImageToToolReturn } from "./chat.js";
 import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
+import { readPendingApproval, resolveApproval } from "./pending-approval.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
 import {
@@ -721,7 +722,23 @@ function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
     return { action_id: actionId, status: "rejected", reason: "missing event name" };
   }
   const approvalDecision = approvalDecisionFromAction(action, actionId);
-  const matchedApproval = Boolean(approvalDecision && action.run_id && resolveApprovalGate(action.run_id, approvalDecision));
+  // lcp-indw: WS is the canonical decision entrypoint. When a durable
+  // pending-approval file exists (server-side permissions path), funnel the
+  // decision through the SINGLE resolveApproval funnel so the durable file is
+  // rewritten, the audit/policy recorded, the live gate resolved, and the
+  // approval_resolved broadcast fired — exactly the same path REST uses. When
+  // there is NO pending file (legacy live A2UI path, or feature off), fall
+  // back to resolving the in-memory gate directly so behavior is unchanged.
+  let matchedApproval = false;
+  if (approvalDecision && action.run_id) {
+    const hasPending = Boolean(readPendingApproval(action.run_id));
+    if (hasPending) {
+      const result = resolveApproval(action.run_id, approvalDecision);
+      matchedApproval = result.found;
+    } else {
+      matchedApproval = resolveApprovalGate(action.run_id, approvalDecision);
+    }
+  }
   const syntheticInput = !approvalDecision ? syntheticInputFromAction(action, actionId) : null;
   const routedAs = matchedApproval
     ? "approval"
@@ -1002,6 +1019,7 @@ import {
   getActiveTasks as cronGetActiveTasks,
 } from "./crons.js";
 import { broadcastCronEvent, subscribeCronEvents } from "./cron-events.js";
+import { subscribeApprovalEvents } from "./approval-events.js";
 import type {
   AddTaskInput,
   AddTaskResult,
@@ -1187,6 +1205,8 @@ interface MobileChannelHost {
   handleCronDelete: typeof handleCronDelete;
   handleCronDeleteAll: typeof handleCronDeleteAll;
   subscribeCronEvents: typeof subscribeCronEvents;
+  /** lcp-indw: per-connection subscription for approval_resolved pushes. */
+  subscribeApprovalEvents: typeof subscribeApprovalEvents;
 }
 
 /**
@@ -1296,6 +1316,7 @@ async function createMobileChannelAdapter(
     handleCronDelete,
     handleCronDeleteAll,
     subscribeCronEvents,
+    subscribeApprovalEvents,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();
