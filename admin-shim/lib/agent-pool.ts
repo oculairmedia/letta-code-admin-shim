@@ -142,9 +142,14 @@ export function waitForApprovalDecision(
   runId: string,
   toolName: string,
   toolCallId: string,
+  timeoutMsOverride?: number,
 ): Promise<ApprovalDecision> {
   return new Promise((resolve, reject) => {
-    const APPROVAL_TIMEOUT_MS = Number(process.env["A2UI_APPROVAL_TIMEOUT_MS"] ?? 30_000);
+    // lcp-indw: the server-side-permissions `ask` path passes an explicit
+    // long timeout (tied to the turn ceiling, NOT 30s) so a human-paced
+    // approval over WS/REST is not killed by the legacy 30s gate timeout.
+    // The legacy A2UI path keeps the 30s default.
+    const APPROVAL_TIMEOUT_MS = timeoutMsOverride ?? Number(process.env["A2UI_APPROVAL_TIMEOUT_MS"] ?? 30_000);
     
     const timeoutHandle = setTimeout(() => {
       approvalGates.delete(runId);

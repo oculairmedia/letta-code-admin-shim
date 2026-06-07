@@ -218,6 +218,43 @@ function storageDir(): string {
   );
 }
 
+/**
+ * lcp-indw: exported accessor for the shim storage root. The server-side
+ * permissions feature (lib/permissions.ts) and the durable pending-approval
+ * store co-locate their files under this same root (permissions.json,
+ * permissions/<agentId>.json, runs/<runId>/pending-approval.json), so they
+ * resolve the path through this single seam rather than re-deriving the
+ * LETTA_LOCAL_BACKEND_DIR / LETTA_HOME fallback logic independently.
+ */
+export function getStorageDir(): string {
+  return storageDir();
+}
+
+/**
+ * lcp-indw: list run ids that currently have a directory on disk (live root
+ * only — archived/terminal runs never hold a pending approval). The boot
+ * sweep walks these to find surviving pending-approval.json files.
+ */
+export function listRunIdsOnDisk(): string[] {
+  const root = runsRoot();
+  if (!existsSync(root)) return [];
+  const out: string[] = [];
+  for (const name of readdirSync(root)) {
+    if (name === ARCHIVE_DIR_NAME) continue;
+    out.push(name);
+  }
+  return out;
+}
+
+/**
+ * lcp-indw: absolute path to a run's directory (live root). Exported so the
+ * pending-approval store can place pending-approval.json alongside
+ * frames.jsonl without duplicating the runsRoot()/runDir() logic.
+ */
+export function getRunDir(runId: string): string {
+  return runDir(runId);
+}
+
 function runsRoot(): string {
   return join(storageDir(), "runs");
 }
@@ -598,6 +635,84 @@ export function appendRunFrame(runId: string, frame: unknown): { seq: number } {
     console.error(`[runs] frame append failed for ${runId}: ${msg}`);
   }
   return { seq };
+}
+
+/**
+ * lcp-indw: append a frame to a run that has NO in-memory handle. Used by
+ * the pending-approval boot sweep — after a restart the parked run's handle
+ * is gone, but we still must append a synthetic terminal frame so a
+ * reconnecting client sees a resolved/expired card instead of an eternal
+ * spinner. Seq is derived from the on-disk line count (best-effort; the
+ * subscribe reader tolerates seq gaps). Returns the assigned seq or -1 if
+ * the run dir doesn't exist.
+ */
+export function appendRunFrameOnDisk(runId: string, frame: unknown): { seq: number } {
+  const dir = resolveRunDir(runId);
+  const path = join(dir, "frames.jsonl");
+  if (!existsSync(dir)) return { seq: -1 };
+  let seq = 1;
+  try {
+    if (existsSync(path)) {
+      const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
+      seq = lines.length + 1;
+    }
+  } catch {
+    seq = 1;
+  }
+  const line = JSON.stringify({ seq, ts: nowIso(), frame }) + "\n";
+  try {
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(path, line);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] on-disk frame append failed for ${runId}: ${msg}`);
+  }
+  return { seq };
+}
+
+/**
+ * lcp-indw: finalize a run that has NO in-memory handle (boot sweep, after
+ * restart). Rewrites run.json to a terminal status if it still reads as
+ * "running". No-op if the run is missing or already terminal. Returns true
+ * if it flipped the status.
+ */
+export function finalizeRunOnDisk(
+  runId: string,
+  { status = "failed", stopReason = null }: { status?: "completed" | "failed" | "cancelled"; stopReason?: string | null } = {},
+): boolean {
+  // Defensive: if a live in-memory handle still exists (it won't after a
+  // real restart, but a same-process caller / test may have one), flip it
+  // too so getRun(runId) — which prefers the in-memory record — reflects the
+  // terminal status. Mirrors finalizeRun's bookkeeping minus the usage/timing.
+  const live = _activeRuns.get(runId);
+  if (live) {
+    if (live.record.status !== "running") return false;
+    live.record.status = status;
+    live.record.stop_reason = stopReason;
+    live.record.completed_at = nowIso();
+    live.record.total_duration_ns = nanosSince(live.hrStart);
+    writeJsonAtomic(runFile(runId), live.record);
+    _activeRuns.delete(runId);
+    _cancelHandlers.delete(runId);
+    return true;
+  }
+  const record = readRunFromDisk(runId);
+  if (!record) return false;
+  if (record.status !== "running") return false;
+  record.status = status;
+  record.stop_reason = stopReason;
+  record.completed_at = nowIso();
+  // Resolve the dir the record actually lives in (live or archive).
+  const dir = resolveRunDir(runId);
+  try {
+    writeJsonAtomic(join(dir, "run.json"), record);
+    runFileCache.delete(join(dir, "run.json"));
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runs] on-disk finalize failed for ${runId}: ${msg}`);
+    return false;
+  }
 }
 
 /**

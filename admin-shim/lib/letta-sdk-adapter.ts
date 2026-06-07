@@ -72,6 +72,15 @@ import { ensureA2uiBlockAttached, type A2uiCapability } from "./a2ui-adapter.js"
 
 import { listMessages } from "./store.js";
 
+import {
+  evaluatePermission,
+  serverPermissionsEnabled,
+} from "./permissions.js";
+import {
+  clearPendingApproval,
+  createPendingApproval,
+} from "./pending-approval.js";
+
 function logLine(msg: string): void {
   console.log(`[sdk-adapter] ${msg}`);
 }
@@ -153,7 +162,17 @@ const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 1_800_00
 const DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions";
 
 function currentPermissionMode(): PermissionMode {
-  return (process.env["SHIM_PERMISSION_MODE"] ?? DEFAULT_PERMISSION_MODE) as PermissionMode;
+  // lcp-indw / D4: when server-side permissions is enabled, the spawned
+  // session MUST run at permissionMode "default" so the SDK invokes
+  // canUseTool for EVERY tool call (at "bypassPermissions" the callback is
+  // short-circuited and the evaluator never runs — the feature would be
+  // inert). An explicit SHIM_PERMISSION_MODE override still wins so an
+  // operator can force a specific mode, but the default coupling is:
+  // SHIM_SERVER_PERMISSIONS=1 ⇒ "default".
+  const explicit = process.env["SHIM_PERMISSION_MODE"];
+  if (explicit) return explicit as PermissionMode;
+  if (serverPermissionsEnabled()) return "default";
+  return DEFAULT_PERMISSION_MODE;
 }
 
 export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
@@ -181,6 +200,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   private currentOnFrame: ((frame: LettaStreamFrame, meta: { runId: string }) => void) | null = null;
   private currentApprovalScopeCache: Map<string, ApprovalScopeCacheEntry> | null = null;
   private currentA2uiCapability: A2uiCapability | null = null;
+  // lcp-indw / D2: the stream loop's resetSilenceTimer, shared into the
+  // canUseTool closure (same pattern as currentRunHandle above). While an
+  // `ask` is parked we periodically call this so a human-paced approval does
+  // NOT trip the silence watchdog (SHIM_POOL_TURN_SILENCE_MS). It reverts
+  // automatically when the park ends (the keepalive interval is cleared).
+  // The absolute turn ceiling (SHIM_POOL_TURN_TIMEOUT) remains the hard
+  // backstop so a forgotten approval can never park a worker forever.
+  private currentResetSilenceTimer: (() => void) | null = null;
   // Monotonic seq counter for synthesized approval frames within the
   // current turn. Real upstream frames carry seq_id from letta-code; the
   // SDK-side synthetic ones start at a high offset so they don't collide
@@ -378,6 +405,10 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       silenceTimer = setTimeout(() => fireTimeout("silence"), TURN_SILENCE_MS);
     };
     resetSilenceTimer();
+    // lcp-indw / D2: expose the silence-watchdog reset to the canUseTool
+    // closure so a parked `ask` can keep the turn alive across a long,
+    // human-paced approval without faking wire traffic.
+    this.currentResetSilenceTimer = resetSilenceTimer;
 
     const absoluteTimer: NodeJS.Timeout = setTimeout(
       () => fireTimeout("absolute"),
@@ -447,6 +478,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       this.currentOnFrame = null;
       this.currentApprovalScopeCache = null;
       this.currentA2uiCapability = null;
+      this.currentResetSilenceTimer = null;
     }
 
     // lcp-sdk.4: shared post-turn finalization — stampNewMessages,
@@ -540,6 +572,22 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       // normal flow — log and default-allow rather than block forever.
       logLine(`canUseTool fired with no active turn (tool=${toolName}) — defaulting allow`);
       return { behavior: "allow" };
+    }
+
+    // lcp-indw / D6: server-side permissions path is gated behind
+    // SHIM_SERVER_PERMISSIONS=1 (default OFF). When the flag is off, this
+    // returns null and we fall through to the byte-identical legacy behavior
+    // below (bypassPermissions short-circuit / A2UI gate). When on, the
+    // evaluator decides allow/deny/ask per the on-disk rules.
+    if (serverPermissionsEnabled()) {
+      const decided = await this._handleCanUseToolServerPermissions(
+        toolName,
+        toolInput,
+        runHandle,
+        onFrame,
+        cache,
+      );
+      if (decided) return decided;
     }
 
     if (currentPermissionMode() === "bypassPermissions") {
@@ -659,6 +707,243 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     return decision.decision === "approve"
       ? { behavior: "allow", message: decision.reason }
       : { behavior: "deny", message: decision.reason };
+  }
+
+  /**
+   * lcp-indw: server-side permissions evaluator hook. Only invoked when
+   * SHIM_SERVER_PERMISSIONS=1. Returns a CanUseToolResponse (always — when
+   * the flag is on the evaluator is authoritative), or null only on an
+   * internal error so the caller can fall back to legacy behavior.
+   *
+   * Decision flow (§3.1):
+   *   allow → record approve(rule_allow); allow.
+   *   deny  → record deny(rule_deny); emit a deny frame; deny(reason).
+   *   ask   → (a) scope cache hit → auto-allow;
+   *           (b) write pending-approval.json (durable "a turn is waiting");
+   *           (c) emit the canonical approval_request_message frame;
+   *           (d) park on the durable wait (no 30s cap; turn-ceiling timeout);
+   *           (e) on decision: record audit/policy, clear pending, return.
+   *
+   * D5 (headless / no-approver semantics): a `deny` rule always denies; an
+   * `ask` with NO approver (no A2UI client connected) → DENY with reason
+   * (NOT auto-allow), so headless/cron/rig turns keep working as long as
+   * the operator's rules don't ask/deny the tools the rig needs;
+   * `allow`/default-allow always allows.
+   */
+  private async _handleCanUseToolServerPermissions(
+    toolName: string,
+    toolInput: Record<string, unknown>,
+    runHandle: RunHandle,
+    onFrame: ((frame: LettaStreamFrame, meta: { runId: string }) => void) | null,
+    cache: Map<string, ApprovalScopeCacheEntry>,
+  ): Promise<CanUseToolResponse | null> {
+    const a2ui = this.currentA2uiCapability;
+    const timestamp = new Date().toISOString();
+    const result = evaluatePermission(this.agentId, this.conversationId, toolName, toolInput);
+
+    if (result.action === "allow") {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `rule-allow-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: "Once",
+        reason: result.reason || "rule_allow",
+        timestamp,
+      });
+      return { behavior: "allow", message: result.reason || "rule_allow" };
+    }
+
+    if (result.action === "deny") {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `rule-deny-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "deny",
+        scope: "Deny",
+        reason: result.reason || "rule_deny",
+        timestamp,
+      });
+      // Emit a deny frame so a connected client sees WHY the tool was blocked.
+      this._emitApprovalDenyFrame(toolName, result.reason || "rule_deny", runHandle, onFrame);
+      return { behavior: "deny", message: result.reason || "rule_deny" };
+    }
+
+    // result.action === "ask"
+    // (a) Session/Forever scope cache → auto-allow without a round-trip.
+    const cached = cache.get(toolName);
+    if (cached) {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `cached-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: cached.scope,
+        reason: "cached_approval",
+        timestamp,
+      });
+      return { behavior: "allow", message: "cached_approval" };
+    }
+
+    // D5: ask with no approver attached → DENY (headless safe default).
+    if (!a2ui) {
+      const reason = result.reason
+        ? `${result.reason} (no approver connected; headless deny)`
+        : "ask rule requires approval but no approver is connected (headless deny)";
+      recordApprovalDecision(runHandle.id, {
+        action_id: `no-approver-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "deny",
+        scope: "Deny",
+        reason,
+        timestamp,
+      });
+      this._emitApprovalDenyFrame(toolName, reason, runHandle, onFrame);
+      return { behavior: "deny", message: reason };
+    }
+
+    const toolCallId = `synthetic-${randomUUID()}`;
+
+    // (b) Write the durable pending-approval file BEFORE parking — the
+    //     on-disk truth that "a turn is waiting", keyed by runId.
+    try {
+      createPendingApproval({
+        runId: runHandle.id,
+        agentId: this.agentId,
+        conversationId: this.conversationId,
+        toolCallId,
+        toolName,
+        toolInput,
+        reason: result.reason,
+        ruleSource: result.source,
+      });
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      logLine(`pending-approval write failed for ${runHandle.id}: ${m}`);
+    }
+
+    // (c) Emit the canonical approval_request_message frame (persists to
+    //     frames.jsonl, replays via subscribeToRun — the one wire contract
+    //     both clients already render).
+    const seqId = ++this.syntheticSeqId;
+    const frame: LettaStreamFrame = {
+      type: "stream_event",
+      session_id: this.sessionId,
+      uuid: `synthetic-${randomUUID()}`,
+      timestamp,
+      event: {
+        message_type: "approval_request_message",
+        id: `synthetic-msg-${seqId}`,
+        date: new Date().toISOString(),
+        agent_id: this.agentId,
+        conversation_id: this.conversationId,
+        run_id: runHandle.id,
+        seq_id: seqId,
+        reason: result.reason,
+        tool_call: {
+          tool_call_id: toolCallId,
+          name: toolName,
+          arguments: JSON.stringify(toolInput),
+        },
+      } as unknown as LettaInnerEvent,
+    };
+    try { onFrame?.(frame, { runId: runHandle.id }); } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      logLine(`onFrame error during approval emit: ${m}`);
+    }
+
+    // (d) Park on the durable wait. No 30s cap — the wait lives as long as
+    //     the turn; the absolute turn ceiling (SHIM_POOL_TURN_TIMEOUT) is the
+    //     hard backstop so a forgotten approval can never park forever.
+    //
+    //     D2 (Commit 2): while parked, reset the silence watchdog on a
+    //     cadence shorter than SHIM_POOL_TURN_SILENCE_MS so a human-paced
+    //     approval does not trip the turn's silence timeout. The interval is
+    //     unref'd (never keeps the process alive) and is cleared the instant
+    //     the wait settles, reverting to normal silence-watchdog behavior.
+    const askTimeoutMs = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 1_800_000);
+    // Read the silence budget live (env may be overridden per-deployment/test)
+    // and keep alive at half that cadence so the watchdog never trips while
+    // parked. Floor of 25ms keeps the interval sane under tiny test budgets.
+    const silenceBudgetMs = Number(process.env["SHIM_POOL_TURN_SILENCE_MS"] ?? TURN_SILENCE_MS);
+    const keepaliveMs = Math.max(25, Math.floor(silenceBudgetMs / 2));
+    const reset = this.currentResetSilenceTimer;
+    const keepalive: NodeJS.Timeout | null = reset
+      ? setInterval(() => { try { reset(); } catch { /* best-effort */ } }, keepaliveMs)
+      : null;
+    keepalive?.unref?.();
+    let decision: ApprovalDecision;
+    try {
+      decision = await waitForApprovalDecision(runHandle.id, toolName, toolCallId, askTimeoutMs);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      recordApprovalDecision(runHandle.id, {
+        action_id: `timeout-${toolCallId}`,
+        tool_name: toolName,
+        decision: reason.startsWith("approval_timeout") ? "timeout" : "deny",
+        scope: "Deny",
+        reason,
+        timestamp,
+      });
+      clearPendingApproval(runHandle.id);
+      return { behavior: "deny", message: reason };
+    } finally {
+      // D2: stop refreshing the silence watchdog the instant the park ends —
+      // normal silence-watchdog behavior resumes automatically.
+      if (keepalive) clearInterval(keepalive);
+    }
+
+    // (e) Decision received via the resolveApproval funnel (WS or REST). The
+    //     funnel already rewrote the pending file + recorded audit/policy +
+    //     broadcast; we clear the pending file on turn-tool completion and
+    //     update the in-process scope cache for Session/Forever approvals.
+    if (
+      decision.decision === "approve" &&
+      (decision.scope === "Session" || decision.scope === "Forever")
+    ) {
+      cache.set(toolName, {
+        scope: decision.scope as Extract<ApprovalScope, "Session" | "Forever">,
+        timestamp,
+      });
+    }
+    clearPendingApproval(runHandle.id);
+    return decision.decision === "approve"
+      ? { behavior: "allow", message: decision.reason }
+      : { behavior: "deny", message: decision.reason };
+  }
+
+  /**
+   * lcp-indw: emit a lightweight deny frame so a connected client sees that
+   * (and why) a tool was blocked by a rule, rather than the tool silently
+   * vanishing. Reuses the approval_request_message-adjacent shape with a
+   * terminal status so existing renderers can surface it.
+   */
+  private _emitApprovalDenyFrame(
+    toolName: string,
+    reason: string,
+    runHandle: RunHandle,
+    onFrame: ((frame: LettaStreamFrame, meta: { runId: string }) => void) | null,
+  ): void {
+    const seqId = ++this.syntheticSeqId;
+    const frame: LettaStreamFrame = {
+      type: "stream_event",
+      session_id: this.sessionId,
+      uuid: `synthetic-${randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      event: {
+        message_type: "approval_resolved",
+        id: `synthetic-deny-${seqId}`,
+        date: new Date().toISOString(),
+        agent_id: this.agentId,
+        conversation_id: this.conversationId,
+        run_id: runHandle.id,
+        seq_id: seqId,
+        status: "denied",
+        reason,
+        tool_name: toolName,
+      } as unknown as LettaInnerEvent,
+    };
+    try { onFrame?.(frame, { runId: runHandle.id }); } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      logLine(`onFrame error during deny emit: ${m}`);
+    }
   }
 
   async abort(reason?: string): Promise<void> {

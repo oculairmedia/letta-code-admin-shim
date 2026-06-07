@@ -85,6 +85,22 @@ import {
 } from "./lib/crons.js";
 import { broadcastCronEvent } from "./lib/cron-events.js";
 import type { AddTaskInput, CronTask } from "./lib/types/crons.js";
+import {
+  evaluatePermission,
+  readAgentConfigOrEffective,
+  readGlobalConfig,
+  writeAgentConfig,
+  writeGlobalConfig,
+  patchAgentConfig,
+  type PermissionAction,
+  type PermissionConfig,
+  type PermissionRule,
+} from "./lib/permissions.js";
+import {
+  listPendingApprovals,
+  resolveApproval,
+  sweepPendingApprovalsOnBoot,
+} from "./lib/pending-approval.js";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
@@ -1321,6 +1337,170 @@ function handleCronBulkDelete(res: ServerResponse, url: URL): void {
   json(res, 200, { deleted });
 }
 
+// ── /shim/v1/permissions/* + /shim/v1/approvals/* (lcp-indw) ──────────
+//
+// Thin REST mirror over the SAME files + functions the WS path uses. The
+// permissions config endpoints read/write lib/permissions.ts (lock-serialized
+// writes); the approval endpoints read the durable pending-approval store and
+// resolve via the SINGLE resolveApproval funnel — no second source of truth.
+//
+// D3: config PUT/PATCH over REST is allowed (it's config, not a live turn).
+//
+// NOTE (must also appear in user-facing docs): prefix-match deny rules are a
+// UX guardrail to prevent accidents, NOT a security boundary. They are
+// trivially bypassed (bash -c '…', aliases, env indirection). Real isolation
+// must come from the execution environment, not string matching.
+
+function parseRulesBody(body: Record<string, unknown>): PermissionRule[] | { error: string } {
+  const rulesRaw = body["rules"];
+  if (!Array.isArray(rulesRaw)) return { error: "`rules` must be an array" };
+  const rules: PermissionRule[] = [];
+  for (const r of rulesRaw) {
+    if (typeof r !== "object" || r === null) return { error: "each rule must be an object" };
+    const ro = r as Record<string, unknown>;
+    if (typeof ro["tool"] !== "string" || ro["tool"].length === 0) {
+      return { error: "each rule needs a non-empty `tool`" };
+    }
+    const action = ro["action"];
+    if (action !== "allow" && action !== "ask" && action !== "deny") {
+      return { error: "each rule `action` must be allow|ask|deny" };
+    }
+    const rule: PermissionRule = { tool: ro["tool"], action };
+    if (typeof ro["reason"] === "string") rule.reason = ro["reason"];
+    rules.push(rule);
+  }
+  return rules;
+}
+
+function configFromBody(body: Record<string, unknown>): PermissionConfig | { error: string } {
+  const rules = parseRulesBody(body);
+  if ("error" in rules) return rules;
+  const defRaw = body["default"];
+  const def: PermissionAction =
+    defRaw === "allow" || defRaw === "ask" || defRaw === "deny" ? defRaw : "allow";
+  return { version: 1, default: def, rules };
+}
+
+function handlePermissionsAgentGet(res: ServerResponse, agentId: string): void {
+  json(res, 200, readAgentConfigOrEffective(agentId));
+}
+
+async function handlePermissionsAgentPut(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  const body = await readJsonBody(req);
+  const config = configFromBody(body);
+  if ("error" in config) return badRequest(res, config.error);
+  json(res, 200, writeAgentConfig(agentId, config));
+}
+
+async function handlePermissionsAgentPatch(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  const body = await readJsonBody(req);
+  const patch: { default?: PermissionAction; rules?: PermissionRule[] } = {};
+  if (body["default"] !== undefined) {
+    const d = body["default"];
+    if (d !== "allow" && d !== "ask" && d !== "deny") {
+      return badRequest(res, "`default` must be allow|ask|deny");
+    }
+    patch.default = d;
+  }
+  if (body["rules"] !== undefined) {
+    const rules = parseRulesBody(body);
+    if ("error" in rules) return badRequest(res, rules.error);
+    patch.rules = rules;
+  }
+  if (patch.default === undefined && patch.rules === undefined) {
+    return badRequest(res, "PATCH requires at least `default` or `rules`");
+  }
+  json(res, 200, patchAgentConfig(agentId, patch));
+}
+
+function handlePermissionsGlobalGet(res: ServerResponse): void {
+  json(res, 200, readGlobalConfig());
+}
+
+async function handlePermissionsGlobalPut(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  const config = configFromBody(body);
+  if ("error" in config) return badRequest(res, config.error);
+  json(res, 200, writeGlobalConfig(config));
+}
+
+function handlePermissionsPreview(res: ServerResponse, url: URL): void {
+  const agentId = url.searchParams.get("agent_id") ?? "";
+  const tool = url.searchParams.get("tool") ?? "";
+  if (!tool) return badRequest(res, "`tool` query param is required");
+  const argsRaw = url.searchParams.get("args");
+  let toolInput: Record<string, unknown> = {};
+  if (argsRaw) {
+    try {
+      const parsed = JSON.parse(argsRaw) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        toolInput = parsed as Record<string, unknown>;
+      } else {
+        // Treat a bare string as the primary command arg for prefix matching.
+        toolInput = { command: argsRaw };
+      }
+    } catch {
+      toolInput = { command: argsRaw };
+    }
+  }
+  const result = evaluatePermission(
+    agentId,
+    url.searchParams.get("conversation_id") ?? null,
+    tool,
+    toolInput,
+  );
+  json(res, 200, {
+    action: result.action,
+    reason: result.reason,
+    source: result.source,
+    requires_approval: result.action !== "allow",
+  });
+}
+
+function handleApprovalsPending(res: ServerResponse, url: URL): void {
+  const filters: { agentId?: string; conversationId?: string } = {};
+  const agentId = url.searchParams.get("agent_id");
+  const conversationId = url.searchParams.get("conversation_id");
+  if (agentId) filters.agentId = agentId;
+  if (conversationId) filters.conversationId = conversationId;
+  json(res, 200, { pending: listPendingApprovals(filters) });
+}
+
+async function handleApprovalsDecision(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+  const body = await readJsonBody(req);
+  const decisionRaw = body["decision"];
+  if (decisionRaw !== "approve" && decisionRaw !== "deny") {
+    return badRequest(res, "`decision` must be approve|deny");
+  }
+  const decision: {
+    decision: "approve" | "deny";
+    scope?: "Once" | "Session" | "Forever" | "Deny";
+    reason?: string;
+    userId?: string;
+  } = { decision: decisionRaw };
+  const scope = body["scope"];
+  if (scope === "Once" || scope === "Session" || scope === "Forever" || scope === "Deny") {
+    decision.scope = scope;
+  }
+  if (typeof body["reason"] === "string") decision.reason = body["reason"];
+  if (typeof body["user_id"] === "string") decision.userId = body["user_id"];
+  const result = resolveApproval(runId, decision);
+  if (!result.found) return notFound(res, `pending approval for run ${runId}`);
+  json(res, 200, { status: result.status, ...(result.already_resolved ? { already_resolved: true } : {}) });
+}
+
+function handleApprovalsDelete(res: ServerResponse, runId: string): void {
+  // DELETE = deny shorthand. Same resolve funnel.
+  const result = resolveApproval(runId, { decision: "deny", scope: "Deny", reason: "rest_delete" });
+  if (!result.found) return notFound(res, `pending approval for run ${runId}`);
+  json(res, 200, { status: result.status, ...(result.already_resolved ? { already_resolved: true } : {}) });
+}
+
+function handlePermissionsMethodNotAllowed(req: IncomingMessage, res: ServerResponse): void {
+  res.setHeader("Allow", "GET, PUT, PATCH, OPTIONS");
+  json(res, 405, { detail: `${req.method} not allowed on this permissions endpoint` });
+}
+
 function handleRunsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const { limit } = parsePagination(url.searchParams);
   const params: ListRunsParams & { agentIds?: string[]; statuses?: string[] } = {
@@ -1770,6 +1950,43 @@ const server = createServer((req, res) => {
   const agentCancel = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/messages\/cancel\/?$/);
   if (agentCancel && req.method === "POST") return handleAgentMessagesCancel(req, res, agentCancel[1]!);
 
+  // /shim/v1/permissions/* + /shim/v1/approvals/* — server-side permissions
+  // (lcp-indw). Config PUT/PATCH over REST is allowed (D3 — it's config, not
+  // a live turn). Approval decisions funnel through the SAME resolveApproval
+  // the WS path uses. The entire evaluator path is dark-shipped behind
+  // SHIM_SERVER_PERMISSIONS=1, but these config/read endpoints are always
+  // mounted (they have no effect on live turns when the flag is off).
+  if (pathname === "/shim/v1/permissions/global" || pathname === "/shim/v1/permissions/global/") {
+    if (req.method === "GET") return handlePermissionsGlobalGet(res);
+    if (req.method === "PUT") return void handlePermissionsGlobalPut(req, res);
+    return handlePermissionsMethodNotAllowed(req, res);
+  }
+  if (pathname === "/shim/v1/permissions/preview" || pathname === "/shim/v1/permissions/preview/") {
+    if (req.method === "GET") return handlePermissionsPreview(res, url);
+    return handlePermissionsMethodNotAllowed(req, res);
+  }
+  const permAgent = pathname.match(/^\/shim\/v1\/permissions\/agents\/([^/]+)\/?$/);
+  if (permAgent) {
+    const agentId = decodeURIComponent(permAgent[1]!);
+    if (req.method === "GET") return handlePermissionsAgentGet(res, agentId);
+    if (req.method === "PUT") return void handlePermissionsAgentPut(req, res, agentId);
+    if (req.method === "PATCH") return void handlePermissionsAgentPatch(req, res, agentId);
+    return handlePermissionsMethodNotAllowed(req, res);
+  }
+  if (pathname === "/shim/v1/approvals/pending" || pathname === "/shim/v1/approvals/pending/") {
+    if (req.method === "GET") return handleApprovalsPending(res, url);
+    res.setHeader("Allow", "GET, OPTIONS");
+    return json(res, 405, { detail: `${req.method} not allowed on /shim/v1/approvals/pending` });
+  }
+  const approvalDecision = pathname.match(/^\/shim\/v1\/approvals\/([^/]+)\/?$/);
+  if (approvalDecision && approvalDecision[1] !== "pending") {
+    const runId = decodeURIComponent(approvalDecision[1]!);
+    if (req.method === "POST") return void handleApprovalsDecision(req, res, runId);
+    if (req.method === "DELETE") return handleApprovalsDelete(res, runId);
+    res.setHeader("Allow", "POST, DELETE, OPTIONS");
+    return json(res, 405, { detail: `${req.method} not allowed on /shim/v1/approvals/:runId` });
+  }
+
   // /v1/crons/* — read mirror (lcp-9h3) + REST mutations (lcp-5o9o). All
   // writes go through the lock-serialized store in lib/crons.ts so concurrent
   // WS-write + REST-write cannot lose updates; we never touch crons.json here.
@@ -1836,6 +2053,20 @@ server.listen(PORT, HOST, () => {
   const actualPort = typeof addr === "object" && addr ? addr.port : PORT;
   console.log(`letta-code admin shim listening on http://${HOST}:${actualPort}`);
   console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env["LETTA_LOCAL_BACKEND_DIR"] ?? "(default)"}`);
+
+  // lcp-indw: boot-sweep surviving pending approvals (R1). A turn parked on
+  // an `ask` when the shim died cannot resume (its CLI session is gone), so
+  // we flip each surviving `pending` → `expired`, append a synthetic terminal
+  // frame (no eternal spinner on reconnect), and finalize the run. Runs
+  // unconditionally — even with the feature flag off — so a restart after a
+  // flag-on deploy never leaves a stuck approval. No-op when there are none.
+  try {
+    const swept = sweepPendingApprovalsOnBoot();
+    if (swept > 0) console.log(`[permissions] boot-sweep expired ${swept} pending approval(s)`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[permissions] boot-sweep failed: ${msg}`);
+  }
 
   // lcp-0mw: claim the cron scheduler lease and start ticking. Set
   // SHIM_CRON_ENABLED=0 to opt out (tests do this so the suite doesn't

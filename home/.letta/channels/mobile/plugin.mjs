@@ -179,6 +179,10 @@ function createMobileAdapter(account, host) {
         handleCronDelete: host.handleCronDelete,
         handleCronDeleteAll: host.handleCronDeleteAll,
         subscribeCronEvents: host.subscribeCronEvents,
+        // lcp-indw: approval_resolved cross-client push. MUST be explicitly
+        // forwarded here (same gotcha as subscribeCronEvents) — the handler
+        // only sees host methods it is handed.
+        subscribeApprovalEvents: host.subscribeApprovalEvents,
       });
     },
   };
