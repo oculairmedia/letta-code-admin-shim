@@ -1,0 +1,7 @@
+{
+  "name": "weather-lookup",
+  "version": "1.0.0",
+  "description": "Look up current weather conditions for a location",
+  "tags": ["weather", "utilities", "api"],
+  "author": "community"
+}

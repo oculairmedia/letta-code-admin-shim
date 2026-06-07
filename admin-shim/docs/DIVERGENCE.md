@@ -240,6 +240,103 @@ conversations it owns. Do not also consume
 `/v1/conversations/{id}/stream` for those conversations. REST `/messages`
 remains the durable cold-start, post-turn reconciliation, and repair surface.
 
+## Required fixes: Letta Code desktop client compatibility
+
+These are not intentional divergences — they are gaps that prevent Letta Code's
+desktop client from connecting to the shim. All must be resolved before the
+shim can serve as a drop-in backend for the desktop app.
+
+### 1. `POST /v1/conversations/{id}/stream` returns 501
+
+**Current behavior:** `handleConversationStream` returns `501 Not Implemented`.
+
+**Expected behavior:** Letta Code's desktop client uses this endpoint for SSE
+streaming, not `POST /v1/conversations/{id}/messages`. The shim's streaming
+logic lives in `handleConversationSendMessage`; `handleConversationStream`
+needs the same SSE logic but wrapped in a `/stream` route.
+
+**Fix:** Duplicate the SSE streaming path from `handleConversationSendMessage`
+into `handleConversationStream`. The `stream-coalescer` logic is already in
+`lib/stream-coalescer.ts` — wire it up.
+
+### 2. `POST /v1/conversations/{id}/fork` returns 501
+
+**Current behavior:** `handleConversationStub` returns `501`.
+
+**Expected behavior:** Desktop client uses this to fork/branch a conversation.
+
+**Fix:** Implement conversation forking by copying the source conversation's
+messages to a new conversation record with a fresh `conv-<uuid>` id.
+
+### 3. `POST /v1/conversations/{id}/recompile` returns 501
+
+**Current behavior:** `handleConversationStub` returns `501`.
+
+**Expected behavior:** Desktop client uses this to trigger system prompt
+recompilation — typically by replaying the agent's system prompt through the
+LLM with the current context to produce a fresh prompt.
+
+**Fix:** Implement recompile by reading the agent's current system prompt and
+memory blocks, then invoking the LLM to regenerate. Store the result back to
+the agent's `system` memory block.
+
+### 4. `DELETE /v1/agents/{id}` is not implemented
+
+**Current behavior:** No route exists. Requests 404.
+
+**Expected behavior:** Desktop client can delete agents. Must remove the
+agent's LocalBackend directory and all associated state (conversations,
+messages, runs).
+
+**Fix:** Add `DELETE /v1/agents/{agent-*}` handler that removes the agent's
+on-disk record and associated data.
+
+### 5. `/v1/mcp-servers` returns empty stub
+
+**Current behavior:** Returns `[]`.
+
+**Expected behavior:** Desktop app exposes an MCP server management UI.
+Needs at minimum `GET /v1/mcp-servers` (list) and likely `POST /v1/mcp-servers`
+(create), `DELETE /v1/mcp-servers/{id}` (remove), `PATCH /v1/mcp-servers/{id}`
+(update).
+
+**Fix:** Implement MCP server CRUD against LocalBackend storage, or return a
+structured empty response that communicates "MCP servers not yet supported"
+rather than a bare `[]`.
+
+### 6. `/v1/jobs` returns empty stub
+
+**Current behavior:** Returns `[]`.
+
+**Expected behavior:** Background job tracking for long-running operations.
+
+**Fix:** Either implement job tracking or return a structured response
+indicating the feature is unsupported.
+
+### 7. `/v1/folders` and `/v1/groups` return empty stubs
+
+**Current behavior:** Both return `[]`.
+
+**Expected behavior:** Agent organization and grouping. Desktop app uses
+these for organizing agent rosters.
+
+**Fix:** Implement folder/group CRUD against LocalBackend, or return
+structured empty responses.
+
+### 8. Conversation id format: `conv-default-<agentId>` vs `conv-<uuid>`
+
+**Current behavior:** Default conversations created during migration use
+`conv-default-<agentId>` format.
+
+**Expected behavior:** Vanilla Letta uses `conv-<uuid>` for all conversations.
+
+**Impact:** The desktop client may assume `conv-<uuid>` format when parsing
+or constructing conversation URLs. The mobile client parser is stated as
+"string-agnostic" but the desktop client may not be.
+
+**Fix:** Migrate any `conv-default-*` conversation ids to `conv-<uuid>` format,
+or ensure the desktop client handles both formats gracefully.
+
 ## What's NOT a divergence (and should stay that way)
 
 - **Conversation list and detail responses** — same shape as vanilla.
@@ -281,18 +378,26 @@ working off the same codebase indefinitely.
 
 ## Quick reference table
 
-| Feature | Vanilla | Shim today | Notes |
+| Feature | Vanilla | Shim today | Desktop client impact |
 |---|---|---|---|
-| `/v1/health/` extra fields | none | `server_id`, `server_started_at`, `backend` | Additive, clients can ignore |
-| `/v1/health/` mobile capability | none | `capabilities.mobile_transport` | Lets mobile detect admin-shim WS support |
-| `/shim/v1/capabilities` | n/a | REST/SSE/WS role metadata | Shim-only discovery endpoint |
-| WS `welcome` canonical transport | n/a | `canonical_live_transport: "ws"` | Suppress concurrent mobile SSE after welcome |
-| Streaming chunked assistant | one frame per turn | one frame per turn (coalesced) | Matches vanilla |
-| Streaming chunked tool calls | per-call frames | per-call frames | Matches vanilla |
-| `stop_reason` envelope | bare | bare | Matches vanilla |
-| `usage_statistics` envelope | bare | bare | Matches vanilla |
-| Conversation id format | `conv-<uuid>` | `conv-default-<agentId>` for migrated defaults, `conv-<uuid>` for fresh | Slight shape difference; mobile parser is string-agnostic |
-| Agent id aliases | n/a | maps legacy → canonical | Transitional; remove once mobile caches roll |
-| `/shim/pool` | n/a | warm-worker stats | Shim-only |
-| Native chunked streaming | n/a | future Path A or B | Not built yet |
-| Server-pushed events to client | none | future shim WS | Not built yet |
+| `/v1/health/` extra fields | none | `server_id`, `server_started_at`, `backend` | Additive, clients ignore — OK |
+| `/v1/health/` mobile capability | none | `capabilities.mobile_transport` | Lets mobile detect admin-shim WS support — OK |
+| `/shim/v1/capabilities` | n/a | REST/SSE/WS role metadata | Shim-only — OK |
+| WS `welcome` canonical transport | n/a | `canonical_live_transport: "ws"` | Suppress concurrent mobile SSE after welcome — OK |
+| Streaming chunked assistant | one frame per turn | one frame per turn (coalesced) | Matches vanilla — OK |
+| Streaming chunked tool calls | per-call frames | per-call frames | Matches vanilla — OK |
+| `stop_reason` envelope | bare | bare | Matches vanilla — OK |
+| `usage_statistics` envelope | bare | bare | Matches vanilla — OK |
+| Conversation id format | `conv-<uuid>` | `conv-default-<agentId>` for migrated defaults, `conv-<uuid>` for fresh | Desktop client may assume `conv-<uuid>` — **fix needed** |
+| Agent id aliases | n/a | maps legacy → canonical | Transitional; remove once mobile caches roll — OK |
+| `/shim/pool` | n/a | warm-worker stats | Shim-only — OK |
+| `POST /v1/conversations/{id}/stream` | SSE streaming | **501 stub** | Desktop client uses this for SSE — **fix needed** |
+| `POST /v1/conversations/{id}/fork` | fork conversation | **501 stub** | Desktop client uses for branching — **fix needed** |
+| `POST /v1/conversations/{id}/recompile` | rebuild system prompt | **501 stub** | Desktop client uses for prompt rebuild — **fix needed** |
+| `DELETE /v1/agents/{id}` | delete agent | **not implemented (404)** | Desktop client needs agent deletion — **fix needed** |
+| `/v1/mcp-servers` | MCP server CRUD | empty stub `[]` | Desktop MCP server UI — **fix needed** |
+| `/v1/jobs` | background jobs | empty stub `[]` | Desktop job tracking — **fix or document** |
+| `/v1/folders` | agent folders | empty stub `[]` | Desktop organization — **fix or document** |
+| `/v1/groups` | agent groups | empty stub `[]` | Desktop grouping — **fix or document** |
+| Native chunked streaming | n/a | future Path A or B | Not built yet — OK to defer |
+| Server-pushed events to client | none | future shim WS | Not built yet — OK to defer |
