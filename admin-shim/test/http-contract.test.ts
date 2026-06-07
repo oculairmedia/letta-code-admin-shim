@@ -1231,7 +1231,12 @@ test("GET /v1/tools/{tool_id} returns 404 for an unknown id", async (t) => {
 
 // ── messages search ────────────────────────────────────────────────
 
-test("POST /v1/messages/search returns { messages: [] }", async (t) => {
+test("POST /v1/messages/search requires agent_id (lcp-c61s)", async (t) => {
+  // The Phase-1 stub (which returned { messages: [] } for any body) was
+  // replaced by the derived FTS5 search (lcp-c61s). The new contract takes
+  // { query, agent_id, limit }; a missing agent_id is a 400. Searches that
+  // target a real agent are exercised in test/search.test.ts against on-disk
+  // fixtures.
   const shim = await startShim();
   t.after(() => shim.stop());
 
@@ -1240,9 +1245,9 @@ test("POST /v1/messages/search returns { messages: [] }", async (t) => {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query: "anything" }),
   });
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.deepEqual(body, { messages: [] });
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { detail?: string };
+  assert.match(body.detail ?? "", /agent_id/);
 });
 
 // ── stub list/count endpoints ─────────────────────────────────────
