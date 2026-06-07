@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 
 import { getAgentPool } from "./agent-pool.js";
-import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.js";
+import { findUnmappedTailUserMessageId, writeOtidForLocalId, syncSkillsBlockForAgent } from "./store.js";
 import { toStringArrayOrNull } from "./translate.js";
 import type {
   LettaMessage,
@@ -800,6 +800,15 @@ export async function handleSendMessage(
         }
         handleRawFrame(raw);
       };
+
+      // Progressive disclosure (lcp-6eef): inject ONLY a compact
+      // `name: description` index of installed skills into the agent's
+      // SYSTEM CONTEXT (memfs system block), NOT the user message. The full
+      // SKILL.md body is fetched on demand via GET /v1/agents/{id}/skills/{name}.
+      // This replaces the old per-turn O(installed-skills × body) full-body
+      // injection that polluted every user message.
+      syncSkillsBlockForAgent(agentId);
+
       // lcp-0vi: route through runTurnWithHeal so a dangling-tool-use error
       // on this turn evicts + heals the transcript before returning. The
       // healed disk is picked up by the next pool.get() the next time a

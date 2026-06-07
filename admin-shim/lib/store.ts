@@ -13,9 +13,12 @@
 
 import {
   existsSync,
+  mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import {
   mkdir as fsMkdir,
@@ -984,6 +987,593 @@ export function readBlocksForAgent(agentId: string): Block[] {
     });
   }
   return out;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Directory copy helper
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Copy a directory recursively from src to dst.
+ */
+function copyDirRecursive(src: string, dst: string): void {
+  mkdirSync(dst, { recursive: true });
+  const entries = readdirSync(src);
+  for (const entry of entries) {
+    const srcPath = join(src, entry);
+    const dstPath = join(dst, entry);
+    if (statSync(srcPath).isDirectory()) {
+      copyDirRecursive(srcPath, dstPath);
+    } else {
+      writeFileSync(dstPath, readFileSync(srcPath));
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Skills — skill discovery, installation, and management
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Skill manifest shape as returned by the skills API.
+ */
+export interface SkillManifest {
+  name: string;
+  version: string;
+  description: string;
+  tags: string[];
+  author: string;
+}
+
+/**
+ * Extended skill detail returned by GET /v1/skills/{name}.
+ */
+export interface SkillDetail extends SkillManifest {
+  readme: string;
+  files: string[];
+  dependencies: string[];
+}
+
+/**
+ * Skill listing item with installation count.
+ */
+export interface SkillListingItem extends SkillManifest {
+  installed_count: number;
+}
+
+/**
+ * Get the global skills store directory.
+ *
+ * The global registry is intentionally a USER-LEVEL shared store (default
+ * `~/.letta/skills`, overridable via `LETTA_HOME`). It is shared across
+ * deployments and is interoperable with the official Letta client (see
+ * DIVERGENCE.md). This is deliberately NOT under `storageDir()` so that
+ * the same global skill catalog is visible regardless of which
+ * lc-local-backend a given shim instance points at.
+ *
+ * Tests / isolated installs may override the registry root explicitly via
+ * `LETTA_SKILLS_DIR`.
+ */
+export function skillsStoreDir(): string {
+  return (
+    process.env["LETTA_SKILLS_DIR"] ||
+    join(process.env["LETTA_HOME"] || join(homedir(), ".letta"), "skills")
+  );
+}
+
+/**
+ * Get the directory for an agent's installed skills.
+ *
+ * Per-agent installed skills are SHIM STATE — they live alongside the rest
+ * of the agent's state under `storageDir()/agents/<id>/skills/` (the same
+ * root as `agents/<b64url(id)>.json`, `memfs/<id>/...`, etc.) rather than a
+ * hardcoded `~/.letta`. This keeps per-agent state co-located with the
+ * lc-local-backend it belongs to.
+ */
+export function agentSkillsDir(agentId: string): string {
+  return join(storageDir(), "agents", agentId, "skills");
+}
+
+/**
+ * Parse skill metadata from a SKILL.md file's frontmatter or first lines.
+ * Returns the parsed metadata or null if the file doesn't contain valid skill info.
+ */
+function parseSkillMetadata(skillDir: string, skillName: string): SkillManifest | null {
+  const skillMdPath = join(skillDir, "SKILL.md");
+  const metadataPath = join(skillDir, "metadata.json");
+
+  // Try metadata.json first
+  if (existsSync(metadataPath)) {
+    try {
+      const raw = JSON.parse(readFileSync(metadataPath, "utf8")) as Record<string, unknown>;
+      if (typeof raw["name"] === "string") {
+        return {
+          name: raw["name"] as string,
+          version: typeof raw["version"] === "string" ? raw["version"] as string : "1.0.0",
+          description: typeof raw["description"] === "string" ? raw["description"] as string : "",
+          tags: Array.isArray(raw["tags"]) ? (raw["tags"] as string[]).filter((t) => typeof t === "string") : [],
+          author: typeof raw["author"] === "string" ? raw["author"] as string : "community",
+        };
+      }
+    } catch {
+      // Fall through to SKILL.md parsing
+    }
+  }
+
+  // Parse SKILL.md for frontmatter or structured content
+  if (existsSync(skillMdPath)) {
+    try {
+      const content = readFileSync(skillMdPath, "utf8");
+      let name = skillName;
+      let description = "";
+      let version = "1.0.0";
+      let author = "community";
+      const tags: string[] = [];
+
+      // Try YAML frontmatter
+      const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n/);
+      if (frontmatterMatch && frontmatterMatch[1]) {
+        const fm = frontmatterMatch[1];
+        const nameMatch = fm.match(/name:\s*["']?([^"'\n]+)["']?/i);
+        if (nameMatch && nameMatch[1]) name = nameMatch[1].trim();
+        const descMatch = fm.match(/description:\s*["']?([^"'\n]+)["']?/i);
+        if (descMatch && descMatch[1]) description = descMatch[1].trim();
+        const verMatch = fm.match(/version:\s*["']?([^"'\n]+)["']?/i);
+        if (verMatch && verMatch[1]) version = verMatch[1].trim();
+        const authMatch = fm.match(/author:\s*["']?([^"'\n]+)["']?/i);
+        if (authMatch && authMatch[1]) author = authMatch[1].trim();
+        const tagsMatch = fm.match(/tags:\s*\[(.*?)\]/i);
+        if (tagsMatch && tagsMatch[1]) {
+          const tagsStr = tagsMatch[1];
+          const tagMatches = tagsStr.match(/["']([^"']+)["']/g);
+          if (tagMatches) {
+            for (const tm of tagMatches) {
+              tags.push(tm.replace(/["']/g, "").trim());
+            }
+          }
+        }
+      } else {
+        // Try extracting from first few lines (name: ... / description: ...)
+        const lines = content.split("\n").slice(0, 20);
+        for (const line of lines) {
+          const nameMatch = line.match(/^#\s*(?:skill\s+)?name:\s*(.+)/i);
+          if (nameMatch && nameMatch[1]) { name = nameMatch[1].trim(); continue; }
+          const descMatch = line.match(/^#\s*description:\s*(.+)/i);
+          if (descMatch && descMatch[1]) { description = descMatch[1].trim(); continue; }
+          const verMatch = line.match(/^#\s*version:\s*(.+)/i);
+          if (verMatch && verMatch[1]) { version = verMatch[1].trim(); continue; }
+          const authMatch = line.match(/^#\s*author:\s*(.+)/i);
+          if (authMatch && authMatch[1]) { author = authMatch[1].trim(); continue; }
+          const tagsMatch = line.match(/^#\s*tags:\s*(.+)/i);
+          if (tagsMatch && tagsMatch[1]) {
+            const tagsStr = tagsMatch[1];
+            const tagMatches = tagsStr.match(/[\w-]+/g);
+            if (tagMatches) tags.push(...tagMatches);
+          }
+        }
+        // Use first heading as description fallback
+        if (!description) {
+          const headingMatch = content.match(/^#\s+(.+)/m);
+          if (headingMatch && headingMatch[1]) description = headingMatch[1].trim();
+        }
+      }
+
+      return { name, version, description, tags, author };
+    } catch {
+      // Return default manifest
+    }
+  }
+
+  // Return default manifest
+  return {
+    name: skillName,
+    version: "1.0.0",
+    description: "",
+    tags: [],
+    author: "community",
+  };
+}
+
+/**
+ * List all available skills in the global store.
+ */
+export function listAvailableSkills(): SkillListingItem[] {
+  const storeDir = skillsStoreDir();
+  if (!existsSync(storeDir)) return [];
+
+  const out: SkillListingItem[] = [];
+  try {
+    const entries = readdirSync(storeDir);
+    for (const entry of entries) {
+      const skillDir = join(storeDir, entry);
+      // Check if this is a directory with a SKILL.md file
+      if (!statSync(skillDir).isDirectory()) continue;
+      const skillMdPath = join(skillDir, "SKILL.md");
+      if (!existsSync(skillMdPath)) continue;
+
+      const manifest = parseSkillMetadata(skillDir, entry);
+      if (!manifest) continue;
+
+      // Count how many agents have this skill installed. Per-agent skills
+      // live under storageDir()/agents/<id>/skills/ (see agentSkillsDir).
+      const agentsDir = join(storageDir(), "agents");
+      let installedCount = 0;
+      if (existsSync(agentsDir)) {
+        try {
+          const agentDirs = readdirSync(agentsDir);
+          for (const agentDir of agentDirs) {
+            const agentSkillPath = join(agentsDir, agentDir, "skills", entry);
+            if (existsSync(agentSkillPath)) installedCount++;
+          }
+        } catch {
+          // Ignore errors counting installations
+        }
+      }
+
+      out.push({
+        ...manifest,
+        installed_count: installedCount,
+      });
+    }
+  } catch {
+    // Return empty list on error
+  }
+  return out;
+}
+
+/**
+ * Get detailed information about a specific skill in the global store.
+ */
+export function getSkillDetail(skillName: string): SkillDetail | null {
+  const storeDir = skillsStoreDir();
+  const skillDir = join(storeDir, skillName);
+
+  if (!existsSync(skillDir) || !statSync(skillDir).isDirectory()) return null;
+
+  const skillMdPath = join(skillDir, "SKILL.md");
+  if (!existsSync(skillMdPath)) return null;
+
+  const manifest = parseSkillMetadata(skillDir, skillName);
+  if (!manifest) return null;
+
+  // Read the SKILL.md content
+  let readme = "";
+  try {
+    readme = readFileSync(skillMdPath, "utf8");
+  } catch {
+    // Keep empty
+  }
+
+  // List all files in the skill directory
+  const files: string[] = [];
+  try {
+    const entries = readdirSync(skillDir);
+    for (const entry of entries) {
+      const fullPath = join(skillDir, entry);
+      if (statSync(fullPath).isDirectory()) {
+        files.push(`${entry}/`);
+ // Add files within subdirectories
+        try {
+          const subEntries = readdirSync(fullPath);
+          for (const subEntry of subEntries) {
+            files.push(`${entry}/${subEntry}`);
+          }
+        } catch {
+          // Ignore
+        }
+      } else {
+        files.push(entry);
+      }
+    }
+  } catch {
+    // Keep empty
+  }
+
+  return {
+    ...manifest,
+    readme,
+    files,
+    dependencies: [],
+  };
+}
+
+/**
+ * List skills installed for a specific agent.
+ */
+export function listInstalledSkillsForAgent(agentId: string): SkillManifest[] {
+  const agentSkills = agentSkillsDir(agentId);
+  if (!existsSync(agentSkills)) return [];
+
+  const out: SkillManifest[] = [];
+  try {
+    const entries = readdirSync(agentSkills);
+    for (const entry of entries) {
+      const skillDir = join(agentSkills, entry);
+      if (!statSync(skillDir).isDirectory()) continue;
+      const manifest = parseSkillMetadata(skillDir, entry);
+      if (manifest) out.push(manifest);
+    }
+  } catch {
+    // Return empty
+  }
+  return out;
+}
+
+/**
+ * Get details about an installed skill for an agent.
+ */
+export function getInstalledSkillDetail(agentId: string, skillName: string): SkillDetail | null {
+  const skillDir = join(agentSkillsDir(agentId), skillName);
+  if (!existsSync(skillDir) || !statSync(skillDir).isDirectory()) return null;
+
+  const skillMdPath = join(skillDir, "SKILL.md");
+  if (!existsSync(skillMdPath)) return null;
+
+  const manifest = parseSkillMetadata(skillDir, skillName);
+  if (!manifest) return null;
+
+  let readme = "";
+  try {
+    readme = readFileSync(skillMdPath, "utf8");
+  } catch {
+    // Keep empty
+  }
+
+  const files: string[] = [];
+  try {
+    const entries = readdirSync(skillDir);
+    for (const entry of entries) {
+      const fullPath = join(skillDir, entry);
+      if (statSync(fullPath).isDirectory()) {
+        files.push(`${entry}/`);
+        try {
+          const subEntries = readdirSync(fullPath);
+          for (const subEntry of subEntries) {
+            files.push(`${entry}/${subEntry}`);
+          }
+        } catch {
+          // Ignore
+        }
+      } else {
+        files.push(entry);
+      }
+    }
+  } catch {
+    // Keep empty
+  }
+
+  return {
+    ...manifest,
+    readme,
+    files,
+    dependencies: [],
+  };
+}
+
+/**
+ * Install a skill to an agent by copying from the global store.
+ * Returns true on success, false on failure.
+ */
+export function installSkillToAgent(agentId: string, skillName: string): boolean {
+  const storeDir = skillsStoreDir();
+  const sourceDir = join(storeDir, skillName);
+  const targetDir = join(agentSkillsDir(agentId), skillName);
+
+  // Verify source exists
+  if (!existsSync(sourceDir) || !statSync(sourceDir).isDirectory()) return false;
+  const skillMdPath = join(sourceDir, "SKILL.md");
+  if (!existsSync(skillMdPath)) return false;
+
+  // Create target directory
+  try {
+    mkdirSync(targetDir, { recursive: true });
+  } catch {
+    return false;
+  }
+
+  // Copy all files from source to target
+  try {
+    const entries = readdirSync(sourceDir);
+    for (const entry of entries) {
+      const srcPath = join(sourceDir, entry);
+      const dstPath = join(targetDir, entry);
+      const stat = statSync(srcPath);
+      if (stat.isDirectory()) {
+        copyDirRecursive(srcPath, dstPath);
+      } else {
+        writeFileSync(dstPath, readFileSync(srcPath));
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Uninstall a skill from an agent (remove the installed copy).
+ * Returns true on success, false on failure.
+ */
+export function uninstallSkillFromAgent(agentId: string, skillName: string): boolean {
+  const skillDir = join(agentSkillsDir(agentId), skillName);
+  if (!existsSync(skillDir)) return false;
+
+  try {
+    rmSync(skillDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if a skill is installed for an agent.
+ */
+export function isSkillInstalledForAgent(agentId: string, skillName: string): boolean {
+  const skillDir = join(agentSkillsDir(agentId), skillName);
+  return existsSync(skillDir) && statSync(skillDir).isDirectory();
+}
+
+/**
+ * Lightweight `{ name, description }` listing of an agent's installed
+ * skills. This is the PROGRESSIVE-DISCLOSURE source: it parses the small
+ * per-skill manifests (frontmatter / metadata.json) via
+ * listInstalledSkillsForAgent — it never reads SKILL.md BODIES. The full
+ * body is retrieved on demand only, via getInstalledSkillDetail
+ * (GET /v1/agents/{id}/skills/{name}).
+ *
+ * Used to build the per-turn "Available Skills" system block so the
+ * context carries a compact one-line-per-skill index instead of the full
+ * O(installed-skills × body-size) text every turn.
+ */
+export function readInstalledSkillDescriptions(
+  agentId: string,
+): { name: string; description: string }[] {
+  return listInstalledSkillsForAgent(agentId).map((m) => ({
+    name: m.name,
+    description: m.description,
+  }));
+}
+
+/**
+ * Read all installed SKILL.md files for an agent and return their content.
+ *
+ * NOTE: This reads the FULL SKILL.md body for every installed skill and is
+ * therefore expensive. It MUST NOT be used for per-turn context injection
+ * (that pollutes every turn with O(installed-skills × body) text — see
+ * readInstalledSkillDescriptions for the progressive-disclosure path).
+ * Retained for any caller that genuinely needs the full bodies in bulk.
+ */
+export function readInstalledSkillContents(agentId: string): string[] {
+  const agentSkills = agentSkillsDir(agentId);
+  if (!existsSync(agentSkills)) return [];
+
+  const contents: string[] = [];
+  try {
+    const entries = readdirSync(agentSkills);
+    for (const entry of entries) {
+      const skillDir = join(agentSkills, entry);
+      if (!statSync(skillDir).isDirectory()) continue;
+      const skillMdPath = join(skillDir, "SKILL.md");
+      if (!existsSync(skillMdPath)) continue;
+      try {
+        const content = readFileSync(skillMdPath, "utf8");
+        contents.push(content);
+      } catch {
+        // Skip files we can't read
+      }
+    }
+  } catch {
+    // Return what we have
+  }
+  return contents;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Progressive-disclosure system-context injection
+//
+// The skills index is injected into the agent's SYSTEM CONTEXT (not the
+// user message) via the LocalBackend memfs mechanism: every `.md` file in
+// `<storageDir>/memfs/<agent>/memory/system/` is read by letta-code as a
+// memory block and included in the agent's persistent context every turn
+// (see readBlocksForAgent + lib/a2ui-adapter.ts for the same pattern).
+//
+// We write ONLY a compact `name: description` index here — never the full
+// SKILL.md bodies. The full body is retrieved on demand via
+// getInstalledSkillDetail (GET /v1/agents/{id}/skills/{name}). Unlike the
+// static A2UI block, the skills list is dynamic (install/uninstall), so we
+// re-sync write-if-changed rather than write-if-absent.
+// ──────────────────────────────────────────────────────────────────────
+
+/** Memory-block label for the per-agent installed-skills index. */
+export const SKILLS_BLOCK_LABEL = "available_skills";
+
+/**
+ * Build the compact, descriptions-only "Available Skills" block content.
+ * One line per installed skill (`- <name>: <description>`) plus a short
+ * instruction telling the agent the full instructions can be loaded on
+ * demand. Returns null when no skills are installed (caller removes any
+ * stale block in that case).
+ */
+export function buildSkillsBlockContent(
+  skills: { name: string; description: string }[],
+): string | null {
+  if (skills.length === 0) return null;
+  const lines = skills.map((s) =>
+    s.description ? `- ${s.name}: ${s.description}` : `- ${s.name}`,
+  );
+  return [
+    "## Available Skills",
+    "",
+    "The following skills are installed for you. Each line is `name: description`.",
+    "Load a skill's full instructions on demand only when you actually need it",
+    "(e.g. fetch GET /v1/agents/{id}/skills/{name}); the full skill bodies are NOT",
+    "inlined here to keep this context compact.",
+    "",
+    ...lines,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Sync the per-agent installed-skills index into the agent's system-context
+ * memfs block (`available_skills.md`). Idempotent and write-if-changed:
+ *   - no installed skills        → remove any stale block file
+ *   - installed skills present   → write the compact descriptions-only block
+ *     iff its content differs from what's on disk
+ *
+ * This is called once per turn from chat.ts. It is cheap: it parses the
+ * small per-skill manifests (NOT SKILL.md bodies) and only touches disk
+ * when the rendered index actually changed.
+ */
+export function syncSkillsBlockForAgent(agentId: string): void {
+  const sysDir = join(storageDir(), "memfs", agentId, "memory", "system");
+  const blockPath = join(sysDir, `${SKILLS_BLOCK_LABEL}.md`);
+  try {
+    const skills = readInstalledSkillDescriptions(agentId);
+    const next = buildSkillsBlockContent(skills);
+
+    if (next === null) {
+      // No skills installed — drop any stale block so we don't leave a
+      // dangling (or empty) "Available Skills" section in context.
+      if (existsSync(blockPath)) rmSync(blockPath, { force: true });
+      return;
+    }
+
+    if (!existsSync(sysDir)) mkdirSync(sysDir, { recursive: true });
+    const current = existsSync(blockPath) ? readFileSync(blockPath, "utf8") : null;
+    if (current !== next) writeFileSync(blockPath, next);
+  } catch {
+    // Non-fatal: missing the index for one turn is far better than failing
+    // the turn on an unrelated FS error.
+  }
+}
+
+/**
+ * Search skills by tag or keyword in name/description.
+ */
+export function searchSkills(query: string, tags?: string[]): SkillListingItem[] {
+  const allSkills = listAvailableSkills();
+  const q = query.toLowerCase();
+  const tagSet = new Set((tags ?? []).map((t) => t.toLowerCase()));
+
+  return allSkills.filter((skill) => {
+    // Match by query string
+    if (q) {
+      const nameMatch = skill.name.toLowerCase().includes(q);
+      const descMatch = skill.description.toLowerCase().includes(q);
+      if (!nameMatch && !descMatch) return false;
+    }
+
+    // Match by tags (if any tags specified)
+    if (tagSet.size > 0) {
+      const skillTags = new Set(skill.tags.map((t) => t.toLowerCase()));
+      const hasMatch = [...tagSet].some((t) => skillTags.has(t));
+      if (!hasMatch) return false;
+    }
+
+    return true;
+  });
 }
 
 // ──────────────────────────────────────────────────────────────────────
