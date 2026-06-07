@@ -60,6 +60,9 @@ import {
   type ApprovalEvent,
 } from "../lib/approval-events.js";
 import { startShim } from "./helpers/index.js";
+import { SdkBackedLettaSessionAdapter } from "../lib/letta-sdk-adapter.js";
+import { loadApprovalScopeCache } from "../lib/runs.js";
+import type { LettaStreamFrame } from "../lib/types/letta-stream.js";
 
 // ── temp backend dir harness (mirrors frames-log.test.ts) ──────────────
 
@@ -579,4 +582,95 @@ test("dark-ship: flag OFF preserves the bypassPermissions default permission mod
     if (prevMode === undefined) delete process.env["SHIM_PERMISSION_MODE"];
     else process.env["SHIM_PERMISSION_MODE"] = prevMode;
   }
+});
+
+// ── Test 9 (Commit 2): silence-watchdog NOT tripped by a parked ask ────
+
+test("silence watchdog: a parked ask resets the watchdog and is not falsely timed out", async (t) => {
+  // Drive the adapter's server-permissions canUseTool hook directly (the SDK
+  // pump would normally invoke it). A short SHIM_POOL_TURN_SILENCE_MS makes
+  // the keepalive interval (silence/2) fire several times during the park; we
+  // count resetSilenceTimer invocations to prove the watchdog is being kept
+  // alive, then resolve via the resolveApproval funnel and assert the call
+  // returns the decision (no false timeout-deny).
+  const stateDir = mkdtempSync(join(tmpdir(), "permissions-watchdog-"));
+  const prevDir = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  const prevFlag = process.env["SHIM_SERVER_PERMISSIONS"];
+  const prevSilence = process.env["SHIM_POOL_TURN_SILENCE_MS"];
+  const prevMode = process.env["SHIM_PERMISSION_MODE"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  process.env["SHIM_SERVER_PERMISSIONS"] = "1";
+  process.env["SHIM_POOL_TURN_SILENCE_MS"] = "100"; // keepalive cadence = 50ms
+  delete process.env["SHIM_PERMISSION_MODE"];
+  __clearPermissionConfigCache();
+  __clearApprovalEventSubscribers();
+  t.after(() => {
+    if (prevDir === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prevDir;
+    if (prevFlag === undefined) delete process.env["SHIM_SERVER_PERMISSIONS"];
+    else process.env["SHIM_SERVER_PERMISSIONS"] = prevFlag;
+    if (prevSilence === undefined) delete process.env["SHIM_POOL_TURN_SILENCE_MS"];
+    else process.env["SHIM_POOL_TURN_SILENCE_MS"] = prevSilence;
+    if (prevMode === undefined) delete process.env["SHIM_PERMISSION_MODE"];
+    else process.env["SHIM_PERMISSION_MODE"] = prevMode;
+    __clearPermissionConfigCache();
+    __clearApprovalEventSubscribers();
+    try { rmSync(stateDir, { recursive: true, force: true }); } catch {}
+  });
+
+  // Rule: ask for Bash.
+  writeGlobalConfig(cfg({ rules: [{ tool: "Bash", action: "ask", reason: "review" }] }));
+
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-wd" });
+  (adapter as unknown as { ready: boolean }).ready = true;
+  const runHandle = createRun({ agentId: "agent-wd", conversationId: "default" });
+
+  // Spy on the silence-watchdog reset that the keepalive interval calls.
+  let resetCalls = 0;
+  const fields = adapter as unknown as {
+    currentRunHandle: typeof runHandle;
+    currentOnFrame: ((f: LettaStreamFrame, m: { runId: string }) => void) | null;
+    currentApprovalScopeCache: Map<string, unknown>;
+    currentA2uiCapability: unknown;
+    currentResetSilenceTimer: (() => void) | null;
+  };
+  fields.currentRunHandle = runHandle;
+  fields.currentOnFrame = null;
+  fields.currentApprovalScopeCache = loadApprovalScopeCache(runHandle.id, "default");
+  fields.currentA2uiCapability = { version: "0.9", catalogId: "basic" };
+  fields.currentResetSilenceTimer = () => { resetCalls += 1; };
+
+  // Park the ask (returns a pending promise — canUseTool blocks).
+  const canUsePromise = (adapter as unknown as {
+    _handleCanUseToolServerPermissions: (
+      n: string,
+      i: Record<string, unknown>,
+      h: typeof runHandle,
+      onFrame: ((f: LettaStreamFrame, m: { runId: string }) => void) | null,
+      cache: Map<string, unknown>,
+    ) => Promise<{ behavior: string; message?: string } | null>;
+  })._handleCanUseToolServerPermissions(
+    "Bash",
+    { command: "ls" },
+    runHandle,
+    null,
+    fields.currentApprovalScopeCache,
+  );
+
+  // Let the park run well past SHIM_POOL_TURN_SILENCE_MS (100ms) so the
+  // keepalive interval (50ms) has fired multiple times. If the watchdog were
+  // NOT being reset, a real turn would have tripped silence by now.
+  await new Promise((r) => setTimeout(r, 350));
+  assert.ok(resetCalls >= 2, `keepalive must reset the watchdog while parked (got ${resetCalls})`);
+
+  // The pending file exists (durable park) and the turn is still alive.
+  assert.equal(readPendingApproval(runHandle.id)!.status, "pending");
+
+  // Resolve via the canonical funnel — the parked canUseTool returns the
+  // decision (NOT a false timeout-deny).
+  const r = resolveApproval(runHandle.id, { decision: "approve", reason: "ok" });
+  assert.equal(r.status, "approved");
+  const result = await canUsePromise;
+  assert.ok(result, "canUseTool returns a decision");
+  assert.equal(result!.behavior, "allow", "approved after a long park; no false silence timeout");
 });

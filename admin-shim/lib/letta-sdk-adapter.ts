@@ -200,6 +200,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   private currentOnFrame: ((frame: LettaStreamFrame, meta: { runId: string }) => void) | null = null;
   private currentApprovalScopeCache: Map<string, ApprovalScopeCacheEntry> | null = null;
   private currentA2uiCapability: A2uiCapability | null = null;
+  // lcp-indw / D2: the stream loop's resetSilenceTimer, shared into the
+  // canUseTool closure (same pattern as currentRunHandle above). While an
+  // `ask` is parked we periodically call this so a human-paced approval does
+  // NOT trip the silence watchdog (SHIM_POOL_TURN_SILENCE_MS). It reverts
+  // automatically when the park ends (the keepalive interval is cleared).
+  // The absolute turn ceiling (SHIM_POOL_TURN_TIMEOUT) remains the hard
+  // backstop so a forgotten approval can never park a worker forever.
+  private currentResetSilenceTimer: (() => void) | null = null;
   // Monotonic seq counter for synthesized approval frames within the
   // current turn. Real upstream frames carry seq_id from letta-code; the
   // SDK-side synthetic ones start at a high offset so they don't collide
@@ -397,6 +405,10 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       silenceTimer = setTimeout(() => fireTimeout("silence"), TURN_SILENCE_MS);
     };
     resetSilenceTimer();
+    // lcp-indw / D2: expose the silence-watchdog reset to the canUseTool
+    // closure so a parked `ask` can keep the turn alive across a long,
+    // human-paced approval without faking wire traffic.
+    this.currentResetSilenceTimer = resetSilenceTimer;
 
     const absoluteTimer: NodeJS.Timeout = setTimeout(
       () => fireTimeout("absolute"),
@@ -466,6 +478,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       this.currentOnFrame = null;
       this.currentApprovalScopeCache = null;
       this.currentA2uiCapability = null;
+      this.currentResetSilenceTimer = null;
     }
 
     // lcp-sdk.4: shared post-turn finalization — stampNewMessages,
@@ -839,7 +852,23 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // (d) Park on the durable wait. No 30s cap — the wait lives as long as
     //     the turn; the absolute turn ceiling (SHIM_POOL_TURN_TIMEOUT) is the
     //     hard backstop so a forgotten approval can never park forever.
+    //
+    //     D2 (Commit 2): while parked, reset the silence watchdog on a
+    //     cadence shorter than SHIM_POOL_TURN_SILENCE_MS so a human-paced
+    //     approval does not trip the turn's silence timeout. The interval is
+    //     unref'd (never keeps the process alive) and is cleared the instant
+    //     the wait settles, reverting to normal silence-watchdog behavior.
     const askTimeoutMs = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 1_800_000);
+    // Read the silence budget live (env may be overridden per-deployment/test)
+    // and keep alive at half that cadence so the watchdog never trips while
+    // parked. Floor of 25ms keeps the interval sane under tiny test budgets.
+    const silenceBudgetMs = Number(process.env["SHIM_POOL_TURN_SILENCE_MS"] ?? TURN_SILENCE_MS);
+    const keepaliveMs = Math.max(25, Math.floor(silenceBudgetMs / 2));
+    const reset = this.currentResetSilenceTimer;
+    const keepalive: NodeJS.Timeout | null = reset
+      ? setInterval(() => { try { reset(); } catch { /* best-effort */ } }, keepaliveMs)
+      : null;
+    keepalive?.unref?.();
     let decision: ApprovalDecision;
     try {
       decision = await waitForApprovalDecision(runHandle.id, toolName, toolCallId, askTimeoutMs);
@@ -855,6 +884,10 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       });
       clearPendingApproval(runHandle.id);
       return { behavior: "deny", message: reason };
+    } finally {
+      // D2: stop refreshing the silence watchdog the instant the park ends —
+      // normal silence-watchdog behavior resumes automatically.
+      if (keepalive) clearInterval(keepalive);
     }
 
     // (e) Decision received via the resolveApproval funnel (WS or REST). The
