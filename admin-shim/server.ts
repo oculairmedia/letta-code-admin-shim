@@ -71,7 +71,20 @@ import {
   startCronScheduler,
   stopCronScheduler,
 } from "./lib/cron-scheduler.js";
-import { getTask as getCronTask, listTasks as listCronTasks } from "./lib/crons.js";
+import {
+  addTask as addCronTask,
+  deleteAllTasks as deleteAllCronTasks,
+  deleteTask as deleteCronTask,
+  getActiveTasks as getActiveCronTasks,
+  getTask as getCronTask,
+  isValidCron,
+  listTasks as listCronTasks,
+  parseAt,
+  parseEvery,
+  updateTask as updateCronTask,
+} from "./lib/crons.js";
+import { broadcastCronEvent } from "./lib/cron-events.js";
+import type { AddTaskInput, CronTask } from "./lib/types/crons.js";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
@@ -1066,12 +1079,15 @@ function parseBoolParam(searchParams: URLSearchParams, name: string): boolean | 
   return null;
 }
 
-// ── /v1/crons (lcp-9h3) ───────────────────────────────────────────
+// ── /v1/crons (lcp-9h3 reads, lcp-5o9o mutations) ─────────────────
 //
-// Read-only mirror of the cron store. Mutations live on the mobile WS
-// channel per the shim-new-features-mutations-ws-reads-may-mirror-rest
-// rule — POST/PUT/DELETE here returns 405 with a pointer to the WS
-// protocol.
+// GET endpoints mirror the cron store; POST/PUT/PATCH/DELETE perform real
+// mutations. ALL writes go through the lock-serialized store API in
+// lib/crons.ts (addTask/updateTask/deleteTask/deleteAllTasks, each wrapped
+// in withLock), so a REST write and a concurrent WS write are serialized on
+// the same on-disk lock and neither can lose the other's update. server.ts
+// NEVER writes crons.json directly. The cron `schedule` is validated on
+// every write (400 on a bad expression) via the store's parse helpers.
 
 function handleCronsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const agentId = url.searchParams.get("agent_id") ?? undefined;
@@ -1092,13 +1108,217 @@ function handleCronScheduler(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, getCronSchedulerStatus());
 }
 
+// 405 retained for the scheduler sub-resource (read-only; no mutations).
 function handleCronMethodNotAllowed(req: IncomingMessage, res: ServerResponse): void {
   res.setHeader("Allow", "GET, OPTIONS");
   json(res, 405, {
-    detail: `${req.method} not allowed on cron REST endpoints — mutations are WS-only`,
+    detail: `${req.method} not allowed on this cron endpoint`,
     ws_endpoint: "/shim/v1/mobile",
     ws_frames: ["cron_add", "cron_list", "cron_get", "cron_delete"],
   });
+}
+
+function badRequest(res: ServerResponse, detail: string): void {
+  json(res, 400, { detail });
+}
+
+// After any REST mutation we broadcast a `client_mutation` cron event so peer
+// WS clients receive a `crons_updated` push immediately — mirroring the WS
+// mutation path in lib/mobile-channel-host.ts. The fs.watch in cron-scheduler
+// would also catch the write, but the direct broadcast is lower-latency.
+function broadcastCronMutation(): void {
+  broadcastCronEvent({
+    reason: "client_mutation",
+    tasks_active: getActiveCronTasks().length,
+    at: new Date().toISOString(),
+  });
+}
+
+// Resolve a schedule from the request body. Accepts exactly one of `cron`
+// (raw 5-field expression), `every` (e.g. "5m"), or `at` (e.g. "3:30pm" /
+// "in 10m"). Returns the resolved cron expression + recurring flag +
+// optional one-shot scheduled_for, or an error string for a 400.
+interface ResolvedSchedule {
+  cron: string;
+  recurring: boolean;
+  scheduledFor?: Date;
+}
+
+function resolveSchedule(body: Record<string, unknown>): ResolvedSchedule | { error: string } {
+  const cronRaw = typeof body["cron"] === "string" ? (body["cron"] as string) : undefined;
+  const everyRaw = typeof body["every"] === "string" ? (body["every"] as string) : undefined;
+  const atRaw = typeof body["at"] === "string" ? (body["at"] as string) : undefined;
+  const provided = [cronRaw, everyRaw, atRaw].filter((v) => v !== undefined && v.length > 0).length;
+  if (provided === 0) {
+    return { error: "one of `cron`, `every`, or `at` is required" };
+  }
+  if (provided > 1) {
+    return { error: "exactly one of `cron`, `every`, or `at` may be set" };
+  }
+  if (cronRaw) {
+    if (!isValidCron(cronRaw)) {
+      return { error: `invalid cron expression: ${cronRaw}` };
+    }
+    const recurring = typeof body["recurring"] === "boolean" ? (body["recurring"] as boolean) : true;
+    return { cron: cronRaw, recurring };
+  }
+  if (everyRaw) {
+    const parsed = parseEvery(everyRaw);
+    if (!parsed) return { error: `invalid every: ${everyRaw}` };
+    return { cron: parsed.cron, recurring: true };
+  }
+  // atRaw
+  const parsed = parseAt(atRaw!);
+  if (!parsed) return { error: `invalid at: ${atRaw}` };
+  return { cron: parsed.cron, recurring: false, scheduledFor: parsed.scheduledFor };
+}
+
+// POST /v1/crons — create a task. Body: agent_id, conversation_id, name,
+// prompt, schedule (one of cron/every/at), recurring, timezone, description.
+async function handleCronCreate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  const agentId = body["agent_id"];
+  if (typeof agentId !== "string" || agentId.length === 0) {
+    return badRequest(res, "agent_id is required");
+  }
+  const prompt = body["prompt"];
+  if (typeof prompt !== "string" || prompt.length === 0) {
+    return badRequest(res, "prompt is required");
+  }
+  const schedule = resolveSchedule(body);
+  if ("error" in schedule) return badRequest(res, schedule.error);
+
+  const input: AddTaskInput = {
+    agent_id: agentId,
+    name: typeof body["name"] === "string" ? (body["name"] as string) : `task-${Date.now()}`,
+    description: typeof body["description"] === "string" ? (body["description"] as string) : "",
+    cron: schedule.cron,
+    recurring: schedule.recurring,
+    prompt,
+  };
+  if (typeof body["conversation_id"] === "string") input.conversation_id = body["conversation_id"] as string;
+  if (typeof body["timezone"] === "string") input.timezone = body["timezone"] as string;
+  if (schedule.scheduledFor !== undefined) input.scheduled_for = schedule.scheduledFor;
+
+  let task: CronTask;
+  let warning: string | undefined;
+  try {
+    const result = addCronTask(input);
+    task = result.task;
+    warning = result.warning;
+  } catch (err) {
+    return badRequest(res, err instanceof Error ? err.message : String(err));
+  }
+  broadcastCronMutation();
+  // Response shape mirrors the GET /v1/crons/{id} body (raw CronTask), so a
+  // freshly-created task is byte-identical to what a subsequent read returns.
+  json(res, 201, warning === undefined ? task : { ...task, warning });
+}
+
+// Apply a schedule + mutable fields to a task in place. Shared by PUT (full
+// replace) and PATCH (partial). `requireAll` enforces the PUT contract that
+// the core descriptive fields are present.
+function applyTaskUpdate(
+  task: CronTask,
+  body: Record<string, unknown>,
+  schedule: ResolvedSchedule | null,
+): void {
+  if (schedule) {
+    task.cron = schedule.cron;
+    task.recurring = schedule.recurring;
+    task.scheduled_for = schedule.scheduledFor?.toISOString() ?? null;
+  }
+  if (typeof body["name"] === "string") task.name = body["name"] as string;
+  if (typeof body["description"] === "string") task.description = body["description"] as string;
+  if (typeof body["prompt"] === "string") task.prompt = body["prompt"] as string;
+  if (typeof body["conversation_id"] === "string") task.conversation_id = body["conversation_id"] as string;
+  if (typeof body["timezone"] === "string") task.timezone = body["timezone"] as string;
+  if (typeof body["enabled"] === "boolean") {
+    task.status = (body["enabled"] as boolean) ? "active" : "cancelled";
+    if (!(body["enabled"] as boolean) && task.cancel_reason === null) {
+      task.cancel_reason = "disabled via REST";
+    }
+    if (body["enabled"] as boolean) task.cancel_reason = null;
+  }
+}
+
+// PUT /v1/crons/{id} — full replace. All core fields required.
+async function handleCronReplace(req: IncomingMessage, res: ServerResponse, taskId: string): Promise<void> {
+  const body = await readJsonBody(req);
+  if (!getCronTask(taskId)) return notFound(res, `cron task ${taskId}`);
+  if (typeof body["prompt"] !== "string" || (body["prompt"] as string).length === 0) {
+    return badRequest(res, "prompt is required for full replace");
+  }
+  if (typeof body["name"] !== "string" || (body["name"] as string).length === 0) {
+    return badRequest(res, "name is required for full replace");
+  }
+  const schedule = resolveSchedule(body);
+  if ("error" in schedule) return badRequest(res, schedule.error);
+
+  const updated = updateCronTask(taskId, (task) => {
+    applyTaskUpdate(task, body, schedule);
+  });
+  if (!updated) return notFound(res, `cron task ${taskId}`);
+  broadcastCronMutation();
+  json(res, 200, updated);
+}
+
+// PATCH /v1/crons/{id} — partial update. Schedule fields optional; when
+// present they are validated. At least one mutable field must be supplied.
+async function handleCronPatch(req: IncomingMessage, res: ServerResponse, taskId: string): Promise<void> {
+  const body = await readJsonBody(req);
+  if (!getCronTask(taskId)) return notFound(res, `cron task ${taskId}`);
+
+  const hasSchedule = ["cron", "every", "at"].some(
+    (k) => typeof body[k] === "string" && (body[k] as string).length > 0,
+  );
+  let schedule: ResolvedSchedule | null = null;
+  if (hasSchedule) {
+    const resolved = resolveSchedule(body);
+    if ("error" in resolved) return badRequest(res, resolved.error);
+    schedule = resolved;
+  }
+
+  const updated = updateCronTask(taskId, (task) => {
+    applyTaskUpdate(task, body, schedule);
+  });
+  if (!updated) return notFound(res, `cron task ${taskId}`);
+  broadcastCronMutation();
+  json(res, 200, updated);
+}
+
+// DELETE /v1/crons/{id} — remove a single task.
+function handleCronDelete(res: ServerResponse, taskId: string): void {
+  const removed = deleteCronTask(taskId);
+  if (!removed) return notFound(res, `cron task ${taskId}`);
+  broadcastCronMutation();
+  json(res, 200, { deleted: true, id: taskId });
+}
+
+// DELETE /v1/crons — bulk delete. Supports `?agent_id=` and/or
+// `?conversation_id=` filters. agent_id alone uses the store's optimized
+// deleteAllTasks; otherwise we delete the filtered set individually (still
+// each lock-serialized via deleteTask).
+function handleCronBulkDelete(res: ServerResponse, url: URL): void {
+  const agentId = url.searchParams.get("agent_id") ?? undefined;
+  const conversationId = url.searchParams.get("conversation_id") ?? undefined;
+  if (!agentId && !conversationId) {
+    return badRequest(res, "bulk delete requires an `agent_id` and/or `conversation_id` filter");
+  }
+  let deleted = 0;
+  if (agentId && !conversationId) {
+    deleted = deleteAllCronTasks(agentId);
+  } else {
+    const filters: { agent_id?: string; conversation_id?: string } = {};
+    if (agentId) filters.agent_id = agentId;
+    if (conversationId) filters.conversation_id = conversationId;
+    const targets = listCronTasks(filters);
+    for (const t of targets) {
+      if (deleteCronTask(t.id)) deleted++;
+    }
+  }
+  if (deleted > 0) broadcastCronMutation();
+  json(res, 200, { deleted });
 }
 
 function handleRunsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
@@ -1550,10 +1770,13 @@ const server = createServer((req, res) => {
   const agentCancel = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/messages\/cancel\/?$/);
   if (agentCancel && req.method === "POST") return handleAgentMessagesCancel(req, res, agentCancel[1]!);
 
-  // /v1/crons/* — read-only mirror of cron store (lcp-9h3).
-  // Mutations are WS-only per shim-new-features-mutations-ws-reads-may-mirror-rest.
+  // /v1/crons/* — read mirror (lcp-9h3) + REST mutations (lcp-5o9o). All
+  // writes go through the lock-serialized store in lib/crons.ts so concurrent
+  // WS-write + REST-write cannot lose updates; we never touch crons.json here.
   if (pathname === "/v1/crons" || pathname === "/v1/crons/") {
     if (req.method === "GET") return handleCronsList(req, res, url);
+    if (req.method === "POST") return handleCronCreate(req, res);
+    if (req.method === "DELETE") return handleCronBulkDelete(res, url);
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     return handleCronMethodNotAllowed(req, res);
   }
@@ -1565,6 +1788,9 @@ const server = createServer((req, res) => {
   const cronDetail = pathname.match(/^\/v1\/crons\/([a-zA-Z0-9_-]+)\/?$/);
   if (cronDetail) {
     if (req.method === "GET") return handleCronDetail(req, res, cronDetail[1]!);
+    if (req.method === "PUT") return handleCronReplace(req, res, cronDetail[1]!);
+    if (req.method === "PATCH") return handleCronPatch(req, res, cronDetail[1]!);
+    if (req.method === "DELETE") return handleCronDelete(res, cronDetail[1]!);
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     return handleCronMethodNotAllowed(req, res);
   }

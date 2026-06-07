@@ -11,7 +11,13 @@
  *     conversation_id filters honored).
  *   - GET /v1/crons/{id} returns the task; 404 for unknown ids.
  *   - GET /v1/crons/scheduler reflects lease_held=true while running.
- *   - POST/DELETE/PUT on /v1/crons* return 405 with a WS pointer.
+ *   - POST /v1/crons creates a task (lcp-5o9o).
+ *   - PUT /v1/crons/{id} full-replaces; PATCH partial-updates.
+ *   - DELETE /v1/crons/{id} removes one; DELETE /v1/crons bulk-deletes
+ *     with agent_id / conversation_id filters.
+ *   - An invalid cron schedule returns 400 on write.
+ *   - Concurrent WS-write + REST-write does not lose either task.
+ *   - PUT on the scheduler sub-resource still returns 405 (read-only).
  */
 
 import { test } from "node:test";
@@ -169,43 +175,308 @@ test("GET /v1/crons/scheduler reflects tasks_active after external write", async
   }
 });
 
-test("POST /v1/crons returns 405 with WS pointer", async () => {
+test("POST /v1/crons creates a task and returns it (lcp-5o9o)", async () => {
   const shim = await startShim();
   try {
     const res = await fetch(`${shim.url}/v1/crons`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "nope" }),
+      body: JSON.stringify({
+        agent_id: "agent-create",
+        name: "created-task",
+        prompt: "do the thing",
+        cron: "*/5 * * * *",
+      }),
     });
-    assert.equal(res.status, 405);
-    const allow = res.headers.get("allow");
-    assert.match(allow ?? "", /GET/);
-    const body = (await res.json()) as {
-      detail: string;
-      ws_endpoint: string;
-      ws_frames: string[];
-    };
-    assert.match(body.detail, /WS-only/);
-    assert.equal(body.ws_endpoint, "/shim/v1/mobile");
-    assert.ok(body.ws_frames.includes("cron_add"));
+    assert.equal(res.status, 201);
+    const task = (await res.json()) as CronTask;
+    assert.ok(task.id, "created task has an id");
+    assert.equal(task.agent_id, "agent-create");
+    assert.equal(task.name, "created-task");
+    assert.equal(task.prompt, "do the thing");
+    assert.equal(task.cron, "*/5 * * * *");
+    assert.equal(task.status, "active");
+    assert.equal(task.fire_count, 0);
+    assert.equal(task.last_fired_at, null);
+    // Readable back via GET with identical shape.
+    const get = await fetch(`${shim.url}/v1/crons/${task.id}`);
+    assert.equal(get.status, 200);
+    const fetched = (await get.json()) as CronTask;
+    assert.deepEqual(fetched, task);
   } finally {
     await shim.stop();
   }
 });
 
-test("DELETE /v1/crons/{id} returns 405", async () => {
+test("POST /v1/crons with invalid schedule returns 400", async () => {
   const shim = await startShim();
   try {
-    seedCrons(shim, [makeTask({ id: "abc123" })]);
-    const res = await fetch(`${shim.url}/v1/crons/abc123`, { method: "DELETE" });
-    assert.equal(res.status, 405);
-    const body = (await res.json()) as { detail: string; ws_frames: string[] };
-    assert.match(body.detail, /WS-only/);
-    assert.ok(body.ws_frames.includes("cron_delete"));
+    const res = await fetch(`${shim.url}/v1/crons`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agent_id: "agent-bad",
+        name: "bad",
+        prompt: "p",
+        cron: "not a cron",
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { detail: string };
+    assert.match(body.detail, /invalid cron/);
   } finally {
     await shim.stop();
   }
 });
+
+test("POST /v1/crons without agent_id or prompt returns 400", async () => {
+  const shim = await startShim();
+  try {
+    const noAgent = await fetch(`${shim.url}/v1/crons`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "x", prompt: "p", cron: "*/5 * * * *" }),
+    });
+    assert.equal(noAgent.status, 400);
+    const noPrompt = await fetch(`${shim.url}/v1/crons`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_id: "a", name: "x", cron: "*/5 * * * *" }),
+    });
+    assert.equal(noPrompt.status, 400);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("PUT /v1/crons/{id} full-replaces all fields", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [makeTask({ id: "rep1", name: "old", prompt: "old-prompt", cron: "*/5 * * * *" })]);
+    const res = await fetch(`${shim.url}/v1/crons/rep1`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agent_id: "agent-a",
+        name: "new-name",
+        prompt: "new-prompt",
+        cron: "0 9 * * *",
+      }),
+    });
+    assert.equal(res.status, 200);
+    const task = (await res.json()) as CronTask;
+    assert.equal(task.id, "rep1");
+    assert.equal(task.name, "new-name");
+    assert.equal(task.prompt, "new-prompt");
+    assert.equal(task.cron, "0 9 * * *");
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("PUT /v1/crons/{id} with invalid schedule returns 400", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [makeTask({ id: "rep2" })]);
+    const res = await fetch(`${shim.url}/v1/crons/rep2`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "n", prompt: "p", cron: "99 99 99 99 99 99" }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("PUT /v1/crons/{id} on unknown id returns 404", async () => {
+  const shim = await startShim();
+  try {
+    const res = await fetch(`${shim.url}/v1/crons/nope`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "n", prompt: "p", cron: "*/5 * * * *" }),
+    });
+    assert.equal(res.status, 404);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("PATCH /v1/crons/{id} partially updates fields", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [makeTask({ id: "pat1", status: "active", cron: "*/5 * * * *" })]);
+    const res = await fetch(`${shim.url}/v1/crons/pat1`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: false, cron: "0 0 * * *" }),
+    });
+    assert.equal(res.status, 200);
+    const task = (await res.json()) as CronTask;
+    assert.equal(task.cron, "0 0 * * *");
+    assert.equal(task.status, "cancelled");
+    // Unspecified fields are preserved.
+    assert.equal(task.prompt, "hello");
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("PATCH /v1/crons/{id} with invalid schedule returns 400", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [makeTask({ id: "pat2" })]);
+    const res = await fetch(`${shim.url}/v1/crons/pat2`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cron: "garbage" }),
+    });
+    assert.equal(res.status, 400);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("DELETE /v1/crons/{id} removes a single task", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [makeTask({ id: "del1" }), makeTask({ id: "del2" })]);
+    const res = await fetch(`${shim.url}/v1/crons/del1`, { method: "DELETE" });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { deleted: boolean; id: string };
+    assert.deepEqual(body, { deleted: true, id: "del1" });
+    const list = await (await fetch(`${shim.url}/v1/crons`)).json() as { tasks: CronTask[] };
+    assert.deepEqual(list.tasks.map((t) => t.id), ["del2"]);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("DELETE /v1/crons/{id} on unknown id returns 404", async () => {
+  const shim = await startShim();
+  try {
+    const res = await fetch(`${shim.url}/v1/crons/ghost`, { method: "DELETE" });
+    assert.equal(res.status, 404);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("DELETE /v1/crons?agent_id=… bulk-deletes by agent", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [
+      makeTask({ id: "b1", agent_id: "agent-x" }),
+      makeTask({ id: "b2", agent_id: "agent-x" }),
+      makeTask({ id: "b3", agent_id: "agent-y" }),
+    ]);
+    const res = await fetch(`${shim.url}/v1/crons?agent_id=agent-x`, { method: "DELETE" });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { deleted: number };
+    assert.equal(body.deleted, 2);
+    const list = await (await fetch(`${shim.url}/v1/crons`)).json() as { tasks: CronTask[] };
+    assert.deepEqual(list.tasks.map((t) => t.id), ["b3"]);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("DELETE /v1/crons?conversation_id=… bulk-deletes by conversation", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [
+      makeTask({ id: "c-a", agent_id: "agent-x", conversation_id: "conv-1" }),
+      makeTask({ id: "c-b", agent_id: "agent-y", conversation_id: "conv-1" }),
+      makeTask({ id: "c-c", agent_id: "agent-x", conversation_id: "conv-2" }),
+    ]);
+    // agent_id + conversation_id filter together.
+    const res = await fetch(`${shim.url}/v1/crons?agent_id=agent-x&conversation_id=conv-1`, { method: "DELETE" });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { deleted: number };
+    assert.equal(body.deleted, 1);
+    const list = await (await fetch(`${shim.url}/v1/crons`)).json() as { tasks: CronTask[] };
+    assert.deepEqual(list.tasks.map((t) => t.id).sort(), ["c-b", "c-c"]);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("DELETE /v1/crons without filters returns 400 (refuse to wipe all)", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [makeTask({ id: "keep" })]);
+    const res = await fetch(`${shim.url}/v1/crons`, { method: "DELETE" });
+    assert.equal(res.status, 400);
+    const list = await (await fetch(`${shim.url}/v1/crons`)).json() as { tasks: CronTask[] };
+    assert.equal(list.tasks.length, 1);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("concurrent WS-write + REST-write: neither update is lost (lcp-5o9o)", async () => {
+  const shim = await startShim();
+  try {
+    const conn = await openMobileWs(shim.url!, { token: shim.mobileToken });
+    try {
+      // Fire a WS cron_add and a REST POST at the same instant. Both go
+      // through lib/crons.ts addTask() under withLock(), so the second
+      // writer must observe the first writer's row when it read-modify-writes
+      // crons.json. If the lock were missing, one create would clobber the
+      // other and only one task would survive.
+      const wsAdd = (async () => {
+        conn.send({
+          type: "cron_add",
+          agent_id: "agent-ws",
+          name: "ws-task",
+          prompt: "from ws",
+          cron: "*/5 * * * *",
+        });
+        return conn.waitFor("cron_add_response", { timeoutMs: 5000 });
+      })();
+      const restAdd = fetch(`${shim.url}/v1/crons`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agent_id: "agent-rest",
+          name: "rest-task",
+          prompt: "from rest",
+          cron: "*/5 * * * *",
+        }),
+      });
+      const [, restRes] = await Promise.all([wsAdd, restAdd]);
+      assert.equal(restRes.status, 201);
+
+      // Both tasks must be present in the canonical store.
+      const list = await (await fetch(`${shim.url}/v1/crons`)).json() as { tasks: CronTask[] };
+      const names = list.tasks.map((t) => t.name).sort();
+      assert.deepEqual(names, ["rest-task", "ws-task"], "both concurrent writers survived");
+    } finally {
+      conn.close();
+    }
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("two concurrent REST POSTs both survive", async () => {
+  const shim = await startShim();
+  try {
+    const mk = (n: string) => fetch(`${shim.url}/v1/crons`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_id: "agent-z", name: n, prompt: "p", cron: "*/5 * * * *" }),
+    });
+    const results = await Promise.all([mk("one"), mk("two"), mk("three")]);
+    for (const r of results) assert.equal(r.status, 201);
+    const list = await (await fetch(`${shim.url}/v1/crons`)).json() as { tasks: CronTask[] };
+    assert.deepEqual(list.tasks.map((t) => t.name).sort(), ["one", "three", "two"]);
+  } finally {
+    await shim.stop();
+  }
+});
+
 
 test("PUT /v1/crons/scheduler returns 405", async () => {
   const shim = await startShim();
