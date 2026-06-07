@@ -1042,22 +1042,36 @@ export interface SkillListingItem extends SkillManifest {
 }
 
 /**
- * Get the global skills store directory (~/.letta/skills/).
+ * Get the global skills store directory.
+ *
+ * The global registry is intentionally a USER-LEVEL shared store (default
+ * `~/.letta/skills`, overridable via `LETTA_HOME`). It is shared across
+ * deployments and is interoperable with the official Letta client (see
+ * DIVERGENCE.md). This is deliberately NOT under `storageDir()` so that
+ * the same global skill catalog is visible regardless of which
+ * lc-local-backend a given shim instance points at.
+ *
+ * Tests / isolated installs may override the registry root explicitly via
+ * `LETTA_SKILLS_DIR`.
  */
 export function skillsStoreDir(): string {
-  return join(process.env["LETTA_HOME"] || join(homedir(), ".letta"), "skills");
+  return (
+    process.env["LETTA_SKILLS_DIR"] ||
+    join(process.env["LETTA_HOME"] || join(homedir(), ".letta"), "skills")
+  );
 }
 
 /**
  * Get the directory for an agent's installed skills.
+ *
+ * Per-agent installed skills are SHIM STATE — they live alongside the rest
+ * of the agent's state under `storageDir()/agents/<id>/skills/` (the same
+ * root as `agents/<b64url(id)>.json`, `memfs/<id>/...`, etc.) rather than a
+ * hardcoded `~/.letta`. This keeps per-agent state co-located with the
+ * lc-local-backend it belongs to.
  */
 export function agentSkillsDir(agentId: string): string {
-  return join(
-    process.env["LETTA_HOME"] || join(homedir(), ".letta"),
-    "agents",
-    agentId,
-    "skills",
-  );
+  return join(storageDir(), "agents", agentId, "skills");
 }
 
 /**
@@ -1180,8 +1194,9 @@ export function listAvailableSkills(): SkillListingItem[] {
       const manifest = parseSkillMetadata(skillDir, entry);
       if (!manifest) continue;
 
-      // Count how many agents have this skill installed
-      const agentsDir = join(process.env["LETTA_HOME"] || join(homedir(), ".letta"), "agents");
+      // Count how many agents have this skill installed. Per-agent skills
+      // live under storageDir()/agents/<id>/skills/ (see agentSkillsDir).
+      const agentsDir = join(storageDir(), "agents");
       let installedCount = 0;
       if (existsSync(agentsDir)) {
         try {
@@ -1400,8 +1415,34 @@ export function isSkillInstalledForAgent(agentId: string, skillName: string): bo
 }
 
 /**
+ * Lightweight `{ name, description }` listing of an agent's installed
+ * skills. This is the PROGRESSIVE-DISCLOSURE source: it parses the small
+ * per-skill manifests (frontmatter / metadata.json) via
+ * listInstalledSkillsForAgent — it never reads SKILL.md BODIES. The full
+ * body is retrieved on demand only, via getInstalledSkillDetail
+ * (GET /v1/agents/{id}/skills/{name}).
+ *
+ * Used to build the per-turn "Available Skills" system block so the
+ * context carries a compact one-line-per-skill index instead of the full
+ * O(installed-skills × body-size) text every turn.
+ */
+export function readInstalledSkillDescriptions(
+  agentId: string,
+): { name: string; description: string }[] {
+  return listInstalledSkillsForAgent(agentId).map((m) => ({
+    name: m.name,
+    description: m.description,
+  }));
+}
+
+/**
  * Read all installed SKILL.md files for an agent and return their content.
- * Used to inject skills into the turn context.
+ *
+ * NOTE: This reads the FULL SKILL.md body for every installed skill and is
+ * therefore expensive. It MUST NOT be used for per-turn context injection
+ * (that pollutes every turn with O(installed-skills × body) text — see
+ * readInstalledSkillDescriptions for the progressive-disclosure path).
+ * Retained for any caller that genuinely needs the full bodies in bulk.
  */
 export function readInstalledSkillContents(agentId: string): string[] {
   const agentSkills = agentSkillsDir(agentId);
@@ -1426,6 +1467,86 @@ export function readInstalledSkillContents(agentId: string): string[] {
     // Return what we have
   }
   return contents;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Progressive-disclosure system-context injection
+//
+// The skills index is injected into the agent's SYSTEM CONTEXT (not the
+// user message) via the LocalBackend memfs mechanism: every `.md` file in
+// `<storageDir>/memfs/<agent>/memory/system/` is read by letta-code as a
+// memory block and included in the agent's persistent context every turn
+// (see readBlocksForAgent + lib/a2ui-adapter.ts for the same pattern).
+//
+// We write ONLY a compact `name: description` index here — never the full
+// SKILL.md bodies. The full body is retrieved on demand via
+// getInstalledSkillDetail (GET /v1/agents/{id}/skills/{name}). Unlike the
+// static A2UI block, the skills list is dynamic (install/uninstall), so we
+// re-sync write-if-changed rather than write-if-absent.
+// ──────────────────────────────────────────────────────────────────────
+
+/** Memory-block label for the per-agent installed-skills index. */
+export const SKILLS_BLOCK_LABEL = "available_skills";
+
+/**
+ * Build the compact, descriptions-only "Available Skills" block content.
+ * One line per installed skill (`- <name>: <description>`) plus a short
+ * instruction telling the agent the full instructions can be loaded on
+ * demand. Returns null when no skills are installed (caller removes any
+ * stale block in that case).
+ */
+export function buildSkillsBlockContent(
+  skills: { name: string; description: string }[],
+): string | null {
+  if (skills.length === 0) return null;
+  const lines = skills.map((s) =>
+    s.description ? `- ${s.name}: ${s.description}` : `- ${s.name}`,
+  );
+  return [
+    "## Available Skills",
+    "",
+    "The following skills are installed for you. Each line is `name: description`.",
+    "Load a skill's full instructions on demand only when you actually need it",
+    "(e.g. fetch GET /v1/agents/{id}/skills/{name}); the full skill bodies are NOT",
+    "inlined here to keep this context compact.",
+    "",
+    ...lines,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Sync the per-agent installed-skills index into the agent's system-context
+ * memfs block (`available_skills.md`). Idempotent and write-if-changed:
+ *   - no installed skills        → remove any stale block file
+ *   - installed skills present   → write the compact descriptions-only block
+ *     iff its content differs from what's on disk
+ *
+ * This is called once per turn from chat.ts. It is cheap: it parses the
+ * small per-skill manifests (NOT SKILL.md bodies) and only touches disk
+ * when the rendered index actually changed.
+ */
+export function syncSkillsBlockForAgent(agentId: string): void {
+  const sysDir = join(storageDir(), "memfs", agentId, "memory", "system");
+  const blockPath = join(sysDir, `${SKILLS_BLOCK_LABEL}.md`);
+  try {
+    const skills = readInstalledSkillDescriptions(agentId);
+    const next = buildSkillsBlockContent(skills);
+
+    if (next === null) {
+      // No skills installed — drop any stale block so we don't leave a
+      // dangling (or empty) "Available Skills" section in context.
+      if (existsSync(blockPath)) rmSync(blockPath, { force: true });
+      return;
+    }
+
+    if (!existsSync(sysDir)) mkdirSync(sysDir, { recursive: true });
+    const current = existsSync(blockPath) ? readFileSync(blockPath, "utf8") : null;
+    if (current !== next) writeFileSync(blockPath, next);
+  } catch {
+    // Non-fatal: missing the index for one turn is far better than failing
+    // the turn on an unrelated FS error.
+  }
 }
 
 /**
