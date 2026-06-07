@@ -86,6 +86,11 @@ import {
 import { broadcastCronEvent } from "./lib/cron-events.js";
 import type { AddTaskInput, CronTask } from "./lib/types/crons.js";
 import {
+  getStatus as getSearchStatus,
+  rebuild as rebuildSearchIndex,
+  search as runSearch,
+} from "./lib/search.js";
+import {
   evaluatePermission,
   readAgentConfigOrEffective,
   readGlobalConfig,
@@ -1689,6 +1694,58 @@ async function handleAgentMessagesCancel(req: IncomingMessage, res: ServerRespon
   json(res, 200, out);
 }
 
+// ── search (lcp-c61s) ──────────────────────────────────────────────
+//
+// Derived FTS5 index over canonical MemFS. The index is deletable /
+// rebuildable; nothing here treats it as a source of truth. Cold path is
+// BOUNDED: lib/search.ensureIndex returns indexing=true if a build runs past
+// the cap, in which case we answer 202 and the client polls
+// GET /v1/agents/{id}/search/status. We never hold the request open for the
+// full ~30s cold build.
+
+async function handleMessagesSearch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  const query = typeof body["query"] === "string" ? body["query"] : "";
+  const rawAgent = typeof body["agent_id"] === "string" ? body["agent_id"] : "";
+  const agentId = rawAgent
+    ? resolveAgentIdAlias(rawAgent, (id) => getAgentRecord(id) != null)
+    : "";
+  const limitRaw = Number(body["limit"]);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 20;
+  if (!agentId) {
+    return badRequest(res, "agent_id is required");
+  }
+  try {
+    const result = await runSearch(agentId, query, limit);
+    if (result.indexing) {
+      // Cold build still running — tell the client to poll status. Results may
+      // be empty/partial; we return 202 with what we have so far.
+      return json(res, 202, result);
+    }
+    return json(res, 200, result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return json(res, 500, { detail: `search failed: ${msg}` });
+  }
+}
+
+function handleSearchStatus(_req: IncomingMessage, res: ServerResponse, agentIdRaw: string): void {
+  const agentId = resolveAgentIdAlias(agentIdRaw, (id) => getAgentRecord(id) != null);
+  json(res, 200, getSearchStatus(agentId));
+}
+
+function handleSearchRebuild(_req: IncomingMessage, res: ServerResponse, agentIdRaw: string): void {
+  const agentId = resolveAgentIdAlias(agentIdRaw, (id) => getAgentRecord(id) != null);
+  // Kick the rebuild and return immediately (202). The promise is detached;
+  // failures are logged but don't crash the request — status will reflect
+  // the result once the build settles.
+  rebuildSearchIndex(agentId).catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[search] rebuild for ${agentId} failed: ${msg}`);
+  });
+  json(res, 202, { rebuilding: true, agent_id: agentId });
+}
+
 // ── helpers ────────────────────────────────────────────────────────
 
 function cryptoRandomUUID(): string {
@@ -1922,8 +1979,12 @@ const server = createServer((req, res) => {
   if (stubCount({ pn: "/v1/steps/count" })) return;
   if (stubCount({ pn: "/v1/archives/count" })) return;
   if (pathname === "/v1/messages/search" && req.method === "POST") {
-    return json(res, 200, { messages: [] });
+    return handleMessagesSearch(req, res);
   }
+  const searchStatus = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/search\/status\/?$/);
+  if (searchStatus && req.method === "GET") return handleSearchStatus(req, res, searchStatus[1]!);
+  const searchRebuild = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/search\/rebuild\/?$/);
+  if (searchRebuild && req.method === "POST") return handleSearchRebuild(req, res, searchRebuild[1]!);
   if (pathname === "/api/projects" && req.method === "GET") return json(res, 200, []);
   if (pathname === "/v1/projects" && req.method === "GET") return json(res, 200, []);
 
