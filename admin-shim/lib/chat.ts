@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 
 import { getAgentPool } from "./agent-pool.js";
-import { findUnmappedTailUserMessageId, writeOtidForLocalId } from "./store.js";
+import { findUnmappedTailUserMessageId, writeOtidForLocalId, readInstalledSkillContents } from "./store.js";
 import { toStringArrayOrNull } from "./translate.js";
 import type {
   LettaMessage,
@@ -800,12 +800,22 @@ export async function handleSendMessage(
         }
         handleRawFrame(raw);
       };
+
+      // Inject installed skills into the turn context
+      // Read all installed SKILL.md files and prepend them to the user input
+      const skillContents = readInstalledSkillContents(agentId);
+      let enrichedText = text;
+      if (skillContents.length > 0) {
+        const skillsSection = `\n\n## Available Skills\n\n${skillContents.join("\n\n---\n\n")}\n`;
+        enrichedText = `${skillsSection}\n\n## User Message\n\n${text}`;
+      }
+
       // lcp-0vi: route through runTurnWithHeal so a dangling-tool-use error
       // on this turn evicts + heals the transcript before returning. The
       // healed disk is picked up by the next pool.get() the next time a
       // user turn comes through; the caller still sees this turn's
       // failure exactly as before, just with the disk already cleaned.
-      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, text, {
+      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, enrichedText, {
         onFrame: handleRawFrameWithRun,
         onRunCreated: (id: string) => {
           activeRunId = id;

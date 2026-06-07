@@ -38,6 +38,13 @@ import {
   readSystemPrompt,
   resolveConversationId,
   writeAgentRecord,
+  listAvailableSkills,
+  getSkillDetail,
+  listInstalledSkillsForAgent,
+  getInstalledSkillDetail,
+  installSkillToAgent,
+  uninstallSkillFromAgent,
+  searchSkills,
   _internals as storeInternals,
   type OnDiskAgentRecord,
   type OnDiskConversation,
@@ -1101,6 +1108,68 @@ function handleCronMethodNotAllowed(req: IncomingMessage, res: ServerResponse): 
   });
 }
 
+// ── /v1/skills/* — skill discovery, search, install, uninstall ──────────
+//
+// Skills let agents discover and use specialized capabilities. The shim
+// manages the skill store at ~/.letta/skills/ and per-agent installations
+// at ~/.letta/agents/{agentId}/skills/.
+
+function handleSkillsList(_req: IncomingMessage, res: ServerResponse): void {
+  const skills = listAvailableSkills();
+  json(res, 200, { skills });
+}
+
+function handleSkillDetail(_req: IncomingMessage, res: ServerResponse, skillName: string): void {
+  const skill = getSkillDetail(skillName);
+  if (!skill) return notFound(res, `skill ${skillName}`);
+  json(res, 200, skill);
+}
+
+async function handleSkillsSearch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  const query = typeof body["query"] === "string" ? body["query"] as string : "";
+  const tags = Array.isArray(body["tags"]) ? (body["tags"] as string[]).filter((t) => typeof t === "string") : undefined;
+  const skills = searchSkills(query, tags);
+  json(res, 200, { skills });
+}
+
+function handleAgentSkillsList(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const skills = listInstalledSkillsForAgent(agentId);
+  json(res, 200, { skills });
+}
+
+function handleAgentSkillDetail(_req: IncomingMessage, res: ServerResponse, agentId: string, skillName: string): void {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const skill = getInstalledSkillDetail(agentId, skillName);
+  if (!skill) return notFound(res, `skill ${skillName} for agent ${agentId}`);
+  json(res, 200, skill);
+}
+
+async function handleAgentSkillInstall(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const body = await readJsonBody(req);
+  const skillName = typeof body["name"] === "string" ? body["name"] as string : "";
+  if (!skillName) {
+    return json(res, 400, { detail: "skill name is required" });
+  }
+  const ok = installSkillToAgent(agentId, skillName);
+  if (!ok) {
+    return notFound(res, `skill ${skillName} not found in global store`);
+  }
+  const skill = getInstalledSkillDetail(agentId, skillName);
+  json(res, 201, skill);
+}
+
+async function handleAgentSkillUninstall(_req: IncomingMessage, res: ServerResponse, agentId: string, skillName: string): Promise<void> {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const ok = uninstallSkillFromAgent(agentId, skillName);
+  if (!ok) {
+    return notFound(res, `skill ${skillName} not installed for agent ${agentId}`);
+  }
+  json(res, 200, { name: skillName, uninstalled: true });
+}
+
 function handleRunsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const { limit } = parsePagination(url.searchParams);
   const params: ListRunsParams & { agentIds?: string[]; statuses?: string[] } = {
@@ -1567,6 +1636,28 @@ const server = createServer((req, res) => {
     if (req.method === "GET") return handleCronDetail(req, res, cronDetail[1]!);
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     return handleCronMethodNotAllowed(req, res);
+  }
+
+  // /v1/skills/* — skill discovery, search, install, uninstall
+  if (pathname === "/v1/skills" || pathname === "/v1/skills/") {
+    if (req.method === "GET") return handleSkillsList(req, res);
+    if (req.method === "POST") return handleSkillsSearch(req, res);
+  }
+  const skillDetail = pathname.match(/^\/v1\/skills\/([^/]+)\/?$/);
+  if (skillDetail) {
+    if (req.method === "GET") return handleSkillDetail(req, res, skillDetail[1]!);
+  }
+
+  // /v1/agents/{agentId}/skills/* — per-agent skill management
+  const agentSkillsList = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/skills\/?$/);
+  if (agentSkillsList) {
+    if (req.method === "GET") return handleAgentSkillsList(req, res, agentSkillsList[1]!);
+    if (req.method === "POST") return handleAgentSkillInstall(req, res, agentSkillsList[1]!);
+  }
+  const agentSkillDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/skills\/([^/]+)\/?$/);
+  if (agentSkillDetail) {
+    if (req.method === "GET") return handleAgentSkillDetail(req, res, agentSkillDetail[1]!, agentSkillDetail[2]!);
+    if (req.method === "DELETE") return handleAgentSkillUninstall(req, res, agentSkillDetail[1]!, agentSkillDetail[2]!);
   }
 
   // /shim/v1/usage — aggregate token tracking (shim extension, not vanilla)
