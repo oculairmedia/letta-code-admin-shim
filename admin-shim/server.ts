@@ -45,7 +45,10 @@ import {
   installSkillToAgent,
   uninstallSkillFromAgent,
   searchSkills,
+  publishSkillToStore,
+  deleteSkillFromStore,
   _internals as storeInternals,
+  type PublishSkillInput,
   type OnDiskAgentRecord,
   type OnDiskConversation,
 } from "./lib/store.js";
@@ -1538,6 +1541,45 @@ async function handleSkillsSearch(req: IncomingMessage, res: ServerResponse): Pr
   json(res, 200, { skills });
 }
 
+// PUT /v1/skills/{name} — create-or-replace a skill in the GLOBAL registry.
+// Idempotent: 201 on first create, 200 on overwrite. Body accepts either a
+// full `readme` (SKILL.md written verbatim) or structured metadata
+// (description/version/tags/author) from which a minimal SKILL.md is built.
+async function handleSkillPublish(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  // Name validation up front (defense in depth; the store layer re-checks).
+  if (skillName.includes("/") || skillName.includes("\\") || skillName.includes("..") || !/^[A-Za-z0-9._-]+$/.test(skillName)) {
+    return json(res, 400, { detail: "invalid skill name" });
+  }
+  const body = await readJsonBody(req);
+  // Build the input with only the keys actually supplied (exactOptionalPropertyTypes).
+  const input: PublishSkillInput = {};
+  if (typeof body["description"] === "string") input.description = body["description"];
+  if (typeof body["version"] === "string") input.version = body["version"];
+  if (typeof body["author"] === "string") input.author = body["author"];
+  if (Array.isArray(body["tags"])) {
+    input.tags = (body["tags"] as unknown[]).filter((t): t is string => typeof t === "string");
+  }
+  if (typeof body["readme"] === "string") input.readme = body["readme"];
+  const result = publishSkillToStore(skillName, input);
+  if (!result.ok) {
+    if (result.error === "invalid_name") return json(res, 400, { detail: "invalid skill name" });
+    if (result.error === "invalid_body") {
+      return json(res, 400, { detail: "skill must include a non-empty `readme` or `description`" });
+    }
+    return json(res, 500, { detail: "failed to write skill" });
+  }
+  const skill = getSkillDetail(skillName);
+  json(res, result.created ? 201 : 200, skill);
+}
+
+// DELETE /v1/skills/{name} — remove a skill from the GLOBAL registry.
+// Per-agent installed copies are left intact (independent snapshots).
+function handleSkillDelete(_req: IncomingMessage, res: ServerResponse, skillName: string): void {
+  const ok = deleteSkillFromStore(skillName);
+  if (!ok) return notFound(res, `skill ${skillName}`);
+  json(res, 200, { name: skillName, deleted: true });
+}
+
 function handleAgentSkillsList(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
   if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
   const skills = listInstalledSkillsForAgent(agentId);
@@ -2155,6 +2197,8 @@ const server = createServer((req, res) => {
   const skillDetail = pathname.match(/^\/v1\/skills\/([^/]+)\/?$/);
   if (skillDetail) {
     if (req.method === "GET") return handleSkillDetail(req, res, skillDetail[1]!);
+    if (req.method === "PUT") return handleSkillPublish(req, res, skillDetail[1]!);
+    if (req.method === "DELETE") return handleSkillDelete(req, res, skillDetail[1]!);
   }
 
   // /v1/agents/{agentId}/skills/* — per-agent skill management

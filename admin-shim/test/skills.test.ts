@@ -14,12 +14,14 @@ import { join } from "node:path";
 import {
   SKILLS_BLOCK_LABEL,
   buildSkillsBlockContent,
+  deleteSkillFromStore,
   getInstalledSkillDetail,
   getSkillDetail,
   installSkillToAgent,
   isSkillInstalledForAgent,
   listAvailableSkills,
   listInstalledSkillsForAgent,
+  publishSkillToStore,
   readInstalledSkillDescriptions,
   searchSkills,
   syncSkillsBlockForAgent,
@@ -284,5 +286,100 @@ test("skills: path-traversal skill names are rejected (no fs escape)", () => {
     assert.equal(uninstallSkillFromAgent(AGENT, bad), false, `uninstall rejects ${JSON.stringify(bad)}`);
     assert.equal(getSkillDetail(bad), null, `getSkillDetail rejects ${JSON.stringify(bad)}`);
     assert.equal(isSkillInstalledForAgent(AGENT, bad), false, `isInstalled rejects ${JSON.stringify(bad)}`);
+    assert.equal(publishSkillToStore(bad, { description: "x" }).ok, false, `publish rejects ${JSON.stringify(bad)}`);
+    assert.equal(deleteSkillFromStore(bad), false, `delete rejects ${JSON.stringify(bad)}`);
   }
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Publish / delete — the GLOBAL registry write half.
+// ──────────────────────────────────────────────────────────────────────
+
+test("skills: publish from metadata creates a catalog entry (created=true)", () => {
+  const result = publishSkillToStore("metadata-skill", {
+    description: "Built from metadata",
+    tags: ["alpha", "beta"],
+    version: "2.1.0",
+    author: "tester",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.created, true, "first publish is a create");
+
+  // Now discoverable via the normal read path.
+  const detail = getSkillDetail("metadata-skill");
+  assert.ok(detail, "published skill is readable");
+  assert.equal(detail.name, "metadata-skill");
+  assert.equal(detail.description, "Built from metadata");
+  assert.equal(detail.version, "2.1.0");
+  assert.equal(detail.author, "tester");
+  assert.deepEqual(detail.tags.sort(), ["alpha", "beta"]);
+  assert.ok(detail.files.includes("SKILL.md"));
+
+  const listed = listAvailableSkills().map((s) => s.name);
+  assert.ok(listed.includes("metadata-skill"));
+});
+
+test("skills: publish with a full readme is written verbatim", () => {
+  const readme =
+    "---\nname: full-skill\ndescription: A fully authored skill\ntags: [\"x\"]\n---\n\n" +
+    "# full-skill\n\nVERBATIM_BODY_MARKER\n";
+  const result = publishSkillToStore("full-skill", { readme });
+  assert.equal(result.ok, true);
+
+  const detail = getSkillDetail("full-skill");
+  assert.ok(detail);
+  assert.equal(detail.readme, readme, "readme written verbatim");
+  assert.match(detail.readme, /VERBATIM_BODY_MARKER/);
+  assert.equal(detail.description, "A fully authored skill");
+});
+
+test("skills: publish is idempotent create-or-replace (created=false on overwrite)", () => {
+  const first = publishSkillToStore("dup-skill", { description: "v1" });
+  assert.equal(first.created, true);
+
+  const second = publishSkillToStore("dup-skill", { description: "v2 updated" });
+  assert.equal(second.ok, true);
+  assert.equal(second.created, false, "second publish overwrites, not creates");
+
+  const detail = getSkillDetail("dup-skill");
+  assert.ok(detail);
+  assert.equal(detail.description, "v2 updated", "overwrite reflects new content");
+
+  // No duplicate catalog entries.
+  const count = listAvailableSkills().filter((s) => s.name === "dup-skill").length;
+  assert.equal(count, 1);
+});
+
+test("skills: publish rejects empty body (no readme and no description)", () => {
+  const result = publishSkillToStore("empty-skill", {});
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "invalid_body");
+  assert.equal(getSkillDetail("empty-skill"), null, "nothing written on invalid body");
+});
+
+test("skills: a published skill can be installed to an agent end-to-end", () => {
+  publishSkillToStore("publishable", { description: "publish then install" });
+  assert.equal(installSkillToAgent(AGENT, "publishable"), true);
+  assert.equal(isSkillInstalledForAgent(AGENT, "publishable"), true);
+  const installed = listInstalledSkillsForAgent(AGENT).map((s) => s.name);
+  assert.ok(installed.includes("publishable"));
+});
+
+test("skills: deleteSkillFromStore removes catalog entry but NOT agent installs", () => {
+  publishSkillToStore("deletable", { description: "to be deleted" });
+  installSkillToAgent(AGENT, "deletable");
+  assert.equal(isSkillInstalledForAgent(AGENT, "deletable"), true);
+
+  assert.equal(deleteSkillFromStore("deletable"), true);
+  assert.equal(getSkillDetail("deletable"), null, "removed from global registry");
+
+  // The per-agent installed snapshot survives — deletion must not yank it.
+  assert.equal(
+    isSkillInstalledForAgent(AGENT, "deletable"),
+    true,
+    "agent install is an independent snapshot",
+  );
+
+  // Deleting a non-existent skill is a clean false.
+  assert.equal(deleteSkillFromStore("never-existed"), false);
 });
