@@ -1299,6 +1299,141 @@ export function getSkillDetail(skillName: string): SkillDetail | null {
 }
 
 /**
+ * Result of a publish attempt. `created` distinguishes a brand-new skill
+ * (HTTP 201) from an overwrite of an existing one (HTTP 200).
+ */
+export interface PublishSkillResult {
+  ok: boolean;
+  created: boolean;
+  /** Set when ok=false so the route can return a precise 4xx detail. */
+  error?: "invalid_name" | "invalid_body" | "write_failed";
+}
+
+/**
+ * Input for publishing a skill into the GLOBAL registry (skillsStoreDir()).
+ *
+ * Two shapes are accepted:
+ *   - `readme` (a full SKILL.md document) is written verbatim. This is the
+ *     primary path — the app sends the complete SKILL.md the user authored.
+ *   - otherwise a minimal SKILL.md is synthesized from the metadata fields
+ *     (name/description/version/tags/author) so callers that only have
+ *     structured metadata can still publish.
+ *
+ * Either way the on-disk result is `<store>/<name>/SKILL.md`, which is what
+ * every reader (listAvailableSkills/getSkillDetail/install) already expects.
+ */
+export interface PublishSkillInput {
+  description?: string;
+  version?: string;
+  tags?: string[];
+  author?: string;
+  /** Full SKILL.md document. Written verbatim when present. */
+  readme?: string;
+}
+
+/** Escape a value for safe single-line YAML frontmatter. */
+function yamlScalar(value: string): string {
+  // Wrap in double quotes and escape backslashes/quotes so a description
+  // containing `:` or `#` can't break the frontmatter or inject keys.
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Build a minimal SKILL.md document from structured metadata. Used only
+ * when the caller did not supply a full `readme`.
+ */
+function synthesizeSkillMd(name: string, input: PublishSkillInput): string {
+  const description = (input.description ?? "").trim();
+  const version = (input.version ?? "1.0.0").trim() || "1.0.0";
+  const author = (input.author ?? "community").trim() || "community";
+  const tags = (input.tags ?? []).filter((t) => typeof t === "string" && t.length > 0);
+  const tagsLine = tags.length
+    ? `tags: [${tags.map((t) => yamlScalar(t)).join(", ")}]`
+    : "tags: []";
+  return [
+    "---",
+    `name: ${yamlScalar(name)}`,
+    `description: ${yamlScalar(description)}`,
+    `version: ${yamlScalar(version)}`,
+    tagsLine,
+    `author: ${yamlScalar(author)}`,
+    "---",
+    "",
+    `# ${name}`,
+    "",
+    description,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Publish (create-or-replace) a skill in the GLOBAL registry.
+ *
+ * This is the missing write half of the skills catalog: discovery/install
+ * already existed, but there was no way to ADD a skill to the registry over
+ * HTTP. PUT semantics — idempotent create-or-overwrite keyed on `name`.
+ *
+ * Writes atomically via a staging dir + rename, mirroring installSkillToAgent,
+ * so a mid-write failure never leaves a half-written skill that readers would
+ * treat as valid.
+ */
+export function publishSkillToStore(
+  skillName: string,
+  input: PublishSkillInput,
+): PublishSkillResult {
+  if (!isSafeSkillName(skillName)) return { ok: false, created: false, error: "invalid_name" };
+
+  // Require SOMETHING to write: either a full readme or a description.
+  const hasReadme = typeof input.readme === "string" && input.readme.trim().length > 0;
+  const hasDescription =
+    typeof input.description === "string" && input.description.trim().length > 0;
+  if (!hasReadme && !hasDescription) {
+    return { ok: false, created: false, error: "invalid_body" };
+  }
+
+  const storeDir = skillsStoreDir();
+  const targetDir = join(storeDir, skillName);
+  const created = !existsSync(targetDir);
+
+  const content = hasReadme ? (input.readme as string) : synthesizeSkillMd(skillName, input);
+
+  const stagingDir = `${targetDir}.publishing-${process.pid}-${Date.now()}`;
+  try {
+    mkdirSync(stagingDir, { recursive: true });
+    writeFileSync(join(stagingDir, "SKILL.md"), content);
+    if (existsSync(targetDir)) rmSync(targetDir, { recursive: true, force: true });
+    mkdirSync(storeDir, { recursive: true });
+    renameSync(stagingDir, targetDir);
+    return { ok: true, created };
+  } catch {
+    try {
+      if (existsSync(stagingDir)) rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
+    return { ok: false, created: false, error: "write_failed" };
+  }
+}
+
+/**
+ * Delete a skill from the GLOBAL registry. Per-agent INSTALLED copies are
+ * independent snapshots and are intentionally NOT touched — removing a skill
+ * from the catalog must not yank it out from under agents already using it.
+ * Returns true if a skill was removed, false if it did not exist / failed.
+ */
+export function deleteSkillFromStore(skillName: string): boolean {
+  if (!isSafeSkillName(skillName)) return false;
+  const skillDir = join(skillsStoreDir(), skillName);
+  if (!existsSync(skillDir)) return false;
+  try {
+    rmSync(skillDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * List skills installed for a specific agent.
  */
 export function listInstalledSkillsForAgent(agentId: string): SkillManifest[] {
