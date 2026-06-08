@@ -109,6 +109,63 @@ function extractText(body: unknown): string {
   return "";
 }
 
+// Like extractText, but preserves multimodal content. Mobile sends image
+// attachments as `{type:"image", source:{type:"base64", media_type, data}}`
+// parts inside a message's `content` array (see letta-mobile
+// MessageContentPart.toJsonArray). extractText() drops every non-text part,
+// so screenshots never reached the backend. When at least one image part is
+// present we return the full ordered parts array (which the adapter +
+// local backend already accept as `string | unknown[]`); otherwise we fall
+// back to the plain string so text-only sends behave exactly as before.
+// (lcp-qi2f — restored after the fix was lost to a divergent branch.)
+type InboundContentPart = { type: string; [k: string]: unknown };
+
+function extractContent(body: unknown): string | InboundContentPart[] {
+  if (!body || typeof body !== "object") return extractText(body);
+  const rec = body as Record<string, unknown>;
+  // Legacy scalar inputs never carry images.
+  if (typeof rec["input"] === "string" || typeof rec["text"] === "string") {
+    return extractText(body);
+  }
+  const messages = rec["messages"] ?? rec["message"];
+  if (!Array.isArray(messages)) return extractText(body);
+
+  const parts: InboundContentPart[] = [];
+  let sawImage = false;
+  for (const m of messages) {
+    if (typeof m === "string") {
+      if (m) parts.push({ type: "text", text: m });
+      continue;
+    }
+    if (!m || typeof m !== "object") continue;
+    const c = (m as Record<string, unknown>)["content"];
+    if (typeof c === "string") {
+      if (c) parts.push({ type: "text", text: c });
+      continue;
+    }
+    if (!Array.isArray(c)) continue;
+    for (const p of c) {
+      if (!p || typeof p !== "object") continue;
+      const pr = p as Record<string, unknown>;
+      const t = pr["type"];
+      if (t === "text") {
+        if (typeof pr["text"] === "string" && pr["text"]) {
+          parts.push({ type: "text", text: pr["text"] as string });
+        }
+      } else if (t === "image" || t === "image_url" || t === "input_image") {
+        // Pass the native part through unchanged — the local backend speaks
+        // the same `{type:"image", source:{base64}}` shape letta-code emits.
+        sawImage = true;
+        parts.push(pr as InboundContentPart);
+      }
+    }
+  }
+
+  // No image content -> keep legacy string behavior (and exact string shape).
+  if (!sawImage) return extractText(body);
+  return parts;
+}
+
 function sseDataFrame(payload: unknown): string {
   // Mobile's SseParser only reads `data:` lines. Skip the `event:` line.
   // Every payload must have `message_type` at the top level or it's treated
@@ -575,6 +632,11 @@ export async function handleSendMessage(
     res.end(JSON.stringify({ detail: "missing user text" }));
     return;
   }
+  // lcp-qi2f: preserve inbound image content parts so they survive shim→backend.
+  // extractText() (used above for the empty-text guard) drops non-text parts;
+  // extractContent() returns the full ordered parts array when an image is
+  // present, else the same plain string — so text-only sends are unchanged.
+  const content = extractContent(body);
   // Original chained `explicitConv ?? body.conversation_id ?? body.conversationId ?? undefined`.
   // Keep the exact nullish chain — including the possibility that body.conversation_id
   // could be a non-string truthy value (it always is a string in mobile, but
@@ -814,7 +876,7 @@ export async function handleSendMessage(
       // healed disk is picked up by the next pool.get() the next time a
       // user turn comes through; the caller still sees this turn's
       // failure exactly as before, just with the disk already cleaned.
-      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, text, {
+      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, content, {
         onFrame: handleRawFrameWithRun,
         onRunCreated: (id: string) => {
           activeRunId = id;
