@@ -12,19 +12,31 @@ This skill provides weather information for any location. Use it when the user a
 
 ## Usage
 
-When the user asks about weather, use the Bash tool to query a weather API:
+When the user asks about weather, use the Bash tool. Prefer the bundled
+`scripts/weather.sh` helper, which URL-encodes the location for you:
 
 ```bash
-curl -s "https://wttr.in/{location}?format=3"
+scripts/weather.sh "New York"
 ```
 
-Replace `{location}` with the city or location name (e.g., "New York", "Tokyo", "London").
+If you call the API directly with `curl`, the location must be URL-encoded
+(spaces become `%20`):
+
+```bash
+curl -s "https://wttr.in/New%20York?format=3"
+```
 
 ## Examples
 
-- "What's the weather in New York?" → `curl -s "https://wttr.in/New York?format=3"`
-- "Is it raining in London?" → `curl -s "https://wttr.in/London?format=3"`
-- "What's the temperature in Tokyo?" → `curl -s "https://wttr.in/Tokyo?format=3"`
+- "What's the weather in New York?" → `scripts/weather.sh "New York"`
+- "Is it raining in London?" → `scripts/weather.sh "London"`
+- "What's the temperature in São Paulo?" → `scripts/weather.sh "São Paulo"`
+
+Equivalent direct calls (note the URL-encoding):
+
+- `curl -s "https://wttr.in/New%20York?format=3"`
+- `curl -s "https://wttr.in/London?format=3"`
+- `curl -s "https://wttr.in/S%C3%A3o%20Paulo?format=3"`
 
 ## Response Format
 
@@ -36,4 +48,6 @@ Example: `New York: 22°C | Partly cloudy`
 
 - wttr.in is a free weather service that doesn't require an API key
 - For more detailed output, you can use `format=4` or `format=j1`
-- If the location has spaces, use underscores (e.g., "New_York")
+- Always pass the location verbatim to `scripts/weather.sh` (it handles
+  encoding); when calling `curl` directly, URL-encode spaces and special
+  characters (e.g. `New York` → `New%20York`)
