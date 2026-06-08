@@ -248,16 +248,21 @@ shim can serve as a drop-in backend for the desktop app.
 
 ### 1. `POST /v1/conversations/{id}/stream` returns 501
 
-**Current behavior:** `handleConversationStream` returns `501 Not Implemented`.
+**Current behavior:** `handleConversationStream` returns `200` with an
+*ambient keep-alive* SSE stream — a `: connected` line, periodic `: ping`
+heartbeats, and a hard duration cap (`SHIM_STREAM_MAX_MS`, default 60s). It is
+NOT a 501 stub, but it also does NOT carry real turn output: it's a long-poll
+keep-alive so mobile's background polling of cached/nonexistent conversations
+doesn't thrash 404s. (See `server.ts` `handleConversationStream`.)
 
-**Expected behavior:** Letta Code's desktop client uses this endpoint for SSE
-streaming, not `POST /v1/conversations/{id}/messages`. The shim's streaming
-logic lives in `handleConversationSendMessage`; `handleConversationStream`
-needs the same SSE logic but wrapped in a `/stream` route.
+**Expected behavior:** Letta Code's desktop client expects this endpoint to
+stream actual turn output via SSE (the real turn frames), not just heartbeats.
+The shim's real streaming logic lives in `handleConversationSendMessage`.
 
-**Fix:** Duplicate the SSE streaming path from `handleConversationSendMessage`
-into `handleConversationStream`. The `stream-coalescer` logic is already in
-`lib/stream-coalescer.ts` — wire it up.
+**Fix:** Route real SSE turn output through `/stream` (reuse the streaming path
+from `handleConversationSendMessage`; the `stream-coalescer` logic is already in
+`lib/stream-coalescer.ts`), while keeping the ambient keep-alive behavior for
+conversations with no active turn so background polling stays cheap.
 
 ### 2. `POST /v1/conversations/{id}/fork` returns 501
 

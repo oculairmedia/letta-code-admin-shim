@@ -276,3 +276,13 @@ test("skills: syncSkillsBlockForAgent is idempotent and self-cleaning", () => {
   // No skills installed → buildSkillsBlockContent returns null.
   assert.equal(buildSkillsBlockContent([]), null);
 });
+
+test("skills: path-traversal skill names are rejected (no fs escape)", () => {
+  // CodeRabbit critical: skillName must not allow ../ or separators into fs joins.
+  for (const bad of ["../evil", "..", "a/b", "a\\b", "foo/../../etc", "."]) {
+    assert.equal(installSkillToAgent(AGENT, bad), false, `install rejects ${JSON.stringify(bad)}`);
+    assert.equal(uninstallSkillFromAgent(AGENT, bad), false, `uninstall rejects ${JSON.stringify(bad)}`);
+    assert.equal(getSkillDetail(bad), null, `getSkillDetail rejects ${JSON.stringify(bad)}`);
+    assert.equal(isSkillInstalledForAgent(AGENT, bad), false, `isInstalled rejects ${JSON.stringify(bad)}`);
+  }
+});

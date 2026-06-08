@@ -1558,6 +1558,11 @@ async function handleAgentSkillInstall(req: IncomingMessage, res: ServerResponse
   if (!skillName) {
     return json(res, 400, { detail: "skill name is required" });
   }
+  // Reject path-traversal / separator names up front (defense in depth; the
+  // store layer also validates). Keeps a malicious name from reaching fs joins.
+  if (skillName.includes("/") || skillName.includes("\\") || skillName.includes("..") || !/^[A-Za-z0-9._-]+$/.test(skillName)) {
+    return json(res, 400, { detail: "invalid skill name" });
+  }
   const ok = installSkillToAgent(agentId, skillName);
   if (!ok) {
     return notFound(res, `skill ${skillName} not found in global store`);

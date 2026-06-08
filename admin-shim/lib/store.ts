@@ -12,10 +12,12 @@
  */
 
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -997,17 +999,35 @@ export function readBlocksForAgent(agentId: string): Block[] {
  * Copy a directory recursively from src to dst.
  */
 function copyDirRecursive(src: string, dst: string): void {
-  mkdirSync(dst, { recursive: true });
-  const entries = readdirSync(src);
-  for (const entry of entries) {
-    const srcPath = join(src, entry);
-    const dstPath = join(dst, entry);
-    if (statSync(srcPath).isDirectory()) {
-      copyDirRecursive(srcPath, dstPath);
-    } else {
-      writeFileSync(dstPath, readFileSync(srcPath));
-    }
-  }
+  // cpSync preserves file mode bits (executable scripts keep +x). The manual
+  // readFileSync/writeFileSync copy stripped permissions, so skill scripts
+  // copied on install failed when invoked directly. (CodeRabbit: skill copy
+  // strips source file mode bits.)
+  cpSync(src, dst, { recursive: true, preserveTimestamps: true });
+}
+
+/**
+ * Validate a skill name before using it in filesystem path joins.
+ *
+ * skillName arrives from request bodies and URL path segments and is joined
+ * into the skills store / per-agent dirs. Reject any value containing path
+ * separators or `..` traversal so it can never escape the skills directory
+ * (notably uninstall, which deletes). (CodeRabbit: path traversal risk.)
+ */
+function isSafeSkillName(name: unknown): name is string {
+  return (
+    typeof name === "string" &&
+    name.length > 0 &&
+    name.length <= 128 &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("\0") &&
+    name !== "." &&
+    name !== ".." &&
+    // allow only a conservative skill-id charset
+    /^[A-Za-z0-9._-]+$/.test(name) &&
+    !name.includes("..")
+  );
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1225,6 +1245,7 @@ export function listAvailableSkills(): SkillListingItem[] {
  * Get detailed information about a specific skill in the global store.
  */
 export function getSkillDetail(skillName: string): SkillDetail | null {
+  if (!isSafeSkillName(skillName)) return null;
   const storeDir = skillsStoreDir();
   const skillDir = join(storeDir, skillName);
 
@@ -1303,6 +1324,7 @@ export function listInstalledSkillsForAgent(agentId: string): SkillManifest[] {
  * Get details about an installed skill for an agent.
  */
 export function getInstalledSkillDetail(agentId: string, skillName: string): SkillDetail | null {
+  if (!isSafeSkillName(skillName)) return null;
   const skillDir = join(agentSkillsDir(agentId), skillName);
   if (!existsSync(skillDir) || !statSync(skillDir).isDirectory()) return null;
 
@@ -1355,6 +1377,9 @@ export function getInstalledSkillDetail(agentId: string, skillName: string): Ski
  * Returns true on success, false on failure.
  */
 export function installSkillToAgent(agentId: string, skillName: string): boolean {
+  // Reject traversal/separator names before touching the filesystem.
+  if (!isSafeSkillName(skillName)) return false;
+
   const storeDir = skillsStoreDir();
   const sourceDir = join(storeDir, skillName);
   const targetDir = join(agentSkillsDir(agentId), skillName);
@@ -1364,28 +1389,26 @@ export function installSkillToAgent(agentId: string, skillName: string): boolean
   const skillMdPath = join(sourceDir, "SKILL.md");
   if (!existsSync(skillMdPath)) return false;
 
-  // Create target directory
+  // Copy atomically-ish: stage into a temp dir, then swap into place, so a
+  // mid-copy failure never leaves a partially-installed skill that later reads
+  // treat as installed. (CodeRabbit: partial installs leave corrupted state.)
+  const stagingDir = `${targetDir}.installing-${process.pid}-${Date.now()}`;
   try {
-    mkdirSync(targetDir, { recursive: true });
-  } catch {
-    return false;
-  }
-
-  // Copy all files from source to target
-  try {
-    const entries = readdirSync(sourceDir);
-    for (const entry of entries) {
-      const srcPath = join(sourceDir, entry);
-      const dstPath = join(targetDir, entry);
-      const stat = statSync(srcPath);
-      if (stat.isDirectory()) {
-        copyDirRecursive(srcPath, dstPath);
-      } else {
-        writeFileSync(dstPath, readFileSync(srcPath));
-      }
-    }
+    // cpSync preserves mode bits (executable skill scripts keep +x).
+    cpSync(sourceDir, stagingDir, { recursive: true, preserveTimestamps: true });
+    // Remove any prior install, then move staging into place.
+    if (existsSync(targetDir)) rmSync(targetDir, { recursive: true, force: true });
+    mkdirSync(join(targetDir, ".."), { recursive: true });
+    // rename is atomic within the same filesystem.
+    renameSync(stagingDir, targetDir);
     return true;
   } catch {
+    // Clean up the staging dir on any failure so no partial state remains.
+    try {
+      if (existsSync(stagingDir)) rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      // best effort
+    }
     return false;
   }
 }
@@ -1395,6 +1418,8 @@ export function installSkillToAgent(agentId: string, skillName: string): boolean
  * Returns true on success, false on failure.
  */
 export function uninstallSkillFromAgent(agentId: string, skillName: string): boolean {
+  // Reject traversal/separator names — this path is fed to a recursive delete.
+  if (!isSafeSkillName(skillName)) return false;
   const skillDir = join(agentSkillsDir(agentId), skillName);
   if (!existsSync(skillDir)) return false;
 
@@ -1410,6 +1435,7 @@ export function uninstallSkillFromAgent(agentId: string, skillName: string): boo
  * Check if a skill is installed for an agent.
  */
 export function isSkillInstalledForAgent(agentId: string, skillName: string): boolean {
+  if (!isSafeSkillName(skillName)) return false;
   const skillDir = join(agentSkillsDir(agentId), skillName);
   return existsSync(skillDir) && statSync(skillDir).isDirectory();
 }
