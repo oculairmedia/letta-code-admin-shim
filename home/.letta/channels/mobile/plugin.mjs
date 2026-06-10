@@ -183,6 +183,11 @@ function createMobileAdapter(account, host) {
         // forwarded here (same gotcha as subscribeCronEvents) — the handler
         // only sees host methods it is handed.
         subscribeApprovalEvents: host.subscribeApprovalEvents,
+        // lcp-4d5f: reflection (sleeptime) settings get/set + updated push.
+        // Same explicit-forwarding gotcha as the cron/approval handlers.
+        handleReflectionSettingsGet: host.handleReflectionSettingsGet,
+        handleReflectionSettingsSet: host.handleReflectionSettingsSet,
+        subscribeReflectionEvents: host.subscribeReflectionEvents,
       });
     },
   };
