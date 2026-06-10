@@ -837,7 +837,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
               reason: `fork_override: ${override.reason}`,
               timestamp,
             });
-            return { behavior: "allow", message: `fork overridden: ${override.reason}` };
+            // lcp-3ruh: pass the CLEANED input (without override fields) to
+            // the tool executor via updatedInput. The audit log above
+            // already captured the raw input with override fields intact.
+            return {
+              behavior: "allow",
+              message: `fork overridden: ${override.reason}`,
+              updatedInput: stripOverrideFields(toolInput),
+            };
           }
           // Over limit — mutate result to "ask" and fall through to
           // the ask handling below. If no approver is connected, the
