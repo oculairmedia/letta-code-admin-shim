@@ -70,3 +70,6 @@ admin-shim/*.tsbuildinfo
 *.db
 .beads-credential-key
 admin-shim/test/fixtures/stream-traces/*.stderr
+
+# letta-code session state at repo root
+/.letta/

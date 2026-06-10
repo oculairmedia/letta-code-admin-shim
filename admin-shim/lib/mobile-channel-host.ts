@@ -30,7 +30,7 @@ import {
   type A2uiBlock,
   type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
-import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, type ApprovalScope } from "./runs.js";
+import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
 import {
   ackConversation,
   mobileConversationCursorCapabilities,
@@ -903,11 +903,16 @@ export function subscribeToRun(
   let stopped = false;
   let watcher: FSWatcher | null = null;
   let polling = false;
+  let liveUnsubscribe: (() => void) | null = null;
+  let terminalDrainTimer: NodeJS.Timeout | null = null;
 
-  // Replay (and live-tail) is "read whole file, filter by seq > lastSeqSent,
-  // emit, advance lastSeqSent". Re-reading on every change is O(n) per
-  // append; fine for v1 since runs rarely exceed thousands of frames and
-  // appendFileSync guarantees lines are ordered + complete.
+  // lcp-2oxb.3: catch-up replay reads the whole file ONCE (and again only on
+  // rare gap/terminal edges). Live tailing no longer re-reads the file per
+  // append — frames arrive via the in-process subscribeLiveFrames fanout in
+  // runs.ts, which is O(1) per frame. The fs.watch implementation below is
+  // retained only as the fallback for runs with no in-memory handle (a
+  // non-terminal run observed across a shim restart — rare, and the boot
+  // sweep finalizes those shortly after).
   const readAndEmit = (): void => {
     if (stopped) return;
     let body: string;
@@ -954,6 +959,14 @@ export function subscribeToRun(
 
   function stop(): void {
     stopped = true;
+    if (liveUnsubscribe) {
+      liveUnsubscribe();
+      liveUnsubscribe = null;
+    }
+    if (terminalDrainTimer) {
+      clearTimeout(terminalDrainTimer);
+      terminalDrainTimer = null;
+    }
     if (watcher) {
       try {
         watcher.close();
@@ -969,9 +982,62 @@ export function subscribeToRun(
   readAndEmit();
   if (checkTerminalAndMaybeFinish()) return { unsubscribe: stop };
 
-  // Live-tail. fs.watch can fire multiple times per append on some FSes;
-  // dedup via the polling guard. We use 'change' events; 'rename' would
-  // mean the file was rotated/deleted — treat as terminal-ish error.
+  // lcp-2oxb.3: preferred live path — in-process fanout from runs.ts.
+  // Frames are delivered O(1) per append; the disk file is only consulted
+  // for the catch-up read above and the terminal tail re-read below.
+  const live = subscribeLiveFrames(runId, lastSeqSent, (seq, frame) => {
+    if (stopped) return;
+    if (seq === -1) {
+      // Terminal sentinel. The run finalized, but the late terminal tail
+      // (stop_reason/usage, lcp-xu4l) is emitted by the WS host shortly
+      // AFTER finalizeRun — those frames still flow through this listener.
+      // Hold the subscription open briefly to drain them, then do one
+      // last disk read (belt-and-braces for anything the ring missed) and
+      // finish.
+      const status =
+        frame && typeof frame === "object" && typeof (frame as { __terminal__?: unknown }).__terminal__ === "string"
+          ? (frame as { __terminal__: string }).__terminal__
+          : "completed";
+      if (terminalDrainTimer) return; // already draining
+      // Drain budget: the late tail is emitted in the same macrotask chain
+      // as finalizeRun (bridgeSendMessage's post-turn flush), so a small
+      // budget suffices; tunable for slower hosts.
+      const drainMs = Number(process.env["SHIM_SUBSCRIBE_TERMINAL_DRAIN_MS"] ?? 25);
+      terminalDrainTimer = setTimeout(() => {
+        if (stopped) return;
+        readAndEmit();
+        cbs.onDone({ last_seq: lastSeqSent, status });
+        stop();
+      }, drainMs);
+      terminalDrainTimer.unref?.();
+      return;
+    }
+    if (seq <= lastSeqSent) return;
+    cbs.onFrame(frame, seq);
+    lastSeqSent = seq;
+  });
+
+  if (live.ok) {
+    liveUnsubscribe = live.unsubscribe;
+    // Bridge the attach gap. If the ring has shifted past our cursor
+    // (oldest buffered seq leaves a hole), fill from disk first.
+    const oldest = live.ring[0];
+    if (oldest && oldest.seq > lastSeqSent + 1) readAndEmit();
+    for (const entry of live.ring) {
+      if (stopped) break;
+      if (entry.seq <= lastSeqSent) continue;
+      cbs.onFrame(entry.frame, entry.seq);
+      lastSeqSent = entry.seq;
+    }
+    // The run may have finalized between the catch-up read and the attach —
+    // the sentinel would have fired before our listener existed.
+    if (!stopped) checkTerminalAndMaybeFinish();
+    return { unsubscribe: stop };
+  }
+
+  // Fallback: no in-memory handle (non-terminal run across a shim restart).
+  // Legacy fs.watch tail — O(file) per change, acceptable for this rare
+  // edge; the boot sweep finalizes such runs shortly after startup anyway.
   try {
     watcher = fsWatch(path, (eventType) => {
       if (stopped || polling) return;

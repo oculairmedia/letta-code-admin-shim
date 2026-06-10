@@ -114,6 +114,17 @@ no transport flag and no fallback path — the SDK adapter is the only
 implementation. The release before this one shipped both behind
 `SHIM_LETTA_TRANSPORT=sdk` if you ever need to compare.
 
+**Pool sizing (lcp-2oxb.6)**: each warm worker is a full letta-code CLI
+subprocess — measured ~450 MB RSS warm with loaded conversation state
+(idle letta.js baselines run ~80–100 MB). `SHIM_POOL_MAX` (default 10)
+therefore budgets ~4.5 GB worst case; size it as available-RAM ÷ 450 MB
+and leave headroom, since the pool will temporarily overflow the cap
+rather than kill an in-flight turn (lcp-2oxb.2). Cold-starting an evicted
+worker costs a full Node boot of the bundle plus session resume, so keep
+`SHIM_POOL_IDLE_SEC` (default 300) generous when traffic revisits
+conversations. Live perf counters (event-loop delay, frame throughput,
+RSS) ride on the pool stats endpoint (`lcp-2oxb.1`).
+
 Operational quirks worth knowing:
 
 - **`--backend local` injection**: the SDK doesn't pass `--backend local`

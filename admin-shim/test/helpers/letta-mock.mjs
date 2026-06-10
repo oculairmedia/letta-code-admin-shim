@@ -147,12 +147,65 @@ let pendingApprovalFrames = null;
 
 let turnCounter = 0;
 
+/**
+ * lcp-2oxb.1: synthesize extra assistant_message partial-delta frames so the
+ * bench-stream-turn benchmark can exercise the full frame-append / subscribeToRun
+ * hot path with a realistic frame volume.
+ *
+ * Controlled by LETTA_MOCK_DELTA_FRAMES (integer, default 0). When > 0, the mock
+ * injects that many additional stream_event/assistant_message delta frames
+ * immediately before the stop_reason frame. Each synthetic frame carries a
+ * short `delta` text token so the frame shape is valid but compact.
+ *
+ * @param {any[]} frames - Mutable frame list for this turn (index 0 = init, already skipped).
+ * @param {number} deltaCount - How many extra delta frames to inject.
+ */
+function injectDeltaFrames(frames, deltaCount) {
+  if (deltaCount <= 0) return frames;
+  // Find the stop_reason frame index so we can splice before it.
+  const stopIdx = frames.findIndex(
+    (f) => f?.type === "stream_event" && f?.event?.message_type === "stop_reason",
+  );
+  const insertAt = stopIdx >= 0 ? stopIdx : frames.length - 1;
+  const now = new Date().toISOString();
+  const synthFrames = [];
+  for (let k = 0; k < deltaCount; k++) {
+    synthFrames.push({
+      type: "stream_event",
+      event: {
+        message_type: "assistant_message",
+        id: `synth-delta-${currentTurnRunId}-${k}`,
+        date: now,
+        agent_id: agentId,
+        conversation_id: conversationId,
+        run_id: currentTurnRunId,
+        seq_id: 9000 + k,
+        otid: null,
+        content: [{ type: "text", text: ` d${k}` }],
+      },
+      session_id: sessionId,
+      uuid: `synth-uuid-${currentTurnRunId}-${k}`,
+      timestamp: now,
+    });
+  }
+  return [
+    ...frames.slice(0, insertAt),
+    ...synthFrames,
+    ...frames.slice(insertAt),
+  ];
+}
+
 /** @param {string} content */
 function emitTurn(content) {
   turnCounter += 1;
   currentTurnRunId = `local-run-${turnCounter}`;
   const traceName = pickTrace(content);
-  const frames = loadTrace(traceName);
+  let frames = loadTrace(traceName);
+  // lcp-2oxb.1: inject extra delta frames when LETTA_MOCK_DELTA_FRAMES is set.
+  const deltaFrames = Number(process.env["LETTA_MOCK_DELTA_FRAMES"] ?? 0);
+  if (deltaFrames > 0) {
+    frames = injectDeltaFrames(frames, deltaFrames);
+  }
   // Skip the init frame from the trace (we already emitted one). All other
   // frames replay in order. Add a tiny delay between frames so SSE streaming
   // tests can observe the time ordering.

@@ -43,10 +43,16 @@ import {
   statSync,
   writeFileSync,
   appendFileSync,
+  closeSync,
+  openSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+
+// lcp-2oxb.1: frame-append counter for perf instrumentation.
+import { recordFrameAppend } from "./perf-metrics.js";
 
 import type { Run, RunUsage, Step } from "./types/wire.js";
 import type {
@@ -65,6 +71,19 @@ import type {
  * wire ever drift (e.g. if we add bookkeeping fields not meant to leak).
  */
 type RunRecord = Run;
+
+/**
+ * lcp-2oxb.3: live frame listener callback type.
+ * seq=-1 is the terminal sentinel emitted by finalizeRun after flush.
+ * When seq===-1, frame is { __terminal__: status } — callers must check.
+ */
+export type LiveFrameListener = (seq: number, frame: unknown) => void;
+
+/** lcp-2oxb.3: ring buffer entry for in-memory frame fanout. */
+export interface RingEntry {
+  seq: number;
+  frame: unknown;
+}
 
 /**
  * In-memory handle returned by createRun and consumed by every other
@@ -97,6 +116,18 @@ export interface RunHandle {
   // doesn't race the WS delta stream for the same logical message.
   // Populated at runTurn entry, never re-read on disk.
   messageIdsAtTurnStart: Set<string>;
+  // lcp-2oxb.3: frames.jsonl fd, opened lazily (O_APPEND) on the first
+  // appendRunFrame and reused for the whole run. One writeSync per frame
+  // (~µs to page cache) replaces the old open+write+close+mkdir cycle while
+  // preserving the pinned read-after-write contract: when appendRunFrame
+  // returns, the line is visible to any reader in this process.
+  _frameFd: number | null;
+  // lcp-2oxb.3: bounded ring buffer (last 256 entries) for live fanout.
+  // Subscribers attach and immediately drain whatever gap they missed.
+  _ring: RingEntry[];
+  // lcp-2oxb.3: set of live listeners. Each is called synchronously
+  // AFTER the disk write is queued but before returning to the caller.
+  _listeners: Set<LiveFrameListener>;
 }
 
 /**
@@ -406,9 +437,66 @@ function rememberFinalizedRunForAppend(runId: string, handle: RunHandle): void {
   if (prev) clearTimeout(prev.timeout);
   const timeout = setTimeout(() => {
     _finalizedAppendWindow.delete(runId);
+    // lcp-2oxb.3: the grace window expiring is the moment appends stop being
+    // accepted — release the fd and drop listeners. Writes are synchronous,
+    // so there is nothing left to flush.
+    try {
+      if (handle._frameFd !== null) closeSync(handle._frameFd);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[runs] frame fd close failed for ${runId}: ${msg}`);
+    }
+    handle._frameFd = null;
+    handle._listeners.clear();
+    handle._ring.length = 0;
   }, FINALIZED_APPEND_GRACE_MS);
   timeout.unref?.();
   _finalizedAppendWindow.set(runId, { handle, timeout });
+}
+
+/**
+ * lcp-2oxb.3: deliver the terminal sentinel (seq=-1, { __terminal__: status })
+ * to live listeners. Frame writes are synchronous, so every earlier frame is
+ * already on disk by the time the sentinel fires. Listeners attached during
+ * the grace window still receive late tail frames (lcp-xu4l) because
+ * finalize does NOT clear the listener set — only grace expiry does.
+ */
+function notifyTerminalToListeners(handle: RunHandle, status: string): void {
+  for (const listener of [...handle._listeners]) {
+    try {
+      listener(-1, { __terminal__: status });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[runs] terminal listener error for ${handle.id}: ${msg}`);
+    }
+  }
+}
+
+/**
+ * lcp-2oxb.3: attach a live frame listener to an active (or grace-window)
+ * run. Returns ok:false when no in-memory appendable handle exists —
+ * terminal/archived runs and runs from before a shim restart fall back to
+ * the disk path in subscribeToRun. `ring` carries the buffered entries with
+ * seq > fromSeq so the caller can bridge the gap between its catch-up disk
+ * read and this attach; if the oldest ring entry is > fromSeq+1 the ring has
+ * already shifted past the gap and the caller must do one more disk read.
+ */
+export function subscribeLiveFrames(
+  runId: string,
+  fromSeq: number,
+  listener: LiveFrameListener,
+): { ok: boolean; ring: RingEntry[]; unsubscribe: () => void } {
+  const handle = getAppendableRunHandle(runId);
+  if (!handle) return { ok: false, ring: [], unsubscribe: () => {} };
+  handle._listeners.add(listener);
+  const ring = handle._ring.filter((e) => e.seq > fromSeq);
+  return {
+    ok: true,
+    ring,
+    unsubscribe: () => {
+      handle._listeners.delete(listener);
+    },
+  };
 }
 
 function getAppendableRunHandle(runId: string): RunHandle | undefined {
@@ -471,6 +559,8 @@ export function createRun({ agentId, conversationId, onCancel, background }: Cre
     num_steps: 0,
   };
   const hrStart = process.hrtime();
+  // lcp-2oxb.3: mkdir ONCE here so appendRunFrame never needs it.
+  mkdirSync(runDir(id), { recursive: true });
   const handle: RunHandle = {
     id,
     record,
@@ -479,6 +569,9 @@ export function createRun({ agentId, conversationId, onCancel, background }: Cre
     frameCount: 0,
     inFlightOtids: new Set<string>(),
     messageIdsAtTurnStart: new Set<string>(),
+    _frameFd: null,
+    _ring: [],
+    _listeners: new Set<LiveFrameListener>(),
   };
   _activeRuns.set(id, handle);
   if (typeof onCancel === "function") {
@@ -608,14 +701,36 @@ export function getFramesFilePath(runId: string): string {
 }
 
 /**
- * lcp-p74.1: append a single frame to <run-dir>/frames.jsonl with a
- * monotonic seq. Each line: { seq, ts, frame }. Returns the seq assigned to
- * this frame (or -1 if the run isn't tracked — caller can ignore for
- * fire-and-forget cases).
+ * lcp-2oxb.3: max entries kept in the in-memory ring buffer per run.
+ * 256 entries covers ~8 seconds of heavy streaming (30 fps assistant deltas)
+ * and gives reconnecting subscribers a comfortable reattach window without
+ * needing another disk read in the common case.
+ */
+const RING_MAX = 256;
+
+/**
+ * lcp-p74.1 / lcp-2oxb.3: append a single frame to <run-dir>/frames.jsonl
+ * with a monotonic seq. Each line: { seq, ts, frame }. Returns the seq
+ * assigned to this frame (or -1 if the run isn't tracked — caller can ignore
+ * for fire-and-forget cases).
  *
- * Atomicity: one appendFileSync per line. POSIX guarantees atomic appends
- * for writes ≤ PIPE_BUF (4 KiB); single-writer-per-run holds for the agent
- * pool's serialized turns, so larger frames are also safe in practice.
+ * Writer rewrite (bead lcp-2oxb.3):
+ *   - The run dir is created ONCE in createRun — not per append.
+ *   - An O_APPEND fd is opened lazily on the first append and reused for
+ *     the whole run (+ grace window). Per frame this costs ONE writeSync
+ *     to the page cache (~µs) instead of the old open+write+close+mkdir
+ *     cycle — the dominant event-loop cost of frame persistence.
+ *   - Writes stay synchronous DELIBERATELY: the pinned contract is that
+ *     when appendRunFrame returns, the line is on disk for any reader in
+ *     this process (replay, tests, boot sweep). An async stream was
+ *     considered and rejected — it reopens read-after-write races across
+ *     every replay path for a negligible additional win.
+ *   - After the disk write the frame is pushed into the bounded ring
+ *     buffer and live listeners are notified (each wrapped in try/catch).
+ *
+ * Single-writer-per-run invariant: the agent pool's serialized turns mean
+ * only one call site (mobile-channel-host.ts emit()) appends frames for a
+ * given run, so O_APPEND ordering is trivially preserved.
  *
  * lcp-xu4l: terminal stop/usage frames can arrive just after finalizeRun()
  * removes the handle from `_activeRuns`. Keep a short post-finalize append
@@ -627,13 +742,44 @@ export function appendRunFrame(runId: string, frame: unknown): { seq: number } {
   handle.frameCount += 1;
   const seq = handle.frameCount;
   const line = JSON.stringify({ seq, ts: nowIso(), frame }) + "\n";
+
+  // --- disk write via per-run fd (lcp-2oxb.3) ---
   try {
-    mkdirSync(runDir(runId), { recursive: true });
-    appendFileSync(framesFile(runId), line);
+    if (handle._frameFd === null) {
+      // Lazy open. createRun mkdirs the run dir, but be defensive about
+      // callers that fabricate handles (tests) or raced a cleanup.
+      try {
+        handle._frameFd = openSync(framesFile(runId), "a");
+      } catch {
+        mkdirSync(runDir(runId), { recursive: true });
+        handle._frameFd = openSync(framesFile(runId), "a");
+      }
+    }
+    writeSync(handle._frameFd, line);
+    // lcp-2oxb.1: record the write so perf stats can track throughput.
+    recordFrameAppend(line.length);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[runs] frame append failed for ${runId}: ${msg}`);
   }
+
+  // --- ring buffer push (lcp-2oxb.3) ---
+  handle._ring.push({ seq, frame });
+  if (handle._ring.length > RING_MAX) {
+    handle._ring.shift();
+  }
+
+  // --- live listener fanout (lcp-2oxb.3) ---
+  // Iterate a snapshot so a listener that unsubscribes mid-call is safe.
+  for (const listener of [...handle._listeners]) {
+    try {
+      listener(seq, frame);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[runs] live listener error for ${runId}: ${msg}`);
+    }
+  }
+
   return { seq };
 }
 
@@ -692,8 +838,11 @@ export function finalizeRunOnDisk(
     live.record.completed_at = nowIso();
     live.record.total_duration_ns = nanosSince(live.hrStart);
     writeJsonAtomic(runFile(runId), live.record);
+    rememberFinalizedRunForAppend(runId, live);
     _activeRuns.delete(runId);
     _cancelHandlers.delete(runId);
+    // lcp-2oxb.3: same terminal sentinel as finalizeRun/cancelRun.
+    notifyTerminalToListeners(live, status);
     return true;
   }
   const record = readRunFromDisk(runId);
@@ -979,6 +1128,11 @@ export function finalizeRun(
   rememberFinalizedRunForAppend(handle.id, handle);
   _activeRuns.delete(handle.id);
   _cancelHandlers.delete(handle.id);
+  // lcp-2oxb.3: tell live subscribers the run is terminal (after flush).
+  // Listeners stay attached through the grace window so the late terminal
+  // tail (lcp-xu4l: stop_reason/usage appended just after finalize) still
+  // reaches them before the subscriber closes out.
+  notifyTerminalToListeners(handle, handle.record.status ?? "completed");
   maybeCompactRuns();
 }
 
@@ -1190,8 +1344,14 @@ export function cancelRun(
   handle.record.completed_at = nowIso();
   handle.record.total_duration_ns = nanosSince(handle.hrStart);
   writeJsonAtomic(runFile(handle.id), handle.record);
+  // lcp-2oxb.3: cancelled runs previously never entered the grace window,
+  // which would leak the frame WriteStream and starve late cancel-tail
+  // frames. Route them through the same window + terminal sentinel as
+  // finalizeRun so the stream closes and subscribers get onDone.
+  rememberFinalizedRunForAppend(handle.id, handle);
   _activeRuns.delete(handle.id);
   _cancelHandlers.delete(handle.id);
+  notifyTerminalToListeners(handle, "cancelled");
   if (typeof onCancel === "function") {
     try {
       onCancel(reason);

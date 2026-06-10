@@ -3,38 +3,29 @@
 Pre-flight checklist for promoting `SHIM_LETTA_TRANSPORT=sdk` to default,
 and the rollback path if anything goes sideways in production.
 
-> **Status**: the SDK transport is off by default. Operators opt in by
-> setting `SHIM_LETTA_TRANSPORT=sdk` in the shim's environment. The
-> hand-rolled `DirectSubprocessLettaSessionAdapter` remains the production
-> transport until this smoke passes in a live environment and the result
-> is recorded in lcp-sdk.9's close reason.
+> **Status (updated 2026-06-10)**: COMPLETE. The smoke passed live and the
+> SDK transport was promoted to default; `lcp-sdk.10` (2026-05-22) then
+> removed the direct subprocess adapter, the `SHIM_LETTA_TRANSPORT` flag,
+> and the `SHIM_POOL_DISABLE` legacy path. The SDK transport is now the
+> only implementation — references to the flag and the direct path below
+> are historical. The smoke scenarios themselves remain a useful
+> regression checklist.
 
 ## TL;DR rollback
 
-Set `SHIM_LETTA_TRANSPORT=direct` (or unset the variable entirely) and
-restart the shim. The direct subprocess adapter is still wired in
-parallel; the flag selects which one `AgentPool.get()` returns. No state
-migration is required.
-
-```bash
-# /opt/stacks/letta-code-parallel/env.sh — set or remove the line
-export SHIM_LETTA_TRANSPORT=direct
-
-systemctl restart lettashim.service       # or whatever runs the shim
-journalctl -u lettashim.service -f         # confirm "[pool] spawned transport=direct"
-```
-
-If both `SHIM_LETTA_TRANSPORT=sdk` AND `SHIM_POOL_DISABLE=1` are set, the
-shim logs a one-time warning and falls back to direct. Unset
-`SHIM_POOL_DISABLE` to make SDK transport effective.
+**Historical.** There is no in-codebase rollback anymore: `lcp-sdk.10`
+deleted the direct adapter and the `SHIM_LETTA_TRANSPORT` flag. Reverting
+to the direct path means deploying the release prior to lcp-sdk.10, which
+shipped both transports behind the flag.
 
 ## Environment
 
-The SDK transport needs three envvars beyond what the direct path uses:
+The SDK transport needs these envvars (`SHIM_LETTA_TRANSPORT` was removed
+in lcp-sdk.10 — the SDK path is unconditional now):
 
 | Variable | Purpose | Example |
 |---|---|---|
-| `SHIM_LETTA_TRANSPORT` | `sdk` enables SDK transport; `direct` (or unset) keeps the hand-rolled path. | `sdk` |
+| ~~`SHIM_LETTA_TRANSPORT`~~ | Removed in lcp-sdk.10. SDK transport is always on. | — |
 | `LETTA_CLI_PATH` | Where the SDK looks for the `letta` binary. The SDK resolves in this order: `LETTA_CLI_PATH` → `require.resolve("@letta-ai/letta-code")` → a few hard-coded fallbacks. Pin this so the shim and CLI stay aligned during the migration. | `/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js` |
 | `LETTA_LOCAL_BACKEND_DIR` | The on-disk LocalBackend root that letta-code writes to. The shim reads from the same dir. | `/opt/stacks/letta-code-parallel/migrator/out` |
 
@@ -245,7 +236,7 @@ by `admin-shim/test/sdk-conversation-stability.test.ts`).
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `[pool] spawn failed transport=sdk` | `LETTA_CLI_PATH` doesn't exist or isn't executable. | Verify the path; the SDK also falls back to `require.resolve("@letta-ai/letta-code")`. |
-| `WARN: SHIM_LETTA_TRANSPORT=sdk has no effect while SHIM_POOL_DISABLE=1` | Legacy per-request spawn is on. | Unset `SHIM_POOL_DISABLE`. |
+| ~~`WARN: SHIM_LETTA_TRANSPORT=sdk has no effect while SHIM_POOL_DISABLE=1`~~ | Historical — both the flag and `SHIM_POOL_DISABLE` were removed in lcp-sdk.10. | n/a |
 | Turn hangs, no frames after `[sdk-adapter] started` | Mock CLI without the per-turn `local-run-<n>` patch will be filtered by `lastCompletedRunIds`. Real CLI generates fresh ids — if a real CLI exhibits this, set `DEBUG_SDK=1` and look for `discarding stale message`. | See lcp-sdk.8 and the per-turn run-id patch in `test/helpers/letta-mock.mjs`. |
 | Approval card never appears for a tool call | `a2uiCapability == null` on the turn — `_handleCanUseTool` default-allows without emitting a frame. | Verify the WS `hello` carried an `a2ui_version`. |
 | Synthetic `tool_call_id` doesn't match `tool_return_message` | Known divergence (lcp-j3r) — the SDK doesn't surface the CLI-side `tool_call_id` to `canUseTool`. | UI correlation by tool_call_id is degraded; approval gate (keyed by run_id) still works. |
@@ -253,9 +244,12 @@ by `admin-shim/test/sdk-conversation-stability.test.ts`).
 
 ## Promotion checklist
 
-- [ ] Scenarios 1–9 above run cleanly under `SHIM_LETTA_TRANSPORT=sdk`
-- [ ] Pool log shows exactly `transport=sdk` for new turns
-- [ ] `/v1/runs/<id>` shape matches the direct path (lcp-sdk.4)
-- [ ] Approval card UX matches the direct path (mod lcp-j3r)
-- [ ] Conversation list is stable across N turns on the same conv
-- [ ] Rollback (`SHIM_LETTA_TRANSPORT=direct` + restart) verified once
+Completed — the SDK transport was promoted and the flag removed
+(lcp-sdk.10). Kept for the historical record:
+
+- [x] Scenarios 1–9 above run cleanly under `SHIM_LETTA_TRANSPORT=sdk`
+- [x] Pool log shows exactly `transport=sdk` for new turns
+- [x] `/v1/runs/<id>` shape matches the direct path (lcp-sdk.4)
+- [x] Approval card UX matches the direct path (mod lcp-j3r)
+- [x] Conversation list is stable across N turns on the same conv
+- [x] Rollback (`SHIM_LETTA_TRANSPORT=direct` + restart) verified once

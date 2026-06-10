@@ -1,7 +1,8 @@
 /**
- * POST /v1/agents/{id}/messages — spawn letta-code as a subprocess and
- * relay its stream-json output as SSE (streaming case) or a single JSON
- * payload (non-streaming case).
+ * POST /v1/agents/{id}/messages — run the turn through the pooled
+ * letta-code SDK Session (agent-pool.ts) and relay its stream-json
+ * frames as SSE (streaming case) or a single JSON payload
+ * (non-streaming case).
  *
  * letta-code emits one JSON frame per stdout line:
  *   {type:"system", subtype:"init", ...}
@@ -595,7 +596,6 @@ function findTerminalStopReason(frames: LettaMessage[]): StopReasonMessage | und
   return undefined;
 }
 
-/** Options accepted by the legacy per-request spawn arg builder. */
 /** Optional handler args supplied by the route. */
 export interface HandleSendMessageOptions {
   conversationId?: string | undefined;

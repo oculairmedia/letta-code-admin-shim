@@ -36,10 +36,25 @@ export MOBILE_CHANNEL_TOKEN="${MOBILE_CHANNEL_TOKEN:-}"
 export SHIM_PORT="${SHIM_PORT:-8291}"
 export SHIM_HOST="${SHIM_HOST:-0.0.0.0}"
 
-# Optional: pool tuning.
+# Optional: pool tuning (lcp-2oxb.6 sizing guidance).
+#
+# Each warm pool worker is a full letta-code CLI subprocess. Measured on
+# this host 2026-06-10: ~450 MB RSS for a warm shim worker with loaded
+# conversation state (plain letta.js instances idle at ~80-100 MB; budget
+# toward the high end for agents with real history). Size the cap as:
+#
+#   SHIM_POOL_MAX ≈ (RAM you can spend on workers) / 450 MB
+#
+# e.g. ~4.5 GB worst case at the default of 10. The pool LRU-evicts idle
+# non-busy workers past the cap and may temporarily exceed it rather than
+# kill an in-flight turn (lcp-2oxb.2 overflow), so leave headroom. Cold
+# start of an evicted worker is a full Node boot of the ~491k-line bundle
+# plus session resume — keep SHIM_POOL_IDLE_SEC generous (default 300s)
+# if your traffic pattern revisits conversations.
 # export SHIM_POOL_MAX=10
 # export SHIM_POOL_IDLE_SEC=300
-# export SHIM_POOL_TURN_TIMEOUT=180000
+# export SHIM_POOL_TURN_TIMEOUT=1800000        # absolute turn ceiling (ms)
+# export SHIM_POOL_TURN_SILENCE_MS=120000      # silence watchdog (ms)
 
 # Letta Code CLI binary the SDK adapter spawns.
 #

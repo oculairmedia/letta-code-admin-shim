@@ -130,13 +130,15 @@ The frame log survives anything short of disk corruption. Specifically:
 ## 3. Worker TTL
 
 The agent pool (`admin-shim/lib/agent-pool.ts`) holds long-lived
-letta-code subprocesses, keyed by `(conversation_id, agent_id)`.
+`@letta-ai/letta-code-sdk` Sessions (each owning a letta-code CLI
+subprocess), keyed by `(conversation_id, agent_id)`. (Pre-lcp-sdk.10
+this was a hand-rolled `spawn(LETTA_BIN, …)` worker.)
 
 ### 3.1 Pool lifecycle
 
-- **Spawn.** First turn on a conv triggers
-  `spawn(LETTA_BIN, ["--backend", "local", "--agent", …])`. Reads the
-  worker's stdout for stream-json frames.
+- **Spawn.** First turn on a conv triggers `resumeSession()` via the
+  SDK, which spawns the CLI (resolved through `LETTA_CLI_PATH`) with
+  stream-json input/output. The Session yields the stream frames.
 - **Reuse.** Subsequent turns on the same conv reuse the existing
   worker (no respawn cost). Each turn updates `worker.lastUsedAt`
   *after* the turn completes.

@@ -31,6 +31,14 @@
  */
 
 import { listMessages, stampNewMessages } from "./store.js";
+// lcp-2oxb.1: perf instrumentation surfaced through pool stats.
+import {
+  getEventLoopDelayStats,
+  getFrameAppendStats,
+  getRssBytes,
+  type EventLoopDelayStats,
+  type FrameAppendStats,
+} from "./perf-metrics.js";
 import { type A2uiCapability } from "./a2ui-adapter.js";
 import {
   detectConsecutiveUserMessageIndices,
@@ -200,7 +208,14 @@ export interface RunTurnOptions {
  * is set in practice).
  */
 export interface RunTurnResult {
+  /**
+   * lcp-2oxb.5: retained frames only. assistant/reasoning partial deltas
+   * are dropped after side-effects + onFrame delivery (they dominated
+   * per-turn memory and have no post-turn consumer). `frameCountTotal`
+   * preserves the true stream volume for diagnostics.
+   */
   frames: LettaStreamFrame[];
+  frameCountTotal?: number;
   stderr: string;
   run_id?: string;
   cancelled?: boolean;
@@ -290,12 +305,28 @@ export interface WorkerStat {
   spawned_sec: number;
 }
 
+/**
+ * lcp-2oxb.1: performance snapshot bundled into pool stats.
+ * Included as an additive `perf` field — existing REST clients that
+ * ignore unknown keys see no breakage.
+ */
+export interface PoolPerfStats {
+  /** Event-loop delay percentiles for the window since the last stats() call. */
+  event_loop: EventLoopDelayStats;
+  /** Cumulative frame-append counters since process start. */
+  frames: FrameAppendStats;
+  /** Resident set size of this process in bytes. */
+  rss_bytes: number;
+}
+
 /** Return shape of `AgentPool#stats`. */
 export interface PoolStats {
   size: number;
   max: number;
   idle_evict_sec: number;
   workers: WorkerStat[];
+  /** lcp-2oxb.1: additive performance snapshot; never undefined. */
+  perf: PoolPerfStats;
 }
 
 function logLine(msg: string): void {
@@ -529,10 +560,23 @@ async function createAdapter(opts: LettaSessionAdapterOptions): Promise<LettaSes
   return new SdkBackedLettaSessionAdapter(opts);
 }
 
-class AgentPool {
+/**
+ * lcp-2oxb.2: Per-conversation pool of SDK-backed session adapters.
+ *
+ * Exported so unit tests can instantiate the pool directly with fake
+ * adapters (via _adapterFactory override) without spawning a real shim
+ * subprocess. Production callers use getAgentPool() exclusively.
+ */
+export class AgentPool {
   workers: Map<string, LettaSessionAdapter>;
   spawning: Map<string, Promise<LettaSessionAdapter>>;
   housekeepTimer: NodeJS.Timeout;
+  /**
+   * lcp-2oxb.2: seam for unit tests. When set, get() calls this instead
+   * of the module-level createAdapter() so tests can inject fake adapters
+   * without spawning real SDK sessions. Production code never sets this.
+   */
+  _adapterFactory: ((opts: LettaSessionAdapterOptions) => Promise<LettaSessionAdapter>) | null = null;
 
   constructor() {
     this.workers = new Map(); // key: conversationId → LettaSessionAdapter
@@ -571,22 +615,44 @@ class AgentPool {
     if (inFlight) return inFlight;
 
     const p = (async (): Promise<LettaSessionAdapter> => {
-      // Evict if over cap (LRU).
+      // lcp-2oxb.2: Evict LRU idle worker(s) when at/over cap.
+      //
+      // The original loop always evicted the absolute stalest worker by
+      // lastUsedAt, even when that worker had a turn in flight (busy===true).
+      // Closing a busy worker terminates the SDK session mid-turn, causing
+      // the in-flight turn to resolve with dead:true — worst-case when the
+      // parked turn is exactly the stalest (a "ask" keepalive refreshes the
+      // silence watchdog but NOT lastUsedAt, so a parked approval is always
+      // the LRU victim under churn).
+      //
+      // Fix: sort workers LRU-first but skip any where busy===true. If ALL
+      // workers at/over cap are busy, break out of the loop and spawn anyway
+      // (temporary overflow bounded by the number of concurrent turns).
+      // housekeep() naturally drains overflow as each busy turn finishes —
+      // it already skips busy workers and evicts idle ones on the next tick.
+      //
+      // Invariant preserved: a busy worker is NEVER closed here.
       while (this.workers.size >= MAX_WORKERS) {
+        // Sort all pool entries LRU-first (oldest lastUsedAt first).
         const entries = [...this.workers.entries()].sort(
           (a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
         );
-        const first = entries[0];
-        if (!first) break;
-        const oldestKey = first[0];
-        if (!oldestKey) break;
-        const victim = this.workers.get(oldestKey);
+        // Find the least-recently-used entry that is not busy.
+        const victimEntry = entries.find(([, w]) => !w.busy);
+        if (!victimEntry) {
+          // All workers at/over cap are busy with in-flight turns. Allow a
+          // temporary overflow rather than killing any busy worker.
+          logLine(`pool overflow (all busy) size=${this.workers.size} max=${MAX_WORKERS}`);
+          break;
+        }
+        const [oldestKey, victim] = victimEntry;
         logLine(`evicting (cap) conv=${oldestKey}`);
         this.workers.delete(oldestKey);
-        victim?.close();
+        victim.close();
       }
 
-      const w = await createAdapter({ conversationId, agentId });
+      const factory = this._adapterFactory ?? createAdapter;
+      const w = await factory({ conversationId, agentId });
       try {
         await w.start();
       } catch (err) {
@@ -823,6 +889,13 @@ class AgentPool {
   }
 
   stats(): PoolStats {
+    // lcp-2oxb.1: snapshot perf metrics once per stats() call. The ELD
+    // histogram resets after each read, so this is a "since last call" window.
+    const perf: PoolPerfStats = {
+      event_loop: getEventLoopDelayStats(),
+      frames: getFrameAppendStats(),
+      rss_bytes: getRssBytes(),
+    };
     return {
       size: this.workers.size,
       max: MAX_WORKERS,
@@ -836,6 +909,7 @@ class AgentPool {
         idle_sec: Math.round((Date.now() - w.lastUsedAt) / 1000),
         spawned_sec: Math.round((Date.now() - w.spawnedAt) / 1000),
       })),
+      perf,
     };
   }
 }

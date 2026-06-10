@@ -51,7 +51,7 @@ import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
 import type { LocalMessage, LocalMessagePart } from "./types/letta-stream.js";
-import { _internals as storeInternals, listMessages } from "./store.js";
+import { _internals as storeInternals, invalidateMessagesCache, listMessages } from "./store.js";
 
 // ── Detection ─────────────────────────────────────────────────────────
 
@@ -348,6 +348,9 @@ export async function healConversation(
   // Atomic write. Same .tmp+rename pattern store.ts uses for the JSON
   // sidecars — partial writes on crash leave the original intact.
   await atomicWriteJsonl(messagesPath, nextRecords);
+  // lcp-2oxb.4: in-place rewrite — drop the suffix-parse cache entry so
+  // the next listMessages can never extend a stale prefix.
+  invalidateMessagesCache(conversationId, agentId);
 
   // Audit sidecar.
   await writeHealAudit({
@@ -429,6 +432,9 @@ export async function healConsecutiveUserMessages(
   const removeSet = new Set(removeIndices);
   const nextRecords = records.filter((_record, idx) => !removeSet.has(idx));
   await atomicWriteJsonl(messagesPath, nextRecords);
+  // lcp-2oxb.4: in-place rewrite — drop the suffix-parse cache entry so
+  // the next listMessages can never extend a stale prefix.
+  invalidateMessagesCache(conversationId, agentId);
   await writeHealAudit({
     conversationId,
     agentId,
@@ -509,6 +515,9 @@ export async function healUnexpectedToolResults(
   const removeSet = new Set(removeIndices);
   const nextRecords = edited.filter((_record, idx) => !removeSet.has(idx));
   await atomicWriteJsonl(messagesPath, nextRecords);
+  // lcp-2oxb.4: in-place rewrite — drop the suffix-parse cache entry so
+  // the next listMessages can never extend a stale prefix.
+  invalidateMessagesCache(conversationId, agentId);
   await writeHealAudit({
     conversationId,
     agentId,

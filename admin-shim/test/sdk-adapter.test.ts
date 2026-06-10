@@ -180,15 +180,17 @@ test("sdk-adapter: runTurn pumps frames through onFrame and terminates on result
   assert.equal(out.done, true);
   assert.equal(out.timeout, undefined);
   assert.equal(out.dead, undefined);
-  assert.equal(out.frames.length, 3, "expected stream_event + stream_event + result");
+  // lcp-2oxb.5: assistant/reasoning DELTAS are delivered via onFrame but
+  // dropped from post-turn retention; frameCountTotal keeps the true count.
+  assert.equal(out.frames.length, 2, "retained: stop_reason stream_event + result");
+  assert.equal(out.frameCountTotal, 3, "true stream volume preserved");
   assert.equal(out.frames[0]!.type, "stream_event");
-  assert.equal(out.frames[1]!.type, "stream_event");
-  assert.equal(out.frames[2]!.type, "result");
-  // onFrame must receive the same frames in the same order.
+  assert.equal(out.frames[1]!.type, "result");
+  // onFrame must receive ALL frames (deltas included) in order.
   assert.equal(seen.length, 3);
   assert.deepEqual(
     seen.map((f) => f.type),
-    out.frames.map((f) => f.type),
+    ["stream_event", "stream_event", "result"],
   );
 });
 

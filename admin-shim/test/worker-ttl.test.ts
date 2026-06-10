@@ -10,9 +10,13 @@
  *   - A worker that just handled a turn stays in the pool until idle —
  *     the post-turn lastUsedAt bump defers eviction.
  *
- * Tests drive turns via the WS channel against the real shim subprocess
- * (the same one all the other integration tests use). The mock letta
- * binary replays a captured stream-trace so the worker actually runs.
+ * lcp-2oxb.2 additions:
+ *   - cap eviction skips a busy worker (unit test — no real shim subprocess).
+ *   - all-busy at cap allows temporary pool overflow (unit test).
+ *
+ * Integration tests drive turns via the WS channel against the real shim
+ * subprocess. The mock letta binary replays captured stream-traces so
+ * the worker actually runs.
  *
  * Eviction is fast in this suite via two env overrides:
  *   SHIM_POOL_IDLE_SEC=1       (1s idle threshold instead of 300s)
@@ -22,6 +26,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
+
+// lcp-2oxb.2: import AgentPool directly so unit tests can inject fake
+// adapters via _adapterFactory without spawning a real shim subprocess.
+import {
+  AgentPool,
+  type LettaSessionAdapter,
+  type LettaSessionAdapterOptions,
+  type LettaSessionInit,
+} from "../lib/agent-pool.js";
 
 import { openMobileWs, startShim } from "./helpers/index.js";
 import type { MobileWsHandle, MobileWsFrame } from "./helpers/ws.js";
@@ -209,5 +222,197 @@ test("idle worker is reaped after SHIM_POOL_IDLE_SEC + one housekeep tick", asyn
     conn.close();
   } finally {
     await shim.stop();
+  }
+});
+
+// ── lcp-2oxb.2: pool-level unit tests (no subprocess, fake adapters) ───────
+
+/**
+ * Build a minimal fake LettaSessionAdapter for pool unit tests. Each call
+ * returns a fresh object so callers get an independently-trackable adapter.
+ *
+ * @param opts.busy   - Initial busy state (default false).
+ * @param opts.lastUsedAt - Initial lastUsedAt timestamp (default Date.now()).
+ */
+function makeFakeAdapter(opts: {
+  conversationId?: string;
+  agentId?: string;
+  busy?: boolean;
+  lastUsedAt?: number;
+} = {}): LettaSessionAdapter & { closedCount: number } {
+  let closedCount = 0;
+  return {
+    conversationId: opts.conversationId ?? "conv-fake",
+    agentId: opts.agentId ?? "agent-fake",
+    ready: true,
+    dead: false,
+    lastUsedAt: opts.lastUsedAt ?? Date.now(),
+    spawnedAt: Date.now() - 1000,
+    get busy() { return opts.busy ?? false; },
+    async start(): Promise<LettaSessionInit> {
+      return { agentId: this.agentId, conversationId: this.conversationId };
+    },
+    async runTurn() {
+      return { frames: [], stderr: "", done: true };
+    },
+    abort() { /* no-op */ },
+    close() {
+      closedCount += 1;
+      (this as { dead: boolean }).dead = true;
+    },
+    get closedCount() { return closedCount; },
+  };
+}
+
+/**
+ * lcp-2oxb.2: cap eviction MUST skip a busy worker and instead evict the
+ * least-recently-used NON-BUSY worker.
+ *
+ * Setup: fill a pool of max=2 with two workers:
+ *   - "stale-busy" (lastUsedAt=0, busy=true)  ← LRU but must NOT be evicted
+ *   - "fresh-idle" (lastUsedAt=1000, busy=false) ← slightly fresher but evictable
+ *
+ * Trigger: get() for a new key (forces eviction since pool is at cap).
+ *
+ * Assert:
+ *   - "stale-busy" was NOT closed (its closedCount stays 0).
+ *   - "fresh-idle" WAS closed (its closedCount becomes 1).
+ *   - The new adapter is returned successfully (no exception).
+ */
+test("lcp-2oxb.2: cap eviction skips busy worker, evicts idle LRU", async () => {
+  const pool = new AgentPool();
+  // Disable housekeep timer (we don't need it and it leaks into other tests).
+  clearInterval(pool.housekeepTimer);
+
+  const staleBusy = makeFakeAdapter({
+    conversationId: "conv-stale-busy",
+    agentId: "agent-a",
+    busy: true,
+    lastUsedAt: 0, // oldest — would be evicted without the busy-skip fix
+  });
+  const freshIdle = makeFakeAdapter({
+    conversationId: "conv-fresh-idle",
+    agentId: "agent-b",
+    busy: false,
+    lastUsedAt: 1000, // fresher than staleBusy
+  });
+
+  // Pre-populate the pool with two workers at the cap.
+  const fakeMax = 2;
+  pool.workers.set(pool._key("conv-stale-busy", "agent-a"), staleBusy);
+  pool.workers.set(pool._key("conv-fresh-idle", "agent-b"), freshIdle);
+  assert.equal(pool.workers.size, fakeMax, "pool should be at cap");
+
+  // Inject a fake factory that returns a tracked new adapter. We manipulate
+  // SHIM_POOL_MAX via the pool's internal map size, so override MAX_WORKERS
+  // by using a factory that counts successful spawns.
+  let newAdapterSpawnCount = 0;
+  const newAdapter = makeFakeAdapter({ conversationId: "conv-new", agentId: "agent-new" });
+  pool._adapterFactory = async (_opts: LettaSessionAdapterOptions): Promise<LettaSessionAdapter> => {
+    newAdapterSpawnCount += 1;
+    return newAdapter;
+  };
+
+  // Force the pool to think its cap is 2 — the pool checks this.workers.size
+  // against MAX_WORKERS from the module-level const. We arrange the pool to
+  // have exactly MAX_WORKERS entries before calling get() by setting the
+  // actual pool size == the runtime cap. The runtime MAX_WORKERS is 10 by
+  // default in the test process (no SHIM_POOL_MAX override), so we pre-fill
+  // the pool to 10 entries to trigger eviction.
+  //
+  // Simpler approach: just override the module env before import isn't possible
+  // in ESM. Instead, fill the pool to the runtime MAX_WORKERS (default 10)
+  // with extra idle entries beyond our two test entries.
+  const MAX_WORKERS_RUNTIME = Number(process.env["SHIM_POOL_MAX"] ?? 10);
+  // Add filler adapters (idle, non-busy, last-used earlier than freshIdle) up
+  // to cap-1 so our staleBusy and freshIdle are the last two.
+  const fillers: Array<LettaSessionAdapter & { closedCount: number }> = [];
+  for (let i = pool.workers.size; i < MAX_WORKERS_RUNTIME; i++) {
+    const filler = makeFakeAdapter({
+      conversationId: `conv-filler-${i}`,
+      agentId: `agent-filler-${i}`,
+      busy: false,
+      lastUsedAt: 2000 + i, // fresher than freshIdle=1000, but evictable
+    });
+    pool.workers.set(pool._key(`conv-filler-${i}`, `agent-filler-${i}`), filler);
+    fillers.push(filler);
+  }
+  assert.equal(pool.workers.size, MAX_WORKERS_RUNTIME, "pool should be at runtime cap");
+
+  // Now get() for the new key. staleBusy is the absolute LRU (lastUsedAt=0)
+  // but must be skipped. freshIdle (lastUsedAt=1000) is the next LRU idle
+  // victim — expect it to be evicted along with fillers as needed.
+  const result = await pool.get("conv-new", "agent-new");
+  assert.ok(result, "get() must return a new adapter");
+  assert.equal(newAdapterSpawnCount, 1, "factory called exactly once");
+
+  // The busy worker must NOT have been closed.
+  assert.equal(
+    staleBusy.closedCount,
+    0,
+    "busy worker (staleBusy) must not be closed during cap eviction (lcp-2oxb.2)",
+  );
+  // The idle workers (filler + freshIdle) should have been closed (one per
+  // eviction round until below cap). We don't assert which specific idle was
+  // first, only that staleBusy was untouched.
+  const totalIdleClosed =
+    fillers.reduce((s, f) => s + f.closedCount, 0) + freshIdle.closedCount;
+  assert.ok(totalIdleClosed > 0, "at least one idle worker must have been evicted");
+});
+
+/**
+ * lcp-2oxb.2: when ALL workers at cap are busy, get() must still return a
+ * new working adapter (temporary overflow) and must NOT close any busy worker.
+ *
+ * Setup: fill pool to MAX_WORKERS with all-busy adapters.
+ *
+ * Assert:
+ *   - get() resolves (no error / dead result).
+ *   - pool.workers.size > MAX_WORKERS_RUNTIME (overflow).
+ *   - No busy adapter received close().
+ */
+test("lcp-2oxb.2: all-busy at cap → overflow, no busy worker closed", async () => {
+  const pool = new AgentPool();
+  clearInterval(pool.housekeepTimer);
+
+  const MAX_WORKERS_RUNTIME = Number(process.env["SHIM_POOL_MAX"] ?? 10);
+
+  const busyAdapters: Array<LettaSessionAdapter & { closedCount: number }> = [];
+  for (let i = 0; i < MAX_WORKERS_RUNTIME; i++) {
+    const adapter = makeFakeAdapter({
+      conversationId: `conv-busy-${i}`,
+      agentId: `agent-busy-${i}`,
+      busy: true,
+      lastUsedAt: i, // monotonically increasing so there's a clear LRU
+    });
+    pool.workers.set(pool._key(`conv-busy-${i}`, `agent-busy-${i}`), adapter);
+    busyAdapters.push(adapter);
+  }
+  assert.equal(pool.workers.size, MAX_WORKERS_RUNTIME, "pool at cap");
+
+  let spawned = 0;
+  const overflowAdapter = makeFakeAdapter({ conversationId: "conv-overflow", agentId: "agent-overflow" });
+  pool._adapterFactory = async (_opts: LettaSessionAdapterOptions): Promise<LettaSessionAdapter> => {
+    spawned += 1;
+    return overflowAdapter;
+  };
+
+  const result = await pool.get("conv-overflow", "agent-overflow");
+  assert.ok(result, "get() must succeed even when all workers are busy (overflow)");
+  assert.equal(spawned, 1, "factory called exactly once");
+
+  // Pool size should exceed the cap (temporary overflow).
+  assert.ok(
+    pool.workers.size > MAX_WORKERS_RUNTIME,
+    `pool size (${pool.workers.size}) must exceed max (${MAX_WORKERS_RUNTIME}) on all-busy overflow`,
+  );
+
+  // No busy adapter may have been closed.
+  for (let i = 0; i < busyAdapters.length; i++) {
+    assert.equal(
+      busyAdapters[i]!.closedCount,
+      0,
+      `busyAdapters[${i}] must not be closed during all-busy overflow (lcp-2oxb.2)`,
+    );
   }
 });

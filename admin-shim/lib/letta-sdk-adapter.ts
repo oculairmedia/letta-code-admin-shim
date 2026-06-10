@@ -342,6 +342,21 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       : (typeof passedStart === "number" ? new Date(passedStart) : new Date());
 
     const frames: LettaStreamFrame[] = [];
+    let frameCountTotal = 0;
+    // lcp-2oxb.5: retention policy for the per-turn frames[] buffer.
+    // assistant_message / reasoning_message stream_events are partial
+    // DELTAS — hundreds per turn, ~20 MB retained on a heavy streaming
+    // turn — and nothing downstream of this adapter reads them back:
+    // finalizeTurnLifecycle needs stop_reason/usage frames, turn
+    // settlement needs tool_call/tool_return/approval frames, and every
+    // live consumer already received the delta via onFrame. Drop them
+    // from retention; everything else (tool frames, approvals, stop,
+    // usage, result, auto_approval) is kept.
+    const retainFrame = (f: LettaStreamFrame): boolean => {
+      if (f.type !== "stream_event") return true;
+      const mt = (f.event as { message_type?: unknown }).message_type;
+      return mt !== "assistant_message" && mt !== "reasoning_message";
+    };
     let pendingStepUsage: UsageInput | null = null;
     let result: SDKResultMessage | null = null;
     // lcp-0vi: SDK pumps an `SDKErrorMessage` when the CLI hits a recoverable
@@ -430,7 +445,8 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
           // Mirror the direct adapter: heartbeat lastUsedAt on every frame
           // so housekeep() doesn't idle-evict an in-flight long turn.
           this.lastUsedAt = Date.now();
-          frames.push(frame);
+          frameCountTotal += 1;
+          if (retainFrame(frame)) frames.push(frame);
           // lcp-sdk.4: same per-frame run-bookkeeping as the direct
           // adapter (markRunFirstToken / recordRunTool / recordRunStep,
           // pendingStepUsage tracking). Behavior-identical via the
@@ -506,11 +522,12 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // without hauling the full SDKErrorMessage shape upward.
     const errorPayload = sdkErrorPayload(lastError, result);
     if (timedOut) {
-      return { frames, stderr: "", run_id: runHandle.id, timeout: true, cancelled, newUserMessageId, ...(errorPayload ? { errorPayload } : {}) };
+      return { frames, frameCountTotal, stderr: "", run_id: runHandle.id, timeout: true, cancelled, newUserMessageId, ...(errorPayload ? { errorPayload } : {}) };
     }
     if (result) {
       return {
         frames,
+        frameCountTotal,
         stderr: "",
         run_id: runHandle.id,
         done: result.success,
@@ -524,7 +541,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       };
     }
     // Stream ended without a result frame (e.g. session closed mid-turn).
-    return { frames, stderr: "", run_id: runHandle.id, dead: true, cancelled, newUserMessageId, error: "stream ended without result", ...(errorPayload ? { errorPayload } : {}) };
+    return { frames, frameCountTotal, stderr: "", run_id: runHandle.id, dead: true, cancelled, newUserMessageId, error: "stream ended without result", ...(errorPayload ? { errorPayload } : {}) };
   }
 
   /**
@@ -865,8 +882,18 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const silenceBudgetMs = Number(process.env["SHIM_POOL_TURN_SILENCE_MS"] ?? TURN_SILENCE_MS);
     const keepaliveMs = Math.max(25, Math.floor(silenceBudgetMs / 2));
     const reset = this.currentResetSilenceTimer;
+    // lcp-2oxb.2: while parked on an `ask`, bump lastUsedAt on each keepalive
+    // tick in addition to resetting the silence watchdog. Without this, a long
+    // human-paced approval parks the worker with a stale lastUsedAt — making
+    // it the LRU victim in get()'s cap-eviction loop. The busy-skip in get()
+    // (also lcp-2oxb.2) is the primary guard; this is defense-in-depth so
+    // that if busy transitions to false between ticks the worker is still not
+    // flagged as idle-stale by the time the next housekeep fires.
     const keepalive: NodeJS.Timeout | null = reset
-      ? setInterval(() => { try { reset(); } catch { /* best-effort */ } }, keepaliveMs)
+      ? setInterval(() => {
+          try { reset(); } catch { /* best-effort */ }
+          this.lastUsedAt = Date.now();
+        }, keepaliveMs)
       : null;
     keepalive?.unref?.();
     let decision: ApprovalDecision;

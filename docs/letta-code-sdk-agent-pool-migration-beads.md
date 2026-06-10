@@ -1,5 +1,18 @@
 # Letta Code SDK Agent Pool Migration Beads
 
+> **Status: COMPLETED — historical planning doc.** The migration shipped;
+> epic `lcp-sdk` closed 2026-05-23 after a live smoke on prod. As built:
+> `admin-shim/lib/agent-pool.ts` is now a per-conversation pool of
+> `@letta-ai/letta-code-sdk@0.1.14` Sessions, `letta-sdk-adapter.ts` is the
+> only transport, and `lcp-sdk.10` (2026-05-22) removed the hand-rolled
+> direct-spawn implementation along with the `SHIM_LETTA_TRANSPORT` flag,
+> the `SHIM_POOL_DISABLE` legacy path, and `LETTA_BIN` (replaced by
+> `LETTA_CLI_PATH` / `LETTA_CLI_PATH_REAL`, auto-wired in `server.ts`).
+> There is no in-codebase rollback; the prior release carried both paths.
+> The "Current State" below describes the pre-migration world and is kept
+> as the record of the plan. Follow-ups tracked separately: `lcp-j3r`,
+> `lcp-3eh`, `lcp-rfb`, `lcp-lzap`, `lcp-rs2`.
+
 ## Purpose
 
 Create a bead-ready work plan for replacing the admin shim's hand-rolled Letta Code subprocess/session layer with `@letta-ai/letta-code-sdk`.

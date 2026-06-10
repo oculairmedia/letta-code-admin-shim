@@ -12,10 +12,13 @@
  */
 
 import {
+  closeSync,
   cpSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -23,7 +26,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import {
+  appendFile as fsAppendFile,
   mkdir as fsMkdir,
+  open as fsOpen,
   readFile as fsReadFile,
   readdir as fsReaddir,
   rename as fsRename,
@@ -236,21 +241,8 @@ function parseJsonl(raw: string): unknown[] {
   return out;
 }
 
-async function readJsonlOrEmptyAsync(path: string): Promise<unknown[]> {
-  try {
-    return parseJsonl(await fsReadFile(path, "utf8"));
-  } catch {
-    return [];
-  }
-}
-
-function readJsonlOrEmpty(path: string): unknown[] {
-  try {
-    return parseJsonl(readFileSync(path, "utf8"));
-  } catch {
-    return [];
-  }
-}
+// lcp-2oxb.4: readJsonlOrEmpty{,Async} retired — the messages loaders now
+// read Buffers directly so byte offsets stay valid for the suffix cache.
 
 // ── Type guards ───────────────────────────────────────────────────────
 
@@ -583,20 +575,50 @@ export async function getAgentIdForConversation(externalId: string): Promise<str
 // from memory after a single `stat`, and any change triggers exactly one full
 // reparse — never more work than before.
 //
-// We deliberately do NOT attempt byte-range tail-append reads: the healer
-// rewrites the file in place (conversation-healer.atomicWriteJsonl), so a
-// larger size doesn't guarantee the existing prefix is unchanged. Gating on
-// (size, mtimeMs) + full reparse-on-change is correct against both append and
-// rewrite while still collapsing the hot poll path to a stat.
+// lcp-2oxb.4: suffix-read optimization. When the file grew (st.size >
+// cached.size) we check whether the previously-cached tail bytes are still
+// present at the same offset in the new file (probe region). If they match,
+// the prefix is intact and we only parse the new suffix. If they don't
+// match — rewrite detected (healer atomicWriteJsonl, or CLI snapshot) —
+// we fall through to a full re-parse. This cuts O(history) work to O(new
+// lines) on the hot append path while remaining correct under full rewrites.
+//
+// CRITICAL: messages.jsonl is NOT strictly append-only. The CLI can rewrite
+// the entire file (with its in-memory snapshot) at end-of-turn — the new
+// file may be larger than the old one even when the content is completely
+// different. The probe catches this: if the bytes at [probeOffset,
+// probeOffset+probeLen) differ from what we cached, we fall back to full
+// re-parse. The healer's atomicWriteJsonl also rewrites, and calls
+// invalidateMessagesCache() so the cache entry is cleared entirely before
+// the new stat is taken.
 interface MessagesCacheEntry {
   size: number;
   mtimeMs: number;
   filtered: LocalMessage[];
+  // lcp-2oxb.4: messages parsed from the COMPLETE-line region only (bytes
+  // [0, lastCompleteLineEnd)). `filtered` may additionally include a final
+  // unterminated-but-parseable line; incremental reads always rebuild from
+  // `filteredComplete` so that trailing line is never double-counted.
+  filteredComplete: LocalMessage[];
+  // lcp-2oxb.4: tail probe for rewrite detection. probeBytes are the bytes
+  // at [probeOffset, lastCompleteLineEnd) as of the most recent read
+  // (≤ PROBE_LEN long, ending exactly at the checkpoint).
+  probeOffset: number;
+  probeBytes: Buffer;
+  // Byte offset one past the final '\n' as of the last read (0 if the file
+  // had no newline). Incremental reads start here, so a trailing partial
+  // line is re-read — and re-parsed — on the next poll.
+  lastCompleteLineEnd: number;
 }
 const messagesCache = new Map<string, MessagesCacheEntry>();
 // Bound memory: large transcripts parse to tens of MB of heap each. Keep only
 // the most-recently-read conversations hot; mobile works a handful at a time.
 const MESSAGES_CACHE_MAX = 24;
+
+// lcp-2oxb.4: how many tail bytes to probe for rewrite detection.
+// 1 KB is enough to span several JSONL lines — collisions are astronomically
+// unlikely and the overhead is a single pread of 1 KB per changed-size poll.
+const PROBE_LEN = 1024;
 
 function touchMessagesCache(path: string, entry: MessagesCacheEntry): void {
   // Map preserves insertion order — delete+set moves the key to most-recent.
@@ -614,6 +636,135 @@ function normalizeAndFilter(items: unknown[]): LocalMessage[] {
   return items.map(normalizeMessage).filter(isLocalMessage);
 }
 
+/**
+ * lcp-2oxb.4: build a full cache entry from the complete file contents.
+ * Splits the buffer at the last '\n' so the cached checkpoint always sits
+ * on a line boundary; a trailing unterminated line is parsed into
+ * `filtered` (preserving the old behavior of including a complete-but-
+ * unterminated final JSON line) but excluded from `filteredComplete`.
+ */
+function buildMessagesCacheEntry(buf: Buffer, st: { size: number; mtimeMs: number }): MessagesCacheEntry {
+  const nl = buf.lastIndexOf(0x0a);
+  const checkpoint = nl === -1 ? 0 : nl + 1;
+  const completeBuf = buf.subarray(0, checkpoint);
+  const tailBuf = buf.subarray(checkpoint);
+  const filteredComplete = normalizeAndFilter(parseJsonl(completeBuf.toString("utf8")));
+  const filtered = tailBuf.length > 0
+    ? filteredComplete.concat(normalizeAndFilter(parseJsonl(tailBuf.toString("utf8"))))
+    : filteredComplete;
+  const probeOffset = Math.max(0, checkpoint - PROBE_LEN);
+  return {
+    size: st.size,
+    mtimeMs: st.mtimeMs,
+    filtered,
+    filteredComplete,
+    probeOffset,
+    probeBytes: Buffer.from(completeBuf.subarray(probeOffset, checkpoint)),
+    lastCompleteLineEnd: checkpoint,
+  };
+}
+
+/**
+ * lcp-2oxb.4: fold freshly-appended bytes into a cached entry. `appended`
+ * is the file content from the previous checkpoint onward; the caller has
+ * already verified via the tail probe that the prefix is unchanged.
+ */
+function extendMessagesCacheEntry(
+  cached: MessagesCacheEntry,
+  appended: Buffer,
+  st: { size: number; mtimeMs: number },
+): MessagesCacheEntry {
+  const nl = appended.lastIndexOf(0x0a);
+  const deltaCheckpoint = nl === -1 ? 0 : nl + 1;
+  const completeNew = appended.subarray(0, deltaCheckpoint);
+  const tailNew = appended.subarray(deltaCheckpoint);
+  const filteredComplete = deltaCheckpoint > 0
+    ? cached.filteredComplete.concat(normalizeAndFilter(parseJsonl(completeNew.toString("utf8"))))
+    : cached.filteredComplete;
+  const filtered = tailNew.length > 0
+    ? filteredComplete.concat(normalizeAndFilter(parseJsonl(tailNew.toString("utf8"))))
+    : filteredComplete;
+  const checkpoint = cached.lastCompleteLineEnd + deltaCheckpoint;
+  // Reconstruct the probe window: cached.probeBytes ends exactly where
+  // completeNew begins, so their concat is contiguous file content ending
+  // at the new checkpoint. Keep the last PROBE_LEN bytes of that.
+  const combined = Buffer.concat([cached.probeBytes, completeNew]);
+  const probeBytes = Buffer.from(combined.subarray(Math.max(0, combined.length - PROBE_LEN)));
+  return {
+    size: st.size,
+    mtimeMs: st.mtimeMs,
+    filtered,
+    filteredComplete,
+    probeOffset: checkpoint - probeBytes.length,
+    probeBytes,
+    lastCompleteLineEnd: checkpoint,
+  };
+}
+
+/**
+ * lcp-2oxb.4 (sync): attempt the probe-verified suffix read. Returns the
+ * extended entry, or null when the probe mismatches (file was rewritten),
+ * the file shrank, or any read fails — callers fall back to a full parse.
+ */
+function tryIncrementalReadSync(
+  path: string,
+  cached: MessagesCacheEntry,
+  st: { size: number; mtimeMs: number },
+): MessagesCacheEntry | null {
+  if (st.size <= cached.lastCompleteLineEnd) return null;
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    if (cached.probeBytes.length > 0) {
+      const probe = Buffer.allocUnsafe(cached.probeBytes.length);
+      const n = readSync(fd, probe, 0, probe.length, cached.probeOffset);
+      if (n !== probe.length || !probe.equals(cached.probeBytes)) return null;
+    }
+    const wanted = st.size - cached.lastCompleteLineEnd;
+    const appended = Buffer.allocUnsafe(wanted);
+    const n = readSync(fd, appended, 0, wanted, cached.lastCompleteLineEnd);
+    return extendMessagesCacheEntry(cached, appended.subarray(0, n), st);
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** lcp-2oxb.4 (async): same contract as tryIncrementalReadSync. */
+async function tryIncrementalRead(
+  path: string,
+  cached: MessagesCacheEntry,
+  st: { size: number; mtimeMs: number },
+): Promise<MessagesCacheEntry | null> {
+  if (st.size <= cached.lastCompleteLineEnd) return null;
+  let fh;
+  try {
+    fh = await fsOpen(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    if (cached.probeBytes.length > 0) {
+      const probe = Buffer.allocUnsafe(cached.probeBytes.length);
+      const { bytesRead } = await fh.read(probe, 0, probe.length, cached.probeOffset);
+      if (bytesRead !== probe.length || !probe.equals(cached.probeBytes)) return null;
+    }
+    const wanted = st.size - cached.lastCompleteLineEnd;
+    const appended = Buffer.allocUnsafe(wanted);
+    const { bytesRead } = await fh.read(appended, 0, wanted, cached.lastCompleteLineEnd);
+    return extendMessagesCacheEntry(cached, appended.subarray(0, bytesRead), st);
+  } catch {
+    return null;
+  } finally {
+    await fh.close().catch(() => {});
+  }
+}
+
 async function loadFilteredMessages(path: string): Promise<LocalMessage[]> {
   let st;
   try {
@@ -627,12 +778,29 @@ async function loadFilteredMessages(path: string): Promise<LocalMessage[]> {
     touchMessagesCache(path, cached);
     return cached.filtered;
   }
+  // lcp-2oxb.4: file grew — try the probe-verified suffix read before
+  // falling back to a full parse. A rewrite (healer or CLI snapshot) fails
+  // the probe and falls through.
+  if (cached && st.size > cached.size) {
+    const extended = await tryIncrementalRead(path, cached, st);
+    if (extended) {
+      touchMessagesCache(path, extended);
+      return extended.filtered;
+    }
+  }
   // Stat (taken BEFORE the read) is what we store: if the file changes after
   // this read, its next stat differs from `st` and we reparse — conservative,
   // never stale.
-  const filtered = normalizeAndFilter(await readJsonlOrEmptyAsync(path));
-  touchMessagesCache(path, { size: st.size, mtimeMs: st.mtimeMs, filtered });
-  return filtered;
+  let buf: Buffer;
+  try {
+    buf = await fsReadFile(path);
+  } catch {
+    messagesCache.delete(path);
+    return [];
+  }
+  const entry = buildMessagesCacheEntry(buf, st);
+  touchMessagesCache(path, entry);
+  return entry.filtered;
 }
 
 function loadFilteredMessagesSync(path: string): LocalMessage[] {
@@ -648,9 +816,35 @@ function loadFilteredMessagesSync(path: string): LocalMessage[] {
     touchMessagesCache(path, cached);
     return cached.filtered;
   }
-  const filtered = normalizeAndFilter(readJsonlOrEmpty(path));
-  touchMessagesCache(path, { size: st.size, mtimeMs: st.mtimeMs, filtered });
-  return filtered;
+  if (cached && st.size > cached.size) {
+    const extended = tryIncrementalReadSync(path, cached, st);
+    if (extended) {
+      touchMessagesCache(path, extended);
+      return extended.filtered;
+    }
+  }
+  let buf: Buffer;
+  try {
+    buf = readFileSync(path);
+  } catch {
+    messagesCache.delete(path);
+    return [];
+  }
+  const entry = buildMessagesCacheEntry(buf, st);
+  touchMessagesCache(path, entry);
+  return entry.filtered;
+}
+
+/**
+ * lcp-2oxb.4: drop the cached parse for one conversation's messages.jsonl.
+ * Shim-side writers that rewrite the file in place (conversation-healer,
+ * turn-settlement) call this after writing so the next read can never be
+ * served a stale suffix-extended entry. The tail probe would catch the
+ * rewrite anyway — this is belt-and-braces.
+ */
+export function invalidateMessagesCache(conversationId: string, agentId: string): void {
+  const key = conversationKey(conversationId, agentId);
+  messagesCache.delete(join(storageDir(), "conversations", b64url(key), "messages.jsonl"));
 }
 
 export async function listMessages(
@@ -710,6 +904,36 @@ function timestampSidecarPath(conversationId: string, agentId: string): string {
   return join(storageDir(), "conversations", b64url(key), "_real-times.json");
 }
 
+/**
+ * lcp-2oxb.4: append-only successor to the legacy `_real-times.json` map.
+ * One line per stamp: {"id":"...","iso":"..."} — last-wins on duplicate ids.
+ * stampNewMessages appends only the NEWLY stamped ids each turn (O(new)
+ * instead of rewriting the whole O(history) map); readMessageTimestamps
+ * folds legacy JSON (if still present) + JSONL lines into the in-memory map
+ * and compacts the JSONL when duplicates pile past 2× the distinct ids.
+ */
+function timestampJsonlPath(conversationId: string, agentId: string): string {
+  const key = conversationKey(conversationId, agentId);
+  return join(storageDir(), "conversations", b64url(key), "_real-times.jsonl");
+}
+
+/** lcp-2oxb.4: atomic JSONL rewrite (tmp + rename), mirrors atomicWriteJson. */
+async function atomicWriteTimestampJsonl(path: string, map: TimestampSidecar): Promise<void> {
+  const dir = dirname(path);
+  await fsMkdir(dir, { recursive: true });
+  const tmp = join(dir, `.${randomBytes(6).toString("hex")}.tmp`);
+  const body = Object.entries(map)
+    .map(([id, iso]) => JSON.stringify({ id, iso }))
+    .join("\n");
+  try {
+    await fsWriteFile(tmp, body.length > 0 ? body + "\n" : "");
+    await fsRename(tmp, path);
+  } catch (err) {
+    await fsUnlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
 function otidSidecarPath(conversationId: string, agentId: string): string {
   const key = conversationKey(conversationId, agentId);
   return join(storageDir(), "conversations", b64url(key), "_otid-map.json");
@@ -733,9 +957,42 @@ export async function readMessageTimestamps(conversationId: string, agentId: str
   const cacheKey = realTimesCacheKey(conversationId, agentId);
   const cached = realTimesCache.get(cacheKey);
   if (cached) return cached;
-  const path = timestampSidecarPath(conversationId, agentId);
-  const raw = await readJsonOrNullAsync(path);
-  const map: TimestampSidecar = isStringRecord(raw) ? raw : {};
+  // lcp-2oxb.4: legacy JSON map first (pre-migration conversations), then
+  // overlay the append-only JSONL — later lines win, matching append order.
+  const legacyRaw = await readJsonOrNullAsync(timestampSidecarPath(conversationId, agentId));
+  const map: TimestampSidecar = isStringRecord(legacyRaw) ? { ...legacyRaw } : {};
+  const jsonlPath = timestampJsonlPath(conversationId, agentId);
+  let lineCount = 0;
+  try {
+    const body = await fsReadFile(jsonlPath, "utf8");
+    for (const line of body.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      lineCount += 1;
+      try {
+        const obj = JSON.parse(trimmed) as { id?: unknown; iso?: unknown };
+        if (typeof obj.id === "string" && typeof obj.iso === "string") {
+          map[obj.id] = obj.iso;
+        }
+      } catch {
+        // Skip malformed / partial trailing line (crash mid-append) —
+        // the worst case is one message falling back to its sentinel date.
+      }
+    }
+  } catch {
+    // No JSONL yet — legacy-only or fresh conversation.
+  }
+  // Compaction: duplicate ids accumulate one line per re-stamp attempt.
+  // Rewrite one-line-per-id when the file is more than 2× the live set.
+  const distinct = Object.keys(map).length;
+  if (distinct > 0 && lineCount > distinct * 2) {
+    try {
+      await atomicWriteTimestampJsonl(jsonlPath, map);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[store] timestamp jsonl compaction failed for ${conversationId}: ${msg}`);
+    }
+  }
   realTimesCache.set(cacheKey, map);
   return map;
 }
@@ -884,19 +1141,36 @@ export async function stampNewMessages(
   let offset = 0;
   let maxStampedIso = "";
   const baseMs = startTime.getTime();
+  const newlyStamped: Array<{ id: string; iso: string }> = [];
   for (const m of messages) {
     if (m?.id && !current[m.id]) {
       const iso = new Date(baseMs + offset).toISOString();
       current[m.id] = iso;
+      newlyStamped.push({ id: m.id, iso });
       maxStampedIso = iso;
       offset += 1;
       dirty = true;
     }
   }
   if (dirty) {
-    const path = timestampSidecarPath(conversationId, agentId);
+    const legacyPath = timestampSidecarPath(conversationId, agentId);
+    const jsonlPath = timestampJsonlPath(conversationId, agentId);
     try {
-      await atomicWriteJson(path, current);
+      if (existsSync(legacyPath)) {
+        // lcp-2oxb.4 one-time migration: fold the legacy JSON map (already
+        // merged into `current` by readMessageTimestamps) into a compacted
+        // JSONL, then drop the legacy file. Subsequent turns take the cheap
+        // append path below.
+        await atomicWriteTimestampJsonl(jsonlPath, current);
+        await fsUnlink(legacyPath).catch(() => {});
+      } else {
+        // Hot path: append ONLY this turn's new stamps — O(new messages)
+        // instead of rewriting the whole O(history) map (lcp-2oxb.4).
+        await fsAppendFile(
+          jsonlPath,
+          newlyStamped.map((e) => JSON.stringify(e)).join("\n") + "\n",
+        );
+      }
     } catch (err) {
       // lcp-66pv: the in-place mutation above already updated the cached map;
       // if persistence failed, evict so the next read re-loads authoritative
