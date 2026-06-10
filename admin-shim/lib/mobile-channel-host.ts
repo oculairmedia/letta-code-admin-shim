@@ -385,19 +385,29 @@ export async function bridgeSendMessage(
   // context utilization, and session role as a system-reminder so
   // the agent always knows its runtime state without a tool call.
   // Also detect mid-conversation model changes and surface a delta.
-  const connectionReminder = buildConnectionReminder(effectiveAgentId, effectiveConvId);
-  const modelDelta = detectModelChange(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
-  const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
-  if (prefix) {
-    if (typeof userInput === "string") {
-      userInput = prefix + "\n\n" + userInput;
-    } else if (Array.isArray(userInput)) {
-      userInput = [{ type: "text", text: prefix + "\n\n" }, ...userInput];
+  //
+  // **Fail-open**: the introspection block runs inside a try/catch.
+  // The reminder is an enhancement — if any lookup fails the message
+  // path proceeds unblocked with the original user input.
+  try {
+    const connectionReminder = buildConnectionReminder(effectiveAgentId, effectiveConvId);
+    const modelDelta = detectModelChange(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
+    const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
+    if (prefix) {
+      if (typeof userInput === "string") {
+        userInput = prefix + "\n\n" + userInput;
+      } else if (Array.isArray(userInput)) {
+        userInput = [{ type: "text", text: prefix + "\n\n" }, ...userInput];
+      }
     }
+    // Seed the model tracker so the first turn doesn't emit a spurious
+    // "changed" frame.
+    seedModelHandle(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[mobile-channel] runtime-introspection injection failed (fail-open): ${msg}`);
+    // userInput is unchanged — message delivery proceeds normally.
   }
-  // Seed the model tracker so the first turn doesn't emit a spurious
-  // "changed" frame.
-  seedModelHandle(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
 
   // lcp-0vi: route through pool.runTurnWithHeal so a dangling-tool-use
   // failure on this turn evicts the warm adapter + heals the transcript

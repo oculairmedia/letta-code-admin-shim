@@ -881,21 +881,31 @@ export async function handleSendMessage(
       // context utilization, and session role as a system-reminder so
       // the agent always knows its runtime state without a tool call.
       // Also detect mid-conversation model changes and surface a delta.
+      //
+      // **Fail-open**: the introspection block runs inside a try/catch.
+      // The reminder is an enhancement — if any lookup fails the message
+      // path proceeds unblocked with the original user input.
       const effectiveConv = conversationId ?? "default";
       let runtimeContent = content;
-      const connectionReminder = buildConnectionReminder(agentId, effectiveConv);
-      const modelDelta = detectModelChange(agentId, effectiveConv, getServingModelHandle(agentId));
-      const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
-      if (prefix) {
-        if (typeof runtimeContent === "string") {
-          runtimeContent = prefix + "\n\n" + runtimeContent;
-        } else if (Array.isArray(runtimeContent)) {
-          runtimeContent = [{ type: "text", text: prefix + "\n\n" }, ...runtimeContent];
+      try {
+        const connectionReminder = buildConnectionReminder(agentId, effectiveConv);
+        const modelDelta = detectModelChange(agentId, effectiveConv, getServingModelHandle(agentId));
+        const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
+        if (prefix) {
+          if (typeof runtimeContent === "string") {
+            runtimeContent = prefix + "\n\n" + runtimeContent;
+          } else if (Array.isArray(runtimeContent)) {
+            runtimeContent = [{ type: "text", text: prefix + "\n\n" }, ...runtimeContent];
+          }
         }
+        // Seed the model tracker so the first turn doesn't emit a spurious
+        // "changed" frame.
+        seedModelHandle(agentId, effectiveConv, getServingModelHandle(agentId));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[chat] runtime-introspection injection failed (fail-open): ${msg}`);
+        // runtimeContent is unchanged — message delivery proceeds normally.
       }
-      // Seed the model tracker so the first turn doesn't emit a spurious
-      // "changed" frame.
-      seedModelHandle(agentId, effectiveConv, getServingModelHandle(agentId));
 
       // lcp-0vi: route through runTurnWithHeal so a dangling-tool-use error
       // on this turn evicts + heals the transcript before returning. The

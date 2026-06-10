@@ -190,23 +190,34 @@ export function seedModelHandle(
  * Includes serving model, context utilization, and session role.
  * Callers prepend this to the user message before sending to the
  * agent pool.
+ *
+ * **Fail-open**: this function must NEVER throw or block. The
+ * reminder is an enhancement — if any lookup fails (missing agent
+ * record, I/O error, unexpected input), the function silently
+ * returns "" and the message path proceeds unblocked.
  */
 export function buildConnectionReminder(
   agentId: string,
   conversationId: string,
 ): string {
-  const role = getSessionRole(agentId, conversationId);
-  const model = getServingModelHandle(agentId);
-  const ctx = getContextUtilizationSummary(agentId, conversationId);
+  try {
+    const role = getSessionRole(agentId, conversationId);
+    const model = getServingModelHandle(agentId);
+    const ctx = getContextUtilizationSummary(agentId, conversationId);
 
-  const lines: string[] = [];
-  if (model) lines.push(`Serving model: ${model}`);
-  if (ctx) lines.push(`Context utilization: ${ctx}`);
-  lines.push(`Session role: ${role}`);
+    const lines: string[] = [];
+    if (model) lines.push(`Serving model: ${model}`);
+    if (ctx) lines.push(`Context utilization: ${ctx}`);
+    lines.push(`Session role: ${role}`);
 
-  if (lines.length === 0) return "";
+    if (lines.length === 0) return "";
 
-  return `<system-reminder>\n${lines.join("\n")}\n</system-reminder>`;
+    return `<system-reminder>\n${lines.join("\n")}\n</system-reminder>`;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[runtime-introspection] buildConnectionReminder failed (fail-open): ${msg}`);
+    return "";
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────
