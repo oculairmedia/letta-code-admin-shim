@@ -192,6 +192,21 @@ function isProcessAlive(
   } catch {
     return false;
   }
+  // kill(pid, 0) succeeds on zombies. A defunct holder can pin the scheduler
+  // lease indefinitely when its parent is too wedged to reap it (observed
+  // live 2026-06-10: SIGKILLed shim left a zombie under a hung systemd and
+  // the replacement instance could never claim). State "Z" in
+  // /proc/<pid>/stat means the process is dead for every purpose we care
+  // about here.
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const close = stat.lastIndexOf(")");
+    if (close !== -1 && stat.slice(close + 1).trim().startsWith("Z")) {
+      return false;
+    }
+  } catch {
+    // /proc unavailable (non-Linux) — fall through to identity checks.
+  }
   if (owner) {
     const identity = readProcessIdentity(pid);
     if (identity) {
