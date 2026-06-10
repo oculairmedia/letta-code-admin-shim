@@ -164,15 +164,23 @@ const DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions";
 
 function currentPermissionMode(): PermissionMode {
   // lcp-indw / D4: when server-side permissions is enabled, the spawned
-  // session MUST run at permissionMode "default" so the SDK invokes
-  // canUseTool for EVERY tool call (at "bypassPermissions" the callback is
-  // short-circuited and the evaluator never runs — the feature would be
-  // inert). An explicit SHIM_PERMISSION_MODE override still wins so an
-  // operator can force a specific mode, but the default coupling is:
-  // SHIM_SERVER_PERMISSIONS=1 ⇒ "default".
+  // session MUST run in a mode where the CLI emits can_use_tool control
+  // requests, otherwise the evaluator never runs and the feature is inert.
+  //
+  // GOTCHA (found live 2026-06-10): the SDK's "default" mode is NOT that
+  // mode. buildCliArgs omits --permission-mode for "default", and letta.js's
+  // DEFAULT_PERMISSION_MODE is "unrestricted" — the CLI then auto-approves
+  // every tool itself ("matched_rule":"unrestricted mode") and the SDK
+  // callback is never consulted. The CLI mode that requests approval is
+  // "standard"; it is not part of the SDK's TS PermissionMode union but is
+  // passed through verbatim to --permission-mode at runtime.
+  //
+  // An explicit SHIM_PERMISSION_MODE override still wins so an operator can
+  // force a specific mode, but the default coupling is:
+  // SHIM_SERVER_PERMISSIONS=1 ⇒ "standard" (CLI request-approval mode).
   const explicit = process.env["SHIM_PERMISSION_MODE"];
   if (explicit) return explicit as PermissionMode;
-  if (serverPermissionsEnabled()) return "default";
+  if (serverPermissionsEnabled()) return "standard" as PermissionMode;
   return DEFAULT_PERMISSION_MODE;
 }
 
