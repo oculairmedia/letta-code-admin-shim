@@ -32,6 +32,16 @@ import {
 } from "./a2ui-stream-splitter.js";
 import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
 import {
+  getSubagent,
+  ingestParentFrame,
+  listActiveSubagents,
+  snapshotSubagents,
+  subscribeSubagentEvents,
+  type SubagentEntry,
+  type SubagentEvent,
+} from "./subagent-registry.js";
+import { readSubagentTodos, type TodoSnapshot } from "./subagent-todos.js";
+import {
   ackConversation,
   mobileConversationCursorCapabilities,
   resumeConversation,
@@ -252,6 +262,12 @@ export async function bridgeSendMessage(
   // lcp-p74.2: stamp the assigned seq onto the frame so live consumers track
   // their cursor in lockstep with what subscribe(run_id, cursor) would replay.
   const emit = (frame: BridgeFrame): void => {
+    try {
+      ingestParentFrame(frame, runHandle.id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] subagent-registry ingest failed: ${msg}`);
+    }
     const { seq } = appendRunFrame(runHandle.id, frame);
     if (seq > 0) {
       const asRec = frame as unknown as Record<string, unknown>;
@@ -1273,6 +1289,45 @@ export function handleCronDeleteAll(agentId: string): { success: boolean; count:
   return { success: true, count };
 }
 
+// ── Active-subagent registry WS handlers (letta-mobile-73o2h.1) ───────
+
+export function handleSubagentList(
+  { all = false }: { all?: boolean } = {},
+): { subagents: SubagentEntry[] } {
+  return { subagents: all ? snapshotSubagents() : listActiveSubagents() };
+}
+
+export function handleSubagentTodos(
+  toolCallId: string,
+): {
+  found: boolean;
+  subagent: SubagentEntry | null;
+  todos: TodoSnapshot["todos"];
+  todos_found: boolean;
+} {
+  const subagent = getSubagent(toolCallId);
+  if (!subagent) {
+    return { found: false, subagent: null, todos: [], todos_found: false };
+  }
+  let snapshot: TodoSnapshot = { todos: [], found: false };
+  if (subagent.subagentAgentId) {
+    snapshot = readSubagentTodos(
+      subagent.subagentAgentId,
+      subagent.subagentConversationId ?? "default",
+    );
+  }
+  return {
+    found: true,
+    subagent,
+    todos: snapshot.todos,
+    todos_found: snapshot.found,
+  };
+}
+
+/** Re-export the registry event subscription for the host wiring. */
+export { subscribeSubagentEvents };
+export type { SubagentEntry, SubagentEvent };
+
 // ── Reflection (sleeptime) settings WS handlers (lcp-4d5f) ──────────────
 //
 // Backed by lib/reflection-settings.ts. WS is the canonical mutation path
@@ -1382,6 +1437,10 @@ interface MobileChannelHost {
   handleReflectionSettingsGet: typeof handleReflectionSettingsGet;
   handleReflectionSettingsSet: typeof handleReflectionSettingsSet;
   subscribeReflectionEvents: typeof subscribeReflectionEvents;
+
+  handleSubagentList: typeof handleSubagentList;
+  handleSubagentTodos: typeof handleSubagentTodos;
+  subscribeSubagentEvents: typeof subscribeSubagentEvents;
 }
 
 /**
@@ -1495,6 +1554,9 @@ async function createMobileChannelAdapter(
     handleReflectionSettingsGet,
     handleReflectionSettingsSet,
     subscribeReflectionEvents,
+      handleSubagentList,
+    handleSubagentTodos,
+    subscribeSubagentEvents,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();
