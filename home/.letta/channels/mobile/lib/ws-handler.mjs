@@ -144,6 +144,8 @@ export function handleConnection(ws, request, host) {
   let approvalEventsUnsubscribe = null;
   // lcp-4d5f: per-socket subscription to reflection_settings_updated push.
   let reflectionEventsUnsubscribe = null;
+  // letta-mobile-73o2h.1: per-socket subscription to subagents_updated push.
+  let subagentEventsUnsubscribe = null;
   // lcp-cq7x: per-socket registration for server-originated channel pushes.
   // Installed only after hello auth succeeds so outbound sendMessage never
   // targets unauthenticated sockets.
@@ -176,6 +178,10 @@ export function handleConnection(ws, request, host) {
     if (reflectionEventsUnsubscribe) {
       safeUnsubscribe("reflection events", reflectionEventsUnsubscribe);
       reflectionEventsUnsubscribe = null;
+    }
+    if (subagentEventsUnsubscribe) {
+      safeUnsubscribe("subagent events", subagentEventsUnsubscribe);
+      subagentEventsUnsubscribe = null;
     }
     if (pushClientUnregister) {
       safeUnsubscribe("push client", pushClientUnregister);
@@ -622,6 +628,28 @@ export function handleConnection(ws, request, host) {
           safeSend(ws, makeFrame("reflection_settings_updated", {
             agent_id: event.agent_id,
             settings: event.settings,
+            at: event.at,
+          }), log);
+        });
+      }
+      // letta-mobile-73o2h.1: subscribe to subagents_updated push events for
+      // the lifetime of this socket so the active-subagent bar live-updates
+      // as subagents start/finish without polling.
+      if (typeof host.subscribeSubagentEvents === "function") {
+        subagentEventsUnsubscribe = host.subscribeSubagentEvents((event) => {
+          if (closed) return;
+          // The event carries the single changed subagent + reason; include
+          // the fresh active list so the bar can reduce by replacement.
+          let subagentsActive = null;
+          if (typeof host.handleSubagentList === "function") {
+            try {
+              subagentsActive = host.handleSubagentList({ all: false }).subagents;
+            } catch { /* fall back to single-subagent delta */ }
+          }
+          safeSend(ws, makeFrame("subagents_updated", {
+            reason: event.reason,
+            subagents_active: subagentsActive,
+            subagent: event.subagent ?? null,
             at: event.at,
           }), log);
         });
@@ -1105,6 +1133,65 @@ export function handleConnection(ws, request, host) {
             request_id: typeof frame.request_id === "string" ? frame.request_id : null,
             success: false,
             error: err.message ?? "cron_list failed",
+          }), log);
+        }
+        break;
+      }
+      case "subagent_list": {
+        // letta-mobile-73o2h.1: enumerate currently-active subagents (or all,
+        // with { all: true }) for the mobile status bar.
+        if (typeof host.handleSubagentList !== "function") {
+          sendError(ERROR_CODES.INTERNAL, "subagent_list handler not wired", { close: false });
+          break;
+        }
+        try {
+          const all = frame.all === true;
+          const { subagents } = host.handleSubagentList({ all });
+          safeSend(ws, makeFrame("subagent_list_response", {
+            request_id: typeof frame.request_id === "string" ? frame.request_id : null,
+            success: true,
+            subagents,
+          }), log);
+        } catch (err) {
+          safeSend(ws, makeFrame("subagent_list_response", {
+            request_id: typeof frame.request_id === "string" ? frame.request_id : null,
+            success: false,
+            error: err.message ?? "subagent_list failed",
+          }), log);
+        }
+        break;
+      }
+      case "subagent_todos": {
+        // letta-mobile-73o2h.1: a single subagent's latest TodoWrite snapshot
+        // + lifecycle status. Keyed by the parent Agent tool_call_id.
+        if (typeof host.handleSubagentTodos !== "function") {
+          sendError(ERROR_CODES.INTERNAL, "subagent_todos handler not wired", { close: false });
+          break;
+        }
+        const toolCallId = typeof frame.tool_call_id === "string" ? frame.tool_call_id : null;
+        if (!toolCallId) {
+          safeSend(ws, makeFrame("subagent_todos_response", {
+            request_id: typeof frame.request_id === "string" ? frame.request_id : null,
+            success: false,
+            error: "tool_call_id is required",
+          }), log);
+          break;
+        }
+        try {
+          const result = host.handleSubagentTodos(toolCallId);
+          safeSend(ws, makeFrame("subagent_todos_response", {
+            request_id: typeof frame.request_id === "string" ? frame.request_id : null,
+            success: true,
+            found: result.found,
+            subagent: result.subagent,
+            todos: result.todos,
+            todos_found: result.todos_found,
+          }), log);
+        } catch (err) {
+          safeSend(ws, makeFrame("subagent_todos_response", {
+            request_id: typeof frame.request_id === "string" ? frame.request_id : null,
+            success: false,
+            error: err.message ?? "subagent_todos failed",
           }), log);
         }
         break;
