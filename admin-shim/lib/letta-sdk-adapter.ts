@@ -75,12 +75,25 @@ import { sleeptimeOptionsForAgent } from "./reflection-settings.js";
 
 import {
   evaluatePermission,
+  evaluatePermissionWithFork,
   serverPermissionsEnabled,
+  forkVerdictEnabled,
+  extractOverride,
+  stripOverrideFields,
+  checkOverrideRateLimit,
+  recordOverride,
+  appendOverrideAudit,
+  resetOverrideTurnCounter,
+  forkOverrideEnabled,
+  type ForkSessionRole,
 } from "./permissions.js";
 import {
   clearPendingApproval,
   createPendingApproval,
 } from "./pending-approval.js";
+import {
+  getSessionRole,
+} from "./runtime-introspection.js";
 
 function logLine(msg: string): void {
   console.log(`[sdk-adapter] ${msg}`);
@@ -346,6 +359,9 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // set (= current disk ids − pre-turn snapshot) and drop those rows
     // before they collide with the WS delta stream.
     setMessageIdsAtTurnStart(runHandle, messageIdsBefore);
+
+    // lcp-wd3i: reset per-turn override counter for fork-verdict bypass.
+    resetOverrideTurnCounter(this.agentId, this.conversationId);
 
     // Anchor stamp time: caller may supply a turn-start time captured
     // before this method ran (mobile WS uses this so disk-stamped and
@@ -770,7 +786,86 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   ): Promise<CanUseToolResponse | null> {
     const a2ui = this.currentA2uiCapability;
     const timestamp = new Date().toISOString();
-    const result = evaluatePermission(this.agentId, this.conversationId, toolName, toolInput);
+
+    // lcp-wd3i: evaluate with fork-verdict awareness, including
+    // session-role based exemption (fork/subagent sessions always
+    // bypass fork rules — workers must work).
+    const sessionRole: ForkSessionRole = getSessionRole(this.agentId, this.conversationId);
+    const result = evaluatePermissionWithFork(
+      this.agentId,
+      this.conversationId,
+      toolName,
+      toolInput,
+      sessionRole,
+    );
+
+    // ── Fork verdict handling (lcp-wd3i) ───────────────────────────────
+    if (result.action === "fork") {
+      let forkResolved = false;
+
+      // Check for agent-actuated override
+      if (forkOverrideEnabled()) {
+        const override = extractOverride(toolInput);
+        if (override) {
+          const rateLimitHit = checkOverrideRateLimit(this.agentId, this.conversationId);
+          if (!rateLimitHit) {
+            // Override accepted — execute inline + audit
+            recordOverride(this.agentId, this.conversationId);
+            appendOverrideAudit({
+              agentId: this.agentId,
+              conversationId: this.conversationId,
+              toolName,
+              rule: override.rule,
+              justification: override.reason,
+              timestamp,
+            });
+            logLine(`fork override accepted for ${toolName} by agent ${this.agentId}: ${override.reason}`);
+            recordApprovalDecision(runHandle.id, {
+              action_id: `fork-override-${randomUUID()}`,
+              tool_name: toolName,
+              decision: "approve",
+              scope: "Once",
+              reason: `fork_override: ${override.reason}`,
+              timestamp,
+            });
+            return { behavior: "allow", message: `fork overridden: ${override.reason}` };
+          }
+          // Over limit — mutate result to "ask" and fall through to
+          // the ask handling below. If no approver is connected, the
+          // ask path will deny (headless safe default, D5).
+          (result as { action: string }).action = "ask";
+          (result as { reason: string }).reason =
+            `fork override rate-limited: ${rateLimitHit} (escalated to ask)`;
+          forkResolved = true;
+          // Fall through to ask handling below
+        }
+      }
+
+      if (!forkResolved) {
+        // No override → structured fork denial
+        recordApprovalDecision(runHandle.id, {
+          action_id: `rule-fork-${randomUUID()}`,
+          tool_name: toolName,
+          decision: "deny",
+          scope: "Deny",
+          reason: result.reason || "rule_fork",
+          timestamp,
+        });
+
+        const forkInstructions = [
+          `Tool "${toolName}" requires a fork. Dispatch via Agent(subagent_type:'fork', run_in_background:true) with the intended work.`,
+          result.reason ? `Reason: ${result.reason}` : null,
+          forkOverrideEnabled()
+            ? 'To execute inline, re-issue with permissions_override: { rule: "<matched_rule>", reason: "<one-line justification>" }'
+            : null,
+        ].filter(Boolean).join("\n");
+
+        this._emitApprovalDenyFrame(toolName, forkInstructions, runHandle, onFrame);
+        return { behavior: "deny", message: forkInstructions };
+      }
+    }
+
+    // Existing allow/deny/ask handling below (unchanged)
 
     if (result.action === "allow") {
       recordApprovalDecision(runHandle.id, {

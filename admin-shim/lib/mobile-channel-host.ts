@@ -372,8 +372,43 @@ export async function bridgeSendMessage(
   //
   // lcp-dlj: content_parts wins over text when present and non-empty.
   // letta-code's headless stdin accepts either shape on MessageCreate.content.
-  const userInput: string | unknown[] =
+  let userInput: string | unknown[] =
     Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
+
+  // lcp-d0za: passive runtime introspection — inject serving model,
+  // context utilization, and session role as a system-reminder so
+  // the agent always knows its runtime state without a tool call.
+  // Also detect mid-conversation model changes and surface a delta.
+  //
+  // **Fail-open**: the introspection block runs inside a try/catch.
+  // The reminder is an enhancement — if any lookup fails the message
+  // path proceeds unblocked with the original user input.
+  try {
+    // lcp-d0za: dynamic import so the module graph is only loaded
+    // when a message is actually being sent, not at shim startup.
+    // This prevents a startup hang on Node 20 CI where eager
+    // evaluation of the introspection module's import tree blocks
+    // the server from binding its port.
+    const introspect = await import("./runtime-introspection.js");
+    const connectionReminder = introspect.buildConnectionReminder(effectiveAgentId, effectiveConvId);
+    const modelDelta = introspect.detectModelChange(effectiveAgentId, effectiveConvId, introspect.getServingModelHandle(effectiveAgentId));
+    const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
+    if (prefix) {
+      if (typeof userInput === "string") {
+        userInput = prefix + "\n\n" + userInput;
+      } else if (Array.isArray(userInput)) {
+        userInput = [{ type: "text", text: prefix + "\n\n" }, ...userInput];
+      }
+    }
+    // Seed the model tracker so the first turn doesn't emit a spurious
+    // "changed" frame.
+    introspect.seedModelHandle(effectiveAgentId, effectiveConvId, introspect.getServingModelHandle(effectiveAgentId));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[mobile-channel] runtime-introspection injection failed (fail-open): ${msg}`);
+    // userInput is unchanged — message delivery proceeds normally.
+  }
+
   // lcp-0vi: route through pool.runTurnWithHeal so a dangling-tool-use
   // failure on this turn evicts the warm adapter + heals the transcript
   // before returning. The caller sees the original turn result unchanged;

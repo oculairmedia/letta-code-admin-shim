@@ -73,6 +73,7 @@ import {
 import {
   discoverOpenAICompatibleModels,
   FALLBACK_MODEL_CATALOG,
+  VISION_MODEL_PATTERNS,
 } from "./lib/model-catalog.js";
 import {
   bridgeSendMessage,
@@ -2290,6 +2291,18 @@ server.listen(PORT, HOST, () => {
   const actualPort = typeof addr === "object" && addr ? addr.port : PORT;
   console.log(`letta-code admin shim listening on http://${HOST}:${actualPort}`);
   console.log(`  LETTA_LOCAL_BACKEND_DIR=${process.env["LETTA_LOCAL_BACKEND_DIR"] ?? "(default)"}`);
+
+  // Vision capability is data, not patches: export the catalog's pattern
+  // list (plus operator extras) into our own env so every SDK-spawned
+  // letta-code CLI child inherits it. The patch-loader's
+  // __lcpFixLocalVisionInput helper reads LETTA_VISION_MODELS instead of a
+  // hardcoded regex — adding a vision model means editing
+  // VISION_MODEL_PATTERNS in lib/model-catalog.ts (or setting
+  // SHIM_VISION_MODELS_EXTRA on the unit), never the patch-loader.
+  const visionExtra = (process.env["SHIM_VISION_MODELS_EXTRA"] ?? "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  process.env["LETTA_VISION_MODELS"] = [...VISION_MODEL_PATTERNS, ...visionExtra].join(",");
+  console.log(`  LETTA_VISION_MODELS=${process.env["LETTA_VISION_MODELS"]}`);
 
   // lcp-indw: boot-sweep surviving pending approvals (R1). A turn parked on
   // an `ask` when the shim died cannot resume (its CLI session is gone), so

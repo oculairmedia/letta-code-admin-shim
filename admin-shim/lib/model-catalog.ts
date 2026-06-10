@@ -96,6 +96,47 @@ export const PROVIDER_TO_ENDPOINT_TYPE: Record<string, EndpointType> = {
 };
 
 /**
+ * Vision-capable model id patterns — THE single source of truth for which
+ * models accept image input on the local backend.
+ *
+ * Matched case-insensitively as substrings against "provider/model-id".
+ * Consumed in two places:
+ *  1. server.ts startup exports the list as LETTA_VISION_MODELS into the
+ *     shim's own env, so every SDK-spawned letta-code CLI child inherits it
+ *     and the patch-loader's __lcpFixLocalVisionInput helper reads it —
+ *     adding a vision model here needs NO patch-loader edit anymore.
+ *  2. isVisionCapableModel() for shim-side capability checks.
+ *
+ * Operators can append patterns without a rebuild via the
+ * SHIM_VISION_MODELS_EXTRA env var (comma-separated) on the service unit.
+ */
+export const VISION_MODEL_PATTERNS: readonly string[] = [
+  "llava",
+  "vision",
+  "opus",
+  "sonnet",
+  "haiku",
+  "claude",
+  "fable",
+  "gpt-",
+  "gpt5",
+  "gemini",
+  "grok",
+  "minimax", // MiniMax-M3 and successors are vision-capable
+  "qwen-vl",
+  "qwen2-vl",
+  "qwen2.5-vl",
+];
+
+/** True when the handle/model-id names a known vision-capable family. */
+export function isVisionCapableModel(handleOrId: string): boolean {
+  const haystack = handleOrId.toLowerCase();
+  if (VISION_MODEL_PATTERNS.some((p) => haystack.includes(p))) return true;
+  // "vl" needs word-boundary semantics so e.g. "vllm" doesn't match.
+  return /\bvl\b/.test(haystack);
+}
+
+/**
  * Hardcoded fallback model catalog.
  * Used when /models endpoint is unavailable or env var not set.
  * Sourced from real-world usage patterns (superagent, cline, openclaw, etc.)

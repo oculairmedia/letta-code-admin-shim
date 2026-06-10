@@ -871,12 +871,48 @@ export async function handleSendMessage(
       // injection that polluted every user message.
       syncSkillsBlockForAgent(agentId);
 
+      // lcp-d0za: passive runtime introspection — inject serving model,
+      // context utilization, and session role as a system-reminder so
+      // the agent always knows its runtime state without a tool call.
+      // Also detect mid-conversation model changes and surface a delta.
+      //
+      // **Fail-open**: the introspection block runs inside a try/catch.
+      // The reminder is an enhancement — if any lookup fails the message
+      // path proceeds unblocked with the original user input.
+      const effectiveConv = conversationId ?? "default";
+      let runtimeContent = content;
+      try {
+        // lcp-d0za: dynamic import so the module graph is only loaded
+        // when a message is actually being sent, not at shim startup.
+        // This prevents a startup hang on Node 20 CI where eager
+        // evaluation of the introspection module's import tree blocks
+        // the server from binding its port.
+        const introspect = await import("./runtime-introspection.js");
+        const connectionReminder = introspect.buildConnectionReminder(agentId, effectiveConv);
+        const modelDelta = introspect.detectModelChange(agentId, effectiveConv, introspect.getServingModelHandle(agentId));
+        const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
+        if (prefix) {
+          if (typeof runtimeContent === "string") {
+            runtimeContent = prefix + "\n\n" + runtimeContent;
+          } else if (Array.isArray(runtimeContent)) {
+            runtimeContent = [{ type: "text", text: prefix + "\n\n" }, ...runtimeContent];
+          }
+        }
+        // Seed the model tracker so the first turn doesn't emit a spurious
+        // "changed" frame.
+        introspect.seedModelHandle(agentId, effectiveConv, introspect.getServingModelHandle(agentId));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[chat] runtime-introspection injection failed (fail-open): ${msg}`);
+        // runtimeContent is unchanged — message delivery proceeds normally.
+      }
+
       // lcp-0vi: route through runTurnWithHeal so a dangling-tool-use error
       // on this turn evicts + heals the transcript before returning. The
       // healed disk is picked up by the next pool.get() the next time a
       // user turn comes through; the caller still sees this turn's
       // failure exactly as before, just with the disk already cleaned.
-      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, content, {
+      const turn = await pool.runTurnWithHeal(effectiveConv, agentId, runtimeContent, {
         onFrame: handleRawFrameWithRun,
         onRunCreated: (id: string) => {
           activeRunId = id;
