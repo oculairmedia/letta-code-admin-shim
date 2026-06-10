@@ -58,7 +58,7 @@ import { getStorageDir } from "./runs.js";
 // Types
 // ──────────────────────────────────────────────────────────────────────
 
-export type PermissionAction = "allow" | "ask" | "deny";
+export type PermissionAction = "allow" | "ask" | "deny" | "fork";
 
 export interface PermissionRule {
   /** Match pattern: `*`, bare tool name (`Bash`), or `Name(prefix:*)`. */
@@ -143,7 +143,7 @@ export function emptyConfig(): PermissionConfig {
 // ──────────────────────────────────────────────────────────────────────
 
 function isAction(v: unknown): v is PermissionAction {
-  return v === "allow" || v === "ask" || v === "deny";
+  return v === "allow" || v === "ask" || v === "deny" || v === "fork";
 }
 
 /**
@@ -488,5 +488,245 @@ export function evaluatePermission(
 /** Is server-side permissions enabled? Dark-ship flag (D6, default OFF). */
 export function serverPermissionsEnabled(): boolean {
   return process.env["SHIM_SERVER_PERMISSIONS"] === "1";
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Fork verdict (lcp-wd3i)
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Whether the fork verdict is enabled. Default-off behind
+ * SHIM_FORK_VERDICT=1. When off, the entire fork-verdict path is
+ * bypassed, and a rule with action "fork" is treated as "allow"
+ * (the behavior is byte-identical to the feature being absent).
+ */
+export function forkVerdictEnabled(): boolean {
+  return process.env["SHIM_FORK_VERDICT"] === "1";
+}
+
+/**
+ * Session roles recognised by the fork-verdict exemption logic.
+ * Fork and subagent sessions are EXEMPT from fork rules (workers
+ * must work — only the front-man thread gets forked).
+ */
+export type ForkSessionRole = "main" | "fork" | "subagent";
+
+/**
+ * Evaluate the effective permission with fork-verdict awareness.
+ *
+ * When SHIM_FORK_VERDICT=1 AND the session role is "main":
+ *   - A rule with action "fork" returns a fork verdict.
+ *   - The fork verdict is a structured denial instructing the agent
+ *     to dispatch Agent(subagent_type:'fork') instead.
+ *
+ * When SHIM_FORK_VERDICT=1 but session role is "fork" or "subagent":
+ *   - Fork rules are treated as "allow" (workers must work).
+ *
+ * When SHIM_FORK_VERDICT is unset/0:
+ *   - Fork rules are treated as "allow" (byte-identical legacy).
+ */
+export function evaluatePermissionWithFork(
+  agentId: string,
+  conversationId: string | null | undefined,
+  toolName: string,
+  toolInput: Record<string, unknown> | undefined,
+  sessionRole: ForkSessionRole,
+): EvalResult {
+  const base = evaluatePermission(agentId, conversationId, toolName, toolInput);
+
+  // Fork verdict only activates when the feature flag is on AND the
+  // rule actually returned a fork action.
+  if (base.action !== "fork") return base;
+
+  if (!forkVerdictEnabled()) {
+    // Dark-ship: fork verdict is off → treat as allow (byte-identical).
+    return { action: "allow", reason: base.reason, source: base.source };
+  }
+
+  if (sessionRole !== "main") {
+    // Workers must work — fork rules are a no-op on non-main threads.
+    return { action: "allow", reason: `${base.reason} (fork exempt: session role is ${sessionRole})`, source: base.source };
+  }
+
+  // Main thread + fork enabled → return the fork verdict.
+  return base;
+}
+
+// ── Agent-actuated override (sudo semantics) ─────────────────────────
+
+/**
+ * Shape of the permissions_override field an agent may include in
+ * a tool call to bypass a fork verdict.
+ */
+export interface PermissionsOverride {
+  /** The rule being overridden, e.g. "Bash(*)". */
+  rule: string;
+  /** One-line justification for the override. Required, non-empty. */
+  reason: string;
+}
+
+/**
+ * Extract a permissions_override from the tool input. The override
+ * can be at the top level of the toolInput alongside the tool's
+ * real parameters, or nested under a `permissions_override` key.
+ */
+export function extractOverride(
+  toolInput: Record<string, unknown> | undefined,
+): PermissionsOverride | null {
+  if (!toolInput) return null;
+  // Direct top-level keys (the agent may inline them alongside other args)
+  const rule = toolInput["permissions_override_rule"];
+  const reason = toolInput["permissions_override_reason"];
+  if (typeof rule === "string" && rule.length > 0 &&
+      typeof reason === "string" && reason.length > 0) {
+    return { rule, reason };
+  }
+  // Nested object form
+  const nested = toolInput["permissions_override"];
+  if (nested && typeof nested === "object") {
+    const no = nested as Record<string, unknown>;
+    const nr = no["rule"];
+    const nrs = no["reason"];
+    if (typeof nr === "string" && nr.length > 0 &&
+        typeof nrs === "string" && nrs.length > 0) {
+      return { rule: nr, reason: nrs };
+    }
+  }
+  return null;
+}
+
+/**
+ * Strip permissions_override fields from toolInput so the actual
+ * tool execution doesn't see them.
+ */
+export function stripOverrideFields(
+  toolInput: Record<string, unknown>,
+): Record<string, unknown> {
+  const cleaned = { ...toolInput };
+  delete cleaned["permissions_override_rule"];
+  delete cleaned["permissions_override_reason"];
+  delete cleaned["permissions_override"];
+  return cleaned;
+}
+
+/**
+ * Audit log entry for an override event.
+ */
+export interface OverrideAuditEntry {
+  agentId: string;
+  conversationId: string;
+  toolName: string;
+  rule: string;
+  justification: string;
+  timestamp: string;
+}
+
+/** In-memory override audit log (ring-buffer style, last N entries). */
+const OVERRIDE_AUDIT_MAX = 1000;
+const overrideAuditLog: OverrideAuditEntry[] = [];
+
+/** Simple in-memory rate-limiter state scoped to (agentId, conversationId). */
+interface OverrideRateState {
+  countThisTurn: number;
+  countThisHour: number;
+  hourStart: number;
+  turnStart: number;
+}
+
+const overrideRateState = new Map<string, OverrideRateState>();
+
+function rateKey(agentId: string, conversationId: string): string {
+  return `${agentId}::${conversationId}`;
+}
+
+function getOverrideRateState(agentId: string, conversationId: string): OverrideRateState {
+  const key = rateKey(agentId, conversationId);
+  let state = overrideRateState.get(key);
+  if (!state) {
+    state = { countThisTurn: 0, countThisHour: 0, hourStart: Date.now(), turnStart: Date.now() };
+    overrideRateState.set(key, state);
+  }
+  // Rotate hour window
+  if (Date.now() - state.hourStart > 3_600_000) {
+    state.countThisHour = 0;
+    state.hourStart = Date.now();
+  }
+  return state;
+}
+
+/** Reset per-turn counter (call at start of each turn). */
+export function resetOverrideTurnCounter(agentId: string, conversationId: string): void {
+  const key = rateKey(agentId, conversationId);
+  let state = overrideRateState.get(key);
+  if (!state) {
+    state = { countThisTurn: 0, countThisHour: 0, hourStart: Date.now(), turnStart: Date.now() };
+    overrideRateState.set(key, state);
+  }
+  state.countThisTurn = 0;
+  state.turnStart = Date.now();
+}
+
+/**
+ * Check whether an override is allowed under the current rate limits.
+ * Returns null if allowed, or a reason string if denied.
+ *
+ * Rate limits (env-configurable):
+ *   SHIM_FORK_OVERRIDE_PER_TURN     default 3
+ *   SHIM_FORK_OVERRIDE_PER_HOUR     default 10
+ */
+export function checkOverrideRateLimit(
+  agentId: string,
+  conversationId: string,
+): string | null {
+  const maxPerTurn = Number(process.env["SHIM_FORK_OVERRIDE_PER_TURN"] ?? 3);
+  const maxPerHour = Number(process.env["SHIM_FORK_OVERRIDE_PER_HOUR"] ?? 10);
+
+  const state = getOverrideRateState(agentId, conversationId);
+
+  if (state.countThisTurn >= maxPerTurn) {
+    return `override rate limit exceeded: ${state.countThisTurn}/${maxPerTurn} this turn`;
+  }
+  if (state.countThisHour >= maxPerHour) {
+    return `override rate limit exceeded: ${state.countThisHour}/${maxPerHour} this hour`;
+  }
+  return null;
+}
+
+/** Record a successful override in the rate-limiter state. */
+export function recordOverride(agentId: string, conversationId: string): void {
+  const state = getOverrideRateState(agentId, conversationId);
+  state.countThisTurn += 1;
+  state.countThisHour += 1;
+}
+
+/** Append an override event to the audit log. */
+export function appendOverrideAudit(entry: OverrideAuditEntry): void {
+  overrideAuditLog.push(entry);
+  if (overrideAuditLog.length > OVERRIDE_AUDIT_MAX) {
+    overrideAuditLog.splice(0, overrideAuditLog.length - OVERRIDE_AUDIT_MAX);
+  }
+}
+
+/** Query the override audit log (newest first). */
+export function getOverrideAuditLog(): OverrideAuditEntry[] {
+  return [...overrideAuditLog].reverse();
+}
+
+/**
+ * Whether the agent-actuated override path is enabled.
+ * Controlled by SHIM_FORK_OVERRIDE_ENABLED (default "1" when
+ * SHIM_FORK_VERDICT=1, "0" to disable overrides entirely).
+ */
+export function forkOverrideEnabled(): boolean {
+  if (!forkVerdictEnabled()) return false;
+  const env = process.env["SHIM_FORK_OVERRIDE_ENABLED"];
+  if (env === "0") return false;
+  return true;
+}
+
+/** Test-only: clear audit log + rate state. */
+export function __clearForkAuditAndRateState(): void {
+  overrideAuditLog.length = 0;
+  overrideRateState.clear();
 }
 
