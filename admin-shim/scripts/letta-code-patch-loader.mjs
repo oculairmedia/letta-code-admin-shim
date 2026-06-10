@@ -254,14 +254,27 @@ const EFFECTIVE_AGENT_SETTINGS_REPLACEMENT =
 // Patch the single registeredModelToPiModel() seam so every downstream provider
 // converter sees the same corrected input capabilities. Limit this to local
 // backend mode so remote/Constellation model declarations remain authoritative.
+// Vision model identification is DATA, not code: the shim owns the pattern
+// list in lib/model-catalog.ts (VISION_MODEL_PATTERNS) and exports it into
+// LETTA_VISION_MODELS (comma-separated, case-insensitive substrings) at
+// startup, which this spawned CLI process inherits. The regex below is only
+// a fallback for processes launched outside the shim (manual CLI runs).
+// To add a vision model: edit VISION_MODEL_PATTERNS once, or set
+// SHIM_VISION_MODELS_EXTRA on the service unit — no edit here needed.
 const LOCAL_VISION_INPUT_HELPER_DEFINITION =
   `globalThis.__lcpFixLocalVisionInput = globalThis.__lcpFixLocalVisionInput || function (providerName, modelId, input) {\n` +
   `  try {\n` +
   `    const current = Array.isArray(input) ? input : ["text"];\n` +
   `    if (current.includes("image")) return current;\n` +
   `    if (process.env.LETTA_LOCAL_BACKEND_EXPERIMENTAL !== "1" && !process.env.LETTA_LOCAL_BACKEND_DIR) return current;\n` +
-  `    const haystack = String(providerName || "") + "/" + String(modelId || "");\n` +
-  `    if (/llava|vision|\bvl\b|opus|sonnet|haiku|claude|fable|gpt-|gpt5|gemini|grok/i.test(haystack)) {\n` +
+  `    const haystack = (String(providerName || "") + "/" + String(modelId || "")).toLowerCase();\n` +
+  `    const envList = String(process.env.LETTA_VISION_MODELS || "")\n` +
+  `      .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);\n` +
+  `    if (envList.length > 0) {\n` +
+  `      if (envList.some((p) => haystack.includes(p)) || /\\bvl\\b/.test(haystack)) {\n` +
+  `        return [...current, "image"];\n` +
+  `      }\n` +
+  `    } else if (/llava|vision|\\bvl\\b|opus|sonnet|haiku|claude|fable|gpt-|gpt5|gemini|grok|minimax/i.test(haystack)) {\n` +
   `      return [...current, "image"];\n` +
   `    }\n` +
   `  } catch {}\n` +
