@@ -23,12 +23,6 @@ import { reshapeFrame, attachReadImageToToolReturn } from "./chat.js";
 import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
 import { readPendingApproval, resolveApproval } from "./pending-approval.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
-import {
-  buildConnectionReminder,
-  detectModelChange,
-  getServingModelHandle,
-  seedModelHandle,
-} from "./runtime-introspection.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
 import {
   A2uiStreamSplitter,
@@ -390,8 +384,14 @@ export async function bridgeSendMessage(
   // The reminder is an enhancement — if any lookup fails the message
   // path proceeds unblocked with the original user input.
   try {
-    const connectionReminder = buildConnectionReminder(effectiveAgentId, effectiveConvId);
-    const modelDelta = detectModelChange(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
+    // lcp-d0za: dynamic import so the module graph is only loaded
+    // when a message is actually being sent, not at shim startup.
+    // This prevents a startup hang on Node 20 CI where eager
+    // evaluation of the introspection module's import tree blocks
+    // the server from binding its port.
+    const introspect = await import("./runtime-introspection.js");
+    const connectionReminder = introspect.buildConnectionReminder(effectiveAgentId, effectiveConvId);
+    const modelDelta = introspect.detectModelChange(effectiveAgentId, effectiveConvId, introspect.getServingModelHandle(effectiveAgentId));
     const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
     if (prefix) {
       if (typeof userInput === "string") {
@@ -402,7 +402,7 @@ export async function bridgeSendMessage(
     }
     // Seed the model tracker so the first turn doesn't emit a spurious
     // "changed" frame.
-    seedModelHandle(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
+    introspect.seedModelHandle(effectiveAgentId, effectiveConvId, introspect.getServingModelHandle(effectiveAgentId));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[mobile-channel] runtime-introspection injection failed (fail-open): ${msg}`);

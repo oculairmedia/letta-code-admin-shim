@@ -22,12 +22,6 @@ import { extname } from "node:path";
 import { getAgentPool } from "./agent-pool.js";
 import { findUnmappedTailUserMessageId, writeOtidForLocalId, syncSkillsBlockForAgent } from "./store.js";
 import { toStringArrayOrNull } from "./translate.js";
-import {
-  buildConnectionReminder,
-  detectModelChange,
-  getServingModelHandle,
-  seedModelHandle,
-} from "./runtime-introspection.js";
 import type {
   LettaMessage,
   AssistantMessage,
@@ -888,8 +882,14 @@ export async function handleSendMessage(
       const effectiveConv = conversationId ?? "default";
       let runtimeContent = content;
       try {
-        const connectionReminder = buildConnectionReminder(agentId, effectiveConv);
-        const modelDelta = detectModelChange(agentId, effectiveConv, getServingModelHandle(agentId));
+        // lcp-d0za: dynamic import so the module graph is only loaded
+        // when a message is actually being sent, not at shim startup.
+        // This prevents a startup hang on Node 20 CI where eager
+        // evaluation of the introspection module's import tree blocks
+        // the server from binding its port.
+        const introspect = await import("./runtime-introspection.js");
+        const connectionReminder = introspect.buildConnectionReminder(agentId, effectiveConv);
+        const modelDelta = introspect.detectModelChange(agentId, effectiveConv, introspect.getServingModelHandle(agentId));
         const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
         if (prefix) {
           if (typeof runtimeContent === "string") {
@@ -900,7 +900,7 @@ export async function handleSendMessage(
         }
         // Seed the model tracker so the first turn doesn't emit a spurious
         // "changed" frame.
-        seedModelHandle(agentId, effectiveConv, getServingModelHandle(agentId));
+        introspect.seedModelHandle(agentId, effectiveConv, introspect.getServingModelHandle(agentId));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[chat] runtime-introspection injection failed (fail-open): ${msg}`);
