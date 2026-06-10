@@ -261,7 +261,7 @@ const LOCAL_VISION_INPUT_HELPER_DEFINITION =
   `    if (current.includes("image")) return current;\n` +
   `    if (process.env.LETTA_LOCAL_BACKEND_EXPERIMENTAL !== "1" && !process.env.LETTA_LOCAL_BACKEND_DIR) return current;\n` +
   `    const haystack = String(providerName || "") + "/" + String(modelId || "");\n` +
-  `    if (/llava|vision|\bvl\b|opus|sonnet|haiku|claude|gpt-|gpt5|gemini|grok/i.test(haystack)) {\n` +
+  `    if (/llava|vision|\bvl\b|opus|sonnet|haiku|claude|fable|gpt-|gpt5|gemini|grok/i.test(haystack)) {\n` +
   `      return [...current, "image"];\n` +
   `    }\n` +
   `  } catch {}\n` +

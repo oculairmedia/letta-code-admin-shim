@@ -210,7 +210,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 1000000,
       maxTokens: 16384,
       family: "claude-fable",
-      capabilities: ["text"],
+      capabilities: ["text", "vision"],
       releaseDate: "2026-06-01",
     },
     "claude-opus-4-8": {
