@@ -142,6 +142,8 @@ export function handleConnection(ws, request, host) {
   let cronEventsUnsubscribe = null;
   // lcp-indw: per-socket subscription to approval_resolved push events.
   let approvalEventsUnsubscribe = null;
+  // lcp-4d5f: per-socket subscription to reflection_settings_updated push.
+  let reflectionEventsUnsubscribe = null;
   // lcp-cq7x: per-socket registration for server-originated channel pushes.
   // Installed only after hello auth succeeds so outbound sendMessage never
   // targets unauthenticated sockets.
@@ -170,6 +172,10 @@ export function handleConnection(ws, request, host) {
     if (approvalEventsUnsubscribe) {
       safeUnsubscribe("approval events", approvalEventsUnsubscribe);
       approvalEventsUnsubscribe = null;
+    }
+    if (reflectionEventsUnsubscribe) {
+      safeUnsubscribe("reflection events", reflectionEventsUnsubscribe);
+      reflectionEventsUnsubscribe = null;
     }
     if (pushClientUnregister) {
       safeUnsubscribe("push client", pushClientUnregister);
@@ -604,6 +610,18 @@ export function handleConnection(ws, request, host) {
             tool_call_id: event.tool_call_id,
             status: event.status,
             decided_by: event.decided_by,
+            at: event.at,
+          }), log);
+        });
+      }
+      // lcp-4d5f: subscribe to reflection_settings_updated push events so
+      // peer clients see settings changes without polling.
+      if (typeof host.subscribeReflectionEvents === "function") {
+        reflectionEventsUnsubscribe = host.subscribeReflectionEvents((event) => {
+          if (closed) return;
+          safeSend(ws, makeFrame("reflection_settings_updated", {
+            agent_id: event.agent_id,
+            settings: event.settings,
             at: event.at,
           }), log);
         });
@@ -1206,6 +1224,69 @@ export function handleConnection(ws, request, host) {
         };
         if (!result.success && result.error) out.error = result.error;
         safeSend(ws, makeFrame("cron_delete_all_response", out), log);
+        break;
+      }
+      case "reflection_settings_get": {
+        // lcp-4d5f: read the agent's reflection (sleeptime) settings.
+        if (typeof host.handleReflectionSettingsGet !== "function") {
+          sendError(ERROR_CODES.INTERNAL, "reflection_settings_get handler not wired", { close: false });
+          break;
+        }
+        const requestId = typeof frame.request_id === "string" ? frame.request_id : null;
+        try {
+          const result = host.handleReflectionSettingsGet(
+            typeof frame.agent_id === "string" ? frame.agent_id : "",
+          );
+          const out = { request_id: requestId, success: result.success };
+          if (result.success) {
+            out.agent_id = result.agent_id;
+            out.settings = result.settings;
+          } else {
+            out.error = result.error;
+          }
+          safeSend(ws, makeFrame("reflection_settings_get_response", out), log);
+        } catch (err) {
+          safeSend(ws, makeFrame("reflection_settings_get_response", {
+            request_id: requestId,
+            success: false,
+            error: err.message ?? "reflection_settings_get failed",
+          }), log);
+        }
+        break;
+      }
+      case "reflection_settings_set": {
+        // lcp-4d5f: update reflection settings; peers learn via the
+        // reflection_settings_updated push the host broadcasts.
+        if (typeof host.handleReflectionSettingsSet !== "function") {
+          sendError(ERROR_CODES.INTERNAL, "reflection_settings_set handler not wired", { close: false });
+          break;
+        }
+        const requestId = typeof frame.request_id === "string" ? frame.request_id : null;
+        try {
+          const result = host.handleReflectionSettingsSet(
+            typeof frame.agent_id === "string" ? frame.agent_id : "",
+            {
+              trigger: frame.trigger,
+              behavior: frame.behavior,
+              step_count: frame.step_count,
+            },
+          );
+          const out = { request_id: requestId, success: result.success };
+          if (result.success) {
+            out.agent_id = result.agent_id;
+            out.settings = result.settings;
+            out.workers_recycled = result.workers_recycled;
+          } else {
+            out.error = result.error;
+          }
+          safeSend(ws, makeFrame("reflection_settings_set_response", out), log);
+        } catch (err) {
+          safeSend(ws, makeFrame("reflection_settings_set_response", {
+            request_id: requestId,
+            success: false,
+            error: err.message ?? "reflection_settings_set failed",
+          }), log);
+        }
         break;
       }
       case "ack":

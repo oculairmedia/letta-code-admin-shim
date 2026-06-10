@@ -71,6 +71,7 @@ import {
 import { ensureA2uiBlockAttached, type A2uiCapability } from "./a2ui-adapter.js";
 
 import { listMessages } from "./store.js";
+import { sleeptimeOptionsForAgent } from "./reflection-settings.js";
 
 import {
   evaluatePermission,
@@ -232,8 +233,13 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // agent id and let the SDK resume that agent's default thread.
     // Real `conv-...` ids resume the specific conversation.
     const target = this.conversationId === "default" ? this.agentId : this.conversationId;
+    // lcp-4d5f: apply the shim's persisted per-agent reflection settings on
+    // every session spawn. Undefined when the agent has no override so the
+    // CLI's own defaults stay in charge.
+    const sleeptime = sleeptimeOptionsForAgent(this.agentId);
     const session = resumeSession(target, {
       includePartialMessages: true,
+      ...(sleeptime ? { sleeptime } : {}),
       // vibesync-uuas: spawn at bypassPermissions by default so tool
       // calls (esp. the Agent/Task tool used by rig dispatch to spawn
       // role subagents) execute without halting on requires_approval.

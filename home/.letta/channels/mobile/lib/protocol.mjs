@@ -51,6 +51,14 @@ export const CLIENT_FRAMES = Object.freeze([
   "cron_get", // { request_id?, task_id }
   "cron_delete", // { request_id?, task_id }
   "cron_delete_all", // { request_id?, agent_id }
+  "reflection_settings_get", // { request_id?, agent_id }
+              // lcp-4d5f: read the agent's reflection (sleeptime) settings.
+  "reflection_settings_set", // { request_id?, agent_id, trigger?, behavior?, step_count? }
+              // lcp-4d5f: update reflection settings. trigger: off |
+              // step-count | compaction-event; behavior: reminder |
+              // auto-launch; step_count: positive int. Omitted fields keep
+              // their current values. Applies on the agent's next SDK
+              // session (idle pool workers are recycled immediately).
 ]);
 
 export const SERVER_FRAMES = Object.freeze([
@@ -100,6 +108,11 @@ export const SERVER_FRAMES = Object.freeze([
                   // Server push when crons.json changes. Reasons: client_mutation,
                   // scheduler_write (a tick fired a task), external_write (the
                   // bundled letta CLI or self-schedule skill wrote the file).
+  "reflection_settings_get_response", // { request_id?, success, agent_id?, settings?, error? }
+  "reflection_settings_set_response", // { request_id?, success, agent_id?, settings?, workers_recycled?, error? }
+  "reflection_settings_updated", // { agent_id, settings, at }
+                  // lcp-4d5f: server push when another client (or future
+                  // writer) changes an agent's reflection settings.
 ]);
 
 export const ERROR_CODES = Object.freeze({

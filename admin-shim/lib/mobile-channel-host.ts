@@ -1238,6 +1238,76 @@ export function handleCronDeleteAll(agentId: string): { success: boolean; count:
   return { success: true, count };
 }
 
+// ── Reflection (sleeptime) settings WS handlers (lcp-4d5f) ──────────────
+//
+// Backed by lib/reflection-settings.ts. WS is the canonical mutation path
+// (shim-new-features rule); REST mirrors the read side only
+// (GET /v1/agents/:id/reflection in server.ts). Settings are applied as SDK
+// `sleeptime` options on session resume, so after a successful set we
+// recycle the agent's IDLE pool workers — the next turn then spawns a fresh
+// session with the new settings. Busy workers are never touched; they pick
+// up the change when they next recycle.
+
+import {
+  getReflectionSettings,
+  setReflectionSettings,
+  subscribeReflectionEvents,
+  type ReflectionSettingsRecord,
+  type SetReflectionSettingsInput,
+} from "./reflection-settings.js";
+
+export interface ReflectionSettingsGetResponse {
+  success: true;
+  agent_id: string;
+  settings: ReflectionSettingsRecord;
+}
+
+export interface ReflectionSettingsSetResponse {
+  success: true;
+  agent_id: string;
+  settings: ReflectionSettingsRecord;
+  /** Idle pool workers recycled so the change applies on the next turn. */
+  workers_recycled: number;
+}
+
+export function handleReflectionSettingsGet(
+  agentId: string,
+): ReflectionSettingsGetResponse | CronErrorResponse {
+  if (typeof agentId !== "string" || agentId.length === 0) {
+    return { success: false, error: "agent_id is required" };
+  }
+  const effective = resolveAgentIdAlias(agentId, (id) => getAgentRecord(id) != null);
+  return { success: true, agent_id: effective, settings: getReflectionSettings(effective) };
+}
+
+export function handleReflectionSettingsSet(
+  agentId: string,
+  input: SetReflectionSettingsInput,
+): ReflectionSettingsSetResponse | CronErrorResponse {
+  if (typeof agentId !== "string" || agentId.length === 0) {
+    return { success: false, error: "agent_id is required" };
+  }
+  const effective = resolveAgentIdAlias(agentId, (id) => getAgentRecord(id) != null);
+  const result = setReflectionSettings(effective, input);
+  if (!result.success) return { success: false, error: result.error };
+
+  // Recycle idle workers for this agent so the new settings take effect on
+  // the next turn instead of after the (potentially day-long) idle TTL.
+  const pool = getAgentPool();
+  let recycled = 0;
+  for (const worker of [...pool.workers.values()]) {
+    if (worker.agentId !== effective || worker.busy) continue;
+    void pool.evict(worker.conversationId, worker.agentId).then((evicted) => {
+      if (!evicted) {
+        console.warn(`[reflection-settings] worker for ${effective} vanished before recycle`);
+      }
+    });
+    recycled += 1;
+  }
+
+  return { success: true, agent_id: effective, settings: result.settings, workers_recycled: recycled };
+}
+
 /**
  * The `host` object the shim hands the channel plugin. Mirrors the
  * informal contract the plugin reads in `acceptConnection` (see
@@ -1273,6 +1343,10 @@ interface MobileChannelHost {
   subscribeCronEvents: typeof subscribeCronEvents;
   /** lcp-indw: per-connection subscription for approval_resolved pushes. */
   subscribeApprovalEvents: typeof subscribeApprovalEvents;
+  /** lcp-4d5f: reflection (sleeptime) settings get/set + updated push. */
+  handleReflectionSettingsGet: typeof handleReflectionSettingsGet;
+  handleReflectionSettingsSet: typeof handleReflectionSettingsSet;
+  subscribeReflectionEvents: typeof subscribeReflectionEvents;
 }
 
 /**
@@ -1383,6 +1457,9 @@ async function createMobileChannelAdapter(
     handleCronDeleteAll,
     subscribeCronEvents,
     subscribeApprovalEvents,
+    handleReflectionSettingsGet,
+    handleReflectionSettingsSet,
+    subscribeReflectionEvents,
   };
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();

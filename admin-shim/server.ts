@@ -74,7 +74,11 @@ import {
   discoverOpenAICompatibleModels,
   FALLBACK_MODEL_CATALOG,
 } from "./lib/model-catalog.js";
-import { bridgeSendMessage, getMobileChannelAdapter } from "./lib/mobile-channel-host.js";
+import {
+  bridgeSendMessage,
+  getMobileChannelAdapter,
+  handleReflectionSettingsGet,
+} from "./lib/mobile-channel-host.js";
 import { mobileConversationCursorCapabilities } from "./lib/mobile-conversation-cursors.js";
 import {
   getCronSchedulerStatus,
@@ -340,6 +344,24 @@ function handleShimCapabilities(_req: IncomingMessage, res: ServerResponse): voi
       },
     },
     mobile_transport: MOBILE_TRANSPORT_CONTRACT,
+    reflection_settings: {
+      ws_frames: ["reflection_settings_get", "reflection_settings_set"],
+      ws_push: "reflection_settings_updated",
+      rest_read_mirror: "/v1/agents/{agent_id}/reflection",
+    },
+  });
+}
+
+// lcp-4d5f: REST read mirror. Alias resolution + defaults live in the shared
+// WS handler so both transports report identical settings.
+function handleAgentReflection(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
+  const result = handleReflectionSettingsGet(agentId);
+  if (!result.success) return badRequest(res, result.error);
+  json(res, 200, {
+    agent_id: result.agent_id,
+    settings: result.settings,
+    ws_endpoint: "/shim/v1/mobile",
+    ws_frames: ["reflection_settings_get", "reflection_settings_set"],
   });
 }
 
@@ -2029,6 +2051,20 @@ const server = createServer((req, res) => {
 
   const agentContext = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/context\/?$/);
   if (agentContext && req.method === "GET") return handleAgentContext(req, res, url, agentContext[1]!);
+
+  // lcp-4d5f: read-only mirror of reflection (sleeptime) settings. Mutations
+  // are WS-only (reflection_settings_set on /shim/v1/mobile) per the
+  // WS-first rule for net-new features.
+  const agentReflection = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/reflection\/?$/);
+  if (agentReflection && req.method === "GET") return handleAgentReflection(req, res, agentReflection[1]!);
+  if (agentReflection) {
+    res.setHeader("Allow", "GET, OPTIONS");
+    return json(res, 405, {
+      detail: `${req.method} not allowed; reflection settings mutate over WS`,
+      ws_endpoint: "/shim/v1/mobile",
+      ws_frames: ["reflection_settings_get", "reflection_settings_set"],
+    });
+  }
 
   const agentBlocks = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/core-memory\/blocks\/?$/);
   if (agentBlocks && req.method === "GET") return handleAgentBlocks(req, res, agentBlocks[1]!);
