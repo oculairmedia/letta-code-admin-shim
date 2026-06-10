@@ -6,9 +6,16 @@ import { _internals as storeInternals } from "./store.js";
 
 const DEFAULT_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_FRAMES = 1_000;
+const DEFAULT_CURSOR_CACHE_MAX = 256;
+const DEFAULT_COMPACT_CHECK_APPENDS = 1_000;
 
 const TTL_MS = readPositiveEnvInt("SHIM_MOBILE_CONV_REPLAY_TTL_MS", DEFAULT_TTL_MS);
 const MAX_FRAMES = readPositiveEnvInt("SHIM_MOBILE_CONV_REPLAY_MAX_FRAMES", DEFAULT_MAX_FRAMES);
+const CURSOR_CACHE_MAX = readPositiveEnvInt("SHIM_MOBILE_CONV_CURSOR_CACHE_MAX", DEFAULT_CURSOR_CACHE_MAX);
+const COMPACT_CHECK_APPENDS = readPositiveEnvInt(
+  "SHIM_MOBILE_CONV_REPLAY_COMPACT_APPENDS",
+  DEFAULT_COMPACT_CHECK_APPENDS,
+);
 
 export interface CursorSidecar {
   version: 1;
@@ -26,7 +33,7 @@ interface ReplayEntry {
 
 interface CursorState {
   sidecar: CursorSidecar;
-  replay: ReplayEntry[];
+  appendsSinceCompactCheck: number;
 }
 
 export interface ConversationResumeResult {
@@ -79,15 +86,17 @@ export function stampConversationFrame(
   writeSidecar(conversationId, state.sidecar);
   const stamped = { ...frame, conversation_id: conversationId, conv_seq: convSeq };
   appendReplayFrame(conversationId, { convSeq, tsMs: Date.now(), frame: stamped });
-  state.replay.push({ convSeq, tsMs: Date.now(), frame: stamped });
-  pruneReplay(state);
+  state.appendsSinceCompactCheck += 1;
+  if (state.appendsSinceCompactCheck >= COMPACT_CHECK_APPENDS) {
+    state.appendsSinceCompactCheck = 0;
+    maybeCompactReplayLog(conversationId, state.sidecar.last_ack_seq);
+  }
   return stamped;
 }
 
 export function resumeConversation(conversationId: string, afterSeqInput: unknown): ConversationResumeResult {
   const afterSeq = normalizeSeq(afterSeqInput);
   const state = getState(conversationId);
-  pruneReplay(state);
   const lastSeq = state.sidecar.last_assigned_seq;
   const replay = readReplayFrames(conversationId, state.sidecar.last_ack_seq);
   const oldestSeq = replay.length > 0 ? replay[0]!.convSeq : null;
@@ -115,16 +124,27 @@ export function ackConversation(conversationId: string, ackSeqInput: unknown): C
     updated_at: new Date().toISOString(),
   };
   writeSidecar(conversationId, state.sidecar);
-  pruneReplay(state);
   return state.sidecar;
 }
 
+// Sidecars are persisted on every write, so eviction is lossless — an evicted
+// conversation transparently reloads from disk on its next touch.
 function getState(conversationId: string): CursorState {
   const cached = states.get(conversationId);
-  if (cached) return cached;
+  if (cached) {
+    // Refresh LRU position (Map preserves insertion order).
+    states.delete(conversationId);
+    states.set(conversationId, cached);
+    return cached;
+  }
   const sidecar = readSidecar(conversationId);
-  const state: CursorState = { sidecar, replay: [] };
+  const state: CursorState = { sidecar, appendsSinceCompactCheck: 0 };
   states.set(conversationId, state);
+  while (states.size > CURSOR_CACHE_MAX) {
+    const oldest = states.keys().next().value;
+    if (oldest === undefined) break;
+    states.delete(oldest);
+  }
   return state;
 }
 
@@ -255,10 +275,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function pruneReplay(state: CursorState): void {
-  const cutoff = Date.now() - TTL_MS;
-  state.replay = state.replay.filter((entry) => entry.tsMs >= cutoff && entry.convSeq > state.sidecar.last_ack_seq);
-  if (state.replay.length > MAX_FRAMES) {
-    state.replay = state.replay.slice(state.replay.length - MAX_FRAMES);
+// Rewrite the replay JSONL keeping only frames still eligible for replay
+// (within TTL, unacked, last MAX_FRAMES). Without this the log grows without
+// bound and every reconnect re-reads/parses the full history (lcp-2s5e).
+function maybeCompactReplayLog(conversationId: string, lastAckSeq: number): void {
+  const path = replayPath(conversationId);
+  if (!existsSync(path)) return;
+  try {
+    const retained = readReplayFrames(conversationId, lastAckSeq);
+    if (retained.length === 0) {
+      unlinkSync(path);
+      return;
+    }
+    const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+    const body = retained
+      .map((entry) => JSON.stringify({ seq: entry.convSeq, ts: new Date(entry.tsMs).toISOString(), frame: entry.frame }))
+      .join("\n");
+    writeFileSync(tmp, body + "\n");
+    renameSync(tmp, path);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[mobile-conversation-cursors] replay compaction failed ${path}: ${msg}`);
   }
 }
+
+export const _cursorInternals = {
+  maybeCompactReplayLog,
+  resetCache(): void {
+    states.clear();
+  },
+  cacheSize(): number {
+    return states.size;
+  },
+};
