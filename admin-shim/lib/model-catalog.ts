@@ -117,7 +117,7 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       contextWindow: 400000,
       maxTokens: 128000,
       family: "gpt-5",
-      capabilities: ["text", "vision", "code", "reasoning"],
+      capabilities: ["text", "code", "reasoning"],
       releaseDate: "2026-05-22",
     },
     "gpt-5-codex": {
@@ -204,6 +204,15 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
     },
   },
   anthropic: {
+    "claude-fable-5": {
+      id: "claude-fable-5",
+      name: "Claude Fable 5",
+      contextWindow: 1000000,
+      maxTokens: 16384,
+      family: "claude-fable",
+      capabilities: ["text"],
+      releaseDate: "2026-06-01",
+    },
     "claude-opus-4-8": {
       id: "claude-opus-4-8",
       name: "Claude Opus 4.8",
@@ -451,8 +460,14 @@ export async function discoverOpenAICompatibleModels(
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
+    // Auth-gated endpoints (e.g. the LiteLLM gateway) reject anonymous
+    // /models requests; reuse the backend API key when one is configured.
+    const apiKey = process.env["OPENAI_API_KEY"];
     const response = await fetch(`${baseUrl}/models`, {
       signal: controller.signal,
+      ...(apiKey && apiKey !== "not-needed"
+        ? { headers: { Authorization: `Bearer ${apiKey}` } }
+        : {}),
     });
 
     clearTimeout(timeoutId);
@@ -514,7 +529,7 @@ export function getDefaultOpenAIModels(): string[] {
  * Get default Anthropic models (hardcoded fallback).
  */
 export function getDefaultAnthropicModels(): string[] {
-  return ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"];
+  return ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"];
 }
 
 /**
