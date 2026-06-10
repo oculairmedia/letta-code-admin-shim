@@ -281,7 +281,7 @@ test("stripOverrideFields: removes top-level override keys", () => {
     permissions_override: { rule: "X", reason: "Y" },
   };
   const cleaned = stripOverrideFields(input);
-  assert.equal(cleaned.command, "echo hello");
+  assert.equal(cleaned["command"], "echo hello");
   assert.equal("permissions_override_rule" in cleaned, false);
   assert.equal("permissions_override_reason" in cleaned, false);
   assert.equal("permissions_override" in cleaned, false);
@@ -348,9 +348,9 @@ test("audit log: append and query", () => {
 
   const log = getOverrideAuditLog();
   assert.equal(log.length, 1);
-  assert.equal(log[0].toolName, "Bash");
-  assert.equal(log[0].rule, "Bash(*)");
-  assert.equal(log[0].justification, "quick status check");
+  assert.equal(log[0]!.toolName, "Bash");
+  assert.equal(log[0]!.rule, "Bash(*)");
+  assert.equal(log[0]!.justification, "quick status check");
 });
 
 test("audit log: newest first", () => {
@@ -367,8 +367,8 @@ test("audit log: newest first", () => {
 
   const log = getOverrideAuditLog();
   assert.equal(log.length, 2);
-  assert.equal(log[0].toolName, "Second"); // newest first
-  assert.equal(log[1].toolName, "First");
+  assert.equal(log[0]!.toolName, "Second"); // newest first
+  assert.equal(log[1]!.toolName, "First");
 });
 
 // ── Test 8: forkOverrideEnabled flag ────────────────────────────────────
