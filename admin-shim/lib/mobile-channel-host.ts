@@ -23,6 +23,12 @@ import { reshapeFrame, attachReadImageToToolReturn } from "./chat.js";
 import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
 import { readPendingApproval, resolveApproval } from "./pending-approval.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
+import {
+  buildConnectionReminder,
+  detectModelChange,
+  getServingModelHandle,
+  seedModelHandle,
+} from "./runtime-introspection.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
 import {
   A2uiStreamSplitter,
@@ -372,8 +378,27 @@ export async function bridgeSendMessage(
   //
   // lcp-dlj: content_parts wins over text when present and non-empty.
   // letta-code's headless stdin accepts either shape on MessageCreate.content.
-  const userInput: string | unknown[] =
+  let userInput: string | unknown[] =
     Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
+
+  // lcp-d0za: passive runtime introspection — inject serving model,
+  // context utilization, and session role as a system-reminder so
+  // the agent always knows its runtime state without a tool call.
+  // Also detect mid-conversation model changes and surface a delta.
+  const connectionReminder = buildConnectionReminder(effectiveAgentId, effectiveConvId);
+  const modelDelta = detectModelChange(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
+  const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
+  if (prefix) {
+    if (typeof userInput === "string") {
+      userInput = prefix + "\n\n" + userInput;
+    } else if (Array.isArray(userInput)) {
+      userInput = [{ type: "text", text: prefix + "\n\n" }, ...userInput];
+    }
+  }
+  // Seed the model tracker so the first turn doesn't emit a spurious
+  // "changed" frame.
+  seedModelHandle(effectiveAgentId, effectiveConvId, getServingModelHandle(effectiveAgentId));
+
   // lcp-0vi: route through pool.runTurnWithHeal so a dangling-tool-use
   // failure on this turn evicts the warm adapter + heals the transcript
   // before returning. The caller sees the original turn result unchanged;

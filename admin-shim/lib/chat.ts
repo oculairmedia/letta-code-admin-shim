@@ -22,6 +22,12 @@ import { extname } from "node:path";
 import { getAgentPool } from "./agent-pool.js";
 import { findUnmappedTailUserMessageId, writeOtidForLocalId, syncSkillsBlockForAgent } from "./store.js";
 import { toStringArrayOrNull } from "./translate.js";
+import {
+  buildConnectionReminder,
+  detectModelChange,
+  getServingModelHandle,
+  seedModelHandle,
+} from "./runtime-introspection.js";
 import type {
   LettaMessage,
   AssistantMessage,
@@ -871,12 +877,32 @@ export async function handleSendMessage(
       // injection that polluted every user message.
       syncSkillsBlockForAgent(agentId);
 
+      // lcp-d0za: passive runtime introspection — inject serving model,
+      // context utilization, and session role as a system-reminder so
+      // the agent always knows its runtime state without a tool call.
+      // Also detect mid-conversation model changes and surface a delta.
+      const effectiveConv = conversationId ?? "default";
+      let runtimeContent = content;
+      const connectionReminder = buildConnectionReminder(agentId, effectiveConv);
+      const modelDelta = detectModelChange(agentId, effectiveConv, getServingModelHandle(agentId));
+      const prefix = [connectionReminder, modelDelta].filter(Boolean).join("\n");
+      if (prefix) {
+        if (typeof runtimeContent === "string") {
+          runtimeContent = prefix + "\n\n" + runtimeContent;
+        } else if (Array.isArray(runtimeContent)) {
+          runtimeContent = [{ type: "text", text: prefix + "\n\n" }, ...runtimeContent];
+        }
+      }
+      // Seed the model tracker so the first turn doesn't emit a spurious
+      // "changed" frame.
+      seedModelHandle(agentId, effectiveConv, getServingModelHandle(agentId));
+
       // lcp-0vi: route through runTurnWithHeal so a dangling-tool-use error
       // on this turn evicts + heals the transcript before returning. The
       // healed disk is picked up by the next pool.get() the next time a
       // user turn comes through; the caller still sees this turn's
       // failure exactly as before, just with the disk already cleaned.
-      const turn = await pool.runTurnWithHeal(conversationId ?? "default", agentId, content, {
+      const turn = await pool.runTurnWithHeal(effectiveConv, agentId, runtimeContent, {
         onFrame: handleRawFrameWithRun,
         onRunCreated: (id: string) => {
           activeRunId = id;
