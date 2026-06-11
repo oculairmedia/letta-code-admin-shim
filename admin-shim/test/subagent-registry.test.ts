@@ -17,6 +17,8 @@ import {
   getSubagent,
   markSubagentCompleted,
   markSubagentFailed,
+  recordSubagentDispatch,
+  __resetSubagentRegistry,
 } from "../lib/subagent-registry.js";
 
 function dispatchFrame(toolCallId: string, description: string, background = true) {
@@ -107,4 +109,39 @@ test("subagent-registry: terminal transitions leave active-only list", () => {
   const failedEntry = all.find((s) => s.toolCallId === failed);
   assert.equal(failedEntry?.status, "failed");
   assert.equal(failedEntry?.failureReason, "stream_timeout");
+});
+
+// ── lcp-zncq: source field ──────────────────────────────────────────────
+
+test("subagent-registry: source defaults to 'letta' for Agent-tool dispatch via ingestParentFrame", () => {
+  __resetSubagentRegistry();
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  const entry = ingestParentFrame(dispatchFrame(tcid, "source check"), "run-src");
+  assert.ok(entry);
+  assert.equal(entry!.source, "letta", "Agent-tool dispatch should default source to 'letta'");
+  __resetSubagentRegistry();
+});
+
+test("subagent-registry: recordSubagentDispatch accepts explicit source", () => {
+  __resetSubagentRegistry();
+  const entry = recordSubagentDispatch({
+    toolCallId: "ext-vibesync-mol-1-step-2",
+    parentRunId: null,
+    args: { description: "vibe check", run_in_background: false },
+    source: "vibesync",
+  });
+  assert.equal(entry.source, "vibesync");
+  assert.equal(entry.toolCallId, "ext-vibesync-mol-1-step-2");
+  __resetSubagentRegistry();
+});
+
+test("subagent-registry: recordSubagentDispatch defaults source to 'letta' when omitted", () => {
+  __resetSubagentRegistry();
+  const entry = recordSubagentDispatch({
+    toolCallId: "toolu_no_source",
+    parentRunId: null,
+    args: { description: "no source given", run_in_background: false },
+  });
+  assert.equal(entry.source, "letta", "omitted source should default to 'letta'");
+  __resetSubagentRegistry();
 });
