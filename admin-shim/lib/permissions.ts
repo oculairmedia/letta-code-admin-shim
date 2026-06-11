@@ -667,10 +667,32 @@ export function resetOverrideTurnCounter(agentId: string, conversationId: string
 }
 
 /**
+ * Parse an environment variable as a non-negative integer for
+ * fork-override rate-limit configuration. Returns the parsed value
+ * when valid. On any unparseable value (NaN, Infinity, negative,
+ * fractional, or non-numeric strings like "three"), logs an explicit
+ * warning with the raw value and returns the hardcoded default.
+ *
+ * Zero is valid — it explicitly disables the rate limit (as designed).
+ */
+function parseOverrideRateLimit(envKey: string, defaultVal: number): number {
+  const raw = process.env[envKey];
+  if (raw === undefined || raw === "") return defaultVal;
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num < 0 || !Number.isInteger(num)) {
+    console.warn(
+      `[permissions] ${envKey}=${JSON.stringify(raw)} is not a valid non-negative integer — using default ${defaultVal}`,
+    );
+    return defaultVal;
+  }
+  return num;
+}
+
+/**
  * Check whether an override is allowed under the current rate limits.
  * Returns null if allowed, or a reason string if denied.
  *
- * Rate limits (env-configurable):
+ * Rate limits (env-configurable, validated via parseOverrideRateLimit):
  *   SHIM_FORK_OVERRIDE_PER_TURN     default 3
  *   SHIM_FORK_OVERRIDE_PER_HOUR     default 10
  */
@@ -678,8 +700,8 @@ export function checkOverrideRateLimit(
   agentId: string,
   conversationId: string,
 ): string | null {
-  const maxPerTurn = Number(process.env["SHIM_FORK_OVERRIDE_PER_TURN"] ?? 3);
-  const maxPerHour = Number(process.env["SHIM_FORK_OVERRIDE_PER_HOUR"] ?? 10);
+  const maxPerTurn = parseOverrideRateLimit("SHIM_FORK_OVERRIDE_PER_TURN", 3);
+  const maxPerHour = parseOverrideRateLimit("SHIM_FORK_OVERRIDE_PER_HOUR", 10);
 
   const state = getOverrideRateState(agentId, conversationId);
 

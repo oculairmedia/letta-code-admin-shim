@@ -93,6 +93,7 @@ import {
 } from "./pending-approval.js";
 import {
   getSessionRole,
+  setSessionRole,
 } from "./runtime-introspection.js";
 
 function logLine(msg: string): void {
@@ -290,6 +291,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     this.conversationId = init.conversationId;
     this.agentId = init.agentId;
     this.ready = true;
+
+    // lcp-n66y: tag this conversation as the main session role so the
+    // fork-verdict evaluator can distinguish main-thread tool calls from
+    // fork/subagent workers. Subagents spawned via the Agent tool and fork
+    // copies created via /v1/conversations/{id}/fork will be tagged
+    // separately at their spawn points (lcp-n66y-fork, lcp-n66y-subagent).
+    setSessionRole(this.agentId, this.conversationId, "main");
+
     logLine(`started agent=${this.agentId} conv=${this.conversationId} session=${this.sessionId}`);
     return { agentId: init.agentId, conversationId: init.conversationId };
   }
@@ -828,7 +837,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
               reason: `fork_override: ${override.reason}`,
               timestamp,
             });
-            return { behavior: "allow", message: `fork overridden: ${override.reason}` };
+            // lcp-3ruh: pass the CLEANED input (without override fields) to
+            // the tool executor via updatedInput. The audit log above
+            // already captured the raw input with override fields intact.
+            return {
+              behavior: "allow",
+              message: `fork overridden: ${override.reason}`,
+              updatedInput: stripOverrideFields(toolInput),
+            };
           }
           // Over limit — mutate result to "ask" and fall through to
           // the ask handling below. If no approver is connected, the
