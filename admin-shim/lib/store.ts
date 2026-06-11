@@ -875,9 +875,12 @@ export function listMessagesSync(
   conversationId: string,
   agentId: string,
 ): LocalMessage[] {
+  return loadFilteredMessagesSync(messagesJsonlPath(conversationId, agentId)).slice();
+}
+
+export function messagesJsonlPath(conversationId: string, agentId: string): string {
   const key = conversationKey(conversationId, agentId);
-  const dir = join(storageDir(), "conversations", b64url(key));
-  return loadFilteredMessagesSync(join(dir, "messages.jsonl")).slice();
+  return join(storageDir(), "conversations", b64url(key), "messages.jsonl");
 }
 
 export function readSystemPrompt(conversationId: string, agentId: string): unknown {
