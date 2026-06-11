@@ -188,6 +188,12 @@ function createMobileAdapter(account, host) {
         handleReflectionSettingsGet: host.handleReflectionSettingsGet,
         handleReflectionSettingsSet: host.handleReflectionSettingsSet,
         subscribeReflectionEvents: host.subscribeReflectionEvents,
+        // letta-mobile-73o2h.1: active-subagent registry over WS.
+        // Same explicit-forwarding gotcha as above — the ws-handler
+        // only sees host methods it is explicitly handed.
+        handleSubagentList: host.handleSubagentList,
+        handleSubagentTodos: host.handleSubagentTodos,
+        subscribeSubagentEvents: host.subscribeSubagentEvents,
       });
     },
   };

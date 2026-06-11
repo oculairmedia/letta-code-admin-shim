@@ -101,6 +101,13 @@ import {
 import { broadcastCronEvent } from "./lib/cron-events.js";
 import type { AddTaskInput, CronTask } from "./lib/types/crons.js";
 import {
+  recordSubagentDispatch,
+  markSubagentCompleted,
+  markSubagentFailed,
+  snapshotSubagents,
+  getSubagent,
+} from "./lib/subagent-registry.js";
+import {
   getStatus as getSearchStatus,
   rebuild as rebuildSearchIndex,
   search as runSearch,
@@ -1188,6 +1195,77 @@ function broadcastCronMutation(): void {
   });
 }
 
+// ── POST /v1/work-activity — external work ingest (lcp-zncq) ─────────
+
+/** Valid values for the `status` field in a work-activity ingest payload. */
+const VALID_WORK_ACTIVITY_STATUSES = new Set(["running", "completed", "failed"]);
+
+async function handleWorkActivityIngest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+
+  const externalId = body["external_id"];
+  if (typeof externalId !== "string" || externalId.length === 0) {
+    return badRequest(res, "external_id is required (string)");
+  }
+  const source = body["source"];
+  if (typeof source !== "string" || source.length === 0) {
+    return badRequest(res, "source is required (string)");
+  }
+  const statusRaw = body["status"];
+  if (typeof statusRaw !== "string" || !VALID_WORK_ACTIVITY_STATUSES.has(statusRaw)) {
+    return badRequest(res, `status must be one of: ${[...VALID_WORK_ACTIVITY_STATUSES].join(", ")}`);
+  }
+  const status = statusRaw as "running" | "completed" | "failed";
+
+  // Collision-free namespace: `ext-<source>-<external_id>`
+  const toolCallId = `ext-${source}-${externalId}`;
+  const description = typeof body["description"] === "string" ? (body["description"] as string) : null;
+  const failureReason = typeof body["failure_reason"] === "string" ? (body["failure_reason"] as string) : null;
+
+  if (status === "running") {
+    // Upsert a running entry. recordSubagentDispatch is idempotent on
+    // toolCallId — repeated POSTs update metadata without duplicating.
+    const entry = recordSubagentDispatch({
+      toolCallId,
+      parentRunId: null,
+      args: {
+        subagent_type: null,
+        description,
+        run_in_background: false,
+      },
+      source,
+    });
+    // The registry owns timestamps; caller-supplied started_at is advisory.
+    return json(res, 200, entry);
+  }
+
+  // Terminal statuses: complete or fail an existing entry, or create-then-finalize.
+  let entry = getSubagent(toolCallId);
+
+  if (!entry) {
+    // Create a synthetic dispatch entry and immediately finalize it.
+    recordSubagentDispatch({
+      toolCallId,
+      parentRunId: null,
+      args: {
+        subagent_type: null,
+        description,
+        run_in_background: false,
+      },
+      source,
+    });
+  }
+
+  if (status === "completed") {
+    markSubagentCompleted(toolCallId);
+  } else {
+    markSubagentFailed(toolCallId, failureReason ?? "failed");
+  }
+
+  const final = getSubagent(toolCallId);
+  return json(res, 200, final);
+}
+
 // Resolve a schedule from the request body. Accepts exactly one of `cron`
 // (raw 5-field expression), `every` (e.g. "5m"), or `at` (e.g. "3:30pm" /
 // "in 10m"). Returns the resolved cron expression + recurring flag +
@@ -2224,6 +2302,15 @@ const server = createServer((req, res) => {
     if (req.method === "DELETE") return handleCronDelete(res, cronDetail[1]!);
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     return handleCronMethodNotAllowed(req, res);
+  }
+
+  // /v1/work-activity — external work ingest (lcp-zncq)
+  if (pathname === "/v1/work-activity" || pathname === "/v1/work-activity/") {
+    if (req.method === "POST") return handleWorkActivityIngest(req, res);
+    if (req.method === "GET") return json(res, 200, snapshotSubagents());
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    res.setHeader("Allow", "POST, GET, OPTIONS");
+    return json(res, 405, { detail: `${req.method} not allowed on /v1/work-activity` });
   }
 
   // /v1/skills/* — skill discovery, search, install, uninstall

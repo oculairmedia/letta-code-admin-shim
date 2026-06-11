@@ -81,6 +81,8 @@ export interface SubagentEntry {
   failureReason: string | null;
   /** The parent run id this dispatch was streamed from. */
   parentRunId: string | null;
+  /** Provenance — "letta" for Agent-tool dispatches, or the external producer's id. */
+  source: string;
   /** The subagent's OWN agent id (agent-local-<uuid>); null until resolved. */
   subagentAgentId: string | null;
   /**
@@ -282,8 +284,9 @@ export function recordSubagentDispatch(input: {
   toolCallId: string;
   parentRunId: string | null;
   args: unknown;
+  source?: string;
 }): SubagentEntry {
-  const { toolCallId, parentRunId, args } = input;
+  const { toolCallId, parentRunId, args, source } = input;
   const parsed = parseAgentDispatchArgs(args);
   const existing = _subagents.get(toolCallId);
   if (existing) {
@@ -299,6 +302,7 @@ export function recordSubagentDispatch(input: {
     description: parsed.description,
     subagentType: parsed.subagentType,
     runInBackground: parsed.runInBackground,
+    source: source ?? "letta",
     status: "running",
     failureReason: null,
     parentRunId,
