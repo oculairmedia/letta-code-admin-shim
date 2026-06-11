@@ -106,6 +106,8 @@ import {
   markSubagentFailed,
   snapshotSubagents,
   getSubagent,
+  updateSubagentTodoProgress,
+  type TodoProgress,
 } from "./lib/subagent-registry.js";
 import {
   getStatus as getSearchStatus,
@@ -1200,6 +1202,22 @@ function broadcastCronMutation(): void {
 /** Valid values for the `status` field in a work-activity ingest payload. */
 const VALID_WORK_ACTIVITY_STATUSES = new Set(["running", "completed", "failed"]);
 
+function parseWorkActivityProgress(raw: unknown): TodoProgress | null | { error: string } {
+  if (raw === undefined || raw === null) return null;
+  if (!isRecord(raw)) return { error: "progress must be an object with completed and total numbers" };
+  const completedRaw = raw["completed"];
+  const totalRaw = raw["total"];
+  if (!Number.isInteger(completedRaw) || !Number.isInteger(totalRaw)) {
+    return { error: "progress.completed and progress.total must be integers" };
+  }
+  const completed = completedRaw as number;
+  const total = totalRaw as number;
+  if (completed < 0 || total < 0 || completed > total) {
+    return { error: "progress must satisfy 0 <= completed <= total" };
+  }
+  return { completed, total };
+}
+
 async function handleWorkActivityIngest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody(req);
 
@@ -1221,6 +1239,8 @@ async function handleWorkActivityIngest(req: IncomingMessage, res: ServerRespons
   const toolCallId = `ext-${source}-${externalId}`;
   const description = typeof body["description"] === "string" ? (body["description"] as string) : null;
   const failureReason = typeof body["failure_reason"] === "string" ? (body["failure_reason"] as string) : null;
+  const progress = parseWorkActivityProgress(body["progress"]);
+  if (progress && "error" in progress) return badRequest(res, progress.error);
 
   if (status === "running") {
     // Upsert a running entry. recordSubagentDispatch is idempotent on
@@ -1236,7 +1256,8 @@ async function handleWorkActivityIngest(req: IncomingMessage, res: ServerRespons
       source,
     });
     // The registry owns timestamps; caller-supplied started_at is advisory.
-    return json(res, 200, entry);
+    const withProgress = progress ? updateSubagentTodoProgress(toolCallId, progress) : entry;
+    return json(res, 200, withProgress);
   }
 
   // Terminal statuses: complete or fail an existing entry, or create-then-finalize.
@@ -1262,6 +1283,7 @@ async function handleWorkActivityIngest(req: IncomingMessage, res: ServerRespons
     markSubagentFailed(toolCallId, failureReason ?? "failed");
   }
 
+  if (progress) updateSubagentTodoProgress(toolCallId, progress);
   const final = getSubagent(toolCallId);
   return json(res, 200, final);
 }

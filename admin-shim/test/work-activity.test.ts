@@ -36,6 +36,7 @@ interface SubagentEntry {
   endedAt: string | null;
   subagentType: string | null;
   runInBackground: boolean;
+  todo_progress: { completed: number; total: number } | null;
 }
 
 interface SubagentsUpdatedFrame extends MobileWsFrame {
@@ -341,6 +342,70 @@ test("POST /v1/work-activity returns 400 on missing status", async () => {
 });
 
 // ── Broadcast ────────────────────────────────────────────────────────────
+
+test("POST /v1/work-activity accepts progress and broadcasts todos_changed", async () => {
+  const shim = await startShim();
+  try {
+    const conn = await openMobileWs(shim.url!, { token: shim.mobileToken });
+    try {
+      await fetch(`${shim.url}/v1/work-activity`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          external_id: "mol-progress-1",
+          source: "vibesync",
+          description: "progress-test",
+          status: "running",
+        }),
+      });
+      const observed = waitTyped<SubagentsUpdatedFrame>(conn, "subagents_updated", 5000);
+      const res = await fetch(`${shim.url}/v1/work-activity`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          external_id: "mol-progress-1",
+          source: "vibesync",
+          description: "progress-test",
+          status: "running",
+          progress: { completed: 2, total: 5 },
+        }),
+      });
+      assert.equal(res.status, 200);
+      const entry = (await res.json()) as SubagentEntry;
+      assert.deepEqual(entry.todo_progress, { completed: 2, total: 5 });
+
+      const frame = await observed;
+      assert.equal(frame.reason, "todos_changed");
+      assert.deepEqual(frame.subagent?.todo_progress, { completed: 2, total: 5 });
+    } finally {
+      conn.close();
+    }
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("POST /v1/work-activity rejects invalid progress", async () => {
+  const shim = await startShim();
+  try {
+    const res = await fetch(`${shim.url}/v1/work-activity`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        external_id: "mol-progress-bad",
+        source: "vibesync",
+        description: "bad progress",
+        status: "running",
+        progress: { completed: 3, total: 2 },
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { detail: string };
+    assert.ok(body.detail.includes("progress"));
+  } finally {
+    await shim.stop();
+  }
+});
 
 test("POST /v1/work-activity broadcasts subagents_updated to mobile WS clients", async () => {
   const shim = await startShim();

@@ -50,13 +50,21 @@
  * on demand via `listActiveSubagents()` / `snapshotSubagents()`.
  */
 
-import { existsSync, readFileSync, statSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { basename, dirname } from "node:path";
+import { invalidateMessagesCache, messagesJsonlPath } from "./store.js";
+import { readSubagentTodos, type TodoItem, type TodoSnapshot } from "./subagent-todos.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────────────────────────────
 
 export type SubagentStatus = "running" | "completed" | "failed";
+
+export interface TodoProgress {
+  completed: number;
+  total: number;
+}
 
 /**
  * One registry entry. `taskId` / `subagentAgentId` / `logFile` are only
@@ -85,6 +93,8 @@ export interface SubagentEntry {
   source: string;
   /** The subagent's OWN agent id (agent-local-<uuid>); null until resolved. */
   subagentAgentId: string | null;
+  /** Latest TodoWrite progress fraction for ring-fill clients; null until known. */
+  todo_progress: TodoProgress | null;
   /**
    * The subagent's conversation id. letta-code subagents run in their
    * "default" conversation, so this is "default" once subagentAgentId is
@@ -103,6 +113,7 @@ export interface SubagentEntry {
 export type SubagentEventReason =
   | "started" // a new Agent dispatch was observed
   | "resolved" // the Agent tool_return correlated the subagent run/conversation
+  | "todos_changed" // latest TodoWrite progress changed
   | "completed" // subagent reached terminal success
   | "failed"; // subagent reached terminal failure (incl. stream_timeout)
 
@@ -121,6 +132,8 @@ type Listener = (event: SubagentEvent) => void;
 const _subagents = new Map<string, SubagentEntry>(); // toolCallId → entry
 const _listeners = new Set<Listener>();
 const _logWatchers = new Map<string, FSWatcher>(); // toolCallId → fs.watch handle
+const _todoWatchers = new Map<string, FSWatcher>(); // toolCallId → TodoWrite messages.jsonl watcher
+const _todoDebounceTimers = new Map<string, NodeJS.Timeout>(); // toolCallId → TodoWrite debounce
 const _timeoutTimers = new Map<string, NodeJS.Timeout>(); // toolCallId → watchdog
 
 /**
@@ -307,6 +320,7 @@ export function recordSubagentDispatch(input: {
     failureReason: null,
     parentRunId,
     subagentAgentId: null,
+    todo_progress: null,
     subagentConversationId: null,
     logFile: null,
     startedAt: nowIso(),
@@ -344,7 +358,9 @@ export function recordSubagentReturn(input: {
     if (entry.subagentAgentId) entry.subagentConversationId = "default";
     entry.logFile = parsed.logFile ?? entry.logFile;
     entry.runInBackground = true;
+    refreshTodoProgress(toolCallId, false);
     emit("resolved", entry);
+    if (entry.subagentAgentId) watchSubagentTodos(toolCallId);
     if (entry.logFile) watchBackgroundLog(toolCallId);
     return clone(entry);
   }
@@ -410,7 +426,79 @@ export function markSubagentFailed(toolCallId: string, reason = "failed"): void 
   finalize(toolCallId, "failed", reason);
 }
 
+export function updateSubagentTodoProgress(toolCallId: string, progress: TodoProgress | null): SubagentEntry | null {
+  const entry = _subagents.get(toolCallId);
+  if (!entry) return null;
+  if (!sameTodoProgress(entry.todo_progress, progress)) {
+    entry.todo_progress = progress;
+    emit("todos_changed", entry);
+  }
+  return clone(entry);
+}
+
 const TASK_COMPLETED_MARKER = "[Task completed]";
+const TODO_WATCH_DEBOUNCE_MS = 200;
+
+export function computeTodoProgress(snapshotOrTodos: TodoSnapshot | TodoItem[]): TodoProgress {
+  const todos = Array.isArray(snapshotOrTodos) ? snapshotOrTodos : snapshotOrTodos.todos;
+  return {
+    completed: todos.filter((todo) => todo.status === "completed").length,
+    total: todos.length,
+  };
+}
+
+function sameTodoProgress(a: TodoProgress | null, b: TodoProgress | null): boolean {
+  return a?.completed === b?.completed && a?.total === b?.total;
+}
+
+function refreshTodoProgress(toolCallId: string, shouldEmit: boolean): boolean {
+  const entry = _subagents.get(toolCallId);
+  if (!entry || !entry.subagentAgentId) return false;
+  const conversationId = entry.subagentConversationId ?? "default";
+  invalidateMessagesCache(conversationId, entry.subagentAgentId);
+  const snapshot = readSubagentTodos(entry.subagentAgentId, conversationId);
+  const progress = snapshot.found ? computeTodoProgress(snapshot) : null;
+  if (sameTodoProgress(entry.todo_progress, progress)) return false;
+  entry.todo_progress = progress;
+  if (shouldEmit) emit("todos_changed", entry);
+  return true;
+}
+
+function scheduleTodoRefresh(toolCallId: string): void {
+  const existing = _todoDebounceTimers.get(toolCallId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    _todoDebounceTimers.delete(toolCallId);
+    refreshTodoProgress(toolCallId, true);
+  }, TODO_WATCH_DEBOUNCE_MS);
+  timer.unref?.();
+  _todoDebounceTimers.set(toolCallId, timer);
+}
+
+function watchSubagentTodos(toolCallId: string): void {
+  const entry = _subagents.get(toolCallId);
+  if (!entry || !entry.subagentAgentId) return;
+  if (_todoWatchers.has(toolCallId)) return;
+  const conversationId = entry.subagentConversationId ?? "default";
+  const path = messagesJsonlPath(conversationId, entry.subagentAgentId);
+  const dir = dirname(path);
+  const file = basename(path);
+  try {
+    mkdirSync(dir, { recursive: true });
+    const watcher = fsWatch(dir, (eventType, filename) => {
+      if (_subagents.get(toolCallId)?.status !== "running") {
+        clearWatchers(toolCallId);
+        return;
+      }
+      if (eventType !== "rename" && eventType !== "change") return;
+      if (filename && filename.toString() !== file) return;
+      scheduleTodoRefresh(toolCallId);
+    });
+    _todoWatchers.set(toolCallId, watcher);
+  } catch {
+    // The conversation directory may not exist before the subagent's first write.
+  }
+}
 
 /**
  * Watch a background task's log file for the terminal `[Task completed]`
@@ -477,6 +565,20 @@ function clearWatchers(toolCallId: string): void {
     }
     _logWatchers.delete(toolCallId);
   }
+  const todoWatcher = _todoWatchers.get(toolCallId);
+  if (todoWatcher) {
+    try {
+      todoWatcher.close();
+    } catch {
+      /* best-effort */
+    }
+    _todoWatchers.delete(toolCallId);
+  }
+  const todoTimer = _todoDebounceTimers.get(toolCallId);
+  if (todoTimer) {
+    clearTimeout(todoTimer);
+    _todoDebounceTimers.delete(toolCallId);
+  }
   const timer = _timeoutTimers.get(toolCallId);
   if (timer) {
     clearTimeout(timer);
@@ -491,6 +593,17 @@ function clearWatchers(toolCallId: string): void {
 /** Test-only: drop every entry, listener, watcher, and timer. */
 export function __resetSubagentRegistry(): void {
   for (const toolCallId of [..._subagents.keys()]) clearWatchers(toolCallId);
+  for (const toolCallId of [..._todoWatchers.keys()]) clearWatchers(toolCallId);
+  for (const toolCallId of [..._todoDebounceTimers.keys()]) clearWatchers(toolCallId);
   _subagents.clear();
   _listeners.clear();
+}
+
+export function __getSubagentWatcherCounts(): { logs: number; todos: number; todoDebounces: number; timeouts: number } {
+  return {
+    logs: _logWatchers.size,
+    todos: _todoWatchers.size,
+    todoDebounces: _todoDebounceTimers.size,
+    timeouts: _timeoutTimers.size,
+  };
 }
