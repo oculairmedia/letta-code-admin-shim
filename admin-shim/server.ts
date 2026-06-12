@@ -66,6 +66,7 @@ import {
   deleteRun,
   getRun,
   inFlightMessageIds,
+  getFramesFilePath,
   listRunSteps,
   listRuns,
   type ListRunsParams,
@@ -107,6 +108,9 @@ import {
   snapshotSubagents,
   getSubagent,
   updateSubagentTodoProgress,
+  finalizeSubagent,
+  ingestParentFrame,
+  rehydrateRunningSubagentWatchdogs,
   type TodoProgress,
 } from "./lib/subagent-registry.js";
 import {
@@ -1197,6 +1201,33 @@ function broadcastCronMutation(): void {
   });
 }
 
+function rehydrateSubagentsFromRunFrames(): number {
+  let count = 0;
+  for (const run of listRuns({ limit: 10000 })) {
+    if (!run.id) continue;
+    const framesPath = getFramesFilePath(run.id);
+    if (!existsSync(framesPath)) continue;
+    let text = "";
+    try {
+      text = readFileSync(framesPath, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        const frame = isRecord(parsed) && "frame" in parsed ? parsed["frame"] : parsed;
+        if (ingestParentFrame(frame, run.id)) count += 1;
+      } catch {
+        continue;
+      }
+    }
+  }
+  rehydrateRunningSubagentWatchdogs();
+  return count;
+}
+
 // ── POST /v1/work-activity — external work ingest (lcp-zncq) ─────────
 
 /** Valid values for the `status` field in a work-activity ingest payload. */
@@ -1216,6 +1247,23 @@ function parseWorkActivityProgress(raw: unknown): TodoProgress | null | { error:
     return { error: "progress must satisfy 0 <= completed <= total" };
   }
   return { completed, total };
+}
+
+async function handleWorkActivityOverride(req: IncomingMessage, res: ServerResponse, toolCallId: string): Promise<void> {
+  const body = await readJsonBody(req);
+  const statusRaw = body["status"];
+  if (statusRaw !== "completed" && statusRaw !== "failed") {
+    return badRequest(res, "status must be one of: completed, failed");
+  }
+  const failureReason = typeof body["failureReason"] === "string"
+    ? body["failureReason"]
+    : typeof body["failure_reason"] === "string"
+      ? body["failure_reason"]
+      : null;
+  const existing = getSubagent(toolCallId);
+  if (!existing) return notFound(res, `work activity ${toolCallId}`);
+  const entry = finalizeSubagent(toolCallId, statusRaw, failureReason);
+  return json(res, 200, entry);
 }
 
 async function handleWorkActivityIngest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -2334,6 +2382,14 @@ const server = createServer((req, res) => {
     res.setHeader("Allow", "POST, GET, OPTIONS");
     return json(res, 405, { detail: `${req.method} not allowed on /v1/work-activity` });
   }
+  const workActivityDetail = pathname.match(/^\/v1\/work-activity\/([^/]+)\/?$/);
+  if (workActivityDetail) {
+    const toolCallId = decodeURIComponent(workActivityDetail[1]!);
+    if (req.method === "PATCH") return void handleWorkActivityOverride(req, res, toolCallId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    res.setHeader("Allow", "PATCH, OPTIONS");
+    return json(res, 405, { detail: `${req.method} not allowed on /v1/work-activity/:toolCallId` });
+  }
 
   // /v1/skills/* — skill discovery, search, install, uninstall
   if (pathname === "/v1/skills" || pathname === "/v1/skills/") {
@@ -2412,6 +2468,15 @@ server.listen(PORT, HOST, () => {
     .split(",").map((s) => s.trim()).filter(Boolean);
   process.env["LETTA_VISION_MODELS"] = [...VISION_MODEL_PATTERNS, ...visionExtra].join(",");
   console.log(`  LETTA_VISION_MODELS=${process.env["LETTA_VISION_MODELS"]}`);
+
+  try {
+    const rehydrated = rehydrateSubagentsFromRunFrames();
+    if (rehydrated > 0) console.log(`[subagent-registry] boot-rehydrated ${rehydrated} frame(s)`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[subagent-registry] boot-rehydrate failed: ${msg}`);
+    try { rehydrateRunningSubagentWatchdogs(); } catch {}
+  }
 
   // lcp-indw: boot-sweep surviving pending approvals (R1). A turn parked on
   // an `ask` when the shim died cannot resume (its CLI session is gone), so

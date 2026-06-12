@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,6 +23,8 @@ import {
   recordSubagentDispatch,
   computeTodoProgress,
   subscribeSubagentEvents,
+  rehydrateRunningSubagentWatchdogs,
+  sweepOrphanedSubagents,
   __getSubagentWatcherCounts,
   __resetSubagentRegistry,
 } from "../lib/subagent-registry.js";
@@ -246,4 +248,52 @@ test("subagent-registry: entry serializes todo_progress null by default", () => 
   assert.equal(entry.todo_progress, null);
   assert.equal(JSON.parse(JSON.stringify(entry)).todo_progress, null);
   __resetSubagentRegistry();
+});
+
+test("subagent-registry: rehydrate flips running entry whose log already completed", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-rehydrate-complete-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_90.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\n[Task completed]\n");
+    ingestParentFrame(dispatchFrame(tcid, "Already done"), "run-rehydrate");
+    ingestParentFrame(returnFrame(tcid, "task_90", "agent-local-abc12345-9999-8888-7777-666666666666", logFile), "run-rehydrate");
+    assert.equal(getSubagent(tcid)?.status, "completed");
+
+    __resetSubagentRegistry();
+    ingestParentFrame(dispatchFrame(tcid, "Already done"), "run-rehydrate");
+    ingestParentFrame(returnFrame(tcid, "task_90", "agent-local-abc12345-9999-8888-7777-666666666666", logFile), "run-rehydrate");
+    rehydrateRunningSubagentWatchdogs();
+
+    assert.equal(getSubagent(tcid)?.status, "completed");
+    assert.equal(__getSubagentWatcherCounts().timeouts, 0);
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("subagent-registry: liveness sweep fails stale running log as orphaned", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-orphan-sweep-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_91.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\nworking\n");
+    const stale = new Date(Date.now() - 700_000);
+    utimesSync(logFile, stale, stale);
+    ingestParentFrame(dispatchFrame(tcid, "Stale worker"), "run-orphan");
+    ingestParentFrame(returnFrame(tcid, "task_91", "agent-local-abc12345-aaaa-bbbb-cccc-dddddddddddd", logFile), "run-orphan");
+
+    const swept = sweepOrphanedSubagents(Date.now());
+
+    assert.equal(swept, 1);
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "orphaned");
+  } finally {
+    __resetSubagentRegistry();
+  }
 });

@@ -21,6 +21,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { startShim, openMobileWs } from "./helpers/index.js";
 import type { MobileWsFrame, MobileWsHandle } from "./helpers/ws.js";
@@ -434,6 +436,80 @@ test("POST /v1/work-activity broadcasts subagents_updated to mobile WS clients",
       assert.equal(frame.subagent!.toolCallId, "ext-vibesync-mol-bcast-1");
       assert.equal(frame.subagent!.source, "vibesync");
       assert.equal(frame.reason, "started");
+    } finally {
+      conn.close();
+    }
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("PATCH /v1/work-activity/:toolCallId finalizes letta entry and broadcasts", async () => {
+  const shim = await startShim({ waitForReady: false });
+  const runId = "run-patch-letta";
+  const toolCallId = "toolu_patch_letta";
+  const logFile = join(shim.stateDir, "task_patch.log");
+  try {
+    mkdirSync(join(shim.stateDir, "runs", runId), { recursive: true });
+    writeFileSync(logFile, "[Task started]\n");
+    writeFileSync(join(shim.stateDir, "runs", runId, "run.json"), JSON.stringify({
+      id: runId,
+      agent_id: "agent-test",
+      conversation_id: "default",
+      background: false,
+      status: "running",
+      created_at: new Date().toISOString(),
+      completed_at: null,
+      metadata: {},
+      message_ids: [],
+      tools_used: [],
+      num_steps: 0,
+    }) + "\n");
+    const dispatch = {
+      message_type: "tool_call_message",
+      tool_call: {
+        tool_call_id: toolCallId,
+        name: "Agent",
+        arguments: JSON.stringify({
+          subagent_type: "general-purpose",
+          description: "patch letta entry",
+          run_in_background: true,
+          prompt: "do it",
+        }),
+      },
+    };
+    const ret = {
+      message_type: "tool_return_message",
+      name: "Agent",
+      tool_call_id: toolCallId,
+      tool_return:
+        "Task running in background with task ID: task_92\n" +
+        "Agent ID: agent-local-abc12345-1234-1234-1234-123456789abc\n" +
+        `Output file: ${logFile}`,
+    };
+    writeFileSync(join(shim.stateDir, "runs", runId, "frames.jsonl"),
+      JSON.stringify({ seq: 1, ts: new Date().toISOString(), frame: dispatch }) + "\n" +
+      JSON.stringify({ seq: 2, ts: new Date().toISOString(), frame: ret }) + "\n");
+
+    await shim.waitForLogLine(/listening on/);
+    const conn = await openMobileWs(shim.url!, { token: shim.mobileToken });
+    try {
+      const observed = waitTyped<SubagentsUpdatedFrame>(conn, "subagents_updated", 5000);
+      const res = await fetch(`${shim.url}/v1/work-activity/${encodeURIComponent(toolCallId)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "failed", failureReason: "manual cleanup" }),
+      });
+      assert.equal(res.status, 200);
+      const entry = (await res.json()) as SubagentEntry;
+      assert.equal(entry.source, "letta");
+      assert.equal(entry.status, "failed");
+      assert.equal(entry.failureReason, "manual cleanup");
+
+      const frame = await observed;
+      assert.equal(frame.reason, "failed");
+      assert.equal(frame.subagent?.toolCallId, toolCallId);
+      assert.equal(frame.subagent?.status, "failed");
     } finally {
       conn.close();
     }

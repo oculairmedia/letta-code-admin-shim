@@ -50,7 +50,7 @@
  * on demand via `listActiveSubagents()` / `snapshotSubagents()`.
  */
 
-import { existsSync, mkdirSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 import { invalidateMessagesCache, messagesJsonlPath } from "./store.js";
 import { readSubagentTodos, type TodoItem, type TodoSnapshot } from "./subagent-todos.js";
@@ -135,6 +135,7 @@ const _logWatchers = new Map<string, FSWatcher>(); // toolCallId → fs.watch ha
 const _todoWatchers = new Map<string, FSWatcher>(); // toolCallId → TodoWrite messages.jsonl watcher
 const _todoDebounceTimers = new Map<string, NodeJS.Timeout>(); // toolCallId → TodoWrite debounce
 const _timeoutTimers = new Map<string, NodeJS.Timeout>(); // toolCallId → watchdog
+let _livenessSweepTimer: NodeJS.Timeout | null = null;
 
 /**
  * Stream-timeout window. A background subagent still `running` after this
@@ -145,6 +146,12 @@ const _timeoutTimers = new Map<string, NodeJS.Timeout>(); // toolCallId → watc
 const SUBAGENT_TIMEOUT_MS = (() => {
   const n = Number(process.env["SHIM_SUBAGENT_TIMEOUT_MS"] ?? 600_000);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 600_000;
+})();
+
+/** Periodic orphan detector cadence. Override in tests. */
+const SUBAGENT_LIVENESS_SWEEP_MS = (() => {
+  const n = Number(process.env["SHIM_SUBAGENT_LIVENESS_SWEEP_MS"] ?? 60_000);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 60_000;
 })();
 
 function nowIso(): string {
@@ -426,6 +433,15 @@ export function markSubagentFailed(toolCallId: string, reason = "failed"): void 
   finalize(toolCallId, "failed", reason);
 }
 
+export function finalizeSubagent(
+  toolCallId: string,
+  status: Exclude<SubagentStatus, "running">,
+  reason: string | null = null,
+): SubagentEntry | null {
+  finalize(toolCallId, status, status === "failed" ? reason ?? "failed" : null);
+  return getSubagent(toolCallId);
+}
+
 export function updateSubagentTodoProgress(toolCallId: string, progress: TodoProgress | null): SubagentEntry | null {
   const entry = _subagents.get(toolCallId);
   if (!entry) return null;
@@ -506,6 +522,15 @@ function watchSubagentTodos(toolCallId: string): void {
  * on each change (logs are small). If the marker is already present at
  * attach time we finalize immediately.
  */
+function logHasCompletedMarker(logFile: string): boolean {
+  try {
+    if (!existsSync(logFile)) return false;
+    return readFileSync(logFile, "utf8").includes(TASK_COMPLETED_MARKER);
+  } catch {
+    return false;
+  }
+}
+
 function watchBackgroundLog(toolCallId: string): void {
   const entry = _subagents.get(toolCallId);
   if (!entry || !entry.logFile) return;
@@ -513,14 +538,7 @@ function watchBackgroundLog(toolCallId: string): void {
   const logFile = entry.logFile;
 
   const scan = (): void => {
-    let text = "";
-    try {
-      if (!existsSync(logFile)) return;
-      text = readFileSync(logFile, "utf8");
-    } catch {
-      return;
-    }
-    if (text.includes(TASK_COMPLETED_MARKER)) {
+    if (logHasCompletedMarker(logFile)) {
       finalize(toolCallId, "completed", null);
     }
   };
@@ -553,6 +571,58 @@ function armTimeoutWatchdog(toolCallId: string): void {
   }, SUBAGENT_TIMEOUT_MS);
   timer.unref?.();
   _timeoutTimers.set(toolCallId, timer);
+}
+
+function evaluateRunningSubagent(toolCallId: string): void {
+  const entry = _subagents.get(toolCallId);
+  if (!entry || entry.status !== "running") return;
+  if (entry.logFile && logHasCompletedMarker(entry.logFile)) {
+    finalize(toolCallId, "completed", null);
+    return;
+  }
+  if (entry.subagentAgentId) watchSubagentTodos(toolCallId);
+  if (entry.logFile) watchBackgroundLog(toolCallId);
+  armTimeoutWatchdog(toolCallId);
+}
+
+export function rehydrateRunningSubagentWatchdogs(): void {
+  for (const entry of _subagents.values()) {
+    if (entry.status === "running") evaluateRunningSubagent(entry.toolCallId);
+  }
+  sweepOrphanedSubagents();
+  startSubagentLivenessSweep();
+}
+
+export function sweepOrphanedSubagents(nowMs = Date.now()): number {
+  let swept = 0;
+  for (const entry of _subagents.values()) {
+    if (entry.status !== "running" || !entry.logFile) continue;
+    if (logHasCompletedMarker(entry.logFile)) continue;
+    try {
+      const stat = statSync(entry.logFile);
+      if (nowMs - stat.mtimeMs > SUBAGENT_TIMEOUT_MS) {
+        finalize(entry.toolCallId, "failed", "orphaned");
+        swept += 1;
+      }
+    } catch {
+      // Missing/unreadable logs remain bounded by the normal stream timeout.
+    }
+  }
+  return swept;
+}
+
+export function startSubagentLivenessSweep(): void {
+  if (_livenessSweepTimer) return;
+  _livenessSweepTimer = setInterval(() => {
+    sweepOrphanedSubagents();
+  }, SUBAGENT_LIVENESS_SWEEP_MS);
+  _livenessSweepTimer.unref?.();
+}
+
+export function stopSubagentLivenessSweep(): void {
+  if (!_livenessSweepTimer) return;
+  clearInterval(_livenessSweepTimer);
+  _livenessSweepTimer = null;
 }
 
 function clearWatchers(toolCallId: string): void {
@@ -592,6 +662,7 @@ function clearWatchers(toolCallId: string): void {
 
 /** Test-only: drop every entry, listener, watcher, and timer. */
 export function __resetSubagentRegistry(): void {
+  stopSubagentLivenessSweep();
   for (const toolCallId of [..._subagents.keys()]) clearWatchers(toolCallId);
   for (const toolCallId of [..._todoWatchers.keys()]) clearWatchers(toolCallId);
   for (const toolCallId of [..._todoDebounceTimers.keys()]) clearWatchers(toolCallId);
@@ -599,11 +670,12 @@ export function __resetSubagentRegistry(): void {
   _listeners.clear();
 }
 
-export function __getSubagentWatcherCounts(): { logs: number; todos: number; todoDebounces: number; timeouts: number } {
+export function __getSubagentWatcherCounts(): { logs: number; todos: number; todoDebounces: number; timeouts: number; livenessSweep: number } {
   return {
     logs: _logWatchers.size,
     todos: _todoWatchers.size,
     todoDebounces: _todoDebounceTimers.size,
     timeouts: _timeoutTimers.size,
+    livenessSweep: _livenessSweepTimer ? 1 : 0,
   };
 }
