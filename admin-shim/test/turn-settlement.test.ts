@@ -111,6 +111,55 @@ test("settle: collects ids from tool_call_message AND approval_request_message f
   }
 });
 
+test("settle: synthetic toolResult is inserted IMMEDIATELY AFTER its declaring assistant (positional, not append-at-end)", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agent = "agent-pos-1";
+    const conv = seedConv(stateDir, "default", agent);
+    // Transcript: user, assistant-with-tool_call(toolu_x), user (the assistant
+    // declared the call but no result; a later user row follows). Appending the
+    // synthetic result at the END would orphan it by position; it must go right
+    // after the assistant row.
+    writeFileSync(
+      join(conv, "messages.jsonl"),
+      [
+        JSON.stringify({ id: "u1", role: "user", content: [{ type: "text", text: "do it" }] }),
+        JSON.stringify({
+          id: "a1",
+          role: "assistant",
+          content: [{ type: "toolCall", id: "toolu_x", name: "Bash", arguments: {} }],
+        }),
+        JSON.stringify({ id: "u2", role: "user", content: [{ type: "text", text: "are you done?" }] }),
+      ].join("\n") + "\n",
+    );
+
+    const report = await settleDanglingToolCallsFromFrames({
+      frames: [toolCallFrame("Bash", "toolu_x")],
+      conversationId: "default",
+      agentId: agent,
+      runId: "run-pos-1",
+      reason: "stream_dropped",
+      messageIdsBefore: new Set<string>(["u1", "a1", "u2"]),
+      stateDir,
+    });
+
+    assert.equal(report.messagesAppended, 1);
+    const onDisk = readMessages(conv);
+    // order must be: u1, a1(assistant tool_call), SYNTH toolResult, u2
+    const roles = onDisk.map((m) => m["role"]);
+    assert.deepEqual(roles, ["user", "assistant", "toolResult", "user"]);
+    // the synthetic result sits at index 2, immediately after the assistant (index 1)
+    const synth = onDisk[2]!;
+    assert.equal(synth["role"], "toolResult");
+    assert.equal(synth["toolCallId"], "toolu_x");
+    assert.ok(String(synth["id"]).startsWith("synth-settle:run-pos-1:"));
+    // NOT at the end
+    assert.notEqual(onDisk[onDisk.length - 1]!["role"], "toolResult");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // ── No-op cases ────────────────────────────────────────────────────────
 
 test("settle: no-op when no frames carry tool_call (clean text-only turn)", async () => {

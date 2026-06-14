@@ -541,7 +541,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function localMessagePayload(value: unknown): Record<string, unknown> | null {
+export function localMessagePayload(value: unknown): Record<string, unknown> | null {
   if (!isRecord(value)) return null;
   const nested = value["message"];
   if (isRecord(nested)) return nested;
@@ -555,13 +555,13 @@ function replaceLocalMessagePayload(record: unknown, nextPayload: Record<string,
   return nextPayload;
 }
 
-function pickPartsArray(m: Record<string, unknown>): LocalMessagePart[] {
+export function pickPartsArray(m: Record<string, unknown>): LocalMessagePart[] {
   if (Array.isArray(m["parts"])) return m["parts"] as LocalMessagePart[];
   if (Array.isArray(m["content"])) return m["content"] as LocalMessagePart[];
   return [];
 }
 
-function isToolCallPart(p: unknown): p is { type: "toolCall"; id: string; name?: string; arguments?: unknown } {
+export function isToolCallPart(p: unknown): p is { type: "toolCall"; id: string; name?: string; arguments?: unknown } {
   return isRecord(p) && p["type"] === "toolCall" && typeof p["id"] === "string";
 }
 
@@ -576,7 +576,7 @@ function conversationFilePath(
   return join(stateDir, "conversations", storeInternals.b64url(key), filename);
 }
 
-async function readJsonlOrEmpty(path: string): Promise<unknown[]> {
+export async function readJsonlOrEmpty(path: string): Promise<unknown[]> {
   try {
     const raw = await fsReadFile(path, "utf8");
     return raw
@@ -589,7 +589,7 @@ async function readJsonlOrEmpty(path: string): Promise<unknown[]> {
   }
 }
 
-async function atomicWriteJsonl(path: string, records: unknown[]): Promise<void> {
+export async function atomicWriteJsonl(path: string, records: unknown[]): Promise<void> {
   const dir = dirname(path);
   await fsMkdir(dir, { recursive: true });
   const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
