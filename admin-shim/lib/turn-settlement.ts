@@ -48,6 +48,13 @@ import type {
   LettaInnerEvent,
 } from "./types/letta-stream.js";
 import { _internals as storeInternals, listMessages } from "./store.js";
+import {
+  readJsonlOrEmpty,
+  atomicWriteJsonl,
+  localMessagePayload,
+  pickPartsArray,
+  isToolCallPart,
+} from "./conversation-healer.js";
 
 export type SettlementReason =
   | "cancelled"
@@ -153,12 +160,12 @@ export async function settleDanglingToolCallsFromFrames(
   );
   const isoNow = new Date(nowMs).toISOString();
   const reasonText = REASON_TEXT[args.reason];
-  const newRecords: unknown[] = [];
+  const syntheticById = new Map<string, unknown>();
   for (let i = 0; i < dangling.length; i += 1) {
     const id = dangling[i]!;
     const name = emitted.get(id) ?? "<unknown>";
     report.settled.push({ tool_call_id: id, tool_name: name });
-    newRecords.push({
+    syntheticById.set(id, {
       id: `synth-settle:${args.runId}:${id}`,
       role: "toolResult",
       parts: [{ type: "text", text: reasonText }],
@@ -176,8 +183,39 @@ export async function settleDanglingToolCallsFromFrames(
     });
   }
 
-  await appendJsonl(messagesPath, newRecords);
-  report.messagesAppended = newRecords.length;
+  // letta-mobile-5spje: insert each synthetic toolResult IMMEDIATELY AFTER the
+  // assistant message that declared its tool_call — NOT appended at the end of
+  // the file. Strict OpenAI-shaped providers (GPT-5.x, DeepSeek, lmstudio
+  // custom providers) require every `tool` message to directly follow its
+  // assistant `tool_calls` message; appending at the end produces an
+  // orphaned-by-position result that 400s with "Messages with role 'tool' must
+  // be a response to a preceding message with 'tool_calls'" on every replay.
+  // (Anthropic was lenient about position, so the old append-at-end path only
+  // wedged OpenAI-shaped conversations.) Read → splice-after-assistant →
+  // atomic rewrite, mirroring the device-verified LocalConversationHealer fix.
+  const records = await readJsonlOrEmpty(messagesPath);
+  const remaining = new Set(syntheticById.keys());
+  const rebuilt: unknown[] = [];
+  for (const record of records) {
+    rebuilt.push(record);
+    const payload = localMessagePayload(record);
+    if (!payload || payload["role"] !== "assistant") continue;
+    for (const part of pickPartsArray(payload)) {
+      if (!isToolCallPart(part)) continue;
+      const synthetic = syntheticById.get(part.id);
+      if (synthetic && remaining.has(part.id)) {
+        rebuilt.push(synthetic);
+        remaining.delete(part.id);
+      }
+    }
+  }
+  // Any dangling id whose declaring assistant isn't on disk (rare) — append at
+  // end as a last resort so the call is at least settled.
+  for (const id of remaining) {
+    rebuilt.push(syntheticById.get(id));
+  }
+  await atomicWriteJsonl(messagesPath, rebuilt);
+  report.messagesAppended = syntheticById.size;
 
   await writeSettlementAudit({
     conversationId: args.conversationId,
