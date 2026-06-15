@@ -40,7 +40,12 @@
 import {
   mkdir as fsMkdir,
   appendFile as fsAppendFile,
+  readFile as fsReadFile,
+  rename as fsRename,
+  unlink as fsUnlink,
+  writeFile as fsWriteFile,
 } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import type {
@@ -155,12 +160,16 @@ export async function settleDanglingToolCallsFromFrames(
   );
   const isoNow = new Date(nowMs).toISOString();
   const reasonText = REASON_TEXT[args.reason];
-  const newRecords: unknown[] = [];
+  const records = await readJsonlOrEmpty(messagesPath);
+  const synthByParent = new Map<number, unknown[]>();
   for (let i = 0; i < dangling.length; i += 1) {
     const id = dangling[i]!;
     const name = emitted.get(id) ?? "<unknown>";
+    const parentIdx = findAssistantToolCallIndex(records, id);
+    if (parentIdx < 0) continue;
     report.settled.push({ tool_call_id: id, tool_name: name });
-    newRecords.push({
+    const bucket = synthByParent.get(parentIdx) ?? [];
+    bucket.push({
       id: `synth-settle:${args.runId}:${id}`,
       role: "toolResult",
       parts: [{ type: "text", text: reasonText }],
@@ -176,10 +185,18 @@ export async function settleDanglingToolCallsFromFrames(
         conversation_id: args.conversationId,
       },
     });
+    synthByParent.set(parentIdx, bucket);
   }
 
-  await appendJsonl(messagesPath, newRecords);
-  report.messagesAppended = newRecords.length;
+  if (synthByParent.size > 0) {
+    const nextRecords: unknown[] = [];
+    for (let i = 0; i < records.length; i += 1) {
+      nextRecords.push(records[i]);
+      for (const record of synthByParent.get(i) ?? []) nextRecords.push(record);
+    }
+    await atomicWriteJsonl(messagesPath, nextRecords);
+  }
+  report.messagesAppended = [...synthByParent.values()].reduce((sum, recordsForParent) => sum + recordsForParent.length, 0);
 
   await writeSettlementAudit({
     conversationId: args.conversationId,
@@ -219,17 +236,80 @@ function conversationFilePath(
   return join(stateDir, "conversations", storeInternals.b64url(key), filename);
 }
 
-async function appendJsonl(path: string, records: unknown[]): Promise<void> {
-  if (records.length === 0) return;
-  // Append, not full rewrite — settlement adds a tail of new records to
-  // an otherwise-untouched transcript. Atomicity at the line level: each
-  // JSON.stringify is one line, written in one appendFile call. A crash
-  // mid-append could truncate the last line, which readJsonlOrEmpty
-  // tolerates (it filters blank/parse-fail lines).
+async function readJsonlOrEmpty(path: string): Promise<unknown[]> {
+  try {
+    const raw = await fsReadFile(path, "utf8");
+    return raw
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as unknown);
+  } catch {
+    return [];
+  }
+}
+
+async function atomicWriteJsonl(path: string, records: unknown[]): Promise<void> {
   const dir = dirname(path);
   await fsMkdir(dir, { recursive: true });
-  const payload = records.map((r) => JSON.stringify(r)).join("\n") + "\n";
-  await fsAppendFile(path, payload);
+  const tmp = `${path}.tmp.${process.pid}.${randomBytes(4).toString("hex")}`;
+  const payload = records.map((record) => JSON.stringify(record)).join("\n") + (records.length > 0 ? "\n" : "");
+  try {
+    await fsWriteFile(tmp, payload);
+    await fsRename(tmp, path);
+  } catch (err) {
+    try {
+      await fsUnlink(tmp);
+    } catch (cleanupErr) {
+      const msg = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+      console.warn(`[turn-settlement] failed to remove temp jsonl file ${tmp}: ${msg}`);
+    }
+    throw err;
+  }
+}
+
+function findAssistantToolCallIndex(records: unknown[], id: string): number {
+  for (let i = records.length - 1; i >= 0; i -= 1) {
+    const message = localMessagePayload(records[i]);
+    if (!message || message["role"] !== "assistant") continue;
+    if (assistantToolCallIds(message).includes(id)) return i;
+  }
+  return -1;
+}
+
+function localMessagePayload(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const nested = record["message"];
+  if (nested && typeof nested === "object" && !Array.isArray(nested)) return nested as Record<string, unknown>;
+  return record;
+}
+
+function assistantToolCallIds(message: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  for (const part of pickPartsArray(message)) {
+    if (part && typeof part === "object" && !Array.isArray(part)) {
+      const record = part as Record<string, unknown>;
+      if (record["type"] === "toolCall" && typeof record["id"] === "string") ids.push(record["id"]);
+    }
+  }
+  for (const key of ["tool_calls", "toolCalls"] as const) {
+    const calls = message[key];
+    if (!Array.isArray(calls)) continue;
+    for (const call of calls) {
+      if (call && typeof call === "object" && !Array.isArray(call)) {
+        const record = call as Record<string, unknown>;
+        if (typeof record["id"] === "string") ids.push(record["id"]);
+      }
+    }
+  }
+  return [...new Set(ids)];
+}
+
+function pickPartsArray(message: Record<string, unknown>): unknown[] {
+  if (Array.isArray(message["parts"])) return message["parts"];
+  if (Array.isArray(message["content"])) return message["content"];
+  return [];
 }
 
 async function writeSettlementAudit(args: {
