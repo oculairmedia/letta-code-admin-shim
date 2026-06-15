@@ -58,6 +58,7 @@ import {
 
 export type SettlementReason =
   | "cancelled"
+  | "requires_approval"
   | "turn_timeout"
   | "worker_exit"
   | "stream_dropped";
@@ -70,6 +71,7 @@ export type SettlementReason =
  */
 const REASON_TEXT: Record<SettlementReason, string> = {
   cancelled: "Tool execution interrupted by cancellation",
+  requires_approval: "Tool execution interrupted because approval was required",
   turn_timeout: "Tool execution interrupted by turn timeout",
   worker_exit: "Tool execution interrupted by worker exit",
   stream_dropped: "Tool execution interrupted by stream drop",

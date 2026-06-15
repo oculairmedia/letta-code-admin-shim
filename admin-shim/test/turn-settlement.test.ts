@@ -15,6 +15,8 @@ import { join } from "node:path";
 import {
   settleDanglingToolCallsFromFrames,
 } from "../lib/turn-settlement.js";
+import { finalizeTurnLifecycle } from "../lib/agent-pool.js";
+import { createRun } from "../lib/runs.js";
 import type { LettaStreamFrame } from "../lib/types/letta-stream.js";
 
 function b64url(s: string): string {
@@ -46,6 +48,14 @@ function readMessages(convDir: string): Record<string, unknown>[] {
   return raw.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
+function assistantToolCall(id: string, name = "Bash"): Record<string, unknown> {
+  return {
+    id: `assistant-${id}`,
+    role: "assistant",
+    content: [{ type: "toolCall", id, name, arguments: {} }],
+  };
+}
+
 function toolCallFrame(toolName: string, toolCallId: string): LettaStreamFrame {
   return {
     type: "stream_event",
@@ -72,6 +82,19 @@ function approvalRequestFrame(toolName: string, toolCallId: string): LettaStream
   } as unknown as LettaStreamFrame;
 }
 
+function stopReasonFrame(stopReason: string): LettaStreamFrame {
+  return {
+    type: "stream_event",
+    session_id: "sess-test",
+    uuid: `uuid-stop-${stopReason}`,
+    timestamp: new Date().toISOString(),
+    event: {
+      message_type: "stop_reason",
+      stop_reason: stopReason,
+    },
+  } as unknown as LettaStreamFrame;
+}
+
 // ── Detection: frames carry tool_call.tool_call_id from both shapes ────
 
 test("settle: collects ids from tool_call_message AND approval_request_message frames", async () => {
@@ -79,6 +102,7 @@ test("settle: collects ids from tool_call_message AND approval_request_message f
   try {
     const agent = "agent-test-1";
     const conv = seedConv(stateDir, "default", agent);
+    writeMessages(conv, [assistantToolCall("toolu_aaa", "Bash"), assistantToolCall("toolu_bbb", "Edit")]);
     const before = new Set<string>(); // empty transcript
 
     const report = await settleDanglingToolCallsFromFrames({
@@ -101,6 +125,7 @@ test("settle: collects ids from tool_call_message AND approval_request_message f
     const onDisk = readMessages(conv);
     const synths = onDisk.filter((m) => m["role"] === "toolResult");
     assert.equal(synths.length, 2);
+    assert.deepEqual(onDisk.map((m) => m["role"]), ["assistant", "toolResult", "assistant", "toolResult"]);
     for (const s of synths) {
       assert.equal(s["isError"], true);
       assert.ok(typeof s["toolCallId"] === "string");
@@ -238,11 +263,13 @@ test("settle: only writes a synth toolResult for the dangling id", async () => {
     const convDir = seedConv(stateDir, "default", agent);
     writeMessages(convDir, [
       { id: "ui-msg-1", role: "user", content: [{ type: "text", text: "hi" }] },
+      assistantToolCall("toolu_dangling", "Edit"),
     ]);
-    const before = new Set<string>(["ui-msg-1"]);
+    const before = new Set<string>(["ui-msg-1", "assistant-toolu_dangling"]);
     // Two tool calls emitted; only one returned on disk.
     writeMessages(convDir, [
       { id: "ui-msg-1", role: "user", content: [{ type: "text", text: "hi" }] },
+      assistantToolCall("toolu_dangling", "Edit"),
       {
         id: "ui-msg-2",
         role: "toolResult",
@@ -270,11 +297,12 @@ test("settle: only writes a synth toolResult for the dangling id", async () => {
     assert.equal(report.messagesAppended, 1);
 
     const onDisk = readMessages(convDir);
-    const synth = onDisk.find((m) => String(m["id"]).startsWith("synth-settle:"));
-    assert.ok(synth, "synthetic toolResult missing");
-    assert.equal(synth!["toolCallId"], "toolu_dangling");
-    assert.equal(synth!["isError"], true);
-    const text = (synth!["content"] as Array<{ text: string }>)[0]!.text;
+    assert.equal(onDisk[1]?.["id"], "assistant-toolu_dangling");
+    const synth = onDisk[2];
+    assert.ok(String(synth?.["id"]).startsWith("synth-settle:"), "synthetic toolResult missing");
+    assert.equal(synth?.["toolCallId"], "toolu_dangling");
+    assert.equal(synth?.["isError"], true);
+    const text = (synth?.["content"] as Array<{ text: string }>)[0]!.text;
     assert.match(text, /turn timeout/);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
@@ -298,6 +326,7 @@ test("settle: reason text matches the SettlementReason variant", async () => {
     for (const [reason, pattern] of cases) {
       const fresh = makeTempStateDir();
       const convDir = seedConv(fresh, "default", agent);
+      writeMessages(convDir, [assistantToolCall(`toolu_${reason}`)]);
       const report = await settleDanglingToolCallsFromFrames({
         frames: [toolCallFrame("Bash", `toolu_${reason}`)],
         conversationId: "default",
@@ -309,10 +338,50 @@ test("settle: reason text matches the SettlementReason variant", async () => {
       });
       assert.equal(report.messagesAppended, 1);
       const onDisk = readMessages(convDir);
-      const text = (onDisk[0]!["content"] as Array<{ text: string }>)[0]!.text;
+      const text = (onDisk[1]!["content"] as Array<{ text: string }>)[0]!.text;
       assert.match(text, pattern, `expected ${pattern} for reason=${reason}, got ${text}`);
       rmSync(fresh, { recursive: true, force: true });
     }
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("finalizeTurnLifecycle: requires_approval settles emitted tool calls before next turn", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agent = "agent-test-approval";
+    const convDir = seedConv(stateDir, "default", agent);
+    writeMessages(convDir, [
+      { id: "ui-msg-1", role: "user", parts: [{ type: "text", text: "run a tool" }] },
+      assistantToolCall("toolu_needs_approval", "Bash"),
+    ]);
+    const before = new Set<string>(["ui-msg-1", "assistant-toolu_needs_approval"]);
+    const runHandle = createRun({ agentId: agent, conversationId: "default" });
+
+    await finalizeTurnLifecycle({
+      runHandle,
+      frames: [
+        toolCallFrame("Bash", "toolu_needs_approval"),
+        stopReasonFrame("requires_approval"),
+      ],
+      conversationId: "default",
+      agentId: agent,
+      messageIdsBefore: before,
+      turnStartedAt: new Date("2026-06-01T00:00:00.000Z"),
+      cancelled: false,
+      finishedExit: false,
+      finishedTimeout: false,
+    });
+
+    const onDisk = readMessages(convDir);
+    assert.equal(onDisk[1]?.["id"], "assistant-toolu_needs_approval");
+    const synth = onDisk[2];
+    assert.ok(String(synth?.["id"]).startsWith(`synth-settle:${runHandle.id}:`), "requires_approval turn must settle the dangling tool call");
+    assert.equal(synth?.["toolCallId"], "toolu_needs_approval");
+    assert.equal(synth?.["isError"], true);
+    const text = (synth?.["content"] as Array<{ text: string }>)[0]!.text;
+    assert.match(text, /approval was required/i);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -324,7 +393,8 @@ test("settle: writes settlements.jsonl audit entry alongside run state", async (
   const stateDir = makeTempStateDir();
   try {
     const agent = "agent-test-6";
-    seedConv(stateDir, "default", agent);
+    const convDir = seedConv(stateDir, "default", agent);
+    writeMessages(convDir, [assistantToolCall("toolu_aud")]);
     const runId = "run-audit-test";
     await settleDanglingToolCallsFromFrames({
       frames: [toolCallFrame("Bash", "toolu_aud")],

@@ -79,7 +79,7 @@ export function detectDanglingToolUses(errorPayload: unknown): string[] {
   const colonIdx = text.indexOf("after:");
   if (colonIdx < 0) return [];
   const tail = text.slice(colonIdx);
-  const matches = tail.match(/toolu_[A-Za-z0-9_-]+/g) ?? [];
+  const matches = extractToolCallIds(tail);
   // De-dupe while preserving order — same ID can appear in both the
   // human-readable list and a later "Each tool_use block ..." sentence.
   const seen = new Set<string>();
@@ -95,15 +95,18 @@ export function detectDanglingToolUses(errorPayload: unknown): string[] {
 
 /**
  * Match provider errors for the inverse corrupt-tool shape: a serialized
- * `tool_result` has no corresponding `tool_use` in the immediately preceding
- * assistant message. Once such a stale toolResult is on disk, every later turn
+ * tool result has no corresponding tool call in the immediately preceding
+ * assistant message. Once such a stale result is on disk, every later turn
  * fails before the model can respond.
  */
 export function detectUnexpectedToolResults(errorPayload: unknown): string[] {
   const text = extractErrorText(errorPayload);
   if (!text) return [];
-  if (!/unexpected[^]+?tool_use_id[^]+?tool_result/i.test(text)) return [];
-  const matches = text.match(/toolu_[A-Za-z0-9_-]+/g) ?? [];
+  const isAnthropic = /unexpected[^]+?tool_use_id[^]+?tool_result/i.test(text);
+  const isOpenAi = /role .?tool.?[^]+?response to a preceding message[^]+?.?tool_calls?/i.test(text)
+    || /messages\.[^]+?role .?tool.?[^]+?must be a response[^]+?.?tool_calls?/i.test(text);
+  if (!isAnthropic && !isOpenAi) return [];
+  const matches = extractToolCallIds(text);
   const seen = new Set<string>();
   const out: string[] = [];
   for (const id of matches) {
@@ -113,6 +116,10 @@ export function detectUnexpectedToolResults(errorPayload: unknown): string[] {
     }
   }
   return out;
+}
+
+function extractToolCallIds(text: string): string[] {
+  return text.match(/toolu_[A-Za-z0-9_-]+|call_(?!id\b)[A-Za-z0-9_-]+/g) ?? [];
 }
 
 /**
@@ -214,22 +221,21 @@ export async function healConversation(
   // First pass: classify each dangling ID.
   // Build maps of (id → indices of records that mention it).
   const toolCallSites = new Map<string, number[]>(); // assistant message indices carrying this tool_use
-  const toolResultSites = new Map<string, number[]>(); // toolResult message indices for this id
+  const toolResultSites = new Map<string, number[]>(); // non-synthetic tool result message indices for this id
+  const staleSyntheticSites = new Map<string, number[]>(); // stale synthetic result indices for this id
 
   records.forEach((m, idx) => {
     const message = localMessagePayload(m);
     if (!message) return;
     if (message["role"] === "assistant") {
-      const parts = pickPartsArray(message);
-      for (const p of parts) {
-        if (isToolCallPart(p) && danglingIds.includes(p.id)) {
-          push(toolCallSites, p.id, idx);
-        }
+      for (const id of assistantToolCallIds(message)) {
+        if (danglingIds.includes(id)) push(toolCallSites, id, idx);
       }
-    } else if (message["role"] === "toolResult") {
-      const tcid = message["toolCallId"];
-      if (typeof tcid === "string" && danglingIds.includes(tcid)) {
-        push(toolResultSites, tcid, idx);
+    } else if (isToolResultMessage(message)) {
+      const tcid = toolResultCallId(message);
+      if (tcid && danglingIds.includes(tcid)) {
+        if (isSyntheticToolResult(message)) push(staleSyntheticSites, tcid, idx);
+        else push(toolResultSites, tcid, idx);
       }
     }
   });
@@ -290,13 +296,19 @@ export async function healConversation(
     }
   }
 
-  // (b) For each "settled" id: append a synthetic error toolResult at
-  //     the end of the transcript. Order matters less than presence
-  //     since letta-code's serializer groups consecutive toolResult
-  //     records into a single API user message, but appending at the
-  //     end keeps the disk record monotonic-ish.
+  // Remove stale synthetic heal/settle results before re-inserting them in
+  // strict provider order. A synthetic result appended at transcript tail is
+  // still invalid for OpenAI/GPT-style tool adjacency.
+  for (const id of report.settled) {
+    for (const ridx of staleSyntheticSites.get(id) ?? []) removedIndices.add(ridx);
+  }
+
+  // (b) For each "settled" id: insert a synthetic error toolResult
+  //     immediately after the assistant message containing the matching
+  //     tool call. OpenAI/GPT tool transcripts require positional adjacency:
+  //     assistant(tool_calls=[id]) must be followed by tool(tool_call_id=id).
   const nowMs = opts.now ?? Date.now();
-  const synthAppend: LocalMessage[] = [];
+  const synthByParent = new Map<number, LocalMessage[]>();
   for (const id of report.settled) {
     const sites = toolCallSites.get(id) ?? [];
     if (sites.length === 0) continue;
@@ -312,7 +324,8 @@ export async function healConversation(
       }
     }
     const parentId = typeof parent["id"] === "string" ? parent["id"] : "synth-parent";
-    synthAppend.push({
+    const parentIdx = sites[sites.length - 1]!;
+    const synth = {
       id: `${parentId}:heal-tool-result:${id}`,
       role: "toolResult",
       parts: [{ type: "text", text: "[healed: tool execution interrupted, no result recorded]" }],
@@ -330,20 +343,23 @@ export async function healConversation(
           conversation_id: conversationId,
         },
       } as Record<string, unknown>),
-    } as unknown as LocalMessage);
+    } as unknown as LocalMessage;
+    const bucket = synthByParent.get(parentIdx) ?? [];
+    bucket.push(synth);
+    synthByParent.set(parentIdx, bucket);
   }
 
-  // Materialize the final list (skip removed indices, then append synth).
+  // Materialize the final list (skip removed indices, insert synth after parents).
   const nextRecords: unknown[] = [];
   for (let i = 0; i < edited.length; i += 1) {
     if (removedIndices.has(i)) continue;
     nextRecords.push(edited[i]);
+    for (const m of synthByParent.get(i) ?? []) nextRecords.push(m);
   }
-  for (const m of synthAppend) nextRecords.push(m);
 
   report.messagesEdited = editedMessageIds.size;
   report.messagesRemoved = removedIndices.size;
-  report.messagesAppended = synthAppend.length;
+  report.messagesAppended = [...synthByParent.values()].reduce((sum, recordsForParent) => sum + recordsForParent.length, 0);
 
   // Atomic write. Same .tmp+rename pattern store.ts uses for the JSON
   // sidecars — partial writes on crash leave the original intact.
@@ -469,9 +485,9 @@ export async function healUnexpectedToolResults(
   records.forEach((record, idx) => {
     const message = localMessagePayload(record);
     if (!message) return;
-    if (message["role"] === "toolResult") {
-      const toolCallId = message["toolCallId"];
-      if (typeof toolCallId !== "string" || !wanted.has(toolCallId)) return;
+    if (isToolResultMessage(message)) {
+      const toolCallId = toolResultCallId(message);
+      if (!toolCallId || !wanted.has(toolCallId)) return;
       removeIndices.push(idx);
       removed.push(toolCallId);
       return;
@@ -563,6 +579,38 @@ export function pickPartsArray(m: Record<string, unknown>): LocalMessagePart[] {
 
 export function isToolCallPart(p: unknown): p is { type: "toolCall"; id: string; name?: string; arguments?: unknown } {
   return isRecord(p) && p["type"] === "toolCall" && typeof p["id"] === "string";
+}
+
+function assistantToolCallIds(message: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  for (const part of pickPartsArray(message)) {
+    if (isToolCallPart(part)) ids.push(part.id);
+  }
+  for (const key of ["tool_calls", "toolCalls"] as const) {
+    const calls = message[key];
+    if (!Array.isArray(calls)) continue;
+    for (const call of calls) {
+      if (isRecord(call) && typeof call["id"] === "string") ids.push(call["id"]);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+function isToolResultMessage(message: Record<string, unknown>): boolean {
+  return message["role"] === "toolResult" || message["role"] === "tool";
+}
+
+function toolResultCallId(message: Record<string, unknown>): string | null {
+  const localId = message["toolCallId"];
+  if (typeof localId === "string") return localId;
+  const openAiId = message["tool_call_id"];
+  if (typeof openAiId === "string") return openAiId;
+  return null;
+}
+
+function isSyntheticToolResult(message: Record<string, unknown>): boolean {
+  const id = message["id"];
+  return typeof id === "string" && (id.startsWith("synth-settle:") || id.includes(":heal-tool-result:"));
 }
 
 function conversationFilePath(

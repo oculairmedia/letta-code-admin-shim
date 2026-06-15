@@ -496,10 +496,18 @@ export async function finalizeTurnLifecycle(args: {
   // boundary) — defense in depth. Reason is sourced from the caller's
   // local lifecycle state; "stream_dropped" is the catch-all for cases
   // where no result frame arrived and none of the explicit flags fired.
-  const cleanFinish = !cancelled && !finishedTimeout && !finishedExit && Boolean(stopFrame);
+  const lifecycleStopReason: string | null = (() => {
+    if (!stopFrame) return null;
+    const ev = frameEvent(stopFrame);
+    if ("stop_reason" in ev && typeof ev.stop_reason === "string") return ev.stop_reason;
+    return null;
+  })();
+  const requiresApproval = lifecycleStopReason === "requires_approval";
+  const cleanFinish = !cancelled && !finishedTimeout && !finishedExit && Boolean(stopFrame) && !requiresApproval;
   if (!cleanFinish) {
     const settleReason: SettlementReason =
       cancelled ? "cancelled"
+      : requiresApproval ? "requires_approval"
       : finishedTimeout ? "turn_timeout"
       : finishedExit ? "worker_exit"
       : "stream_dropped";
