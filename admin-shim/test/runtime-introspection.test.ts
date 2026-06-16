@@ -23,12 +23,19 @@ import {
   getContextUtilizationSummary,
   detectModelChange,
   seedModelHandle,
+  buildSubagentSummaryLine,
   buildConnectionReminder,
   __clearRuntimeState,
+  __setListActiveSubagentsForTest,
   type SessionRole,
 } from "../lib/runtime-introspection.js";
 
 import { getStorageDir } from "../lib/runs.js";
+import {
+  recordSubagentDispatch,
+  __resetSubagentRegistry,
+  type SubagentEntry,
+} from "../lib/subagent-registry.js";
 
 // ── temp backend dir harness ────────────────────────────────────────────
 
@@ -67,6 +74,26 @@ function writeSystemPrompt(agentId: string, conversationId: string, content: str
   const memDir = join(getStorageDir(), "memfs", agentId, "memory", "system");
   mkdirSync(memDir, { recursive: true });
   writeFileSync(join(memDir, "system_prompt.md"), content);
+}
+
+function runningSubagent(input: Partial<SubagentEntry> & { toolCallId: string; startedAt: string }): SubagentEntry {
+  return {
+    toolCallId: input.toolCallId,
+    taskId: input.taskId ?? null,
+    description: input.description ?? null,
+    subagentType: input.subagentType ?? null,
+    runInBackground: input.runInBackground ?? true,
+    status: "running",
+    failureReason: null,
+    parentRunId: input.parentRunId ?? null,
+    source: input.source ?? "letta",
+    subagentAgentId: input.subagentAgentId ?? null,
+    todo_progress: input.todo_progress ?? null,
+    subagentConversationId: input.subagentConversationId ?? null,
+    logFile: input.logFile ?? null,
+    startedAt: input.startedAt,
+    endedAt: null,
+  };
 }
 
 // ── Test 1: session role get/set ────────────────────────────────────────
@@ -208,7 +235,63 @@ test("model change: null model is a no-op", () => {
   assert.equal(delta, null);
 });
 
-// ── Test 5: buildConnectionReminder ─────────────────────────────────────
+// ── Test 5: subagent summary ────────────────────────────────────────────
+
+test("buildSubagentSummaryLine: returns null when no subagents are running", () => {
+  __resetSubagentRegistry();
+  try {
+    assert.equal(buildSubagentSummaryLine(Date.parse("2025-01-01T00:00:00.000Z")), null);
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("buildSubagentSummaryLine: lists running subagents with elapsed time", () => {
+  const nowMs = Date.parse("2025-01-01T00:04:30.000Z");
+  __setListActiveSubagentsForTest(() => [
+    runningSubagent({
+      toolCallId: "toolu_worker_1",
+      subagentType: "worker",
+      description: "feat/x branch implementation task",
+      startedAt: "2025-01-01T00:00:00.000Z",
+    }),
+    runningSubagent({
+      toolCallId: "toolu_tester_2",
+      subagentType: "tester",
+      description: "test/y",
+      startedAt: "2025-01-01T00:03:00.000Z",
+    }),
+  ]);
+  try {
+    const line = buildSubagentSummaryLine(nowMs);
+    assert.equal(
+      line,
+      "Subagents: 2 running — worker (feat/x branch implementation…, 4m), tester (test/y, 1m)",
+    );
+  } finally {
+    __clearRuntimeState();
+  }
+});
+
+test("buildSubagentSummaryLine: flags entries older than soft threshold as stuck-suspected", () => {
+  const nowMs = Date.parse("2025-01-01T00:12:00.000Z");
+  __setListActiveSubagentsForTest(() => [
+    runningSubagent({
+      toolCallId: "toolu_builder_3",
+      subagentType: "builder",
+      description: "build assets",
+      startedAt: "2025-01-01T00:00:00.000Z",
+    }),
+  ]);
+  try {
+    const line = buildSubagentSummaryLine(nowMs);
+    assert.equal(line, "Subagents: ⚠ 1 stuck-suspected — builder (build assets, 12m)");
+  } finally {
+    __clearRuntimeState();
+  }
+});
+
+// ── Test 6: buildConnectionReminder ─────────────────────────────────────
 
 test("buildConnectionReminder: includes model, context, and role", async () => {
   await withBackendDir(() => {
@@ -236,6 +319,59 @@ test("buildConnectionReminder: reflects fork role", async () => {
   });
 });
 
+test("buildConnectionReminder: includes subagent summary when subagents are running", async () => {
+  await withBackendDir(() => {
+    __resetSubagentRegistry();
+    try {
+      writeAgent("agent-1", { model: "lmstudio/model-x" });
+      recordSubagentDispatch({
+        toolCallId: "toolu_context_subagent",
+        parentRunId: "run-parent",
+        args: {
+          subagent_type: "worker",
+          description: "ambient status",
+          run_in_background: true,
+        },
+      });
+
+      const reminder = buildConnectionReminder("agent-1", "default");
+      assert.match(reminder, /Subagents: 1 running — worker \(ambient status, \d+s\)/);
+    } finally {
+      __resetSubagentRegistry();
+    }
+  });
+});
+
+test("buildConnectionReminder: omits subagent summary when none are running", async () => {
+  await withBackendDir(() => {
+    __resetSubagentRegistry();
+    try {
+      writeAgent("agent-1", { model: "lmstudio/model-x" });
+      const reminder = buildConnectionReminder("agent-1", "default");
+      assert.equal(reminder.includes("Subagents:"), false);
+    } finally {
+      __resetSubagentRegistry();
+    }
+  });
+});
+
+test("buildConnectionReminder: fail-opens when subagent summary throws", async () => {
+  await withBackendDir(() => {
+    writeAgent("agent-1", { model: "lmstudio/model-x" });
+    __setListActiveSubagentsForTest(() => {
+      throw new Error("registry unavailable");
+    });
+    try {
+      const reminder = buildConnectionReminder("agent-1", "default");
+      assert.match(reminder, /Serving model: lmstudio\/model-x/);
+      assert.match(reminder, /Session role: main/);
+      assert.equal(reminder.includes("Subagents:"), false);
+    } finally {
+      __clearRuntimeState();
+    }
+  });
+});
+
 test("buildConnectionReminder: returns empty string when no data", async () => {
   await withBackendDir(() => {
     // Agent exists but has no model and empty system → context may still produce something
@@ -257,7 +393,7 @@ test("buildConnectionReminder: returns empty string when no data", async () => {
   });
 });
 
-// ── Test 6: system-reminder format compliance ───────────────────────────
+// ── Test 7: system-reminder format compliance ───────────────────────────
 
 test("system-reminder format: valid XML-like tags", () => {
   setSessionRole("agent-1", "conv-1", "main");
@@ -281,7 +417,7 @@ test("system-reminder format: delta model-change reminders are strip-able", () =
   assert.equal(stripped, "");
 });
 
-// ── Test 7: clearRuntimeState resets everything ─────────────────────────
+// ── Test 8: clearRuntimeState resets everything ─────────────────────────
 
 test("clearRuntimeState: resets session roles", () => {
   setSessionRole("agent-1", "conv-1", "fork");
