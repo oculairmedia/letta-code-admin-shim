@@ -21,6 +21,7 @@
  */
 
 import { getAgentRecord, readSystemPrompt } from "./store.js";
+import { listActiveSubagents } from "./subagent-registry.js";
 
 export type SessionRole = "main" | "fork" | "subagent";
 
@@ -182,6 +183,74 @@ export function seedModelHandle(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Subagent summary
+// ──────────────────────────────────────────────────────────────────────
+
+const SUBAGENT_STUCK_SOFT_MS = (() => {
+  const n = Number(process.env["SHIM_SUBAGENT_STUCK_SOFT_MS"] ?? 300_000);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 300_000;
+})();
+
+let listActiveSubagentsForRuntime = listActiveSubagents;
+
+function truncateText(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function formatElapsed(ms: number): string {
+  const safeMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
+  const totalSeconds = Math.floor(safeMs / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  return `${totalHours}h`;
+}
+
+function shortSubagentId(toolCallId: string): string {
+  return toolCallId.length <= 8 ? toolCallId : toolCallId.slice(-8);
+}
+
+function truncateLine(line: string, maxLength = 220): string {
+  if (line.length <= maxLength) return line;
+  return `${line.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+/**
+ * Build a compact one-line summary of currently-running subagents.
+ * Returns null when no subagents are active so the connection reminder
+ * stays quiet unless there is live work to surface.
+ */
+export function buildSubagentSummaryLine(nowMs = Date.now()): string | null {
+  const active = listActiveSubagentsForRuntime();
+  if (active.length === 0) return null;
+
+  const running: string[] = [];
+  const stuck: string[] = [];
+
+  for (const entry of active) {
+    const startedMs = Date.parse(entry.startedAt);
+    const elapsedMs = Number.isNaN(startedMs) ? 0 : Math.max(0, nowMs - startedMs);
+    const label = entry.subagentType ?? shortSubagentId(entry.toolCallId);
+    const description = entry.description ? truncateText(entry.description, 30) : "no description";
+    const summary = `${label} (${description}, ${formatElapsed(elapsedMs)})`;
+    if (elapsedMs > SUBAGENT_STUCK_SOFT_MS) stuck.push(summary);
+    else running.push(summary);
+  }
+
+  const parts: string[] = [];
+  if (running.length > 0) {
+    parts.push(`${running.length} running — ${running.join(", ")}`);
+  }
+  if (stuck.length > 0) {
+    parts.push(`⚠ ${stuck.length} stuck-suspected — ${stuck.join(", ")}`);
+  }
+
+  return truncateLine(`Subagents: ${parts.join("; ")}`);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Connection reminder builder
 // ──────────────────────────────────────────────────────────────────────
 
@@ -209,6 +278,13 @@ export function buildConnectionReminder(
     if (model) lines.push(`Serving model: ${model}`);
     if (ctx) lines.push(`Context utilization: ${ctx}`);
     lines.push(`Session role: ${role}`);
+    try {
+      const subagents = buildSubagentSummaryLine();
+      if (subagents) lines.push(subagents);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[runtime-introspection] subagent summary failed (fail-open): ${msg}`);
+    }
 
     if (lines.length === 0) return "";
 
@@ -227,4 +303,10 @@ export function buildConnectionReminder(
 /** Drop all in-process runtime state (test-only). */
 export function __clearRuntimeState(): void {
   conversationState.clear();
+  listActiveSubagentsForRuntime = listActiveSubagents;
+}
+
+/** Override active-subagent enumeration (test-only). */
+export function __setListActiveSubagentsForTest(fn: typeof listActiveSubagents): void {
+  listActiveSubagentsForRuntime = fn;
 }
