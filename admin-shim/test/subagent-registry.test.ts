@@ -274,6 +274,55 @@ test("subagent-registry: rehydrate flips running entry whose log already complet
   }
 });
 
+test("subagent-registry: liveness sweep fails no-logFile running entry as orphaned", () => {
+  __resetSubagentRegistry();
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    const entry = recordSubagentDispatch({
+      toolCallId: tcid,
+      parentRunId: "run-no-logfile",
+      args: { description: "Dispatch never produced a log", run_in_background: true },
+    });
+    const events: string[] = [];
+    const unsubscribe = subscribeSubagentEvents((event) => {
+      if (event.subagent.toolCallId === tcid) events.push(`${event.reason}:${event.subagent.failureReason ?? ""}`);
+    });
+
+    const swept = sweepOrphanedSubagents(Date.parse(entry.startedAt) + 90_001);
+
+    unsubscribe();
+    assert.equal(swept, 1);
+    const sweptEntry = getSubagent(tcid);
+    assert.equal(sweptEntry?.status, "failed");
+    assert.equal(sweptEntry?.failureReason, "orphaned");
+    assert.deepEqual(events, ["failed:orphaned"]);
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("subagent-registry: liveness sweep leaves fresh running log active", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-fresh-sweep-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_92.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\nworking\n");
+    const fresh = new Date();
+    utimesSync(logFile, fresh, fresh);
+    ingestParentFrame(dispatchFrame(tcid, "Fresh worker"), "run-fresh");
+    ingestParentFrame(returnFrame(tcid, "task_92", "agent-local-abc12345-bbbb-cccc-dddd-eeeeeeeeeeee", logFile), "run-fresh");
+
+    const swept = sweepOrphanedSubagents(Date.now());
+
+    assert.equal(swept, 0);
+    assert.equal(getSubagent(tcid)?.status, "running");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
 test("subagent-registry: liveness sweep fails stale running log as orphaned", () => {
   __resetSubagentRegistry();
   const stateDir = join(tmpdir(), `shim-orphan-sweep-${Math.random().toString(36).slice(2)}`);

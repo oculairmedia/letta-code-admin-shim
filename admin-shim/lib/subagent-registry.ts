@@ -154,6 +154,16 @@ const SUBAGENT_LIVENESS_SWEEP_MS = (() => {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 60_000;
 })();
 
+/**
+ * No-logfile orphan window. Dispatches that never produce an Output file
+ * have not started streaming, so bound them sooner than the 600s stream
+ * timeout while leaving healthy, log-writing subagents on the longer window.
+ */
+const SUBAGENT_NO_LOGFILE_TIMEOUT_MS = (() => {
+  const n = Number(process.env["SHIM_SUBAGENT_NO_LOGFILE_TIMEOUT_MS"] ?? 90_000);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 90_000;
+})();
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -596,7 +606,15 @@ export function rehydrateRunningSubagentWatchdogs(): void {
 export function sweepOrphanedSubagents(nowMs = Date.now()): number {
   let swept = 0;
   for (const entry of _subagents.values()) {
-    if (entry.status !== "running" || !entry.logFile) continue;
+    if (entry.status !== "running") continue;
+    if (!entry.logFile) {
+      const startedMs = Date.parse(entry.startedAt);
+      if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
+        finalize(entry.toolCallId, "failed", "orphaned");
+        swept += 1;
+      }
+      continue;
+    }
     if (logHasCompletedMarker(entry.logFile)) continue;
     try {
       const stat = statSync(entry.logFile);
@@ -605,7 +623,11 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
         swept += 1;
       }
     } catch {
-      // Missing/unreadable logs remain bounded by the normal stream timeout.
+      const startedMs = Date.parse(entry.startedAt);
+      if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
+        finalize(entry.toolCallId, "failed", "orphaned");
+        swept += 1;
+      }
     }
   }
   return swept;
