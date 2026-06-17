@@ -24,6 +24,7 @@ import {
   publishSkillToStore,
   readInstalledSkillDescriptions,
   searchSkills,
+  listSkillSlashCommands,
   syncSkillsBlockForAgent,
   uninstallSkillFromAgent,
 } from "../lib/store.js";
@@ -135,6 +136,42 @@ test("skills: searchSkills matches by keyword and by tag", () => {
 
   // no match
   assert.deepEqual(searchSkills("nonexistent-xyz"), []);
+});
+
+test("skills: slash commands expose compact skill invocations", () => {
+  writeGlobalSkill({ name: "alpha", description: "Alpha helper" });
+  writeGlobalSkill({ name: "beta", description: "Beta helper" });
+  installSkillToAgent(AGENT, "alpha");
+
+  assert.deepEqual(listSkillSlashCommands(), [
+    {
+      name: "alpha",
+      command: "/alpha",
+      description: "Alpha helper",
+      skill_name: "alpha",
+      source: "global_skill",
+      installed: true,
+    },
+    {
+      name: "beta",
+      command: "/beta",
+      description: "Beta helper",
+      skill_name: "beta",
+      source: "global_skill",
+      installed: false,
+    },
+  ]);
+
+  assert.deepEqual(listSkillSlashCommands(AGENT), [
+    {
+      name: "alpha",
+      command: "/alpha",
+      description: "Alpha helper",
+      skill_name: "alpha",
+      source: "agent_skill",
+      installed: true,
+    },
+  ]);
 });
 
 test("skills: install to agent, list installed, then uninstall", () => {
