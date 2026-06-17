@@ -4,11 +4,28 @@ The shim exposes a **skills** system: a global registry of reusable agent
 capabilities plus per-agent installation. This document is the contract the
 app/mobile/web client codes against.
 
+## Configuration — where the global registry lives
+
+The global skills directory is resolved in this order:
+
+1. **`LETTA_SKILLS_DIR`** — explicit absolute path to the skills root. Set this
+   when your skills live outside the default (e.g. `/opt/letta/skills`,
+   `/srv/skills`, a shared volume, etc.). Highest priority.
+2. **`LETTA_HOME`** → `<LETTA_HOME>/skills` — if you relocate the whole Letta
+   home, skills follow.
+3. **`~/.letta/skills`** — final fallback (`HOME` of the shim process).
+
+`GET /v1/skills` returns the resolved path in `skills_dir` so you can confirm
+which directory is active without shelling into the host. Per-agent installs
+always live under `<storageDir>/agents/<agentId>/skills/` regardless of this
+setting.
+
 ## Concepts
 
 - **Global registry** — the shared catalog of available skills, stored on the
-  shim host under `~/.letta/skills/<name>/SKILL.md` (overridable via
-  `LETTA_SKILLS_DIR`). Catalog entries are keyed by `name`.
+  shim host under the resolved skills directory (default `~/.letta/skills`,
+  overridable via `LETTA_SKILLS_DIR` — see Configuration above).
+  Catalog entries are keyed by `name`.
 - **Per-agent install** — a skill *copied* into an agent's state under
   `<storageDir>/agents/<agentId>/skills/<name>/`. Installs are **independent
   snapshots**: deleting a skill from the registry does NOT remove it from

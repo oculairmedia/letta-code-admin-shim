@@ -39,6 +39,7 @@ import {
   resolveConversationId,
   writeAgentRecord,
   listAvailableSkills,
+  skillsStoreDir,
   getSkillDetail,
   listInstalledSkillsForAgent,
   getInstalledSkillDetail,
@@ -1696,7 +1697,9 @@ function handlePermissionsMethodNotAllowed(req: IncomingMessage, res: ServerResp
 
 function handleSkillsList(_req: IncomingMessage, res: ServerResponse): void {
   const skills = listAvailableSkills();
-  json(res, 200, { skills });
+  // Surface the resolved global skills directory so operators can confirm
+  // which path LETTA_SKILLS_DIR / LETTA_HOME resolved to without shelling in.
+  json(res, 200, { skills, skills_dir: skillsStoreDir() });
 }
 
 function handleSlashCommandsList(_req: IncomingMessage, res: ServerResponse): void {

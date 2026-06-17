@@ -174,6 +174,12 @@ test("GET /v1/slash-commands returns compact skill command descriptors", async (
       installed: false,
     }],
   });
+
+  // GET /v1/skills surfaces the resolved skills directory (LETTA_SKILLS_DIR).
+  const list = await getJson(`${shim.url}/v1/skills`);
+  const listBody = list.body as { skills: unknown[]; skills_dir: string };
+  assert.equal(list.res.status, 200);
+  assert.equal(listBody.skills_dir, skillsDir);
 });
 
 // ── agents list / count / detail ────────────────────────────────────
