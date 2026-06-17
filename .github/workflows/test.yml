@@ -6,10 +6,22 @@ on:
   pull_request:
     branches: [master, main]
 
+# node-pty (a transitive dep of @letta-ai/letta-code) tries to compile a
+# native prebuild during `npm ci`, fetching node headers from nodejs.org.
+# That fetch intermittently ETIMEDOUTs on GitHub runners and, under the old
+# 5-minute job cap, hung until timeout — failing EVERY PR's shim-tests with
+# an empty test log even though the suite itself runs in ~8s. The shim tests
+# never use a PTY, so the native build is unnecessary noise. Fixes:
+#   - skip node-pty's source rebuild (npm_config_build_from_source=false)
+#   - retry npm ci once on transient network failure
+#   - give the job headroom above the real ~1-2 min worst case
+env:
+  npm_config_build_from_source: "false"
+
 jobs:
   shim-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +34,7 @@ jobs:
 
       - name: Install shim deps
         working-directory: admin-shim
-        run: npm ci
+        run: npm ci || (echo "npm ci failed, retrying once" && npm ci)
 
       - name: Run shim tests
         working-directory: admin-shim
@@ -30,7 +42,7 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +55,7 @@ jobs:
 
       - name: Install shim deps
         working-directory: admin-shim
-        run: npm ci
+        run: npm ci || (echo "npm ci failed, retrying once" && npm ci)
 
       - name: Run typecheck
         working-directory: admin-shim
