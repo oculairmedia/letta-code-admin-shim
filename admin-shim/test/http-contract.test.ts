@@ -12,7 +12,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -144,6 +145,35 @@ test("GET /v1/health (no trailing slash) is also served", async (t) => {
   const b = body as { status: string };
   assert.equal(res.status, 200);
   assert.equal(b.status, "ok");
+});
+
+// ── skills / slash commands ─────────────────────────────────────────
+
+test("GET /v1/slash-commands returns compact skill command descriptors", async (t) => {
+  const skillsDir = mkdtempSync(join(tmpdir(), "shim-http-skills-"));
+  t.after(() => rmSync(skillsDir, { recursive: true, force: true }));
+  const skillDir = join(skillsDir, "alpha");
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(
+    join(skillDir, "SKILL.md"),
+    "---\nname: alpha\ndescription: Alpha helper\n---\n\n# alpha\n\nFULL_BODY_MARKER\n",
+  );
+
+  const shim = await startShim({ env: { LETTA_SKILLS_DIR: skillsDir } });
+  t.after(() => shim.stop());
+
+  const { res, body } = await getJson(`${shim.url}/v1/slash-commands`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(body, {
+    commands: [{
+      name: "alpha",
+      command: "/alpha",
+      description: "Alpha helper",
+      skill_name: "alpha",
+      source: "global_skill",
+      installed: false,
+    }],
+  });
 });
 
 // ── agents list / count / detail ────────────────────────────────────

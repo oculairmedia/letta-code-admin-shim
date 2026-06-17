@@ -85,6 +85,14 @@ screen).
 404 → { "detail": "skill {name} not found" }
 ```
 
+#### `GET /v1/slash-commands`
+Return compact slash-command descriptors for the global skill catalog. This is
+for command pickers only; it does not include full SKILL.md bodies.
+
+```
+200 → { "commands": [{ "command": "/pdf", "skill_name": "pdf", ... }] }
+```
+
 ### Publish / remove (global registry write) — NEW
 
 #### `PUT /v1/skills/{name}`
@@ -159,6 +167,16 @@ Uninstall a skill from the agent.
 ```
 200 → { "name": "{name}", "uninstalled": true }
 404 → not installed for this agent
+```
+
+#### `GET /v1/agents/{agentId}/slash-commands`
+Return compact slash-command descriptors for the agent's installed skills only.
+Clients can render these as `/skill-name` suggestions while still fetching full
+instructions on demand through the installed-skill detail endpoint.
+
+```
+200 → { "commands": SlashCommand[] }
+404 → { "detail": "agent {agentId} not found" }
 ```
 
 ## Client UX guidance

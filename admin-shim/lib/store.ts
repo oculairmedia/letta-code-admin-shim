@@ -1339,6 +1339,20 @@ export interface SkillListingItem extends SkillManifest {
 }
 
 /**
+ * Slash-command descriptor surfaced to clients. Skills are invokable by name
+ * through the existing Skill tool; this shape lets apps render `/name`
+ * command pickers without loading full SKILL.md bodies.
+ */
+export interface SkillSlashCommand {
+  name: string;
+  command: string;
+  description: string;
+  skill_name: string;
+  source: "global_skill" | "agent_skill";
+  installed: boolean;
+}
+
+/**
  * Get the global skills store directory.
  *
  * The global registry is intentionally a USER-LEVEL shared store (default
@@ -2012,6 +2026,33 @@ export function searchSkills(query: string, tags?: string[]): SkillListingItem[]
 
     return true;
   });
+}
+
+function skillToSlashCommand(
+  skill: SkillManifest,
+  source: "global_skill" | "agent_skill",
+  installed: boolean,
+): SkillSlashCommand {
+  return {
+    name: skill.name,
+    command: `/${skill.name}`,
+    description: skill.description,
+    skill_name: skill.name,
+    source,
+    installed,
+  };
+}
+
+export function listSkillSlashCommands(agentId?: string): SkillSlashCommand[] {
+  if (agentId) {
+    return listInstalledSkillsForAgent(agentId)
+      .map((skill) => skillToSlashCommand(skill, "agent_skill", true))
+      .sort((a, b) => a.command.localeCompare(b.command));
+  }
+
+  return listAvailableSkills()
+    .map((skill) => skillToSlashCommand(skill, "global_skill", skill.installed_count > 0))
+    .sort((a, b) => a.command.localeCompare(b.command));
 }
 
 // ──────────────────────────────────────────────────────────────────────

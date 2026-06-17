@@ -45,6 +45,7 @@ import {
   installSkillToAgent,
   uninstallSkillFromAgent,
   searchSkills,
+  listSkillSlashCommands,
   publishSkillToStore,
   deleteSkillFromStore,
   _internals as storeInternals,
@@ -1698,6 +1699,15 @@ function handleSkillsList(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, { skills });
 }
 
+function handleSlashCommandsList(_req: IncomingMessage, res: ServerResponse): void {
+  json(res, 200, { commands: listSkillSlashCommands() });
+}
+
+function handleAgentSlashCommandsList(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  json(res, 200, { commands: listSkillSlashCommands(agentId) });
+}
+
 function handleSkillDetail(_req: IncomingMessage, res: ServerResponse, skillName: string): void {
   const skill = getSkillDetail(skillName);
   if (!skill) return notFound(res, `skill ${skillName}`);
@@ -2396,6 +2406,9 @@ const server = createServer((req, res) => {
     if (req.method === "GET") return handleSkillsList(req, res);
     if (req.method === "POST") return handleSkillsSearch(req, res);
   }
+  if (pathname === "/v1/slash-commands" || pathname === "/v1/slash-commands/") {
+    if (req.method === "GET") return handleSlashCommandsList(req, res);
+  }
   const skillDetail = pathname.match(/^\/v1\/skills\/([^/]+)\/?$/);
   if (skillDetail) {
     if (req.method === "GET") return handleSkillDetail(req, res, skillDetail[1]!);
@@ -2408,6 +2421,10 @@ const server = createServer((req, res) => {
   if (agentSkillsList) {
     if (req.method === "GET") return handleAgentSkillsList(req, res, agentSkillsList[1]!);
     if (req.method === "POST") return handleAgentSkillInstall(req, res, agentSkillsList[1]!);
+  }
+  const agentSlashCommandsList = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/slash-commands\/?$/);
+  if (agentSlashCommandsList) {
+    if (req.method === "GET") return handleAgentSlashCommandsList(req, res, agentSlashCommandsList[1]!);
   }
   const agentSkillDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/skills\/([^/]+)\/?$/);
   if (agentSkillDetail) {
