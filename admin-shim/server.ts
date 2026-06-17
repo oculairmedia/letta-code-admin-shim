@@ -146,6 +146,7 @@ import {
   type UpdateGoalPatch,
   type RecordProgressInput,
 } from "./lib/goals.js";
+import { broadcastGoalEvent, type GoalEventReason } from "./lib/goal-events.js";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
@@ -1830,6 +1831,19 @@ function handleAgentGoalsList(_req: IncomingMessage, res: ServerResponse, agentI
   json(res, 200, { goals: withStreaks });
 }
 
+// lcp-wgn7: publish a goals_updated event after any goal mutation so peer WS
+// clients (mobile) refresh live. goals_active is recomputed post-mutation.
+function publishGoalEvent(agentId: string, reason: GoalEventReason, goalId?: string): void {
+  const goalsActive = listGoalsForAgent(agentId).filter((g) => g.status === "active").length;
+  broadcastGoalEvent({
+    agent_id: agentId,
+    reason,
+    goals_active: goalsActive,
+    ...(goalId ? { goal_id: goalId } : {}),
+    at: new Date().toISOString(),
+  });
+}
+
 async function handleAgentGoalCreate(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
   if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
   const body = await readJsonBody(req);
@@ -1854,6 +1868,7 @@ async function handleAgentGoalCreate(req: IncomingMessage, res: ServerResponse, 
   if (typeof body["target"] === "number") input.target = body["target"];
   if (typeof body["verificationSource"] === "string") input.verificationSource = body["verificationSource"] as never;
   const goal = createGoal(agentId, input);
+  publishGoalEvent(agentId, "created", goal.id);
   const withStreak = { ...goal, streak: computeStreak(goal) };
   json(res, 201, withStreak);
 }
@@ -1890,6 +1905,7 @@ async function handleAgentGoalUpdate(req: IncomingMessage, res: ServerResponse, 
   }
   const updated = updateGoal(agentId, goalId, patch);
   if (!updated) return notFound(res, `goal ${goalId}`);
+  publishGoalEvent(agentId, "updated", goalId);
   const withStreak = { ...updated, streak: computeStreak(updated) };
   json(res, 200, withStreak);
 }
@@ -1898,6 +1914,7 @@ function handleAgentGoalDelete(_req: IncomingMessage, res: ServerResponse, agent
   if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
   const ok = deleteGoal(agentId, goalId);
   if (!ok) return notFound(res, `goal ${goalId}`);
+  publishGoalEvent(agentId, "deleted", goalId);
   json(res, 200, { id: goalId, deleted: true });
 }
 
@@ -1911,6 +1928,7 @@ async function handleAgentGoalProgress(req: IncomingMessage, res: ServerResponse
   if (typeof body["timestamp"] === "string") input.timestamp = body["timestamp"];
   const updated = recordProgress(agentId, goalId, input);
   if (!updated) return notFound(res, `goal ${goalId}`);
+  publishGoalEvent(agentId, "progress", goalId);
   const withStreak = { ...updated, streak: computeStreak(updated) };
   json(res, 200, withStreak);
 }
