@@ -134,6 +134,18 @@ import {
   resolveApproval,
   sweepPendingApprovalsOnBoot,
 } from "./lib/pending-approval.js";
+import {
+  createGoal,
+  listGoalsForAgent,
+  getGoal,
+  updateGoal,
+  deleteGoal,
+  recordProgress,
+  computeStreak,
+  type CreateGoalInput,
+  type UpdateGoalPatch,
+  type RecordProgressInput,
+} from "./lib/goals.js";
 import { WebSocket, WebSocketServer } from "ws";
 
 const PORT = Number(process.env["SHIM_PORT"] || 8291);
@@ -1804,6 +1816,105 @@ async function handleAgentSkillUninstall(_req: IncomingMessage, res: ServerRespo
   json(res, 200, { name: skillName, uninstalled: true });
 }
 
+// ── /v1/agents/{agentId}/goals/* — goal tracking ──────────────────────────
+//
+// Goals are persisted via lib/goals.ts and projected into the REST surface.
+// Each goal response includes a computed `streak` field derived from progress
+// timestamps — the store layer doesn't mutate the goal itself.
+
+function handleAgentGoalsList(_req: IncomingMessage, res: ServerResponse, agentId: string): void {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const goals = listGoalsForAgent(agentId);
+  // Compute streak at serialization time (do NOT mutate stored Goal).
+  const withStreaks = goals.map((g) => ({ ...g, streak: computeStreak(g) }));
+  json(res, 200, { goals: withStreaks });
+}
+
+async function handleAgentGoalCreate(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const body = await readJsonBody(req);
+  const title = typeof body["title"] === "string" ? body["title"] : "";
+  if (!title || title.length === 0) {
+    return badRequest(res, "title is required");
+  }
+  // Validate status / cadence if present.
+  const validStatuses = ["active", "paused", "done", "abandoned"] as const;
+  const validCadences = ["once", "daily", "weekly", "custom"] as const;
+  if (body["status"] !== undefined && !(validStatuses as readonly string[]).includes(body["status"] as string)) {
+    return badRequest(res, `status must be one of: ${validStatuses.join(", ")}`);
+  }
+  if (body["cadence"] !== undefined && !(validCadences as readonly string[]).includes(body["cadence"] as string)) {
+    return badRequest(res, `cadence must be one of: ${validCadences.join(", ")}`);
+  }
+  const input: CreateGoalInput = { title };
+  if (typeof body["description"] === "string") input.description = body["description"];
+  if (body["status"] !== undefined) input.status = body["status"] as never;
+  if (body["cadence"] !== undefined) input.cadence = body["cadence"] as never;
+  if (typeof body["metric"] === "string") input.metric = body["metric"];
+  if (typeof body["target"] === "number") input.target = body["target"];
+  if (typeof body["verificationSource"] === "string") input.verificationSource = body["verificationSource"] as never;
+  const goal = createGoal(agentId, input);
+  const withStreak = { ...goal, streak: computeStreak(goal) };
+  json(res, 201, withStreak);
+}
+
+function handleAgentGoalDetail(_req: IncomingMessage, res: ServerResponse, agentId: string, goalId: string): void {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const goal = getGoal(agentId, goalId);
+  if (!goal) return notFound(res, `goal ${goalId}`);
+  const withStreak = { ...goal, streak: computeStreak(goal) };
+  json(res, 200, withStreak);
+}
+
+async function handleAgentGoalUpdate(req: IncomingMessage, res: ServerResponse, agentId: string, goalId: string): Promise<void> {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const body = await readJsonBody(req);
+  // Validate status / cadence if present.
+  const validStatuses = ["active", "paused", "done", "abandoned"] as const;
+  const validCadences = ["once", "daily", "weekly", "custom"] as const;
+  if (body["status"] !== undefined && !(validStatuses as readonly string[]).includes(body["status"] as string)) {
+    return badRequest(res, `status must be one of: ${validStatuses.join(", ")}`);
+  }
+  if (body["cadence"] !== undefined && !(validCadences as readonly string[]).includes(body["cadence"] as string)) {
+    return badRequest(res, `cadence must be one of: ${validCadences.join(", ")}`);
+  }
+  const patch: UpdateGoalPatch = {};
+  if (typeof body["title"] === "string") patch.title = body["title"];
+  if (typeof body["description"] === "string") patch.description = body["description"];
+  if (body["status"] !== undefined) patch.status = body["status"] as never;
+  if (body["cadence"] !== undefined) patch.cadence = body["cadence"] as never;
+  if (body["metric"] !== undefined) patch.metric = body["metric"] === null ? null : String(body["metric"]);
+  if (body["target"] !== undefined) patch.target = body["target"] === null ? null : Number(body["target"]);
+  if (body["verificationSource"] !== undefined) {
+    patch.verificationSource = body["verificationSource"] === null ? null : (body["verificationSource"] as never);
+  }
+  const updated = updateGoal(agentId, goalId, patch);
+  if (!updated) return notFound(res, `goal ${goalId}`);
+  const withStreak = { ...updated, streak: computeStreak(updated) };
+  json(res, 200, withStreak);
+}
+
+function handleAgentGoalDelete(_req: IncomingMessage, res: ServerResponse, agentId: string, goalId: string): void {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const ok = deleteGoal(agentId, goalId);
+  if (!ok) return notFound(res, `goal ${goalId}`);
+  json(res, 200, { id: goalId, deleted: true });
+}
+
+async function handleAgentGoalProgress(req: IncomingMessage, res: ServerResponse, agentId: string, goalId: string): Promise<void> {
+  if (!resolveAgentRecord(agentId)) return notFound(res, `agent ${agentId}`);
+  const body = await readJsonBody(req);
+  const input: RecordProgressInput = {};
+  if (typeof body["note"] === "string") input.note = body["note"];
+  if (typeof body["value"] === "number") input.value = body["value"];
+  if (typeof body["source"] === "string") input.source = body["source"] as never;
+  if (typeof body["timestamp"] === "string") input.timestamp = body["timestamp"];
+  const updated = recordProgress(agentId, goalId, input);
+  if (!updated) return notFound(res, `goal ${goalId}`);
+  const withStreak = { ...updated, streak: computeStreak(updated) };
+  json(res, 200, withStreak);
+}
+
 function handleRunsList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
   const { limit } = parsePagination(url.searchParams);
   const params: ListRunsParams & { agentIds?: string[]; statuses?: string[] } = {
@@ -2436,6 +2547,22 @@ const server = createServer((req, res) => {
     if (req.method === "DELETE") return handleAgentSkillUninstall(req, res, agentSkillDetail[1]!, agentSkillDetail[2]!);
   }
 
+  // /v1/agents/{agentId}/goals/* — goal tracking (lcp-2eg2, epic lcp-ctz2)
+  const agentGoalsList = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/goals\/?$/);
+  if (agentGoalsList) {
+    if (req.method === "GET") return handleAgentGoalsList(req, res, agentGoalsList[1]!);
+    if (req.method === "POST") return handleAgentGoalCreate(req, res, agentGoalsList[1]!);
+  }
+  const agentGoalProgress = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/goals\/([^/]+)\/progress\/?$/);
+  if (agentGoalProgress && req.method === "POST") {
+    return handleAgentGoalProgress(req, res, agentGoalProgress[1]!, agentGoalProgress[2]!);
+  }
+  const agentGoalDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/goals\/([^/]+)\/?$/);
+  if (agentGoalDetail) {
+    if (req.method === "GET") return handleAgentGoalDetail(req, res, agentGoalDetail[1]!, agentGoalDetail[2]!);
+    if (req.method === "PATCH") return handleAgentGoalUpdate(req, res, agentGoalDetail[1]!, agentGoalDetail[2]!);
+    if (req.method === "DELETE") return handleAgentGoalDelete(req, res, agentGoalDetail[1]!, agentGoalDetail[2]!);
+  }
   // /shim/v1/usage — aggregate token tracking (shim extension, not vanilla)
   if (req.method === "GET" && (pathname === "/shim/v1/usage/summary" || pathname === "/shim/v1/usage/summary/")) {
     return handleUsageSummary(req, res, url);
