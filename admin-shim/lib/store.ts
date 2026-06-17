@@ -1348,7 +1348,7 @@ export interface SkillSlashCommand {
   command: string;
   description: string;
   skill_name: string;
-  source: "global_skill" | "agent_skill";
+  source: "global_skill" | "agent_skill" | "builtin_goal";
   installed: boolean;
 }
 
@@ -2043,16 +2043,41 @@ function skillToSlashCommand(
   };
 }
 
+export function listBuiltinGoalSlashCommands(): SkillSlashCommand[] {
+  const mk = (name: string, command: string, description: string): SkillSlashCommand => ({
+    name,
+    command,
+    description,
+    skill_name: "__builtin_goal_mode__",
+    source: "builtin_goal",
+    installed: true,
+  });
+  return [
+    mk("goal", "/goal", "Show the current native Letta Code Goal mode status."),
+    mk("goal status", "/goal status", "Show the current goal, active time, and token usage."),
+    mk("goal pause", "/goal pause", "Pause autonomous continuation for the current goal."),
+    mk("goal resume", "/goal resume", "Resume a paused goal."),
+    mk("goal complete", "/goal complete", "Mark the current goal complete after verification."),
+    mk("goal clear", "/goal clear", "Remove the current conversation goal."),
+    mk("goal disable", "/goal disable", "Clear the goal and disable goal tools for this conversation."),
+    mk("goal replace", "/goal --replace", "Replace the current goal with a new objective."),
+    mk("goal budget", "/goal --token-budget", "Start a goal with a token budget."),
+  ];
+}
+
 export function listSkillSlashCommands(agentId?: string): SkillSlashCommand[] {
+  const builtins = listBuiltinGoalSlashCommands();
   if (agentId) {
-    return listInstalledSkillsForAgent(agentId)
-      .map((skill) => skillToSlashCommand(skill, "agent_skill", true))
-      .sort((a, b) => a.command.localeCompare(b.command));
+    return [
+      ...builtins,
+      ...listInstalledSkillsForAgent(agentId).map((skill) => skillToSlashCommand(skill, "agent_skill", true)),
+    ].sort((a, b) => a.command.localeCompare(b.command));
   }
 
-  return listAvailableSkills()
-    .map((skill) => skillToSlashCommand(skill, "global_skill", skill.installed_count > 0))
-    .sort((a, b) => a.command.localeCompare(b.command));
+  return [
+    ...builtins,
+    ...listAvailableSkills().map((skill) => skillToSlashCommand(skill, "global_skill", skill.installed_count > 0)),
+  ].sort((a, b) => a.command.localeCompare(b.command));
 }
 
 // ──────────────────────────────────────────────────────────────────────

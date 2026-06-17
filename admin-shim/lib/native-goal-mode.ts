@@ -1,0 +1,284 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+/**
+ * Thin wrapper over Letta Code's native Goal mode.
+ *
+ * IMPORTANT: this does NOT own goal state. Letta Code's `/goal` command and
+ * CreateGoal/UpdateGoal tools persist one conversation objective in the
+ * project-local `.letta/settings.local.json` under:
+ *   conversationGoalsByServer[serverKey][conversationId]
+ *
+ * The shim only surfaces that native state to mobile. Lifecycle mutations
+ * (start/pause/resume/complete/clear/disable/replace) should continue to use
+ * the existing `/goal ...` command path so there is one source of truth.
+ */
+
+export interface NativeConversationGoal {
+  objective: string;
+  status: string;
+  createdAt?: string;
+  updatedAt?: string;
+  activeStartedAt?: string | null;
+  activeTimeSeconds?: number;
+  tokensUsed?: number;
+  tokenBudget?: number | null;
+}
+
+export interface NativeGoalStatusResponse {
+  source: "letta_code_goal_mode";
+  server_key: string | null;
+  agent_id?: string;
+  conversation_id: string | null;
+  goal: NativeConversationGoal | null;
+  tools_enabled?: boolean;
+}
+
+interface SessionRecord {
+  agentId?: string;
+  conversationId?: string;
+}
+
+interface LocalSettings {
+  sessionsByServer?: Record<string, SessionRecord>;
+  lastSession?: SessionRecord;
+  conversationGoalsByServer?: Record<string, Record<string, NativeConversationGoal>>;
+  conversationGoalToolsByServer?: Record<string, Record<string, boolean>>;
+}
+
+export interface NativeGoalCommandResult extends NativeGoalStatusResponse {
+  ok: boolean;
+  action: string;
+  message: string;
+}
+
+function localSettingsPath(workingDirectory = process.cwd()): string {
+  return join(workingDirectory, ".letta", "settings.local.json");
+}
+
+function readLocalSettings(workingDirectory = process.cwd()): LocalSettings {
+  const path = localSettingsPath(workingDirectory);
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    return typeof parsed === "object" && parsed !== null ? (parsed as LocalSettings) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeLocalSettings(settings: LocalSettings, workingDirectory = process.cwd()): void {
+  const path = localSettingsPath(workingDirectory);
+  mkdirSync(join(workingDirectory, ".letta"), { recursive: true });
+  writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+}
+
+/** Fallback global settings reader for projects that only have global session info. */
+function readGlobalSettings(): LocalSettings {
+  const path = join(process.env["HOME"] || homedir(), ".letta", "settings.json");
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    return typeof parsed === "object" && parsed !== null ? (parsed as LocalSettings) : {};
+  } catch {
+    return {};
+  }
+}
+
+function mergedSettings(): LocalSettings {
+  const local = readLocalSettings();
+  const global = readGlobalSettings();
+  // Letta Code stores conversation goals in project-local settings. Sessions can
+  // be present globally or locally; merge both for agent→conversation lookup.
+  return {
+    ...global,
+    ...local,
+    sessionsByServer: {
+      ...(global.sessionsByServer ?? {}),
+      ...(local.sessionsByServer ?? {}),
+    },
+  };
+}
+
+function findByConversationId(settings: LocalSettings, conversationId: string): NativeGoalStatusResponse | null {
+  const byServer = settings.conversationGoalsByServer ?? {};
+  for (const [serverKey, goalsByConversation] of Object.entries(byServer)) {
+    const goal = goalsByConversation[conversationId] ?? null;
+    if (goal) {
+      const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[conversationId];
+      return {
+        source: "letta_code_goal_mode",
+        server_key: serverKey,
+        conversation_id: conversationId,
+        goal,
+        ...(toolsEnabled !== undefined ? { tools_enabled: toolsEnabled } : {}),
+      };
+    }
+  }
+  return null;
+}
+
+export function getNativeGoalForConversation(conversationId: string): NativeGoalStatusResponse | null {
+  return findByConversationId(mergedSettings(), conversationId);
+}
+
+export function getNativeGoalForAgent(agentId: string): NativeGoalStatusResponse | null {
+  const settings = mergedSettings();
+  const sessions = settings.sessionsByServer ?? {};
+  for (const [serverKey, session] of Object.entries(sessions)) {
+    if (session.agentId !== agentId || !session.conversationId) continue;
+    const goal = settings.conversationGoalsByServer?.[serverKey]?.[session.conversationId] ?? null;
+    const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[session.conversationId];
+    return {
+      source: "letta_code_goal_mode",
+      server_key: serverKey,
+      agent_id: agentId,
+      conversation_id: session.conversationId,
+      goal,
+      ...(toolsEnabled !== undefined ? { tools_enabled: toolsEnabled } : {}),
+    };
+  }
+  return null;
+}
+
+function sessionForAgent(agentId: string, settings: LocalSettings): { serverKey: string; conversationId: string } | null {
+  for (const [serverKey, session] of Object.entries(settings.sessionsByServer ?? {})) {
+    if (session.agentId === agentId && session.conversationId) {
+      return { serverKey, conversationId: session.conversationId };
+    }
+  }
+  return null;
+}
+
+function accrueActiveSeconds(goal: NativeConversationGoal, now: string): NativeConversationGoal {
+  if (goal.status !== "active" || !goal.activeStartedAt) return goal;
+  const delta = Math.max(0, Math.floor((Date.parse(now) - Date.parse(goal.activeStartedAt)) / 1000));
+  return { ...goal, activeTimeSeconds: (goal.activeTimeSeconds ?? 0) + delta };
+}
+
+function parseTokenBudget(argv: string[]): { tokenBudget: number | null; rest: string[]; replace: boolean } {
+  let tokenBudget: number | null = null;
+  let replace = false;
+  const rest: string[] = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i]!;
+    if (a === "--replace") {
+      replace = true;
+      continue;
+    }
+    if (a === "--token-budget") {
+      const raw = argv[++i];
+      const n = raw ? Number(raw) : NaN;
+      if (!Number.isFinite(n) || n <= 0) throw new Error("--token-budget requires a positive number");
+      tokenBudget = Math.floor(n);
+      continue;
+    }
+    rest.push(a);
+  }
+  return { tokenBudget, rest, replace };
+}
+
+/**
+ * Apply a documented `/goal` command to Letta Code's native project settings.
+ * This is intentionally a compatibility wrapper over native Goal-mode state,
+ * not a parallel implementation. Mobile can call this endpoint; CLI users can
+ * continue to use `/goal` directly.
+ */
+export function applyNativeGoalCommandForAgent(agentId: string, command: string): NativeGoalCommandResult {
+  const trimmed = command.trim();
+  if (!trimmed.startsWith("/goal")) throw new Error("command must start with /goal");
+  const local = readLocalSettings();
+  const global = readGlobalSettings();
+  const settings: LocalSettings = {
+    ...local,
+    sessionsByServer: { ...(global.sessionsByServer ?? {}), ...(local.sessionsByServer ?? {}) },
+  };
+  const session = sessionForAgent(agentId, settings);
+  if (!session) throw new Error(`no active conversation for agent ${agentId}`);
+  const now = new Date().toISOString();
+  const words = trimmed.split(/\s+/).slice(1);
+  const { tokenBudget, rest, replace } = parseTokenBudget(words);
+  const sub = rest[0]?.toLowerCase();
+  const objective = rest.join(" ").trim();
+
+  const byServer = { ...(local.conversationGoalsByServer ?? {}) };
+  const goalsForServer = { ...(byServer[session.serverKey] ?? {}) };
+  const existing = goalsForServer[session.conversationId] ?? null;
+  let goal: NativeConversationGoal | null = existing;
+  let action = "status";
+  let message = "Goal status.";
+
+  if (rest.length === 0 || sub === "status") {
+    // read-only
+  } else if (sub === "pause") {
+    if (!existing) throw new Error("no active goal to pause");
+    goal = { ...accrueActiveSeconds(existing, now), status: "paused", activeStartedAt: null, updatedAt: now };
+    action = "pause";
+    message = "Goal paused.";
+  } else if (sub === "resume") {
+    if (!existing) throw new Error("no goal to resume");
+    goal = { ...existing, status: "active", activeStartedAt: now, updatedAt: now };
+    action = "resume";
+    message = "Goal resumed.";
+  } else if (sub === "complete") {
+    if (!existing) throw new Error("no goal to complete");
+    goal = { ...accrueActiveSeconds(existing, now), status: "complete", activeStartedAt: null, updatedAt: now };
+    action = "complete";
+    message = "Goal marked complete.";
+  } else if (sub === "clear") {
+    delete goalsForServer[session.conversationId];
+    goal = null;
+    action = "clear";
+    message = "Goal cleared.";
+  } else if (sub === "disable") {
+    delete goalsForServer[session.conversationId];
+    const toolsByServer = { ...(local.conversationGoalToolsByServer ?? {}) };
+    const tools = { ...(toolsByServer[session.serverKey] ?? {}) };
+    delete tools[session.conversationId];
+    toolsByServer[session.serverKey] = tools;
+    local.conversationGoalToolsByServer = toolsByServer;
+    goal = null;
+    action = "disable";
+    message = "Goal cleared and goal tools disabled for this conversation.";
+  } else {
+    if (existing && !replace) throw new Error("goal already exists; use /goal --replace <objective>");
+    if (!objective) throw new Error("objective is required");
+    goal = {
+      objective,
+      status: "active",
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      activeStartedAt: now,
+      activeTimeSeconds: replace ? 0 : (existing?.activeTimeSeconds ?? 0),
+      tokensUsed: replace ? 0 : (existing?.tokensUsed ?? 0),
+      tokenBudget,
+    };
+    action = replace ? "replace" : "create";
+    message = replace ? "Goal replaced." : "Goal created.";
+  }
+
+  if (goal) goalsForServer[session.serverKey ? session.conversationId : session.conversationId] = goal;
+  byServer[session.serverKey] = goalsForServer;
+  local.conversationGoalsByServer = byServer;
+  writeLocalSettings(local);
+  return {
+    ok: true,
+    action,
+    message,
+    source: "letta_code_goal_mode",
+    server_key: session.serverKey,
+    agent_id: agentId,
+    conversation_id: session.conversationId,
+    goal,
+    ...(local.conversationGoalToolsByServer?.[session.serverKey]?.[session.conversationId] !== undefined
+      ? { tools_enabled: local.conversationGoalToolsByServer[session.serverKey]![session.conversationId] }
+      : {}),
+  };
+}
+
+export const _nativeGoalModeInternals = Object.freeze({
+  readLocalSettings,
+  readGlobalSettings,
+  writeLocalSettings,
+});

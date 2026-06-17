@@ -1,0 +1,161 @@
+import { test, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  applyNativeGoalCommandForAgent,
+  getNativeGoalForAgent,
+  getNativeGoalForConversation,
+} from "../lib/native-goal-mode.js";
+
+let cwd: string;
+let prevCwd: string;
+let home: string;
+let prevHome: string | undefined;
+
+beforeEach(() => {
+  cwd = mkdtempSync(join(tmpdir(), "native-goal-cwd-"));
+  home = mkdtempSync(join(tmpdir(), "native-goal-home-"));
+  mkdirSync(join(cwd, ".letta"), { recursive: true });
+  mkdirSync(join(home, ".letta"), { recursive: true });
+  prevCwd = process.cwd();
+  prevHome = process.env["HOME"];
+  process.chdir(cwd);
+  process.env["HOME"] = home;
+});
+
+afterEach(() => {
+  process.chdir(prevCwd);
+  if (prevHome === undefined) delete process.env["HOME"];
+  else process.env["HOME"] = prevHome;
+  rmSync(cwd, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
+});
+
+function writeLocalSettings(value: unknown): void {
+  writeFileSync(join(cwd, ".letta", "settings.local.json"), JSON.stringify(value, null, 2));
+}
+
+function writeGlobalSettings(value: unknown): void {
+  writeFileSync(join(home, ".letta", "settings.json"), JSON.stringify(value, null, 2));
+}
+
+test("native goal wrapper reads conversation goal from project-local settings", () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+    conversationGoalsByServer: {
+      "local:/tmp/backend": {
+        "conv-a": {
+          objective: "finish the migration and open a PR",
+          status: "active",
+          activeTimeSeconds: 12,
+          tokensUsed: 345,
+          tokenBudget: 50000,
+        },
+      },
+    },
+    conversationGoalToolsByServer: {
+      "local:/tmp/backend": { "conv-a": true },
+    },
+  });
+
+  const byConv = getNativeGoalForConversation("conv-a");
+  assert.equal(byConv?.source, "letta_code_goal_mode");
+  assert.equal(byConv?.server_key, "local:/tmp/backend");
+  assert.equal(byConv?.goal?.objective, "finish the migration and open a PR");
+  assert.equal(byConv?.goal?.tokenBudget, 50000);
+  assert.equal(byConv?.tools_enabled, true);
+
+  const byAgent = getNativeGoalForAgent("agent-a");
+  assert.equal(byAgent?.conversation_id, "conv-a");
+  assert.equal(byAgent?.goal?.status, "active");
+});
+
+test("native goal wrapper returns null when no goal exists", () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+  });
+  assert.equal(getNativeGoalForConversation("conv-a"), null);
+  assert.deepEqual(getNativeGoalForAgent("agent-a"), {
+    source: "letta_code_goal_mode",
+    server_key: "local:/tmp/backend",
+    agent_id: "agent-a",
+    conversation_id: "conv-a",
+    goal: null,
+  });
+});
+
+test("native goal wrapper can map agent sessions from global settings while goals stay local", () => {
+  writeGlobalSettings({
+    sessionsByServer: {
+      "127.0.0.1:0": { agentId: "agent-global", conversationId: "conv-global" },
+    },
+  });
+  writeLocalSettings({
+    conversationGoalsByServer: {
+      "127.0.0.1:0": {
+        "conv-global": { objective: "drive CI green", status: "paused" },
+      },
+    },
+  });
+
+  const result = getNativeGoalForAgent("agent-global");
+  assert.equal(result?.conversation_id, "conv-global");
+  assert.equal(result?.goal?.objective, "drive CI green");
+  assert.equal(result?.goal?.status, "paused");
+});
+
+test("native goal command bridge creates, pauses, resumes, completes, and clears native goal state", () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+  });
+
+  const created = applyNativeGoalCommandForAgent("agent-a", "/goal --token-budget 50000 finish the migration");
+  assert.equal(created.action, "create");
+  assert.equal(created.goal?.objective, "finish the migration");
+  assert.equal(created.goal?.tokenBudget, 50000);
+  assert.equal(created.goal?.status, "active");
+
+  const paused = applyNativeGoalCommandForAgent("agent-a", "/goal pause");
+  assert.equal(paused.action, "pause");
+  assert.equal(paused.goal?.status, "paused");
+  assert.equal(paused.goal?.activeStartedAt, null);
+
+  const resumed = applyNativeGoalCommandForAgent("agent-a", "/goal resume");
+  assert.equal(resumed.action, "resume");
+  assert.equal(resumed.goal?.status, "active");
+  assert.ok(resumed.goal?.activeStartedAt);
+
+  const complete = applyNativeGoalCommandForAgent("agent-a", "/goal complete");
+  assert.equal(complete.action, "complete");
+  assert.equal(complete.goal?.status, "complete");
+
+  const cleared = applyNativeGoalCommandForAgent("agent-a", "/goal clear");
+  assert.equal(cleared.action, "clear");
+  assert.equal(cleared.goal, null);
+  assert.equal(getNativeGoalForAgent("agent-a")?.goal, null);
+});
+
+test("native goal command bridge requires --replace when a goal already exists", () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+  });
+  applyNativeGoalCommandForAgent("agent-a", "/goal first objective");
+  assert.throws(
+    () => applyNativeGoalCommandForAgent("agent-a", "/goal second objective"),
+    /goal already exists/,
+  );
+  const replaced = applyNativeGoalCommandForAgent("agent-a", "/goal --replace second objective");
+  assert.equal(replaced.action, "replace");
+  assert.equal(replaced.goal?.objective, "second objective");
+});

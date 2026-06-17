@@ -143,7 +143,8 @@ test("skills: slash commands expose compact skill invocations", () => {
   writeGlobalSkill({ name: "beta", description: "Beta helper" });
   installSkillToAgent(AGENT, "alpha");
 
-  assert.deepEqual(listSkillSlashCommands(), [
+  assert.ok(listSkillSlashCommands().some((cmd) => cmd.command === "/goal" && cmd.source === "builtin_goal"));
+  assert.deepEqual(listSkillSlashCommands().filter((cmd) => cmd.source === "global_skill"), [
     {
       name: "alpha",
       command: "/alpha",
@@ -162,7 +163,8 @@ test("skills: slash commands expose compact skill invocations", () => {
     },
   ]);
 
-  assert.deepEqual(listSkillSlashCommands(AGENT), [
+  assert.ok(listSkillSlashCommands(AGENT).some((cmd) => cmd.command === "/goal" && cmd.source === "builtin_goal"));
+  assert.deepEqual(listSkillSlashCommands(AGENT).filter((cmd) => cmd.source === "agent_skill"), [
     {
       name: "alpha",
       command: "/alpha",
