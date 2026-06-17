@@ -108,6 +108,9 @@ export const SERVER_FRAMES = Object.freeze([
                   // Server push when crons.json changes. Reasons: client_mutation,
                   // scheduler_write (a tick fired a task), external_write (the
                   // bundled letta CLI or self-schedule skill wrote the file).
+  "goals_updated", // { agent_id, reason, goals_active, goal_id?, at }
+                  // Server push when an agent's goals change (lcp-wgn7).
+                  // Reasons: created, updated, deleted, progress, client_mutation.
   "reflection_settings_get_response", // { request_id?, success, agent_id?, settings?, error? }
   "reflection_settings_set_response", // { request_id?, success, agent_id?, settings?, workers_recycled?, error? }
   "reflection_settings_updated", // { agent_id, settings, at }
