@@ -164,16 +164,16 @@ test("GET /v1/slash-commands returns compact skill command descriptors", async (
 
   const { res, body } = await getJson(`${shim.url}/v1/slash-commands`);
   assert.equal(res.status, 200);
-  assert.deepEqual(body, {
-    commands: [{
-      name: "alpha",
-      command: "/alpha",
-      description: "Alpha helper",
-      skill_name: "alpha",
-      source: "global_skill",
-      installed: false,
-    }],
-  });
+  const commands = (body as { commands: Array<Record<string, unknown>> }).commands;
+  assert.ok(commands.some((cmd) => cmd["command"] === "/goal" && cmd["source"] === "builtin_goal"));
+  assert.deepEqual(commands.filter((cmd) => cmd["source"] === "global_skill"), [{
+    name: "alpha",
+    command: "/alpha",
+    description: "Alpha helper",
+    skill_name: "alpha",
+    source: "global_skill",
+    installed: false,
+  }]);
 
   // GET /v1/skills surfaces the resolved skills directory (LETTA_SKILLS_DIR).
   const list = await getJson(`${shim.url}/v1/skills`);

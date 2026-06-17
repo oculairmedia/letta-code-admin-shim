@@ -71,7 +71,6 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
 
 import type { Block } from "./types/wire.js";
 import type { LocalMessage } from "./types/letta-stream.js";
-import { listGoalsForAgent, computeStreak, type Goal } from "./goals.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // On-disk shapes (NOT identical to wire types — see translate.mjs)
@@ -1349,7 +1348,7 @@ export interface SkillSlashCommand {
   command: string;
   description: string;
   skill_name: string;
-  source: "global_skill" | "agent_skill";
+  source: "global_skill" | "agent_skill" | "builtin_goal";
   installed: boolean;
 }
 
@@ -2002,69 +2001,6 @@ export function syncSkillsBlockForAgent(agentId: string): void {
   }
 }
 
-// ── Goals projection (epic lcp-ctz2, bead lcp-wt5s) ─────────────────────
-// Mirror the skills projection: write a compact, ACTIVE-only "active_goals"
-// system block into the agent's memfs system context each turn so the
-// companion always sees what the user is currently working toward — without
-// inlining full progress history (progressive disclosure).
-
-/** Memory-block label for the per-agent active-goals index. */
-export const GOALS_BLOCK_LABEL = "active_goals";
-
-/**
- * Build the compact "Active Goals" block: one line per ACTIVE goal with
- * cadence, current streak, and the latest progress note (if any). Omits
- * paused/done/abandoned goals and full progress history. Returns null when
- * there are no active goals (caller removes any stale block).
- */
-export function buildGoalsBlockContent(goals: Goal[]): string | null {
-  const active = goals.filter((g) => g.status === "active");
-  if (active.length === 0) return null;
-  const lines = active.map((g) => {
-    const streak = computeStreak(g);
-    const streakStr = streak > 0 ? `, streak ${streak}` : "";
-    const last = g.progress.length ? g.progress[g.progress.length - 1] : undefined;
-    const note = last?.note ? ` — last: ${last.note}` : "";
-    return `- ${g.title} (${g.cadence}${streakStr})${note}`;
-  });
-  return [
-    "## Active Goals",
-    "",
-    "These are the user's currently active goals. Each line is",
-    "`title (cadence, streak) — last: <latest progress note>`. Track progress",
-    "honestly against real signal where possible; you are the narrator of the",
-    "user's progress, not a cheerleader. Full goal history is not inlined here.",
-    "",
-    ...lines,
-    "",
-  ].join("\n");
-}
-
-/**
- * Sync the per-agent active-goals index into the agent's system-context memfs
- * block (`active_goals.md`). Write-if-changed + self-cleaning, mirroring
- * syncSkillsBlockForAgent. Called once per turn from chat.ts.
- */
-export function syncGoalsBlockForAgent(agentId: string): void {
-  const sysDir = join(storageDir(), "memfs", agentId, "memory", "system");
-  const blockPath = join(sysDir, `${GOALS_BLOCK_LABEL}.md`);
-  try {
-    const goals = listGoalsForAgent(agentId);
-    const next = buildGoalsBlockContent(goals);
-
-    if (next === null) {
-      if (existsSync(blockPath)) rmSync(blockPath, { force: true });
-      return;
-    }
-
-    if (!existsSync(sysDir)) mkdirSync(sysDir, { recursive: true });
-    const current = existsSync(blockPath) ? readFileSync(blockPath, "utf8") : null;
-    if (current !== next) writeFileSync(blockPath, next);
-  } catch {
-    // Non-fatal: missing the index for one turn beats failing the turn.
-  }
-}
-
 /**
  * Search skills by tag or keyword in name/description.
  */
@@ -2107,16 +2043,41 @@ function skillToSlashCommand(
   };
 }
 
+export function listBuiltinGoalSlashCommands(): SkillSlashCommand[] {
+  const mk = (name: string, command: string, description: string): SkillSlashCommand => ({
+    name,
+    command,
+    description,
+    skill_name: "__builtin_goal_mode__",
+    source: "builtin_goal",
+    installed: true,
+  });
+  return [
+    mk("goal", "/goal", "Show the current native Letta Code Goal mode status."),
+    mk("goal status", "/goal status", "Show the current goal, active time, and token usage."),
+    mk("goal pause", "/goal pause", "Pause autonomous continuation for the current goal."),
+    mk("goal resume", "/goal resume", "Resume a paused goal."),
+    mk("goal complete", "/goal complete", "Mark the current goal complete after verification."),
+    mk("goal clear", "/goal clear", "Remove the current conversation goal."),
+    mk("goal disable", "/goal disable", "Clear the goal and disable goal tools for this conversation."),
+    mk("goal replace", "/goal --replace", "Replace the current goal with a new objective."),
+    mk("goal budget", "/goal --token-budget", "Start a goal with a token budget."),
+  ];
+}
+
 export function listSkillSlashCommands(agentId?: string): SkillSlashCommand[] {
+  const builtins = listBuiltinGoalSlashCommands();
   if (agentId) {
-    return listInstalledSkillsForAgent(agentId)
-      .map((skill) => skillToSlashCommand(skill, "agent_skill", true))
-      .sort((a, b) => a.command.localeCompare(b.command));
+    return [
+      ...builtins,
+      ...listInstalledSkillsForAgent(agentId).map((skill) => skillToSlashCommand(skill, "agent_skill", true)),
+    ].sort((a, b) => a.command.localeCompare(b.command));
   }
 
-  return listAvailableSkills()
-    .map((skill) => skillToSlashCommand(skill, "global_skill", skill.installed_count > 0))
-    .sort((a, b) => a.command.localeCompare(b.command));
+  return [
+    ...builtins,
+    ...listAvailableSkills().map((skill) => skillToSlashCommand(skill, "global_skill", skill.installed_count > 0)),
+  ].sort((a, b) => a.command.localeCompare(b.command));
 }
 
 // ──────────────────────────────────────────────────────────────────────
