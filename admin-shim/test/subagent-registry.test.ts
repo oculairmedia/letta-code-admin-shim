@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdirSync, writeFileSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -274,6 +274,28 @@ test("subagent-registry: rehydrate flips running entry whose log already complet
   }
 });
 
+test("subagent-registry: rehydrate fails running entry whose background log is missing", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-rehydrate-missing-${Math.random().toString(36).slice(2)}`);
+  const missingLogFile = join(stateDir, "task_94.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    ingestParentFrame(dispatchFrame(tcid, "Missing log on boot"), "run-rehydrate-missing");
+    ingestParentFrame(returnFrame(tcid, "task_94", "agent-local-abc12345-1111-2222-3333-444444444444", missingLogFile), "run-rehydrate-missing");
+    getSubagent(tcid)!.status = "running";
+
+    rehydrateRunningSubagentWatchdogs();
+
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "orphaned");
+    assert.equal(__getSubagentWatcherCounts().timeouts, 0);
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
 test("subagent-registry: liveness sweep fails no-logFile running entry as orphaned", () => {
   __resetSubagentRegistry();
   const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
@@ -296,6 +318,32 @@ test("subagent-registry: liveness sweep fails no-logFile running entry as orphan
     assert.equal(sweptEntry?.status, "failed");
     assert.equal(sweptEntry?.failureReason, "orphaned");
     assert.deepEqual(events, ["failed:orphaned"]);
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("subagent-registry: liveness sweep completes running entry when log already has completed marker", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-complete-sweep-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_93.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\nworking\n");
+    ingestParentFrame(dispatchFrame(tcid, "Completed but watcher missed"), "run-complete-sweep");
+    ingestParentFrame(returnFrame(tcid, "task_93", "agent-local-abc12345-cccc-dddd-eeee-ffffffffffff", logFile), "run-complete-sweep");
+    assert.equal(getSubagent(tcid)?.status, "running");
+    // Simulate fs.watch missing the final write: the canonical log now has the
+    // completed marker, but no watcher callback finalized the registry entry.
+    writeFileSync(logFile, "[Task started]\nworking\n[Task completed]\n");
+
+    const swept = sweepOrphanedSubagents(Date.now());
+
+    assert.equal(swept, 1);
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "completed");
+    assert.equal(entry?.failureReason, null);
   } finally {
     __resetSubagentRegistry();
   }
@@ -335,8 +383,10 @@ test("subagent-registry: liveness sweep fails stale running log as orphaned", ()
     utimesSync(logFile, stale, stale);
     ingestParentFrame(dispatchFrame(tcid, "Stale worker"), "run-orphan");
     ingestParentFrame(returnFrame(tcid, "task_91", "agent-local-abc12345-aaaa-bbbb-cccc-dddddddddddd", logFile), "run-orphan");
+    const timeoutMs = Number(process.env["SHIM_SUBAGENT_TIMEOUT_MS"] ?? 600_000);
+    const nowAfterTimeout = statSync(logFile).mtimeMs + timeoutMs + 1_000;
 
-    const swept = sweepOrphanedSubagents(Date.now());
+    const swept = sweepOrphanedSubagents(nowAfterTimeout);
 
     assert.equal(swept, 1);
     const entry = getSubagent(tcid);

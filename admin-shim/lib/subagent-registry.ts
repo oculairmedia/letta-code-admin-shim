@@ -597,7 +597,24 @@ function evaluateRunningSubagent(toolCallId: string): void {
 
 export function rehydrateRunningSubagentWatchdogs(): void {
   for (const entry of _subagents.values()) {
-    if (entry.status === "running") evaluateRunningSubagent(entry.toolCallId);
+    if (entry.status !== "running") continue;
+    // Boot replay re-ingests historical Agent frames and stamps startedAt as
+    // now. If the background log is already gone (or already terminal), do NOT
+    // arm a fresh watchdog/grace window and resurrect phantom workers in the
+    // app/reminder bar. The log path from the Agent tool_return is canonical.
+    if (!entry.logFile) {
+      finalize(entry.toolCallId, "failed", "orphaned");
+      continue;
+    }
+    if (!existsSync(entry.logFile)) {
+      finalize(entry.toolCallId, "failed", "orphaned");
+      continue;
+    }
+    if (logHasCompletedMarker(entry.logFile)) {
+      finalize(entry.toolCallId, "completed", null);
+      continue;
+    }
+    evaluateRunningSubagent(entry.toolCallId);
   }
   sweepOrphanedSubagents();
   startSubagentLivenessSweep();
@@ -615,7 +632,11 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
       }
       continue;
     }
-    if (logHasCompletedMarker(entry.logFile)) continue;
+    if (logHasCompletedMarker(entry.logFile)) {
+      finalize(entry.toolCallId, "completed", null);
+      swept += 1;
+      continue;
+    }
     try {
       const stat = statSync(entry.logFile);
       if (nowMs - stat.mtimeMs > SUBAGENT_TIMEOUT_MS) {
