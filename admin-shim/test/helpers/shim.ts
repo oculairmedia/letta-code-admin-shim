@@ -183,8 +183,23 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
     child,
     readLog: () => log,
     waitForLogLine(regex, { timeoutMs = 5000 } = {}) {
+      // Opportunistically populate url/port from the "listening on" line so
+      // tests started with { waitForReady: false } that later wait for that
+      // line still get a usable handle.url (otherwise it stays null and any
+      // `shim.url!` use crashes — surfaced once shim-tests actually ran).
+      const maybeCaptureUrl = () => {
+        if (handle.url) return;
+        const m = log.match(/listening on http:\/\/[^:]+:(\d+)/);
+        if (m) {
+          handle.port = Number(m[1]);
+          handle.url = `http://127.0.0.1:${handle.port}`;
+        }
+      };
       return new Promise<true>((resolve, reject) => {
-        if (regex.test(log)) return resolve(true);
+        if (regex.test(log)) {
+          maybeCaptureUrl();
+          return resolve(true);
+        }
         const timer = setTimeout(() => {
           reject(new Error(`timeout waiting for log line ${regex}`));
         }, timeoutMs);
@@ -193,6 +208,7 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
             clearTimeout(timer);
             child.stdout.off("data", checker);
             child.stderr.off("data", checker);
+            maybeCaptureUrl();
             resolve(true);
           }
         };

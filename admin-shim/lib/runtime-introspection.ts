@@ -195,7 +195,8 @@ let listActiveSubagentsForRuntime = listActiveSubagents;
 
 function truncateText(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
-  return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+  // Trim trailing whitespace before the ellipsis so we never emit "word …".
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
 function formatElapsed(ms: number): string {
@@ -214,7 +215,7 @@ function shortSubagentId(toolCallId: string): string {
 
 function truncateLine(line: string, maxLength = 220): string {
   if (line.length <= maxLength) return line;
-  return `${line.slice(0, Math.max(0, maxLength - 1))}…`;
+  return `${line.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
 /**
