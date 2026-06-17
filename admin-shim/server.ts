@@ -116,11 +116,8 @@ import {
   rehydrateRunningSubagentWatchdogs,
   type TodoProgress,
 } from "./lib/subagent-registry.js";
-import {
-  getStatus as getSearchStatus,
-  rebuild as rebuildSearchIndex,
-  search as runSearch,
-} from "./lib/search.js";
+// lcp-c61s: lazy-load search module to avoid node:sqlite import failure on Node < 22.5.
+// The search index is optional; it's only loaded when search endpoints are called.
 import {
   evaluatePermission,
   readAgentConfigOrEffective,
@@ -2017,6 +2014,7 @@ async function handleMessagesSearch(req: IncomingMessage, res: ServerResponse): 
     return badRequest(res, "agent_id is required");
   }
   try {
+    const { search: runSearch } = await import("./lib/search.js");
     const result = await runSearch(agentId, query, limit);
     if (result.indexing) {
       // Cold build still running — tell the client to poll status. Results may
@@ -2030,16 +2028,18 @@ async function handleMessagesSearch(req: IncomingMessage, res: ServerResponse): 
   }
 }
 
-function handleSearchStatus(_req: IncomingMessage, res: ServerResponse, agentIdRaw: string): void {
+async function handleSearchStatus(_req: IncomingMessage, res: ServerResponse, agentIdRaw: string): Promise<void> {
   const agentId = resolveAgentIdAlias(agentIdRaw, (id) => getAgentRecord(id) != null);
+  const { getStatus: getSearchStatus } = await import("./lib/search.js");
   json(res, 200, getSearchStatus(agentId));
 }
 
-function handleSearchRebuild(_req: IncomingMessage, res: ServerResponse, agentIdRaw: string): void {
+async function handleSearchRebuild(_req: IncomingMessage, res: ServerResponse, agentIdRaw: string): Promise<void> {
   const agentId = resolveAgentIdAlias(agentIdRaw, (id) => getAgentRecord(id) != null);
   // Kick the rebuild and return immediately (202). The promise is detached;
   // failures are logged but don't crash the request — status will reflect
   // the result once the build settles.
+  const { rebuild: rebuildSearchIndex } = await import("./lib/search.js");
   rebuildSearchIndex(agentId).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[search] rebuild for ${agentId} failed: ${msg}`);

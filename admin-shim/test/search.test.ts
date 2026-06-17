@@ -26,6 +26,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import {
   existsSync,
   mkdirSync,
@@ -45,6 +46,21 @@ import {
   deleteIndex,
   _searchInternals,
 } from "../lib/search.js";
+
+// The search index requires node:sqlite (Node >= 22.5). It is an OPTIONAL
+// derived feature, so on older runtimes (e.g. Node 20 in CI) these tests skip
+// rather than fail — the rest of the shim works without search. Importing
+// lib/search.ts no longer crashes on Node 20 (sqlite is loaded lazily), so we
+// can detect availability here without a top-level throw.
+const SQLITE_AVAILABLE: boolean = (() => {
+  try {
+    createRequire(import.meta.url)("node:sqlite");
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const skipNoSqlite = SQLITE_AVAILABLE ? undefined : "requires node:sqlite (Node >= 22.5)";
 
 // ── fixture helpers ────────────────────────────────────────────────────
 
@@ -145,7 +161,7 @@ const AGENT = "agent-search-test-0001";
 
 // ── 1. build + query ────────────────────────────────────────────────────
 
-test("FTS5 build + query returns expected hits across blocks/messages/conversations", async () => {
+test("FTS5 build + query returns expected hits across blocks/messages/conversations", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async (dir) => {
     writeBlock(dir, AGENT, "persona", "I am a helpful assistant fluent in TypeScript.");
     writeConversation(dir, AGENT, "conv-alpha", {
@@ -188,7 +204,7 @@ test("FTS5 build + query returns expected hits across blocks/messages/conversati
 
 // ── 2. incremental update picks up a changed file ───────────────────────
 
-test("incremental update picks up a changed message file", async () => {
+test("incremental update picks up a changed message file", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async (dir) => {
     writeConversation(dir, AGENT, "conv-inc", {
       messages: [{ id: "m1", role: "user", text: "original content about otters" }],
@@ -215,7 +231,7 @@ test("incremental update picks up a changed message file", async () => {
 
 // ── 3. bulk / non-monotonic change → full rebuild, no stale ─────────────
 
-test("bulk/non-monotonic MemFS change triggers a full rebuild (stale not served)", async () => {
+test("bulk/non-monotonic MemFS change triggers a full rebuild (stale not served)", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async (dir) => {
     writeConversation(dir, AGENT, "conv-bulk", {
       messages: [{ id: "m1", role: "user", text: "the codeword is aardvark" }],
@@ -241,7 +257,7 @@ test("bulk/non-monotonic MemFS change triggers a full rebuild (stale not served)
 
 // ── 4. rebuild idempotent + lock-serialised under concurrency ───────────
 
-test("rebuild is idempotent and lock-serialised with a concurrent search (no corruption)", async () => {
+test("rebuild is idempotent and lock-serialised with a concurrent search (no corruption)", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async (dir) => {
     writeBlock(dir, AGENT, "persona", "assistant loves capybaras");
     writeConversation(dir, AGENT, "conv-lock", {
@@ -272,7 +288,7 @@ test("rebuild is idempotent and lock-serialised with a concurrent search (no cor
 
 // ── 5. status reports correct counts / freshness ────────────────────────
 
-test("status reports correct counts and real freshness", async () => {
+test("status reports correct counts and real freshness", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async (dir) => {
     writeBlock(dir, AGENT, "a", "block one");
     writeBlock(dir, AGENT, "b", "block two");
@@ -300,7 +316,7 @@ test("status reports correct counts and real freshness", async () => {
 
 // ── 6. deleting the search dir loses nothing canonical; rebuilds ────────
 
-test("deleting the search dir loses nothing canonical and next search rebuilds", async () => {
+test("deleting the search dir loses nothing canonical and next search rebuilds", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async (dir) => {
     const blockPath = writeBlock(dir, AGENT, "persona", "the secret animal is platypus");
     writeConversation(dir, AGENT, "conv-del", {
@@ -324,7 +340,7 @@ test("deleting the search dir loses nothing canonical and next search rebuilds",
 
 // ── 7. empty query / no-index returns sensibly ──────────────────────────
 
-test("empty query returns empty results, no-index agent returns sensibly", async () => {
+test("empty query returns empty results, no-index agent returns sensibly", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async () => {
     // No fixtures at all for this agent.
     const empty = await search("agent-search-empty-9999", "", 20);
@@ -338,7 +354,7 @@ test("empty query returns empty results, no-index agent returns sensibly", async
 
 // ── 8. ensureIndex fresh fast-path ──────────────────────────────────────
 
-test("ensureIndex is a no-op when nothing changed (fresh)", async () => {
+test("ensureIndex is a no-op when nothing changed (fresh)", { skip: skipNoSqlite }, async () => {
   await withBackendDir(async (dir) => {
     writeConversation(dir, AGENT, "conv-fresh", {
       messages: [{ id: "m1", role: "user", text: "stable content here" }],

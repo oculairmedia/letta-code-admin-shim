@@ -43,7 +43,34 @@
  * `score_type: "keyword"`. NO fabricated semantic similarity.
  */
 
-import { DatabaseSync } from "node:sqlite";
+// `node:sqlite` only exists on Node >= 22.5. The search index is an OPTIONAL,
+// derived feature, so we must NOT crash merely by importing this module on
+// older runtimes (e.g. Node 20 in CI). Import the TYPE only (erased at
+// runtime) and resolve the runtime binding lazily in openDb(), throwing a
+// clear error only if search is actually exercised on an unsupported Node.
+import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
+
+let cachedDatabaseSync: typeof DatabaseSyncType | null = null;
+
+function loadDatabaseSync(): typeof DatabaseSyncType {
+  if (cachedDatabaseSync) return cachedDatabaseSync;
+  let mod: { DatabaseSync: typeof DatabaseSyncType };
+  try {
+    // require is synchronous, which keeps openDb() synchronous. createRequire
+    // avoids bundler static analysis pulling node:sqlite at load time.
+    const require = createRequire(import.meta.url);
+    mod = require("node:sqlite") as { DatabaseSync: typeof DatabaseSyncType };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Search index requires node:sqlite (Node >= 22.5). This runtime cannot ` +
+        `provide it: ${msg}. The index is optional; search endpoints are ` +
+        `unavailable on this Node version.`,
+    );
+  }
+  cachedDatabaseSync = mod.DatabaseSync;
+  return cachedDatabaseSync;
+}
 import {
   existsSync,
   mkdirSync,
@@ -55,6 +82,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -365,8 +393,9 @@ function messageType(m: LocalMessage): string {
 
 // ── sqlite / FTS5 ──────────────────────────────────────────────────────
 
-function openDb(agentId: string): DatabaseSync {
+function openDb(agentId: string): DatabaseSyncType {
   mkdirSync(searchDir(agentId), { recursive: true });
+  const DatabaseSync = loadDatabaseSync();
   const db = new DatabaseSync(indexPath(agentId));
   db.exec(
     "CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(" +
