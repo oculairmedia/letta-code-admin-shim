@@ -33,6 +33,7 @@ import {
 import { getStorageDir } from "../lib/runs.js";
 import {
   recordSubagentDispatch,
+  getSubagent,
   __resetSubagentRegistry,
   type SubagentEntry,
 } from "../lib/subagent-registry.js";
@@ -336,6 +337,31 @@ test("buildConnectionReminder: includes subagent summary when subagents are runn
 
       const reminder = buildConnectionReminder("agent-1", "default");
       assert.match(reminder, /Subagents: 1 running — worker \(ambient status, \d+s\)/);
+    } finally {
+      __resetSubagentRegistry();
+    }
+  });
+});
+
+test("buildConnectionReminder: sweeps stale no-log subagents before summarizing", async () => {
+  await withBackendDir(() => {
+    __resetSubagentRegistry();
+    try {
+      writeAgent("agent-1", { model: "lmstudio/model-x" });
+      const entry = recordSubagentDispatch({
+        toolCallId: "toolu_stale_no_log",
+        parentRunId: "run-parent",
+        args: {
+          subagent_type: "general-purpose",
+          description: "orphaned chip",
+          run_in_background: true,
+        },
+      });
+
+      const reminder = buildSubagentSummaryLine(Date.parse(entry.startedAt) + 90_001);
+      assert.equal(reminder, null);
+      assert.equal(getSubagent("toolu_stale_no_log")?.status, "failed");
+      assert.equal(getSubagent("toolu_stale_no_log")?.failureReason, "orphaned");
     } finally {
       __resetSubagentRegistry();
     }

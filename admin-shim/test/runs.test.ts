@@ -21,7 +21,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -34,6 +35,12 @@ import {
 } from "./helpers/index.js";
 import type { ShimHandle } from "./helpers/shim.js";
 import type { SseFrame } from "./helpers/sse.js";
+import {
+  createRun,
+  getFramesFilePath,
+  getRun,
+  sweepOrphanedRunningRunsOnBoot,
+} from "../lib/runs.js";
 
 // ── types ─────────────────────────────────────────────────────────
 
@@ -130,6 +137,32 @@ function readRunRecord(stateDir: string, runId: string): RunRecord | null {
 }
 
 // ── tests ─────────────────────────────────────────────────────────
+
+test("runs: boot sweep finalizes orphaned running runs on disk", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "runs-boot-sweep-"));
+  const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  try {
+    const run = createRun({
+      agentId: "agent-orphaned-run",
+      conversationId: "conv-orphaned-run",
+    });
+
+    assert.ok(run.record.created_at);
+    const swept = sweepOrphanedRunningRunsOnBoot(Date.parse(run.record.created_at) + 1_000);
+
+    assert.equal(swept, 1);
+    const record = getRun(run.id);
+    assert.equal(record?.status, "failed");
+    assert.equal(record?.stop_reason, "shim_restart_orphaned");
+    const frames = readFileSync(getFramesFilePath(run.id), "utf8");
+    assert.match(frames, /shim_restart_orphaned/);
+  } finally {
+    if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
 
 test("runs: turn creates a Run record reachable via GET /v1/runs/{id}", async (t) => {
   const shim = await startShim();
