@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 
 import { getAgentPool } from "./agent-pool.js";
-import { findUnmappedTailUserMessageId, writeOtidForLocalId, syncSkillsBlockForAgent } from "./store.js";
+import { findUnmappedTailUserMessageId, writeOtidForLocalId, syncSkillsBlockForAgent, syncGoalsBlockForAgent } from "./store.js";
 import { toStringArrayOrNull } from "./translate.js";
 import type {
   LettaMessage,
@@ -870,6 +870,9 @@ export async function handleSendMessage(
       // This replaces the old per-turn O(installed-skills × body) full-body
       // injection that polluted every user message.
       syncSkillsBlockForAgent(agentId);
+      // lcp-wt5s: project the user's active goals into system context each
+      // turn (compact, active-only, with streak) — same discipline as skills.
+      syncGoalsBlockForAgent(agentId);
 
       // lcp-d0za: passive runtime introspection — inject serving model,
       // context utilization, and session role as a system-reminder so

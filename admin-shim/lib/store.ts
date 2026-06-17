@@ -71,6 +71,7 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
 
 import type { Block } from "./types/wire.js";
 import type { LocalMessage } from "./types/letta-stream.js";
+import { listGoalsForAgent, computeStreak, type Goal } from "./goals.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // On-disk shapes (NOT identical to wire types — see translate.mjs)
@@ -1998,6 +1999,69 @@ export function syncSkillsBlockForAgent(agentId: string): void {
   } catch {
     // Non-fatal: missing the index for one turn is far better than failing
     // the turn on an unrelated FS error.
+  }
+}
+
+// ── Goals projection (epic lcp-ctz2, bead lcp-wt5s) ─────────────────────
+// Mirror the skills projection: write a compact, ACTIVE-only "active_goals"
+// system block into the agent's memfs system context each turn so the
+// companion always sees what the user is currently working toward — without
+// inlining full progress history (progressive disclosure).
+
+/** Memory-block label for the per-agent active-goals index. */
+export const GOALS_BLOCK_LABEL = "active_goals";
+
+/**
+ * Build the compact "Active Goals" block: one line per ACTIVE goal with
+ * cadence, current streak, and the latest progress note (if any). Omits
+ * paused/done/abandoned goals and full progress history. Returns null when
+ * there are no active goals (caller removes any stale block).
+ */
+export function buildGoalsBlockContent(goals: Goal[]): string | null {
+  const active = goals.filter((g) => g.status === "active");
+  if (active.length === 0) return null;
+  const lines = active.map((g) => {
+    const streak = computeStreak(g);
+    const streakStr = streak > 0 ? `, streak ${streak}` : "";
+    const last = g.progress.length ? g.progress[g.progress.length - 1] : undefined;
+    const note = last?.note ? ` — last: ${last.note}` : "";
+    return `- ${g.title} (${g.cadence}${streakStr})${note}`;
+  });
+  return [
+    "## Active Goals",
+    "",
+    "These are the user's currently active goals. Each line is",
+    "`title (cadence, streak) — last: <latest progress note>`. Track progress",
+    "honestly against real signal where possible; you are the narrator of the",
+    "user's progress, not a cheerleader. Full goal history is not inlined here.",
+    "",
+    ...lines,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Sync the per-agent active-goals index into the agent's system-context memfs
+ * block (`active_goals.md`). Write-if-changed + self-cleaning, mirroring
+ * syncSkillsBlockForAgent. Called once per turn from chat.ts.
+ */
+export function syncGoalsBlockForAgent(agentId: string): void {
+  const sysDir = join(storageDir(), "memfs", agentId, "memory", "system");
+  const blockPath = join(sysDir, `${GOALS_BLOCK_LABEL}.md`);
+  try {
+    const goals = listGoalsForAgent(agentId);
+    const next = buildGoalsBlockContent(goals);
+
+    if (next === null) {
+      if (existsSync(blockPath)) rmSync(blockPath, { force: true });
+      return;
+    }
+
+    if (!existsSync(sysDir)) mkdirSync(sysDir, { recursive: true });
+    const current = existsSync(blockPath) ? readFileSync(blockPath, "utf8") : null;
+    if (current !== next) writeFileSync(blockPath, next);
+  } catch {
+    // Non-fatal: missing the index for one turn beats failing the turn.
   }
 }
 
