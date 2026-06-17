@@ -6,19 +6,21 @@ on:
   pull_request:
     branches: [master, main]
 
-# node-pty (a transitive dep of @letta-ai/letta-code) compiles a native
-# prebuild during `npm ci`, fetching node headers from nodejs.org. That fetch
-# intermittently ETIMEDOUTs on GitHub runners and, under the old 5-minute job
-# cap, hung until timeout — failing EVERY PR's shim-tests with an empty test
-# log even though the suite itself runs in ~8s. Fixes (kept narrow so we do
-# NOT disturb other native deps like sharp, which rely on prebuilt binaries
-# and break when forced to build from source):
-#   - retry npm ci once on transient network failure
-#   - give the job headroom above the real worst case (12 min vs 5)
+# admin-shim has direct native deps (node-pty, sharp). node-pty in particular
+# has no prebuilt binary for this runner's Node/platform combo, so `npm ci`
+# COMPILES it from source every run — fetching node headers from nodejs.org,
+# which intermittently ETIMEDOUTs and pushed install time past the job cap,
+# failing every PR's shim-tests with an empty log even though the suite runs
+# in ~8s. The shim tests are fully mocked and never spawn a PTY.
+#
+# Fix: cache the compiled node_modules keyed on the lockfile so the native
+# build happens at most once per lockfile change, then is reused. Restored
+# cache hits skip `npm ci` entirely.
+
 jobs:
   shim-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -26,12 +28,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: admin-shim/package-lock.json
+
+      - name: Cache shim node_modules
+        id: shim-node-modules
+        uses: actions/cache@v4
+        with:
+          path: admin-shim/node_modules
+          key: shim-node-modules-${{ runner.os }}-node20-${{ hashFiles('admin-shim/package-lock.json') }}
 
       - name: Install shim deps
+        if: steps.shim-node-modules.outputs.cache-hit != 'true'
         working-directory: admin-shim
-        run: npm ci || (echo "npm ci failed, retrying once" && npm ci)
+        run: npm ci
 
       - name: Run shim tests
         working-directory: admin-shim
@@ -39,7 +47,7 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -47,12 +55,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
-          cache-dependency-path: admin-shim/package-lock.json
+
+      - name: Cache shim node_modules
+        id: shim-node-modules
+        uses: actions/cache@v4
+        with:
+          path: admin-shim/node_modules
+          key: shim-node-modules-${{ runner.os }}-node20-${{ hashFiles('admin-shim/package-lock.json') }}
 
       - name: Install shim deps
+        if: steps.shim-node-modules.outputs.cache-hit != 'true'
         working-directory: admin-shim
-        run: npm ci || (echo "npm ci failed, retrying once" && npm ci)
+        run: npm ci
 
       - name: Run typecheck
         working-directory: admin-shim
