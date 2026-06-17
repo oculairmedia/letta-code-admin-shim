@@ -6,21 +6,21 @@ on:
   pull_request:
     branches: [master, main]
 
-# admin-shim has direct native deps (node-pty, sharp). node-pty in particular
-# has no prebuilt binary for this runner's Node/platform combo, so `npm ci`
-# COMPILES it from source every run — fetching node headers from nodejs.org,
-# which intermittently ETIMEDOUTs and pushed install time past the job cap,
-# failing every PR's shim-tests with an empty log even though the suite runs
-# in ~8s. The shim tests are fully mocked and never spawn a PTY.
+# admin-shim has direct native deps (node-pty, sharp). node-pty has no prebuilt
+# binary for this runner's Node/platform, so a plain `npm ci` COMPILES it from
+# source every run, fetching node headers from nodejs.org. That intermittently
+# ETIMEDOUTs and blew past the job timeout, getting every PR's shim-tests
+# cancelled with an empty log even though the suite runs in ~30s.
 #
-# Fix: cache the compiled node_modules keyed on the lockfile so the native
-# build happens at most once per lockfile change, then is reused. Restored
-# cache hits skip `npm ci` entirely.
+# The mocked shim tests and `tsc` typecheck never spawn a PTY or use sharp's
+# native binary, so we install with `--ignore-scripts` to skip the native
+# postinstall builds entirely. Local check: `npm ci --ignore-scripts` drops
+# install from >12min to ~3s and the full suite still passes.
 
 jobs:
   shim-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -28,18 +28,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: admin-shim/package-lock.json
 
-      - name: Cache shim node_modules
-        id: shim-node-modules
-        uses: actions/cache@v4
-        with:
-          path: admin-shim/node_modules
-          key: shim-node-modules-${{ runner.os }}-node20-${{ hashFiles('admin-shim/package-lock.json') }}
-
-      - name: Install shim deps
-        if: steps.shim-node-modules.outputs.cache-hit != 'true'
+      - name: Install shim deps (skip native postinstall builds)
         working-directory: admin-shim
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run shim tests
         working-directory: admin-shim
@@ -47,7 +41,7 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -55,18 +49,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: admin-shim/package-lock.json
 
-      - name: Cache shim node_modules
-        id: shim-node-modules
-        uses: actions/cache@v4
-        with:
-          path: admin-shim/node_modules
-          key: shim-node-modules-${{ runner.os }}-node20-${{ hashFiles('admin-shim/package-lock.json') }}
-
-      - name: Install shim deps
-        if: steps.shim-node-modules.outputs.cache-hit != 'true'
+      - name: Install shim deps (skip native postinstall builds)
         working-directory: admin-shim
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run typecheck
         working-directory: admin-shim
