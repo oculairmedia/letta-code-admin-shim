@@ -21,7 +21,7 @@
  */
 
 import { getAgentRecord, readSystemPrompt } from "./store.js";
-import { listActiveSubagents } from "./subagent-registry.js";
+import { listActiveSubagents, sweepOrphanedSubagents } from "./subagent-registry.js";
 
 export type SessionRole = "main" | "fork" | "subagent";
 
@@ -223,6 +223,7 @@ function truncateLine(line: string, maxLength = 220): string {
  * stays quiet unless there is live work to surface.
  */
 export function buildSubagentSummaryLine(nowMs = Date.now()): string | null {
+  sweepOrphanedSubagents(nowMs);
   const active = listActiveSubagentsForRuntime();
   if (active.length === 0) return null;
 

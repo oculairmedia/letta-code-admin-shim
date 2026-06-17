@@ -865,6 +865,38 @@ export function finalizeRunOnDisk(
 }
 
 /**
+ * Finalize stale on-disk running runs left behind by a shim restart.
+ *
+ * Active turns are process-local: after restart their worker/session and
+ * in-memory RunHandle are gone, but run.json can still say "running".
+ * Mobile uses active/running runs to decide whether the agent is still
+ * responding, so leaving those records alive causes the next send to act
+ * like it is clearing a stale response instead of starting cleanly.
+ */
+export function sweepOrphanedRunningRunsOnBoot(nowMs = Date.now()): number {
+  let swept = 0;
+  for (const runId of listRunIdsOnDisk()) {
+    const record = readRunFromDisk(runId);
+    if (!record || record.status !== "running") continue;
+    const createdMs = Date.parse(record.created_at ?? "");
+    const ageMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : null;
+    const finalized = finalizeRunOnDisk(runId, { status: "failed", stopReason: "shim_restart_orphaned" });
+    if (!finalized) continue;
+    appendRunFrameOnDisk(runId, {
+      message_type: "stop_reason",
+      run_id: runId,
+      agent_id: record.agent_id ?? null,
+      conversation_id: record.conversation_id ?? null,
+      stop_reason: "shim_restart_orphaned",
+      status: "failed",
+      ...(ageMs !== null ? { orphaned_age_ms: ageMs } : {}),
+    });
+    swept += 1;
+  }
+  return swept;
+}
+
+/**
  * Approval decision scope: Once (single call), Session (all calls in this
  * conversation), Forever (all calls across all conversations), or Deny.
  */

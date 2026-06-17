@@ -69,6 +69,7 @@ import {
   getFramesFilePath,
   listRunSteps,
   listRuns,
+  sweepOrphanedRunningRunsOnBoot,
   type ListRunsParams,
 } from "./lib/runs.js";
 import {
@@ -2476,6 +2477,18 @@ server.listen(PORT, HOST, () => {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[subagent-registry] boot-rehydrate failed: ${msg}`);
     try { rehydrateRunningSubagentWatchdogs(); } catch {}
+  }
+
+  // A running run cannot survive a shim restart because its in-memory
+  // worker/session is gone. Finalize any stale on-disk `running` records so
+  // reconnecting mobile clients do not keep the composer latched as
+  // "agent responding" forever.
+  try {
+    const swept = sweepOrphanedRunningRunsOnBoot();
+    if (swept > 0) console.log(`[runs] boot-sweep finalized ${swept} orphaned running run(s)`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[runs] boot-sweep failed: ${msg}`);
   }
 
   // lcp-indw: boot-sweep surviving pending approvals (R1). A turn parked on
