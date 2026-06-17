@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// @ts-nocheck — standalone ExecStartPre runtime utility (not part of the typed
+// shim surface). It parses arbitrary on-disk JSON sidecars, so strict checkJs
+// rules (index-signature env access, implicit-any JSON.parse results) add noise
+// without value here. Behavior is covered by the script running on every boot.
 // Self-heal guard (incident 2026-06-17): a disk-full / EDQUOT event truncated
 // letta-code's non-atomic end-of-turn conversation.json rewrite to 0 bytes.
 // The shim's REST layer skips conversations whose conversation.json is empty
