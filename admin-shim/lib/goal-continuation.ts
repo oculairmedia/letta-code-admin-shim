@@ -20,7 +20,12 @@
  * try/catch that stops (never spins) on error.
  */
 
-import { getNativeGoalForConversation, type NativeGoalStatusResponse } from "./native-goal-mode.js";
+import {
+  addNativeGoalUsage,
+  getNativeGoalForConversation,
+  type NativeGoalStatusResponse,
+  type NativeGoalUsageDelta,
+} from "./native-goal-mode.js";
 import { broadcastGoalEvent } from "./goal-events.js";
 
 const MAX_ITERATIONS = (() => {
@@ -40,15 +45,26 @@ export interface GoalContinuationSendArgs {
   onRunCreated?: (runId: string) => void;
 }
 
+export interface GoalContinuationUsage {
+  tokensUsed?: number;
+  activeSeconds?: number;
+}
+
+export interface GoalContinuationSendResult {
+  assistantText?: string;
+  usage?: GoalContinuationUsage;
+}
+
 /**
  * Issues a single continuation turn and resolves with the assistant text
  * produced (used only for the <goal_status>complete</goal_status> fallback).
  * Implementations should resolve once the turn is terminal.
  */
-export type GoalContinuationSendFn = (args: GoalContinuationSendArgs) => Promise<string>;
+export type GoalContinuationSendFn = (args: GoalContinuationSendArgs) => Promise<string | GoalContinuationSendResult>;
 
 /** Reads native goal status for a conversation. Injectable for tests. */
 export type GoalStatusGetter = (conversationId: string) => NativeGoalStatusResponse | null;
+export type GoalUsageAccruer = (delta: NativeGoalUsageDelta) => NativeGoalStatusResponse | null;
 
 export type GoalContinuationCancelFn = (runId: string) => boolean;
 
@@ -165,6 +181,11 @@ function emitGoalEvent(conversationId: string, getter: GoalStatusGetter): void {
   }
 }
 
+function normalizeSendResult(result: string | GoalContinuationSendResult): Required<GoalContinuationSendResult> {
+  if (typeof result === "string") return { assistantText: result, usage: {} };
+  return { assistantText: result.assistantText ?? "", usage: result.usage ?? {} };
+}
+
 /**
  * If the conversation has an active native goal, drive continuation turns
  * until a terminal condition. Fire-and-forget safe: the loop runs to
@@ -178,6 +199,7 @@ export async function maybeContinue(
   agentId: string,
   sendFn: GoalContinuationSendFn,
   getGoalStatus: GoalStatusGetter = getNativeGoalForConversation,
+  accrueGoalUsage: GoalUsageAccruer = addNativeGoalUsage,
 ): Promise<void> {
   // Single-flight: never run two loops for the same conversation.
   if (activeLoops.get(conversationId)) return;
@@ -203,7 +225,8 @@ export async function maybeContinue(
 
       let assistantText = "";
       try {
-        assistantText = await sendFn({
+        const startedAt = Date.now();
+        const result = normalizeSendResult(await sendFn({
           agent_id: agentId,
           conversation_id: conversationId,
           text: buildContinuationPrompt(g),
@@ -213,7 +236,16 @@ export async function maybeContinue(
             currentRuns.set(conversationId, runId);
             console.info(`[goal-continuation] turn started conv=${conversationId} agent=${agentId} otid=${otid} run=${runId}`);
           },
-        });
+        }));
+        assistantText = result.assistantText;
+        const tokensUsed = Number.isFinite(result.usage.tokensUsed) ? Math.max(0, Math.floor(result.usage.tokensUsed ?? 0)) : 0;
+        const activeSeconds = result.usage.activeSeconds ?? Math.floor((Date.now() - startedAt) / 1000);
+        if (tokensUsed > 0 || activeSeconds > 0) {
+          const status = accrueGoalUsage({ conversationId, agentId, tokensUsed, activeSeconds });
+          if (status) {
+            broadcastGoalEvent({ reason: "external_write", at: new Date().toISOString(), status });
+          }
+        }
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error(

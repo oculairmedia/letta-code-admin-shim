@@ -55,6 +55,20 @@ export interface NativeGoalCommandResult extends NativeGoalStatusResponse {
   message: string;
 }
 
+export interface NativeGoalUsageDelta {
+  conversationId?: string;
+  agentId?: string;
+  tokensUsed?: number;
+  activeSeconds?: number;
+}
+
+interface GoalStorageTarget {
+  serverKey: string;
+  conversationId: string;
+  agentId?: string;
+  externalConversationId: string;
+}
+
 function localSettingsPath(workingDirectory = process.cwd()): string {
   return join(workingDirectory, ".letta", "settings.local.json");
 }
@@ -163,6 +177,40 @@ function findByConversationId(settings: LocalSettings, conversationId: string): 
   return null;
 }
 
+function findStorageTargetByConversationId(settings: LocalSettings, conversationId: string): GoalStorageTarget | null {
+  const alias = findDefaultAlias(settings, conversationId);
+  const lookupConversationId = alias?.storageConversationId ?? conversationId;
+  const lookupServerKey = alias?.serverKey ?? null;
+  const byServer = settings.conversationGoalsByServer ?? {};
+  for (const [serverKey, goalsByConversation] of Object.entries(byServer)) {
+    if (lookupServerKey && serverKey !== lookupServerKey) continue;
+    if (goalsByConversation[lookupConversationId]) {
+      return {
+        serverKey,
+        conversationId: lookupConversationId,
+        ...(alias?.agentId ? { agentId: alias.agentId } : {}),
+        externalConversationId: conversationId,
+      };
+    }
+  }
+  return null;
+}
+
+function findStorageTargetByAgentId(settings: LocalSettings, agentId: string): GoalStorageTarget | null {
+  for (const session of sortSessionsForAgent(settings, sessionsForAgent(agentId, settings))) {
+    const goal = settings.conversationGoalsByServer?.[session.serverKey]?.[session.conversationId] ?? null;
+    if (goal) {
+      return {
+        serverKey: session.serverKey,
+        conversationId: session.conversationId,
+        agentId,
+        externalConversationId: externalConversationId(agentId, session.conversationId),
+      };
+    }
+  }
+  return null;
+}
+
 export function getNativeGoalForConversation(conversationId: string): NativeGoalStatusResponse | null {
   return findByConversationId(mergedSettings(), conversationId);
 }
@@ -182,6 +230,44 @@ export function getNativeGoalForAgent(agentId: string): NativeGoalStatusResponse
     };
   }
   return null;
+}
+
+export function addNativeGoalUsage(delta: NativeGoalUsageDelta): NativeGoalStatusResponse | null {
+  const tokensUsed = Number.isFinite(delta.tokensUsed) ? Math.max(0, Math.floor(delta.tokensUsed ?? 0)) : 0;
+  const activeSeconds = Number.isFinite(delta.activeSeconds) ? Math.max(0, Math.floor(delta.activeSeconds ?? 0)) : 0;
+  if (tokensUsed <= 0 && activeSeconds <= 0) return null;
+
+  const local = readLocalSettings();
+  const global = readGlobalSettings();
+  const settings: LocalSettings = {
+    ...local,
+    sessionsByServer: { ...(global.sessionsByServer ?? {}), ...(local.sessionsByServer ?? {}) },
+  };
+  const target = delta.conversationId
+    ? findStorageTargetByConversationId(settings, delta.conversationId)
+    : delta.agentId
+      ? findStorageTargetByAgentId(settings, delta.agentId)
+      : null;
+  if (!target) return null;
+
+  const byServer = { ...(local.conversationGoalsByServer ?? {}) };
+  const goalsForServer = { ...(byServer[target.serverKey] ?? {}) };
+  const existing = goalsForServer[target.conversationId] ?? null;
+  if (!existing || existing.status !== "active") return null;
+
+  const now = new Date().toISOString();
+  const goal: NativeConversationGoal = {
+    ...existing,
+    tokensUsed: (existing.tokensUsed ?? 0) + tokensUsed,
+    activeTimeSeconds: (existing.activeTimeSeconds ?? 0) + activeSeconds,
+    updatedAt: now,
+  };
+  goalsForServer[target.conversationId] = goal;
+  byServer[target.serverKey] = goalsForServer;
+  local.conversationGoalsByServer = byServer;
+  writeLocalSettings(local);
+
+  return statusForSession(local, target.serverKey, target.conversationId, target.agentId);
 }
 
 interface AgentSession {

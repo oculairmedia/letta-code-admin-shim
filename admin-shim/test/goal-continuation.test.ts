@@ -5,7 +5,7 @@
  * turns are spawned and no native settings file is touched.
  */
 
-import { test } from "node:test";
+import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import {
@@ -17,7 +17,12 @@ import {
   __clearContinuationState,
   type GoalContinuationSendArgs,
 } from "../lib/goal-continuation.js";
+import { __clearGoalEventSubscribers, subscribeGoalEvents } from "../lib/goal-events.js";
 import type { NativeGoalStatusResponse } from "../lib/native-goal-mode.js";
+
+afterEach(() => {
+  __clearGoalEventSubscribers();
+});
 
 function statusResponse(
   conversationId: string,
@@ -120,21 +125,25 @@ test("stops on <goal_status>complete</goal_status> sentinel", async () => {
   assert.equal(calls, 2, "sentinel should stop the loop");
 });
 
-test("stops when token budget reached", async () => {
+test("stops when token budget reached through accrued continuation usage", async () => {
   __clearContinuationState();
   const conv = "conv-budget";
   let calls = 0;
   const used = { n: 0 };
   const sendFn = async () => {
     calls += 1;
-    used.n += 40;
-    return "ok";
+    return { assistantText: "ok", usage: { tokensUsed: 40 } };
   };
   const getter = () =>
     statusResponse(conv, { status: "active", tokensUsed: used.n, tokenBudget: 100 });
-  await maybeContinue(conv, "agent-test", sendFn, getter);
-  // 0 -> send(40) -> 40 -> send(80) -> 80 -> send(120) -> 120 >= 100 stop.
+  const accrue = (delta: { tokensUsed?: number }) => {
+    used.n += delta.tokensUsed ?? 0;
+    return statusResponse(conv, { status: "active", tokensUsed: used.n, tokenBudget: 100 });
+  };
+  await maybeContinue(conv, "agent-test", sendFn, getter, accrue);
+  // 0 -> accrue(40) -> 40 -> accrue(80) -> 80 -> accrue(120) -> 120 >= 100 stop.
   assert.equal(calls, 3);
+  assert.equal(used.n, 120);
 });
 
 test("stops at max-iteration cap", async () => {
@@ -260,4 +269,28 @@ test("stopContinuation cancels current in-flight run", async () => {
   assert.deepEqual(cancelledRuns, ["run-current"]);
   release!();
   await promise;
+});
+
+
+test("accrues continuation turn usage and broadcasts goals_updated", async () => {
+  __clearContinuationState();
+  const conv = "conv-usage";
+  let tokensUsed = 0;
+  const events: NativeGoalStatusResponse[] = [];
+  subscribeGoalEvents((event) => {
+    events.push(event.status);
+  });
+  const sendFn = async () => {
+    return { assistantText: "<goal_status>complete</goal_status>", usage: { tokensUsed: 37, activeSeconds: 1 } };
+  };
+  const getter = () => statusResponse(conv, { status: "active", tokensUsed, tokenBudget: 100 });
+  const accrue = (delta: { tokensUsed?: number }) => {
+    tokensUsed += delta.tokensUsed ?? 0;
+    return statusResponse(conv, { status: "active", tokensUsed, tokenBudget: 100 });
+  };
+
+  await maybeContinue(conv, "agent-test", sendFn, getter, accrue);
+
+  assert.equal(tokensUsed, 37);
+  assert.ok(events.some((status) => status.goal?.tokensUsed === 37), "usage accrual should broadcast updated goal status");
 });
