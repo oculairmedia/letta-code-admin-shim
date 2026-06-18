@@ -9,6 +9,8 @@ import {
   applyNativeGoalCommandForAgent,
   getNativeGoalForAgent,
   getNativeGoalForConversation,
+  listActiveNativeGoals,
+  wasNativeGoalUserStopped,
 } from "../lib/native-goal-mode.js";
 
 let cwd: string;
@@ -133,10 +135,13 @@ test("native goal command bridge creates, pauses, resumes, completes, and clears
   assert.equal(paused.action, "pause");
   assert.equal(paused.goal?.status, "paused");
   assert.equal(paused.goal?.activeStartedAt, null);
+  assert.equal(paused.goal?.userStopped, true);
+  assert.equal(paused.goal?.stoppedReason, "paused");
 
   const resumed = await applyNativeGoalCommandForAgent("agent-a", "/goal resume");
   assert.equal(resumed.action, "resume");
   assert.equal(resumed.goal?.status, "active");
+  assert.equal(resumed.goal?.userStopped, false);
   assert.ok(resumed.goal?.activeStartedAt);
 
   const complete = await applyNativeGoalCommandForAgent("agent-a", "/goal complete");
@@ -146,7 +151,28 @@ test("native goal command bridge creates, pauses, resumes, completes, and clears
   const cleared = await applyNativeGoalCommandForAgent("agent-a", "/goal clear");
   assert.equal(cleared.action, "clear");
   assert.equal(cleared.goal, null);
-  assert.equal(getNativeGoalForAgent("agent-a")?.goal, null);
+  const storedClearedGoal = readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"];
+  assert.equal(storedClearedGoal.status, "cleared");
+  assert.equal(storedClearedGoal.userStopped, true);
+  assert.equal(wasNativeGoalUserStopped(storedClearedGoal), true);
+  assert.equal(getNativeGoalForAgent("agent-a")?.goal?.status, "cleared");
+});
+
+
+test("listActiveNativeGoals excludes user-stopped goals", () => {
+  writeLocalSettings({
+    conversationGoalsByServer: {
+      "local:/tmp/backend": {
+        "conv-active": { objective: "resume me", status: "active", userStopped: false },
+        "conv-paused": { objective: "do not resume", status: "paused", userStopped: true },
+        "conv-cleared": { objective: "do not revive", status: "cleared", userStopped: true },
+        "conv-defensive": { objective: "stopped active marker", status: "active", userStopped: true },
+      },
+    },
+  });
+
+  const active = listActiveNativeGoals();
+  assert.deepEqual(active.map((entry) => entry.conversation_id), ["conv-active"]);
 });
 
 

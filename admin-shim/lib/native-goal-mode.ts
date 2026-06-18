@@ -26,6 +26,9 @@ export interface NativeConversationGoal {
   activeTimeSeconds?: number;
   tokensUsed?: number;
   tokenBudget?: number | null;
+  userStopped?: boolean;
+  stoppedReason?: "paused" | "cleared" | string;
+  stoppedAt?: string;
 }
 
 export interface NativeGoalStatusResponse {
@@ -232,6 +235,29 @@ export function getNativeGoalForAgent(agentId: string): NativeGoalStatusResponse
   return null;
 }
 
+export function wasNativeGoalUserStopped(goal: NativeConversationGoal | null | undefined): boolean {
+  return goal?.userStopped === true || goal?.status === "paused" || goal?.status === "cleared";
+}
+
+export function listActiveNativeGoals(): NativeGoalStatusResponse[] {
+  const settings = mergedSettings();
+  const out: NativeGoalStatusResponse[] = [];
+  for (const [serverKey, goalsByConversation] of Object.entries(settings.conversationGoalsByServer ?? {})) {
+    for (const [conversationId, goal] of Object.entries(goalsByConversation)) {
+      if (goal.status !== "active" || wasNativeGoalUserStopped(goal)) continue;
+      const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[conversationId];
+      out.push({
+        source: "letta_code_goal_mode",
+        server_key: serverKey,
+        conversation_id: conversationId,
+        goal,
+        ...(toolsEnabled !== undefined ? { tools_enabled: toolsEnabled } : {}),
+      });
+    }
+  }
+  return out;
+}
+
 export function addNativeGoalUsage(delta: NativeGoalUsageDelta): NativeGoalStatusResponse | null {
   const tokensUsed = Number.isFinite(delta.tokensUsed) ? Math.max(0, Math.floor(delta.tokensUsed ?? 0)) : 0;
   const activeSeconds = Number.isFinite(delta.activeSeconds) ? Math.max(0, Math.floor(delta.activeSeconds ?? 0)) : 0;
@@ -397,12 +423,13 @@ export async function applyNativeGoalCommandForAgent(
     // read-only
   } else if (sub === "pause") {
     if (!existing) throw new Error("no active goal to pause");
-    goal = { ...accrueActiveSeconds(existing, now), status: "paused", activeStartedAt: null, updatedAt: now };
+    goal = { ...accrueActiveSeconds(existing, now), status: "paused", activeStartedAt: null, updatedAt: now, userStopped: true, stoppedReason: "paused", stoppedAt: now };
     action = "pause";
     message = "Goal paused.";
   } else if (sub === "resume") {
     if (!existing) throw new Error("no goal to resume");
-    goal = { ...existing, status: "active", activeStartedAt: now, updatedAt: now };
+    const { stoppedReason: _stoppedReason, stoppedAt: _stoppedAt, ...resumedGoal } = existing;
+    goal = { ...resumedGoal, status: "active", activeStartedAt: now, updatedAt: now, userStopped: false };
     action = "resume";
     message = "Goal resumed.";
   } else if (sub === "complete") {
@@ -411,7 +438,11 @@ export async function applyNativeGoalCommandForAgent(
     action = "complete";
     message = "Goal marked complete.";
   } else if (sub === "clear") {
-    delete goalsForServer[session.conversationId];
+    if (existing) {
+      goalsForServer[session.conversationId] = { ...accrueActiveSeconds(existing, now), status: "cleared", activeStartedAt: null, updatedAt: now, userStopped: true, stoppedReason: "cleared", stoppedAt: now };
+    } else {
+      delete goalsForServer[session.conversationId];
+    }
     goal = null;
     action = "clear";
     message = "Goal cleared.";
@@ -442,6 +473,7 @@ export async function applyNativeGoalCommandForAgent(
       activeTimeSeconds: replace ? 0 : (existing?.activeTimeSeconds ?? 0),
       tokensUsed: replace ? 0 : (existing?.tokensUsed ?? 0),
       tokenBudget,
+      userStopped: false,
     };
     action = replace ? "replace" : "create";
     message = replace ? "Goal replaced." : "Goal created.";

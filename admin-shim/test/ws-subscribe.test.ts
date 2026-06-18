@@ -50,6 +50,7 @@ function seedRun(
   runId: string,
   frames: SeededFrame[],
   status: "running" | "completed" | "failed" | "cancelled" = "completed",
+  extra: Record<string, unknown> = {},
 ): void {
   const dir = join(shim.stateDir, "runs", runId);
   mkdirSync(dir, { recursive: true });
@@ -65,6 +66,7 @@ function seedRun(
       message_ids: [],
       tools_used: [],
       num_steps: 0,
+      ...extra,
     }),
   );
   for (const f of frames) {
@@ -270,6 +272,33 @@ test("subscribe without run_id yields error{protocol_violation}; socket stays op
       const err = await waitNew<ErrorFrame>(conn, "error", 3000);
       assert.equal(err.code, "protocol_violation");
       assert.match(err.message, /run_id/);
+    } finally {
+      conn.close();
+    }
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("subscribe to a user-cancelled terminal run emits subscribe_done without replay", async () => {
+  const shim = await startShim();
+  try {
+    const runId = "run-userstop-1111-2222-3333-444444444444";
+    seedRun(shim, runId, [
+      { seq: 1, frame: { message_type: "assistant_message", content: "stale" } },
+    ], "cancelled", {
+      completed_at: "2026-05-18T10:01:00.000Z",
+      stop_reason: "user_cancelled",
+      metadata: { user_stopped: true },
+    });
+
+    const conn = await openMobileWs(shim.url!, { token: shim.mobileToken });
+    try {
+      const { frames, done } = await collectSubscribeReplay(conn, runId, 0);
+      assert.equal(frames.length, 0, "user-stopped terminal runs are not replayed/live-tailed");
+      assert.equal(done.status, "cancelled");
+      assert.equal(done.last_seq, 0);
+      assert.equal((done as SubscribeDoneFrame & { user_stopped?: boolean }).user_stopped, true);
     } finally {
       conn.close();
     }
