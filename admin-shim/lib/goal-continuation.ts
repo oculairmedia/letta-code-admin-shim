@@ -176,7 +176,11 @@ export async function maybeContinue(
           otid: `goalcont-${conversationId}-${iteration}`,
           background: true,
         });
-      } catch {
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[goal-continuation] turn failed conv=${conversationId} agent=${agentId} otid=goalcont-${conversationId}-${iteration}: ${errMsg}`,
+        );
         // On any turn error, stop the loop rather than spin.
         break;
       }

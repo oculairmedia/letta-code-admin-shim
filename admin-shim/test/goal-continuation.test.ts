@@ -185,18 +185,28 @@ test("single-flight: concurrent calls don't double-run", async () => {
   assert.equal(calls, 1);
 });
 
-test("stops on sendFn error", async () => {
+test("stops on sendFn error and logs loudly", async () => {
   __clearContinuationState();
   const conv = "conv-err";
   let calls = 0;
+  const logs: string[] = [];
+  const originalError = console.error;
+  console.error = (message?: unknown) => {
+    logs.push(String(message));
+  };
   const sendFn = async () => {
     calls += 1;
-    throw new Error("boom");
+    throw new Error("conversation not found");
   };
   const getter = () => statusResponse(conv, { status: "active" });
-  await maybeContinue(conv, "agent-test", sendFn, getter);
+  try {
+    await maybeContinue(conv, "agent-test", sendFn, getter);
+  } finally {
+    console.error = originalError;
+  }
   assert.equal(calls, 1, "should stop after first error, not spin");
   assert.equal(isContinuationActive(conv), false);
+  assert.match(logs.join("\n"), /\[goal-continuation\] turn failed conv=conv-err agent=agent-test otid=goalcont-conv-err-1: conversation not found/);
 });
 
 test("stopContinuation cancels a running loop", async () => {

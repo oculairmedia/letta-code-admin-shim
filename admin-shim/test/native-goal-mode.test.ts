@@ -111,51 +111,82 @@ test("native goal wrapper can map agent sessions from global settings while goal
   assert.equal(result?.goal?.status, "paused");
 });
 
-test("native goal command bridge creates, pauses, resumes, completes, and clears native goal state", () => {
+test("native goal command bridge creates, pauses, resumes, completes, and clears native goal state", async () => {
   writeLocalSettings({
     sessionsByServer: {
       "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
     },
   });
 
-  const created = applyNativeGoalCommandForAgent("agent-a", "/goal --token-budget 50000 finish the migration");
+  const created = await applyNativeGoalCommandForAgent("agent-a", "/goal --token-budget 50000 finish the migration");
   assert.equal(created.action, "create");
   assert.equal(created.goal?.objective, "finish the migration");
   assert.equal(created.goal?.tokenBudget, 50000);
   assert.equal(created.goal?.status, "active");
 
-  const paused = applyNativeGoalCommandForAgent("agent-a", "/goal pause");
+  const paused = await applyNativeGoalCommandForAgent("agent-a", "/goal pause");
   assert.equal(paused.action, "pause");
   assert.equal(paused.goal?.status, "paused");
   assert.equal(paused.goal?.activeStartedAt, null);
 
-  const resumed = applyNativeGoalCommandForAgent("agent-a", "/goal resume");
+  const resumed = await applyNativeGoalCommandForAgent("agent-a", "/goal resume");
   assert.equal(resumed.action, "resume");
   assert.equal(resumed.goal?.status, "active");
   assert.ok(resumed.goal?.activeStartedAt);
 
-  const complete = applyNativeGoalCommandForAgent("agent-a", "/goal complete");
+  const complete = await applyNativeGoalCommandForAgent("agent-a", "/goal complete");
   assert.equal(complete.action, "complete");
   assert.equal(complete.goal?.status, "complete");
 
-  const cleared = applyNativeGoalCommandForAgent("agent-a", "/goal clear");
+  const cleared = await applyNativeGoalCommandForAgent("agent-a", "/goal clear");
   assert.equal(cleared.action, "clear");
   assert.equal(cleared.goal, null);
   assert.equal(getNativeGoalForAgent("agent-a")?.goal, null);
 });
 
-test("native goal command bridge requires --replace when a goal already exists", () => {
+test("native goal command bridge requires --replace when a goal already exists", async () => {
   writeLocalSettings({
     sessionsByServer: {
       "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
     },
   });
-  applyNativeGoalCommandForAgent("agent-a", "/goal first objective");
-  assert.throws(
+  await applyNativeGoalCommandForAgent("agent-a", "/goal first objective");
+  await assert.rejects(
     () => applyNativeGoalCommandForAgent("agent-a", "/goal second objective"),
     /goal already exists/,
   );
-  const replaced = applyNativeGoalCommandForAgent("agent-a", "/goal --replace second objective");
+  const replaced = await applyNativeGoalCommandForAgent("agent-a", "/goal --replace second objective");
   assert.equal(replaced.action, "replace");
   assert.equal(replaced.goal?.objective, "second objective");
+});
+
+
+test("native goal command prefers resolvable local backend session over stale remote session", async () => {
+  const localBackend = join(tmpdir(), "goal-local-backend");
+  const prevBackend = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = localBackend;
+  try {
+    writeLocalSettings({
+      sessionsByServer: {
+        "192.168.50.90:8289": { agentId: "agent-a", conversationId: "conv-stale" },
+        [`local:${localBackend}`]: { agentId: "agent-a", conversationId: "default" },
+      },
+    });
+
+    const result = await applyNativeGoalCommandForAgent(
+      "agent-a",
+      "/goal drive the real local turn",
+      async (conversationId) =>
+        conversationId === "conv-default-agent-a" ? { agentId: "agent-a", conversationId: "default" } : null,
+    );
+
+    assert.equal(result.server_key, `local:${localBackend}`);
+    assert.equal(result.conversation_id, "conv-default-agent-a");
+    assert.equal(result.goal?.objective, "drive the real local turn");
+    assert.equal(getNativeGoalForConversation("conv-default-agent-a")?.goal?.objective, "drive the real local turn");
+    assert.equal(getNativeGoalForAgent("agent-a")?.conversation_id, "conv-default-agent-a");
+  } finally {
+    if (prevBackend === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prevBackend;
+  }
 });
