@@ -76,6 +76,24 @@ function writeLocalSettings(settings: LocalSettings, workingDirectory = process.
   writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
 }
 
+function statusForSession(
+  settings: LocalSettings,
+  serverKey: string,
+  conversationId: string,
+  agentId?: string,
+): NativeGoalStatusResponse {
+  const goal = settings.conversationGoalsByServer?.[serverKey]?.[conversationId] ?? null;
+  const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[conversationId];
+  return {
+    source: "letta_code_goal_mode",
+    server_key: serverKey,
+    ...(agentId ? { agent_id: agentId } : {}),
+    conversation_id: agentId ? externalConversationId(agentId, conversationId) : conversationId,
+    goal,
+    ...(toolsEnabled !== undefined ? { tools_enabled: toolsEnabled } : {}),
+  };
+}
+
 /** Fallback global settings reader for projects that only have global session info. */
 function readGlobalSettings(): LocalSettings {
   const path = join(process.env["HOME"] || homedir(), ".letta", "settings.json");
@@ -367,6 +385,44 @@ export async function applyNativeGoalCommandForAgent(
     ...(local.conversationGoalToolsByServer?.[session.serverKey]?.[session.conversationId] !== undefined
       ? { tools_enabled: local.conversationGoalToolsByServer[session.serverKey]![session.conversationId] }
       : {}),
+  };
+}
+
+export async function updateNativeGoalStatusForAgent(
+  agentId: string,
+  status: "complete" | "blocked",
+  resolver: ConversationResolver = resolveConversationId,
+): Promise<NativeGoalCommandResult> {
+  const local = readLocalSettings();
+  const global = readGlobalSettings();
+  const settings: LocalSettings = {
+    ...local,
+    sessionsByServer: { ...(global.sessionsByServer ?? {}), ...(local.sessionsByServer ?? {}) },
+  };
+  const session = await sessionForAgent(agentId, settings, resolver);
+  if (!session) throw new Error(`no active conversation for agent ${agentId}`);
+
+  const byServer = { ...(local.conversationGoalsByServer ?? {}) };
+  const goalsForServer = { ...(byServer[session.serverKey] ?? {}) };
+  const existing = goalsForServer[session.conversationId] ?? null;
+  if (!existing) throw new Error(`no active goal to mark ${status}`);
+
+  const now = new Date().toISOString();
+  const goal = { ...accrueActiveSeconds(existing, now), status, activeStartedAt: null, updatedAt: now };
+  goalsForServer[session.conversationId] = goal;
+  byServer[session.serverKey] = goalsForServer;
+  local.conversationGoalsByServer = byServer;
+  writeLocalSettings(local);
+
+  void import("./goal-continuation.js")
+    .then((mod) => mod.stopContinuation(externalConversationId(agentId, session.conversationId)))
+    .catch(() => {});
+
+  return {
+    ok: true,
+    action: status,
+    message: status === "complete" ? "Goal marked complete." : "Goal marked blocked.",
+    ...statusForSession(local, session.serverKey, session.conversationId, agentId),
   };
 }
 
