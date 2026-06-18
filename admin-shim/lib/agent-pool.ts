@@ -40,6 +40,7 @@ import {
   type FrameAppendStats,
 } from "./perf-metrics.js";
 import { type A2uiCapability } from "./a2ui-adapter.js";
+import type { AnyAgentTool } from "@letta-ai/letta-code-sdk";
 import {
   detectConsecutiveUserMessageIndices,
   detectDanglingToolUses,
@@ -179,6 +180,8 @@ export function waitForApprovalDecision(
 /** Options accepted by `LettaSessionAdapter#runTurn`. */
 export interface RunTurnOptions {
   onFrame?: (frame: LettaStreamFrame, meta: { runId: string }) => void;
+  tools?: AnyAgentTool[];
+  closeAfterTurn?: boolean;
   /**
    * Caller-supplied turn-start anchor. `chat.mjs` captures this BEFORE
    * calling `pool.get()` so disk-stamped and stream-emitted timestamps
@@ -259,6 +262,7 @@ export interface LettaSessionInit {
 export interface LettaSessionAdapterOptions {
   conversationId: string;
   agentId: string;
+  tools?: AnyAgentTool[];
 }
 
 /** Adapter-owned turn result. Public callers still see RunTurnResult via AgentPool#get(). */
@@ -766,8 +770,22 @@ export class AgentPool {
       logLine(`preflight role-alternation heal failed conv=${conversationId}: ${msg}`);
     }
 
-    const adapter = await this.get(conversationId, agentId);
-    const result = await adapter.runTurn(input, opts);
+    let adapter: LettaSessionAdapter | null = null;
+    if (opts.tools && opts.tools.length > 0) {
+      const factory = this._adapterFactory ?? createAdapter;
+      adapter = await factory({ conversationId, agentId, tools: opts.tools });
+      await adapter.start();
+    } else {
+      adapter = await this.get(conversationId, agentId);
+    }
+    let result: AdapterRunTurnResult;
+    try {
+      result = await adapter.runTurn(input, opts);
+    } finally {
+      if (opts.closeAfterTurn || (opts.tools && opts.tools.length > 0)) {
+        await adapter.close();
+      }
+    }
     if (!result.errorPayload) return result;
     let ids: string[];
     let roleAlternationViolation = false;

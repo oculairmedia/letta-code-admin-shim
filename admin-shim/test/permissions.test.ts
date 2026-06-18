@@ -586,7 +586,7 @@ test("dark-ship: flag OFF preserves the bypassPermissions default permission mod
 
 // ── Test 9 (Commit 2): silence-watchdog NOT tripped by a parked ask ────
 
-test("goal continuation lifecycle tools bypass approval gating narrowly", async (t) => {
+test("goal_control bypasses approval gating narrowly for goal continuations", async (t) => {
   const stateDir = mkdtempSync(join(tmpdir(), "permissions-goal-tools-"));
   const prevDir = process.env["LETTA_LOCAL_BACKEND_DIR"];
   const prevFlag = process.env["SHIM_SERVER_PERMISSIONS"];
@@ -602,7 +602,7 @@ test("goal continuation lifecycle tools bypass approval gating narrowly", async 
     try { rmSync(stateDir, { recursive: true, force: true }); } catch {}
   });
 
-  writeGlobalConfig(cfg({ rules: [{ tool: "update_goal", action: "ask", reason: "review" }] }));
+  writeGlobalConfig(cfg({ rules: [{ tool: "goal_control", action: "ask", reason: "review" }] }));
   const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-goal" });
   (adapter as unknown as { ready: boolean }).ready = true;
   const runHandle = createRun({ agentId: "agent-goal", conversationId: "default", background: true });
@@ -616,8 +616,8 @@ test("goal continuation lifecycle tools bypass approval gating narrowly", async 
       cache: Map<string, unknown>,
     ) => Promise<{ behavior: string; message?: string } | null>;
   })._handleCanUseToolServerPermissions(
-    "update_goal",
-    { status: "complete" },
+    "goal_control",
+    { action: "complete" },
     runHandle,
     null,
     loadApprovalScopeCache(runHandle.id, "default"),
@@ -625,7 +625,25 @@ test("goal continuation lifecycle tools bypass approval gating narrowly", async 
 
   assert.equal(result?.behavior, "allow");
   assert.equal(result?.message, "goal_continuation_lifecycle_tool");
-  assert.equal(readPendingApproval(runHandle.id), null, "goal tool should not park for approval");
+  assert.equal(readPendingApproval(runHandle.id), null, "goal_control should not park for approval");
+
+  const nonGoalRunHandle = createRun({ agentId: "agent-goal", conversationId: "default", background: true });
+  const denied = await (adapter as unknown as {
+    _handleCanUseToolServerPermissions: (
+      n: string,
+      i: Record<string, unknown>,
+      h: typeof nonGoalRunHandle,
+      onFrame: ((f: LettaStreamFrame, m: { runId: string }) => void) | null,
+      cache: Map<string, unknown>,
+    ) => Promise<{ behavior: string; message?: string } | null>;
+  })._handleCanUseToolServerPermissions(
+    "goal_control",
+    { action: "complete" },
+    nonGoalRunHandle,
+    null,
+    loadApprovalScopeCache(nonGoalRunHandle.id, "default"),
+  );
+  assert.equal(denied?.behavior, "deny");
 });
 
 test("silence watchdog: a parked ask resets the watchdog and is not falsely timed out", async (t) => {

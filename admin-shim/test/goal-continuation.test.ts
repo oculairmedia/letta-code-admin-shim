@@ -59,8 +59,8 @@ test("continuation prompt matches native completion audit guidance", () => {
   });
   assert.match(prompt, /Build a prompt-to-artifact checklist/);
   assert.match(prompt, /Do not rely on intent, partial progress/);
-  assert.match(prompt, /call update_goal with status "complete" so usage accounting is preserved/);
-  assert.match(prompt, /Do not call update_goal unless the goal is complete or blocked/);
+  assert.match(prompt, /call goal_control\(\{\"action\":\"complete\"\}\) so usage accounting is preserved/);
+  assert.match(prompt, /Do not call goal_control unless the goal is complete or blocked/);
   assert.match(prompt, /Say OK &lt;now&gt;/);
 });
 

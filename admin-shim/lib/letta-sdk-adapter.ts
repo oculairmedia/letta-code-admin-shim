@@ -31,6 +31,7 @@ import {
   type SDKMessage,
   type PermissionMode,
   type SDKResultMessage,
+  type AnyAgentTool,
 } from "@letta-ai/letta-code-sdk";
 // CanUseToolResponse is part of letta-code's protocol package, re-exported via
 // the SDK index but not in the explicit type-export list — import directly.
@@ -153,7 +154,7 @@ function sdkErrorPayload(
  */
 const TURN_SILENCE_MS = Number(process.env["SHIM_POOL_TURN_SILENCE_MS"] ?? 120_000);
 const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 1_800_000);
-const GOAL_LIFECYCLE_TOOLS = new Set(["get_goal", "create_goal", "update_goal"]);
+const GOAL_CONTROL_TOOL = "goal_control";
 
 /**
  * vibesync-uuas: permission mode for the spawned letta-code session.
@@ -237,10 +238,12 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   // SDK-side synthetic ones start at a high offset so they don't collide
   // with any upstream-allocated ids in the same turn.
   private syntheticSeqId = 1_000_000;
+  private readonly externalTools: AnyAgentTool[];
 
-  constructor({ conversationId, agentId }: LettaSessionAdapterOptions) {
+  constructor({ conversationId, agentId, tools }: LettaSessionAdapterOptions) {
     this.conversationId = conversationId;
     this.agentId = agentId;
+    this.externalTools = tools ?? [];
     this.session = null;
     this.ready = false;
     this.dead = false;
@@ -263,6 +266,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const session = resumeSession(target, {
       includePartialMessages: true,
       ...(sleeptime ? { sleeptime } : {}),
+      ...(this.externalTools.length > 0 ? { tools: this.externalTools } : {}),
       // vibesync-uuas: spawn at bypassPermissions by default so tool
       // calls (esp. the Agent/Task tool used by rig dispatch to spawn
       // role subagents) execute without halting on requires_approval.
@@ -631,7 +635,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       return { behavior: "allow" };
     }
 
-    if (runHandle.record?.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
+    if (runHandle.record?.metadata?.["goal_continuation"] === true && toolName === GOAL_CONTROL_TOOL) {
       recordApprovalDecision(runHandle.id, {
         action_id: `goal-continuation-${randomUUID()}`,
         tool_name: toolName,
@@ -809,7 +813,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const a2ui = this.currentA2uiCapability;
     const timestamp = new Date().toISOString();
 
-    if (runHandle.record?.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
+    if (runHandle.record?.metadata?.["goal_continuation"] === true && toolName === GOAL_CONTROL_TOOL) {
       recordApprovalDecision(runHandle.id, {
         action_id: `goal-continuation-${randomUUID()}`,
         tool_name: toolName,

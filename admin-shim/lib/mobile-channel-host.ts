@@ -24,6 +24,8 @@ import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
 import { readPendingApproval, resolveApproval } from "./pending-approval.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
+import { getNativeGoalForConversation } from "./native-goal-mode.js";
+import { makeGoalControlTool, shouldInjectGoalControlTool } from "./goal-control-tool.js";
 import {
   A2uiStreamSplitter,
   validateA2uiMessage,
@@ -432,8 +434,18 @@ export async function bridgeSendMessage(
   // failure on this turn evicts the warm adapter + heals the transcript
   // before returning. The caller sees the original turn result unchanged;
   // the cleaned disk is picked up on the next user turn.
+  const isGoalContinuation = shouldInjectGoalControlTool({
+    metadata: runHandle.record.metadata ?? null,
+    otid: otid ?? null,
+    hasActiveGoal: getNativeGoalForConversation(effectiveConvId)?.goal?.status === "active",
+  });
+  const goalControlTools = isGoalContinuation
+    ? [makeGoalControlTool({ agentId: effectiveAgentId, conversationId: effectiveConvId })]
+    : undefined;
+
   const turn = await pool.runTurnWithHeal(effectiveConvId, effectiveAgentId, userInput, {
     a2uiCapability: a2ui_capability ?? null,
+    ...(goalControlTools ? { tools: goalControlTools, closeAfterTurn: true } : {}),
     // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
     // patches the SIGTERM hook onto it via setRunCancelHandler. The
     // worker will NOT call onRunCreated when a handle is provided —
