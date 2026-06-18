@@ -369,13 +369,17 @@ test("sdk-adapter (lcp-sdk.5): canUseTool emits approval_request_message + resol
   const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-approval-"));
   const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
   const prevPermission = process.env["SHIM_PERMISSION_MODE"];
+  const prevServerPermissions = process.env["SHIM_SERVER_PERMISSIONS"];
   process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
   process.env["SHIM_PERMISSION_MODE"] = "default";
+  delete process.env["SHIM_SERVER_PERMISSIONS"];
   t.after(() => {
     if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
     else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
     if (prevPermission === undefined) delete process.env["SHIM_PERMISSION_MODE"];
     else process.env["SHIM_PERMISSION_MODE"] = prevPermission;
+    if (prevServerPermissions === undefined) delete process.env["SHIM_SERVER_PERMISSIONS"];
+    else process.env["SHIM_SERVER_PERMISSIONS"] = prevServerPermissions;
     rmSync(stateDir, { recursive: true, force: true });
   });
 
@@ -452,13 +456,17 @@ test("sdk-adapter (lcp-sdk.5): Session-scope decision caches and short-circuits 
   const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-approval-cache-"));
   const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
   const prevPermission = process.env["SHIM_PERMISSION_MODE"];
+  const prevServerPermissions = process.env["SHIM_SERVER_PERMISSIONS"];
   process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
   process.env["SHIM_PERMISSION_MODE"] = "default";
+  delete process.env["SHIM_SERVER_PERMISSIONS"];
   t.after(() => {
     if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
     else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
     if (prevPermission === undefined) delete process.env["SHIM_PERMISSION_MODE"];
     else process.env["SHIM_PERMISSION_MODE"] = prevPermission;
+    if (prevServerPermissions === undefined) delete process.env["SHIM_SERVER_PERMISSIONS"];
+    else process.env["SHIM_SERVER_PERMISSIONS"] = prevServerPermissions;
     rmSync(stateDir, { recursive: true, force: true });
   });
 
@@ -497,7 +505,13 @@ test("sdk-adapter (lcp-sdk.5): Session-scope decision caches and short-circuits 
   assert.equal(second.message, "cached_approval");
 });
 
-test("sdk-adapter (lcp-sdk.5): no A2UI client → default-allow without emitting a frame", async () => {
+test("sdk-adapter (lcp-sdk.5): no A2UI client → default-allow without emitting a frame", async (t) => {
+  const prevServerPermissions = process.env["SHIM_SERVER_PERMISSIONS"];
+  delete process.env["SHIM_SERVER_PERMISSIONS"];
+  t.after(() => {
+    if (prevServerPermissions === undefined) delete process.env["SHIM_SERVER_PERMISSIONS"];
+    else process.env["SHIM_SERVER_PERMISSIONS"] = prevServerPermissions;
+  });
   // The direct adapter only synthesizes approval cards when a2uiCapability
   // is negotiated. Without A2UI, the upstream approval flow has no UI to
   // drive it, so default-allow keeps the turn moving (matches direct's

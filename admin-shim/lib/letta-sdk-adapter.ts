@@ -631,7 +631,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       return { behavior: "allow" };
     }
 
-    if (runHandle.record.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
+    if (runHandle.record?.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
       recordApprovalDecision(runHandle.id, {
         action_id: `goal-continuation-${randomUUID()}`,
         tool_name: toolName,
@@ -809,7 +809,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const a2ui = this.currentA2uiCapability;
     const timestamp = new Date().toISOString();
 
-    if (runHandle.record.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
+    if (runHandle.record?.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
       recordApprovalDecision(runHandle.id, {
         action_id: `goal-continuation-${randomUUID()}`,
         tool_name: toolName,
