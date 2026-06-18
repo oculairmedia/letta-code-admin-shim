@@ -24,7 +24,7 @@ import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
 import { readPendingApproval, resolveApproval } from "./pending-approval.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
-import { getNativeGoalForConversation } from "./native-goal-mode.js";
+import { getNativeGoalForConversation, listActiveNativeGoals, type ConversationResolver } from "./native-goal-mode.js";
 import { makeGoalControlTool, shouldInjectGoalControlTool } from "./goal-control-tool.js";
 import {
   A2uiStreamSplitter,
@@ -87,6 +87,50 @@ export type {
   A2uiUserAction,
   A2uiUserActionAck,
 };
+
+export interface GoalContinuationKickOptions {
+  maybeContinue?: typeof import("./goal-continuation.js").maybeContinue;
+  resolveConversation?: ConversationResolver;
+}
+
+export async function kickGoalContinuation(
+  conversationId: string,
+  agentId: string,
+  options: GoalContinuationKickOptions = {},
+): Promise<void> {
+  const goalContinuation = options.maybeContinue
+    ? { maybeContinue: options.maybeContinue, configureGoalContinuationCancellation: null }
+    : await import("./goal-continuation.js");
+  goalContinuation.configureGoalContinuationCancellation?.(cancelRun);
+  void goalContinuation.maybeContinue(conversationId, agentId, async (contArgs) => {
+    let tokensUsed = 0;
+    await bridgeSendMessage(
+      contArgs,
+      (frame) => {
+        if ((frame as { message_type?: unknown }).message_type !== "usage_statistics") return;
+        const totalTokens = (frame as { total_tokens?: unknown }).total_tokens;
+        if (typeof totalTokens === "number" && Number.isFinite(totalTokens)) {
+          tokensUsed += Math.max(0, Math.floor(totalTokens));
+        }
+      },
+      contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {},
+    );
+    return { assistantText: "", usage: { tokensUsed } };
+  });
+}
+
+export async function rekickActiveGoalContinuationsOnBoot(
+  options: GoalContinuationKickOptions = {},
+): Promise<number> {
+  const activeGoals = await listActiveNativeGoals(options.resolveConversation, console);
+  for (const entry of activeGoals) {
+    void kickGoalContinuation(entry.conversationId, entry.agentId, options).catch((err: unknown) => {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[goal] boot re-kick failed conv=${entry.conversationId} agent=${entry.agentId}: ${errMsg}`);
+    });
+  }
+  return activeGoals.length;
+}
 
 function channelDir(): string {
   const root = process.env["LETTA_HOME"] || join(homedir(), ".letta");
@@ -776,25 +820,7 @@ export async function bridgeSendMessage(
   // Fire-and-forget: must not block the caller's turn result.
   if (!otid || !otid.startsWith("goalcont-")) {
     try {
-      const { maybeContinue, configureGoalContinuationCancellation } = await import("./goal-continuation.js");
-      configureGoalContinuationCancellation(cancelRun);
-      void maybeContinue(effectiveConvId, effectiveAgentId, async (contArgs) => {
-        let tokensUsed = 0;
-        await bridgeSendMessage(
-          contArgs,
-          (frame) => {
-            if ((frame as { message_type?: unknown }).message_type !== "usage_statistics") return;
-            const totalTokens = (frame as { total_tokens?: unknown }).total_tokens;
-            if (typeof totalTokens === "number" && Number.isFinite(totalTokens)) {
-              tokensUsed += Math.max(0, Math.floor(totalTokens));
-            }
-          },
-          contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {},
-        );
-        // Completion is detected via native goal status (update_goal); the
-        // text-sentinel fallback is unused on this path.
-        return { assistantText: "", usage: { tokensUsed } };
-      });
+      await kickGoalContinuation(effectiveConvId, effectiveAgentId);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[mobile-channel] goal-continuation hook failed: ${errMsg}`);

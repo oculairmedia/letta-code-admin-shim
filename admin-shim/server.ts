@@ -83,6 +83,8 @@ import {
   bridgeSendMessage,
   getMobileChannelAdapter,
   handleReflectionSettingsGet,
+  kickGoalContinuation,
+  rekickActiveGoalContinuationsOnBoot,
 } from "./lib/mobile-channel-host.js";
 import { mobileConversationCursorCapabilities } from "./lib/mobile-conversation-cursors.js";
 import {
@@ -1869,29 +1871,10 @@ async function handleAgentNativeGoalCommand(req: IncomingMessage, res: ServerRes
         broadcastGoalEvent({ reason: "client_mutation", at: new Date().toISOString(), status: result });
         return;
       }
-      void import("./lib/goal-continuation.js")
-        .then(({ maybeContinue, configureGoalContinuationCancellation }) => {
-          configureGoalContinuationCancellation(cancelRun);
-          return maybeContinue(convId, agentId, async (contArgs) => {
-            let tokensUsed = 0;
-            await bridgeSendMessage(
-              contArgs,
-              (frame) => {
-                if ((frame as { message_type?: unknown }).message_type !== "usage_statistics") return;
-                const totalTokens = (frame as { total_tokens?: unknown }).total_tokens;
-                if (typeof totalTokens === "number" && Number.isFinite(totalTokens)) {
-                  tokensUsed += Math.max(0, Math.floor(totalTokens));
-                }
-              },
-              contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {},
-            );
-            return { assistantText: "", usage: { tokensUsed } };
-          });
-        })
-        .catch((err: unknown) => {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          console.error(`[goal] kick-on-create failed: ${errMsg}`);
-        });
+      void kickGoalContinuation(convId, agentId).catch((err: unknown) => {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.error(`[goal] kick-on-create failed: ${errMsg}`);
+      });
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -2620,6 +2603,15 @@ server.listen(PORT, HOST, () => {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[runs] boot-sweep failed: ${msg}`);
   }
+
+  void rekickActiveGoalContinuationsOnBoot()
+    .then((count) => {
+      if (count > 0) console.log(`[goal] boot re-kicked ${count} active goal continuation(s)`);
+    })
+    .catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[goal] boot re-kick scan failed: ${msg}`);
+    });
 
   // lcp-indw: boot-sweep surviving pending approvals (R1). A turn parked on
   // an `ask` when the shim died cannot resume (its CLI session is gone), so

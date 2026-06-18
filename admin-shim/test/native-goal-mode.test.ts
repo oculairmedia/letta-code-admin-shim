@@ -159,22 +159,6 @@ test("native goal command bridge creates, pauses, resumes, completes, and clears
 });
 
 
-test("listActiveNativeGoals excludes user-stopped goals", () => {
-  writeLocalSettings({
-    conversationGoalsByServer: {
-      "local:/tmp/backend": {
-        "conv-active": { objective: "resume me", status: "active", userStopped: false },
-        "conv-paused": { objective: "do not resume", status: "paused", userStopped: true },
-        "conv-cleared": { objective: "do not revive", status: "cleared", userStopped: true },
-        "conv-defensive": { objective: "stopped active marker", status: "active", userStopped: true },
-      },
-    },
-  });
-
-  const active = listActiveNativeGoals();
-  assert.deepEqual(active.map((entry) => entry.conversation_id), ["conv-active"]);
-});
-
 
 test("native goal command enables lifecycle tools on create, replace, and disables them on disable", async () => {
   writeLocalSettings({
@@ -287,4 +271,66 @@ test("addNativeGoalUsage is no-op when no active goal exists", () => {
   assert.equal(addNativeGoalUsage({ conversationId: "conv-a", tokensUsed: 33 }), null);
   assert.equal(readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"].tokensUsed, 25);
   assert.equal(addNativeGoalUsage({ conversationId: "conv-missing", tokensUsed: 33 }), null);
+});
+
+
+test("listActiveNativeGoals returns only active resolvable goals with drivable ids", async () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-active", conversationId: "default" },
+      "local:/tmp/backend-paused": { agentId: "agent-paused", conversationId: "conv-paused" },
+      "local:/tmp/backend-complete": { agentId: "agent-complete", conversationId: "conv-complete" },
+      "local:/tmp/backend-blocked": { agentId: "agent-blocked", conversationId: "conv-blocked" },
+      "local:/tmp/backend-budget": { agentId: "agent-budget", conversationId: "conv-budget" },
+      "local:/tmp/backend-unresolved": { agentId: "agent-unresolved", conversationId: "conv-unresolved" },
+      "local:/tmp/backend-user-stopped": { agentId: "agent-user-stopped", conversationId: "conv-user-stopped" },
+    },
+    conversationGoalsByServer: {
+      "local:/tmp/backend": {
+        default: { objective: "drive active default", status: "active", tokensUsed: 5, tokenBudget: 100 },
+      },
+      "local:/tmp/backend-paused": {
+        "conv-paused": { objective: "paused work", status: "paused" },
+      },
+      "local:/tmp/backend-complete": {
+        "conv-complete": { objective: "complete work", status: "complete" },
+      },
+      "local:/tmp/backend-blocked": {
+        "conv-blocked": { objective: "blocked work", status: "blocked" },
+      },
+      "local:/tmp/backend-budget": {
+        "conv-budget": { objective: "spent work", status: "active", tokensUsed: 10, tokenBudget: 10 },
+      },
+      "local:/tmp/backend-unresolved": {
+        "conv-unresolved": { objective: "lost work", status: "active" },
+      },
+      "local:/tmp/backend-user-stopped": {
+        "conv-user-stopped": { objective: "do not revive", status: "active", userStopped: true },
+      },
+    },
+  });
+  const warnings: unknown[][] = [];
+
+  const active = await listActiveNativeGoals(
+    async (conversationId) =>
+      conversationId === "conv-default-agent-active"
+        ? { agentId: "agent-active", conversationId: "default" }
+        : null,
+    { warn: (...args: unknown[]) => warnings.push(args) },
+  );
+
+  assert.deepEqual(active.map((entry) => ({
+    agentId: entry.agentId,
+    conversationId: entry.conversationId,
+    serverKey: entry.serverKey,
+    storageConversationId: entry.storageConversationId,
+    objective: entry.goal.objective,
+  })), [{
+    agentId: "agent-active",
+    conversationId: "conv-default-agent-active",
+    serverKey: "local:/tmp/backend",
+    storageConversationId: "default",
+    objective: "drive active default",
+  }]);
+  assert.equal(warnings.length, 1);
 });
