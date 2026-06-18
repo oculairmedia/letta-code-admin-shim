@@ -1103,7 +1103,7 @@ export function handleConnection(ws, request, host) {
           },
           onDone: (info) => {
             if (closed) return;
-            safeSend(ws, makeFrame("subscribe_done", { run_id: runId, last_seq: info.last_seq, status: info.status }), log);
+            safeSend(ws, makeFrame("subscribe_done", { run_id: runId, last_seq: info.last_seq, status: info.status, ...(info.user_stopped === true ? { user_stopped: true } : {}) }), log);
             activeSubscriptions.delete(runId);
           },
           onError: (info) => {
