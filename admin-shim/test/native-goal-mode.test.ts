@@ -1,6 +1,6 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -40,6 +40,10 @@ function writeLocalSettings(value: unknown): void {
 
 function writeGlobalSettings(value: unknown): void {
   writeFileSync(join(home, ".letta", "settings.json"), JSON.stringify(value, null, 2));
+}
+
+function readLocalSettings(): any {
+  return JSON.parse(readFileSync(join(cwd, ".letta", "settings.local.json"), "utf8"));
 }
 
 test("native goal wrapper reads conversation goal from project-local settings", () => {
@@ -142,6 +146,30 @@ test("native goal command bridge creates, pauses, resumes, completes, and clears
   assert.equal(cleared.action, "clear");
   assert.equal(cleared.goal, null);
   assert.equal(getNativeGoalForAgent("agent-a")?.goal, null);
+});
+
+
+test("native goal command enables lifecycle tools on create, replace, and disables them on disable", async () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+  });
+
+  const created = await applyNativeGoalCommandForAgent("agent-a", "/goal finish the migration");
+  assert.equal(created.action, "create");
+  assert.equal(created.tools_enabled, true);
+  assert.equal(readLocalSettings().conversationGoalToolsByServer["local:/tmp/backend"]["conv-a"], true);
+
+  const replaced = await applyNativeGoalCommandForAgent("agent-a", "/goal --replace finish the release");
+  assert.equal(replaced.action, "replace");
+  assert.equal(replaced.tools_enabled, true);
+  assert.equal(readLocalSettings().conversationGoalToolsByServer["local:/tmp/backend"]["conv-a"], true);
+
+  const disabled = await applyNativeGoalCommandForAgent("agent-a", "/goal disable");
+  assert.equal(disabled.action, "disable");
+  assert.equal(disabled.tools_enabled, undefined);
+  assert.equal(readLocalSettings().conversationGoalToolsByServer["local:/tmp/backend"]["conv-a"], undefined);
 });
 
 test("native goal command bridge requires --replace when a goal already exists", async () => {
