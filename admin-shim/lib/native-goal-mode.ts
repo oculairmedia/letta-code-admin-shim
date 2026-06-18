@@ -262,6 +262,14 @@ export function applyNativeGoalCommandForAgent(agentId: string, command: string)
   byServer[session.serverKey] = goalsForServer;
   local.conversationGoalsByServer = byServer;
   writeLocalSettings(local);
+  // Stop any running shim-side continuation loop when the goal is no longer
+  // active. Dynamic import avoids a circular dependency (the driver imports
+  // this module). Fail-open: the driver also re-checks status each iteration.
+  if (action === "pause" || action === "complete" || action === "clear" || action === "disable") {
+    void import("./goal-continuation.js")
+      .then((mod) => mod.stopContinuation(session.conversationId))
+      .catch(() => {});
+  }
   return {
     ok: true,
     action,

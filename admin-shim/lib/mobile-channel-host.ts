@@ -742,6 +742,28 @@ export async function bridgeSendMessage(
     }
   }
 
+  // Goal continuation (shim-side autonomous loop). Native /goal
+  // auto-continuation is CLI-only; on this listener path we drive it here.
+  // After a NON-continuation turn finishes for a conversation with an active
+  // native goal, kick off the continuation driver. Continuation turns carry
+  // an `otid` prefixed `goalcont-` and are skipped so the driver owns the
+  // loop (single-flight + iteration cap + budget guards live in the driver).
+  // Fire-and-forget: must not block the caller's turn result.
+  if (!otid || !otid.startsWith("goalcont-")) {
+    try {
+      const { maybeContinue } = await import("./goal-continuation.js");
+      void maybeContinue(effectiveConvId, effectiveAgentId, async (contArgs) => {
+        await bridgeSendMessage(contArgs, () => {}, {});
+        // Completion is detected via native goal status (update_goal); the
+        // text-sentinel fallback is unused on this path.
+        return "";
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[mobile-channel] goal-continuation hook failed: ${errMsg}`);
+    }
+  }
+
   return turn;
 }
 
