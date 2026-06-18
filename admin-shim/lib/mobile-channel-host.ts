@@ -734,7 +734,17 @@ export async function bridgeSendMessage(
   }
 
   // End-of-turn tail: stop_reason → usage_statistics. Assistant chunks
-  // were already forwarded inline above.
+  // were already forwarded inline above. On authoritative user cancel the
+  // SDK stream may not yield an upstream stop_reason, so synthesize the
+  // terminal reason here before the plugin emits turn_done(cancelled).
+  if (turn.cancelled) {
+    pendingStop = {
+      message_type: "stop_reason",
+      stop_reason: "user_cancelled",
+      run_id: runHandle.id,
+    } as BridgeFrame;
+    pendingUsage = null;
+  }
   if (pendingStop) emit(pendingStop);
   if (pendingUsage) emit(pendingUsage);
 
