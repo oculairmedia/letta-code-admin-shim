@@ -246,6 +246,9 @@ export async function bridgeSendMessage(
       // state is observed at run start.
     },
   });
+  if (otid?.startsWith("goalcont-")) {
+    runHandle.record.metadata = { ...(runHandle.record.metadata ?? {}), goal_continuation: true, otid };
+  }
   if (typeof onRunCreated === "function") {
     try {
       onRunCreated(runHandle.id);
@@ -751,9 +754,10 @@ export async function bridgeSendMessage(
   // Fire-and-forget: must not block the caller's turn result.
   if (!otid || !otid.startsWith("goalcont-")) {
     try {
-      const { maybeContinue } = await import("./goal-continuation.js");
+      const { maybeContinue, configureGoalContinuationCancellation } = await import("./goal-continuation.js");
+      configureGoalContinuationCancellation(cancelRun);
       void maybeContinue(effectiveConvId, effectiveAgentId, async (contArgs) => {
-        await bridgeSendMessage(contArgs, () => {}, {});
+        await bridgeSendMessage(contArgs, () => {}, contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {});
         // Completion is detected via native goal status (update_goal); the
         // text-sentinel fallback is unused on this path.
         return "";

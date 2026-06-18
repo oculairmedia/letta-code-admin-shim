@@ -1870,12 +1870,13 @@ async function handleAgentNativeGoalCommand(req: IncomingMessage, res: ServerRes
         return;
       }
       void import("./lib/goal-continuation.js")
-        .then(({ maybeContinue }) =>
-          maybeContinue(convId, agentId, async (contArgs) => {
-            await bridgeSendMessage(contArgs, () => {}, {});
+        .then(({ maybeContinue, configureGoalContinuationCancellation }) => {
+          configureGoalContinuationCancellation(cancelRun);
+          return maybeContinue(convId, agentId, async (contArgs) => {
+            await bridgeSendMessage(contArgs, () => {}, contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {});
             return "";
-          }),
-        )
+          });
+        })
         .catch((err: unknown) => {
           const errMsg = err instanceof Error ? err.message : String(err);
           console.error(`[goal] kick-on-create failed: ${errMsg}`);
