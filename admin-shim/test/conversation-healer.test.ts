@@ -122,6 +122,11 @@ test("detectUnexpectedToolResults: pulls ids from Anthropic unexpected tool_resu
   ]);
 });
 
+test("detectUnexpectedToolResults: pulls OpenAI call ids from role tool errors", () => {
+  const detail = "Invalid parameter: messages with role 'tool' must be a response to a preceding message with 'tool_calls'. Missing tool_call_id call_abc123 and call_def456.";
+  assert.deepEqual(detectUnexpectedToolResults({ error: { message: detail } }), ["call_abc123", "call_def456"]);
+});
+
 test("detectConsecutiveUserMessageIndices: removes all trailing user runs", () => {
   const records = [
     { id: "u0", role: "user" },
@@ -266,7 +271,7 @@ test("healConversation: removes orphan tool_use when matching toolResult exists 
 
 // ── Heal: genuine interrupted-tool case (no toolResult on disk) ────────
 
-test("healConversation: appends synthetic toolResult when none exists for the dangling id", async () => {
+test("healConversation: inserts synthetic toolResult immediately after its assistant tool call", async () => {
   const stateDir = makeTempStateDir();
   try {
     const agentId = "agent-interrupted-test";
@@ -298,6 +303,7 @@ test("healConversation: appends synthetic toolResult when none exists for the da
 
     const after = readMessages(convDir);
     assert.equal(after.length, 3, "u0 + a1 + synthetic toolResult");
+    assert.equal(after[1]?.["id"], "a1");
     const synth = after[2] as Record<string, unknown>;
     assert.equal(synth["role"], "toolResult");
     assert.equal(synth["toolCallId"], "toolu_DROPPED");
@@ -305,6 +311,69 @@ test("healConversation: appends synthetic toolResult when none exists for the da
     assert.equal(synth["isError"], true);
     const content = synth["content"] as Array<{ text: string }>;
     assert.match(content[0]?.text ?? "", /healed: tool execution interrupted/);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
+  }
+});
+
+test("healConversation: repositions stale synthetic results after OpenAI tool_calls parents", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agentId = "agent-openai-reposition-test";
+    seedAgent(stateDir, agentId);
+    const convDir = seedConv(stateDir, "default", agentId);
+
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: [{ type: "text", text: "run tool" }] },
+      {
+        id: "a1",
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "call_OPENAI", type: "function", function: { name: "Bash", arguments: "{}" } }],
+      },
+      { id: "u1", role: "user", content: [{ type: "text", text: "stale interleaving" }] },
+      { id: "a1:heal-tool-result:call_OPENAI", role: "tool", tool_call_id: "call_OPENAI", content: "old synthetic result" },
+    ]);
+
+    const report = await healConversation("default", agentId, ["call_OPENAI"], {
+      stateDir,
+      now: 1779500000000,
+    });
+
+    assert.deepEqual(report.settled, ["call_OPENAI"]);
+    assert.equal(report.messagesAppended, 1);
+    assert.equal(report.messagesRemoved, 1);
+
+    const after = readMessages(convDir);
+    assert.deepEqual(after.map((m) => m["id"]), ["u0", "a1", "a1:heal-tool-result:call_OPENAI", "u1"]);
+    assert.equal(after[2]?.["role"], "toolResult");
+    assert.equal(after[2]?.["toolCallId"], "call_OPENAI");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
+  }
+});
+
+test("healUnexpectedToolResults: removes truly orphaned OpenAI role tool messages", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agentId = "agent-openai-orphan-tool-test";
+    seedAgent(stateDir, agentId);
+    const convDir = seedConv(stateDir, "default", agentId);
+
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: "hello" },
+      { id: "orphan-tool", role: "tool", tool_call_id: "call_ORPHAN", content: "orphaned" },
+      { id: "u1", role: "user", content: "next" },
+    ]);
+
+    const report = await healUnexpectedToolResults("default", agentId, ["call_ORPHAN"], { stateDir });
+
+    assert.deepEqual(report.removed, ["call_ORPHAN"]);
+    assert.equal(report.messagesEdited, 0);
+    assert.equal(report.messagesRemoved, 1);
+    assert.deepEqual(readMessages(convDir).map((m) => m["id"]), ["u0", "u1"]);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
