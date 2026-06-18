@@ -463,6 +463,12 @@ export function updateSubagentTodoProgress(toolCallId: string, progress: TodoPro
 }
 
 const TASK_COMPLETED_MARKER = "[Task completed]";
+// A background task log can close on a FAILURE footer too — e.g.
+// `[Task failed]`, an `[error] ...` line, or a `subagent_status=error`
+// result line. These are terminal just like `[Task completed]`; without
+// recognizing them, a failed worker's log gets rehydrated as `running`
+// on every shim boot and lingers forever (the orphan that survived ~22h).
+const TASK_FAILED_MARKERS = ["[Task failed]", "subagent_status=error"];
 const TODO_WATCH_DEBOUNCE_MS = 200;
 
 export function computeTodoProgress(snapshotOrTodos: TodoSnapshot | TodoItem[]): TodoProgress {
@@ -533,11 +539,25 @@ function watchSubagentTodos(toolCallId: string): void {
  * attach time we finalize immediately.
  */
 function logHasCompletedMarker(logFile: string): boolean {
+  return readLogTerminalStatus(logFile) === "completed";
+}
+
+/**
+ * Read a background task log and classify its terminal state from the
+ * footer markers. Returns "completed" for a `[Task completed]` footer,
+ * "failed" for any failure footer (`[Task failed]`, `subagent_status=error`,
+ * or an `[error] ...` line), or null while still running / unreadable.
+ * Completion wins if both markers somehow appear.
+ */
+function readLogTerminalStatus(logFile: string): "completed" | "failed" | null {
   try {
-    if (!existsSync(logFile)) return false;
-    return readFileSync(logFile, "utf8").includes(TASK_COMPLETED_MARKER);
+    if (!existsSync(logFile)) return null;
+    const text = readFileSync(logFile, "utf8");
+    if (text.includes(TASK_COMPLETED_MARKER)) return "completed";
+    if (TASK_FAILED_MARKERS.some((m) => text.includes(m))) return "failed";
+    return null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -548,8 +568,11 @@ function watchBackgroundLog(toolCallId: string): void {
   const logFile = entry.logFile;
 
   const scan = (): void => {
-    if (logHasCompletedMarker(logFile)) {
+    const terminal = readLogTerminalStatus(logFile);
+    if (terminal === "completed") {
       finalize(toolCallId, "completed", null);
+    } else if (terminal === "failed") {
+      finalize(toolCallId, "failed", "subagent_error");
     }
   };
 
@@ -586,9 +609,16 @@ function armTimeoutWatchdog(toolCallId: string): void {
 function evaluateRunningSubagent(toolCallId: string): void {
   const entry = _subagents.get(toolCallId);
   if (!entry || entry.status !== "running") return;
-  if (entry.logFile && logHasCompletedMarker(entry.logFile)) {
-    finalize(toolCallId, "completed", null);
-    return;
+  if (entry.logFile) {
+    const terminal = readLogTerminalStatus(entry.logFile);
+    if (terminal === "completed") {
+      finalize(toolCallId, "completed", null);
+      return;
+    }
+    if (terminal === "failed") {
+      finalize(toolCallId, "failed", "subagent_error");
+      return;
+    }
   }
   if (entry.subagentAgentId) watchSubagentTodos(toolCallId);
   if (entry.logFile) watchBackgroundLog(toolCallId);
@@ -610,8 +640,13 @@ export function rehydrateRunningSubagentWatchdogs(): void {
       finalize(entry.toolCallId, "failed", "orphaned");
       continue;
     }
-    if (logHasCompletedMarker(entry.logFile)) {
+    const terminal = readLogTerminalStatus(entry.logFile);
+    if (terminal === "completed") {
       finalize(entry.toolCallId, "completed", null);
+      continue;
+    }
+    if (terminal === "failed") {
+      finalize(entry.toolCallId, "failed", "subagent_error");
       continue;
     }
     evaluateRunningSubagent(entry.toolCallId);
@@ -632,8 +667,14 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
       }
       continue;
     }
-    if (logHasCompletedMarker(entry.logFile)) {
+    const terminal = readLogTerminalStatus(entry.logFile);
+    if (terminal === "completed") {
       finalize(entry.toolCallId, "completed", null);
+      swept += 1;
+      continue;
+    }
+    if (terminal === "failed") {
+      finalize(entry.toolCallId, "failed", "subagent_error");
       swept += 1;
       continue;
     }
