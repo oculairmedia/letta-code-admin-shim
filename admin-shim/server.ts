@@ -103,6 +103,7 @@ import {
   updateTask as updateCronTask,
 } from "./lib/crons.js";
 import { broadcastCronEvent } from "./lib/cron-events.js";
+import { broadcastGoalEvent } from "./lib/goal-events.js";
 import type { AddTaskInput, CronTask } from "./lib/types/crons.js";
 import {
   recordSubagentDispatch,
@@ -1848,6 +1849,7 @@ async function handleAgentNativeGoalCommand(req: IncomingMessage, res: ServerRes
   }
   try {
     const result = applyNativeGoalCommandForAgent(agentId, command);
+    broadcastGoalEvent({ reason: "client_mutation", at: new Date().toISOString(), status: result });
     json(res, 200, result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

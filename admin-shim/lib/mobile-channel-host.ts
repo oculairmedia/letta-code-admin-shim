@@ -1136,6 +1136,7 @@ import {
   getActiveTasks as cronGetActiveTasks,
 } from "./crons.js";
 import { broadcastCronEvent, subscribeCronEvents } from "./cron-events.js";
+import { subscribeGoalEvents } from "./goal-events.js";
 import { subscribeApprovalEvents } from "./approval-events.js";
 import type {
   AddTaskInput,
@@ -1410,6 +1411,7 @@ export function handleReflectionSettingsSet(
  *  - `subscribeToRun(runId, cursor, cbs)` — lcp-p74.2 replay + live-tail
  *  - `handleCron*` — lcp-2gx WS-side CRUD for crons.json
  *  - `subscribeCronEvents(listener)` — register for crons_updated push
+ *  - `subscribeGoalEvents(listener)` — register for goals_updated push
  */
 interface MobileChannelHost {
   log: (msg: string) => void;
@@ -1431,6 +1433,7 @@ interface MobileChannelHost {
   handleCronDelete: typeof handleCronDelete;
   handleCronDeleteAll: typeof handleCronDeleteAll;
   subscribeCronEvents: typeof subscribeCronEvents;
+  subscribeGoalEvents: typeof subscribeGoalEvents;
   /** lcp-indw: per-connection subscription for approval_resolved pushes. */
   subscribeApprovalEvents: typeof subscribeApprovalEvents;
   /** lcp-4d5f: reflection (sleeptime) settings get/set + updated push. */
@@ -1550,6 +1553,7 @@ async function createMobileChannelAdapter(
     handleCronDelete,
     handleCronDeleteAll,
     subscribeCronEvents,
+    subscribeGoalEvents,
     subscribeApprovalEvents,
     handleReflectionSettingsGet,
     handleReflectionSettingsSet,
