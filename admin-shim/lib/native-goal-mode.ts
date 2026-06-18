@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { resolveConversationId, type ResolvedConversation } from "./store.js";
+
 /**
  * Thin wrapper over Letta Code's native Goal mode.
  *
@@ -101,15 +103,39 @@ function mergedSettings(): LocalSettings {
   };
 }
 
+function externalConversationId(agentId: string, conversationId: string): string {
+  return conversationId === "default" ? `conv-default-${agentId}` : conversationId;
+}
+
+function findDefaultAlias(
+  settings: LocalSettings,
+  conversationId: string,
+): { serverKey: string; agentId: string; storageConversationId: string } | null {
+  const match = conversationId.match(/^conv-default-(agent-.+)$/);
+  if (!match) return null;
+  const agentId = match[1]!;
+  for (const session of sortSessionsForAgent(settings, sessionsForAgent(agentId, settings))) {
+    if (session.conversationId === "default") {
+      return { serverKey: session.serverKey, agentId, storageConversationId: session.conversationId };
+    }
+  }
+  return null;
+}
+
 function findByConversationId(settings: LocalSettings, conversationId: string): NativeGoalStatusResponse | null {
+  const alias = findDefaultAlias(settings, conversationId);
+  const lookupConversationId = alias?.storageConversationId ?? conversationId;
+  const lookupServerKey = alias?.serverKey ?? null;
   const byServer = settings.conversationGoalsByServer ?? {};
   for (const [serverKey, goalsByConversation] of Object.entries(byServer)) {
-    const goal = goalsByConversation[conversationId] ?? null;
+    if (lookupServerKey && serverKey !== lookupServerKey) continue;
+    const goal = goalsByConversation[lookupConversationId] ?? null;
     if (goal) {
-      const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[conversationId];
+      const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[lookupConversationId];
       return {
         source: "letta_code_goal_mode",
         server_key: serverKey,
+        ...(alias?.agentId ? { agent_id: alias.agentId } : {}),
         conversation_id: conversationId,
         goal,
         ...(toolsEnabled !== undefined ? { tools_enabled: toolsEnabled } : {}),
@@ -125,16 +151,14 @@ export function getNativeGoalForConversation(conversationId: string): NativeGoal
 
 export function getNativeGoalForAgent(agentId: string): NativeGoalStatusResponse | null {
   const settings = mergedSettings();
-  const sessions = settings.sessionsByServer ?? {};
-  for (const [serverKey, session] of Object.entries(sessions)) {
-    if (session.agentId !== agentId || !session.conversationId) continue;
-    const goal = settings.conversationGoalsByServer?.[serverKey]?.[session.conversationId] ?? null;
-    const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[session.conversationId];
+  for (const session of sortSessionsForAgent(settings, sessionsForAgent(agentId, settings))) {
+    const goal = settings.conversationGoalsByServer?.[session.serverKey]?.[session.conversationId] ?? null;
+    const toolsEnabled = settings.conversationGoalToolsByServer?.[session.serverKey]?.[session.conversationId];
     return {
       source: "letta_code_goal_mode",
-      server_key: serverKey,
+      server_key: session.serverKey,
       agent_id: agentId,
-      conversation_id: session.conversationId,
+      conversation_id: externalConversationId(agentId, session.conversationId),
       goal,
       ...(toolsEnabled !== undefined ? { tools_enabled: toolsEnabled } : {}),
     };
@@ -142,13 +166,65 @@ export function getNativeGoalForAgent(agentId: string): NativeGoalStatusResponse
   return null;
 }
 
-function sessionForAgent(agentId: string, settings: LocalSettings): { serverKey: string; conversationId: string } | null {
+interface AgentSession {
+  serverKey: string;
+  conversationId: string;
+}
+
+export type ConversationResolver = (conversationId: string) => Promise<ResolvedConversation | null>;
+
+function localBackendServerKey(): string | null {
+  const dir = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  return dir ? `local:${dir}` : null;
+}
+
+function sessionsForAgent(agentId: string, settings: LocalSettings): AgentSession[] {
+  const out: AgentSession[] = [];
   for (const [serverKey, session] of Object.entries(settings.sessionsByServer ?? {})) {
     if (session.agentId === agentId && session.conversationId) {
-      return { serverKey, conversationId: session.conversationId };
+      out.push({ serverKey, conversationId: session.conversationId });
     }
   }
-  return null;
+  return out;
+}
+
+function sessionHasGoal(settings: LocalSettings, session: AgentSession): boolean {
+  return settings.conversationGoalsByServer?.[session.serverKey]?.[session.conversationId] != null;
+}
+
+function sortSessionsForAgent(settings: LocalSettings, sessions: AgentSession[]): AgentSession[] {
+  const preferredLocalKey = localBackendServerKey();
+  return [...sessions].sort((a, b) => {
+    const aIsPreferredLocal = preferredLocalKey != null && a.serverKey === preferredLocalKey;
+    const bIsPreferredLocal = preferredLocalKey != null && b.serverKey === preferredLocalKey;
+    if (aIsPreferredLocal !== bIsPreferredLocal) return aIsPreferredLocal ? -1 : 1;
+
+    const aIsLocal = a.serverKey.startsWith("local:");
+    const bIsLocal = b.serverKey.startsWith("local:");
+    if (aIsLocal !== bIsLocal) return aIsLocal ? -1 : 1;
+
+    const aHasGoal = sessionHasGoal(settings, a);
+    const bHasGoal = sessionHasGoal(settings, b);
+    if (aHasGoal !== bHasGoal) return aHasGoal ? -1 : 1;
+
+    return 0;
+  });
+}
+
+async function sessionForAgent(
+  agentId: string,
+  settings: LocalSettings,
+  resolver: ConversationResolver = resolveConversationId,
+): Promise<AgentSession | null> {
+  const sessions = sortSessionsForAgent(settings, sessionsForAgent(agentId, settings));
+  for (const session of sessions) {
+    const candidateConversationId = externalConversationId(agentId, session.conversationId);
+    const resolved = await resolver(candidateConversationId);
+    if (resolved?.agentId === agentId && resolved.conversationId === session.conversationId) {
+      return session;
+    }
+  }
+  return sessions[0] ?? null;
 }
 
 function accrueActiveSeconds(goal: NativeConversationGoal, now: string): NativeConversationGoal {
@@ -185,7 +261,11 @@ function parseTokenBudget(argv: string[]): { tokenBudget: number | null; rest: s
  * not a parallel implementation. Mobile can call this endpoint; CLI users can
  * continue to use `/goal` directly.
  */
-export function applyNativeGoalCommandForAgent(agentId: string, command: string): NativeGoalCommandResult {
+export async function applyNativeGoalCommandForAgent(
+  agentId: string,
+  command: string,
+  resolver: ConversationResolver = resolveConversationId,
+): Promise<NativeGoalCommandResult> {
   const trimmed = command.trim();
   if (!trimmed.startsWith("/goal")) throw new Error("command must start with /goal");
   const local = readLocalSettings();
@@ -194,7 +274,7 @@ export function applyNativeGoalCommandForAgent(agentId: string, command: string)
     ...local,
     sessionsByServer: { ...(global.sessionsByServer ?? {}), ...(local.sessionsByServer ?? {}) },
   };
-  const session = sessionForAgent(agentId, settings);
+  const session = await sessionForAgent(agentId, settings, resolver);
   if (!session) throw new Error(`no active conversation for agent ${agentId}`);
   const now = new Date().toISOString();
   const words = trimmed.split(/\s+/).slice(1);
@@ -267,7 +347,7 @@ export function applyNativeGoalCommandForAgent(agentId: string, command: string)
   // this module). Fail-open: the driver also re-checks status each iteration.
   if (action === "pause" || action === "complete" || action === "clear" || action === "disable") {
     void import("./goal-continuation.js")
-      .then((mod) => mod.stopContinuation(session.conversationId))
+      .then((mod) => mod.stopContinuation(externalConversationId(agentId, session.conversationId)))
       .catch(() => {});
   }
   return {
@@ -277,7 +357,7 @@ export function applyNativeGoalCommandForAgent(agentId: string, command: string)
     source: "letta_code_goal_mode",
     server_key: session.serverKey,
     agent_id: agentId,
-    conversation_id: session.conversationId,
+    conversation_id: externalConversationId(agentId, session.conversationId),
     goal,
     ...(local.conversationGoalToolsByServer?.[session.serverKey]?.[session.conversationId] !== undefined
       ? { tools_enabled: local.conversationGoalToolsByServer[session.serverKey]![session.conversationId] }

@@ -1848,7 +1848,7 @@ async function handleAgentNativeGoalCommand(req: IncomingMessage, res: ServerRes
     return badRequest(res, "command must start with /goal");
   }
   try {
-    const result = applyNativeGoalCommandForAgent(agentId, command);
+    const result = await applyNativeGoalCommandForAgent(agentId, command);
     broadcastGoalEvent({ reason: "client_mutation", at: new Date().toISOString(), status: result });
     json(res, 200, result);
 
@@ -1861,6 +1861,14 @@ async function handleAgentNativeGoalCommand(req: IncomingMessage, res: ServerRes
     const convId = result.conversation_id;
     const goalActive = result.goal?.status === "active";
     if (convId && goalActive && (result.action === "create" || result.action === "replace" || result.action === "resume")) {
+      const resolved = await resolveConversationId(convId);
+      if (!resolved || resolved.agentId !== agentId) {
+        console.error(
+          `[goal] cannot start continuation: unresolved conversation conv=${convId} agent=${agentId}`,
+        );
+        broadcastGoalEvent({ reason: "client_mutation", at: new Date().toISOString(), status: result });
+        return;
+      }
       void import("./lib/goal-continuation.js")
         .then(({ maybeContinue }) =>
           maybeContinue(convId, agentId, async (contArgs) => {
