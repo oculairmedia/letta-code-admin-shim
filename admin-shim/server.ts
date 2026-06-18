@@ -1851,6 +1851,28 @@ async function handleAgentNativeGoalCommand(req: IncomingMessage, res: ServerRes
     const result = applyNativeGoalCommandForAgent(agentId, command);
     broadcastGoalEvent({ reason: "client_mutation", at: new Date().toISOString(), status: result });
     json(res, 200, result);
+
+    // Kick the autonomous continuation loop when a /goal command leaves the
+    // conversation with an ACTIVE goal (create / replace / resume). Without
+    // this, a goal set via the command never starts working — the only other
+    // start-hook is end-of-turn in bridgeSendMessage, which a command does not
+    // produce. Fire-and-forget; the driver re-checks status + budget + cap and
+    // is single-flight, so this is safe even if a turn-end hook also fires.
+    const convId = result.conversation_id;
+    const goalActive = result.goal?.status === "active";
+    if (convId && goalActive && (result.action === "create" || result.action === "replace" || result.action === "resume")) {
+      void import("./lib/goal-continuation.js")
+        .then(({ maybeContinue }) =>
+          maybeContinue(convId, agentId, async (contArgs) => {
+            await bridgeSendMessage(contArgs, () => {}, {});
+            return "";
+          }),
+        )
+        .catch((err: unknown) => {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          console.error(`[goal] kick-on-create failed: ${errMsg}`);
+        });
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     badRequest(res, message);
