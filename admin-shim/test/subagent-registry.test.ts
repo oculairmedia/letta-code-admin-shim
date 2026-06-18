@@ -274,6 +274,59 @@ test("subagent-registry: rehydrate flips running entry whose log already complet
   }
 });
 
+test("subagent-registry: rehydrate finalizes running entry whose log shows [Task failed]", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-rehydrate-failed-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_failed.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    // Real-world orphan footer: an interrupted worker writes [Task failed]
+    // and subagent_status=error, NOT [Task completed]. This used to rehydrate
+    // as running forever (the ~22h phantom chip).
+    writeFileSync(
+      logFile,
+      "[Task started: Fix shim CI failures]\nsubagent_status=error\n[error] Interrupted by user\n[Task failed]\n",
+    );
+    ingestParentFrame(dispatchFrame(tcid, "Fix shim CI failures"), "run-rehydrate-failed");
+    ingestParentFrame(returnFrame(tcid, "task_failed", "agent-local-abc12345-5555-4444-3333-222222222222", logFile), "run-rehydrate-failed");
+    getSubagent(tcid)!.status = "running";
+
+    rehydrateRunningSubagentWatchdogs();
+
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "subagent_error");
+    assert.equal(__getSubagentWatcherCounts().timeouts, 0);
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("subagent-registry: sweep finalizes running entry whose log shows subagent_status=error", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-sweep-failed-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_sweep_failed.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\nworking\n");
+    ingestParentFrame(dispatchFrame(tcid, "Will fail"), "run-sweep-failed");
+    ingestParentFrame(returnFrame(tcid, "task_sweep_failed", "agent-local-abc12345-aaaa-bbbb-cccc-dddddddddddd", logFile), "run-sweep-failed");
+    // Worker fails after the watcher's immediate scan; sweep must catch it.
+    writeFileSync(logFile, "[Task started]\nworking\nsubagent_status=error\n[Task failed]\n");
+
+    const swept = sweepOrphanedSubagents(Date.now());
+
+    assert.equal(swept, 1);
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "subagent_error");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
 test("subagent-registry: rehydrate fails running entry whose background log is missing", () => {
   __resetSubagentRegistry();
   const stateDir = join(tmpdir(), `shim-rehydrate-missing-${Math.random().toString(36).slice(2)}`);
