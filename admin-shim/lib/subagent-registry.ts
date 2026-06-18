@@ -37,12 +37,10 @@
  *
  * Background tasks write a plaintext log at `/tmp/letta-background/
  * task_N.log`. The log opens with `[Task started: ...]` and closes with
- * `[Task completed]` (or, on a hard failure mode, never closes). The
- * registry watches that file: a `[Task completed]` footer flips the
- * subagent to `completed`. A still-`running` subagent that exceeds the
- * stream-timeout window (default 600s — the local-provider stream
- * timeout the parent dispatch path documents) is flipped to `failed`
- * with reason `stream_timeout`.
+ * `[Task completed]` or a failure footer. Silence is not terminal: the
+ * registry only finalizes started-only logs when a captured worker PID is
+ * confirmed dead, or during boot rehydrate when the entry belongs to a
+ * previous shim instance and no live worker PID can be verified.
  *
  * The bus is intentionally minimal (mirrors `cron-events.ts`): no replay,
  * no buffering. Late subscribers see only events emitted after they
@@ -50,7 +48,7 @@
  * on demand via `listActiveSubagents()` / `snapshotSubagents()`.
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 import { invalidateMessagesCache, messagesJsonlPath } from "./store.js";
 import { readSubagentTodos, type TodoItem, type TodoSnapshot } from "./subagent-todos.js";
@@ -104,6 +102,10 @@ export interface SubagentEntry {
   subagentConversationId: string | null;
   /** Background task log path; null for sync dispatch. */
   logFile: string | null;
+  /** Worker process id when exposed by task metadata/logs; null when unavailable. */
+  workerPid: number | null;
+  /** Shim process that observed this entry in the current in-memory registry. */
+  ownerShimPid: number | null;
   /** ISO timestamp the dispatch was first observed. */
   startedAt: string;
   /** ISO timestamp the entry reached a terminal status; null while running. */
@@ -224,6 +226,7 @@ export interface ParsedAgentReturn {
   taskId: string | null;
   subagentAgentId: string | null;
   logFile: string | null;
+  workerPid: number | null;
 }
 
 /**
@@ -239,11 +242,14 @@ export interface ParsedAgentReturn {
  */
 export function parseAgentReturnBody(body: unknown): ParsedAgentReturn {
   const text = toReturnText(body);
-  if (!text) return { taskId: null, subagentAgentId: null, logFile: null };
+  if (!text) return { taskId: null, subagentAgentId: null, logFile: null, workerPid: null };
   const taskId = text.match(/task ID:\s*(task_\d+)/i)?.[1] ?? null;
   const subagentAgentId = text.match(/Agent ID:\s*(agent-local-[0-9a-f-]+)/i)?.[1] ?? null;
   const logFile = text.match(/Output file:\s*(\S+)/i)?.[1] ?? null;
-  return { taskId, subagentAgentId, logFile };
+  const pidText = text.match(/(?:Worker PID|PID):\s*(\d+)/i)?.[1] ?? null;
+  const parsedPid = pidText ? Number(pidText) : null;
+  const workerPid = parsedPid !== null && Number.isSafeInteger(parsedPid) && parsedPid > 0 ? parsedPid : null;
+  return { taskId, subagentAgentId, logFile, workerPid };
 }
 
 /**
@@ -340,6 +346,8 @@ export function recordSubagentDispatch(input: {
     todo_progress: null,
     subagentConversationId: null,
     logFile: null,
+    workerPid: null,
+    ownerShimPid: process.pid,
     startedAt: nowIso(),
     endedAt: null,
   };
@@ -374,6 +382,13 @@ export function recordSubagentReturn(input: {
     entry.subagentAgentId = parsed.subagentAgentId ?? entry.subagentAgentId;
     if (entry.subagentAgentId) entry.subagentConversationId = "default";
     entry.logFile = parsed.logFile ?? entry.logFile;
+    entry.workerPid = parsed.workerPid ?? entry.workerPid ?? readLogWorkerPid(entry.logFile);
+    entry.ownerShimPid = process.pid;
+    const pendingTimeout = _timeoutTimers.get(toolCallId);
+    if (pendingTimeout) {
+      clearTimeout(pendingTimeout);
+      _timeoutTimers.delete(toolCallId);
+    }
     entry.runInBackground = true;
     refreshTodoProgress(toolCallId, false);
     emit("resolved", entry);
@@ -549,6 +564,35 @@ function logHasCompletedMarker(logFile: string): boolean {
  * or an `[error] ...` line), or null while still running / unreadable.
  * Completion wins if both markers somehow appear.
  */
+function readLogWorkerPid(logFile: string | null): number | null {
+  if (!logFile) return null;
+  try {
+    if (!existsSync(logFile)) return null;
+    const text = readFileSync(logFile, "utf8");
+    const pidText = text.match(/(?:Worker PID|PID):\s*(\d+)/i)?.[1] ?? null;
+    const parsedPid = pidText ? Number(pidText) : null;
+    return parsedPid !== null && Number.isSafeInteger(parsedPid) && parsedPid > 0 ? parsedPid : null;
+  } catch {
+    return null;
+  }
+}
+
+type ProcessAliveChecker = (pid: number) => boolean;
+let processAliveChecker: ProcessAliveChecker = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+function isWorkerProcessAlive(entry: SubagentEntry): boolean | null {
+  entry.workerPid ??= readLogWorkerPid(entry.logFile);
+  if (!entry.workerPid) return null;
+  return processAliveChecker(entry.workerPid);
+}
+
 function readLogTerminalStatus(logFile: string): "completed" | "failed" | null {
   try {
     if (!existsSync(logFile)) return null;
@@ -591,7 +635,7 @@ function watchBackgroundLog(toolCallId: string): void {
     _logWatchers.set(toolCallId, watcher);
   } catch {
     // fs.watch can fail if the file vanished between the existsSync and
-    // the watch; the timeout watchdog still bounds the entry's lifetime.
+    // the watch; liveness sweep still checks terminal footers and worker PID.
   }
 }
 
@@ -620,9 +664,14 @@ function evaluateRunningSubagent(toolCallId: string): void {
       return;
     }
   }
+  const alive = isWorkerProcessAlive(entry);
+  if (alive === false) {
+    finalize(toolCallId, "failed", "worker_process_dead");
+    return;
+  }
   if (entry.subagentAgentId) watchSubagentTodos(toolCallId);
   if (entry.logFile) watchBackgroundLog(toolCallId);
-  armTimeoutWatchdog(toolCallId);
+  if (!entry.logFile) armTimeoutWatchdog(toolCallId);
 }
 
 export function rehydrateRunningSubagentWatchdogs(): void {
@@ -647,6 +696,11 @@ export function rehydrateRunningSubagentWatchdogs(): void {
     }
     if (terminal === "failed") {
       finalize(entry.toolCallId, "failed", "subagent_error");
+      continue;
+    }
+    const alive = isWorkerProcessAlive(entry);
+    if (alive === false || alive === null) {
+      finalize(entry.toolCallId, "failed", "worker_process_dead");
       continue;
     }
     evaluateRunningSubagent(entry.toolCallId);
@@ -678,13 +732,14 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
       swept += 1;
       continue;
     }
-    try {
-      const stat = statSync(entry.logFile);
-      if (nowMs - stat.mtimeMs > SUBAGENT_TIMEOUT_MS) {
-        finalize(entry.toolCallId, "failed", "orphaned");
-        swept += 1;
-      }
-    } catch {
+    const alive = isWorkerProcessAlive(entry);
+    if (alive === false) {
+      finalize(entry.toolCallId, "failed", "worker_process_dead");
+      swept += 1;
+      continue;
+    }
+    if (alive === true) continue;
+    if (!existsSync(entry.logFile)) {
       const startedMs = Date.parse(entry.startedAt);
       if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
         finalize(entry.toolCallId, "failed", "orphaned");
@@ -752,6 +807,18 @@ export function __resetSubagentRegistry(): void {
   for (const toolCallId of [..._todoDebounceTimers.keys()]) clearWatchers(toolCallId);
   _subagents.clear();
   _listeners.clear();
+  __setSubagentProcessAliveCheckerForTest(null);
+}
+
+export function __setSubagentProcessAliveCheckerForTest(checker: ProcessAliveChecker | null): void {
+  processAliveChecker = checker ?? ((pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+  });
 }
 
 export function __getSubagentWatcherCounts(): { logs: number; todos: number; todoDebounces: number; timeouts: number; livenessSweep: number } {

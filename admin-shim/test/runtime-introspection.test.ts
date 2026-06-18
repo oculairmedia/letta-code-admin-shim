@@ -92,6 +92,8 @@ function runningSubagent(input: Partial<SubagentEntry> & { toolCallId: string; s
     todo_progress: input.todo_progress ?? null,
     subagentConversationId: input.subagentConversationId ?? null,
     logFile: input.logFile ?? null,
+    workerPid: input.workerPid ?? null,
+    ownerShimPid: input.ownerShimPid ?? null,
     startedAt: input.startedAt,
     endedAt: null,
   };

@@ -149,14 +149,58 @@ test("runs: boot sweep finalizes orphaned running runs on disk", () => {
     });
 
     assert.ok(run.record.created_at);
-    const swept = sweepOrphanedRunningRunsOnBoot(Date.parse(run.record.created_at) + 1_000);
+    const swept = sweepOrphanedRunningRunsOnBoot(Date.parse(run.record.created_at ?? "") + 1_000);
 
     assert.equal(swept, 1);
     const record = getRun(run.id);
     assert.equal(record?.status, "failed");
     assert.equal(record?.stop_reason, "shim_restart_orphaned");
-    const frames = readFileSync(getFramesFilePath(run.id), "utf8");
-    assert.match(frames, /shim_restart_orphaned/);
+    const lines = readFileSync(getFramesFilePath(run.id), "utf8").trim().split("\n");
+    const frames = lines.map((line) => JSON.parse(line) as { seq: number; frame: Record<string, unknown> });
+    assert.equal(frames.length, 2);
+    assert.equal(frames[0]?.seq, 1);
+    assert.equal(frames[0]?.frame["message_type"], "stop_reason");
+    assert.equal(frames[0]?.frame["stop_reason"], "shim_restart_orphaned");
+    assert.equal(frames[1]?.seq, 2);
+    assert.equal(frames[1]?.frame["type"], "turn_done");
+    assert.equal(frames[1]?.frame["message_type"], "turn_done");
+    assert.equal(frames[1]?.frame["run_id"], run.id);
+    assert.equal(frames[1]?.frame["turn_id"], run.id);
+    assert.equal(frames[1]?.frame["status"], "failed");
+    assert.equal(frames[1]?.frame["stop_reason"], "shim_restart_orphaned");
+    assert.equal(frames[1]?.frame["error_code"], "shim_restart_orphaned");
+    assert.match(String(frames[1]?.frame["error_message"]), /shim restarted/);
+  } finally {
+    if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+
+test("runs: boot sweep leaves completed runs untouched", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "runs-boot-sweep-complete-"));
+  const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  try {
+    const run = createRun({
+      agentId: "agent-completed-run",
+      conversationId: "conv-completed-run",
+    });
+    const recordPath = join(stateDir, "runs", run.id, "run.json");
+    const completed = {
+      ...run.record,
+      status: "completed",
+      stop_reason: "end_turn",
+      completed_at: new Date().toISOString(),
+    };
+    writeFileSync(recordPath, JSON.stringify(completed, null, 2));
+
+    const swept = sweepOrphanedRunningRunsOnBoot(Date.parse(run.record.created_at ?? "") + 1_000);
+
+    assert.equal(swept, 0);
+    assert.equal(readRunRecord(stateDir, run.id)?.status, "completed");
+    assert.equal(existsSync(getFramesFilePath(run.id)), false);
   } finally {
     if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
     else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;

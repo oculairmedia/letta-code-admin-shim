@@ -891,6 +891,18 @@ export function sweepOrphanedRunningRunsOnBoot(nowMs = Date.now()): number {
       status: "failed",
       ...(ageMs !== null ? { orphaned_age_ms: ageMs } : {}),
     });
+    appendRunFrameOnDisk(runId, {
+      type: "turn_done",
+      message_type: "turn_done",
+      turn_id: runId,
+      run_id: runId,
+      agent_id: record.agent_id ?? null,
+      conversation_id: record.conversation_id ?? null,
+      status: "failed",
+      stop_reason: "shim_restart_orphaned",
+      error_code: "shim_restart_orphaned",
+      error_message: "shim restarted while this turn was running",
+    });
     swept += 1;
   }
   return swept;
