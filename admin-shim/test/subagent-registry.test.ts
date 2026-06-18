@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, utimesSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,6 +27,7 @@ import {
   sweepOrphanedSubagents,
   __getSubagentWatcherCounts,
   __resetSubagentRegistry,
+  __setSubagentProcessAliveCheckerForTest,
 } from "../lib/subagent-registry.js";
 import { messagesJsonlPath } from "../lib/store.js";
 
@@ -46,7 +47,7 @@ function dispatchFrame(toolCallId: string, description: string, background = tru
   };
 }
 
-function returnFrame(toolCallId: string, taskId: string, agentLocalId: string, logFile?: string) {
+function returnFrame(toolCallId: string, taskId: string, agentLocalId: string, logFile?: string, workerPid?: number) {
   return {
     message_type: "tool_return_message",
     name: "Agent",
@@ -54,7 +55,8 @@ function returnFrame(toolCallId: string, taskId: string, agentLocalId: string, l
     tool_return:
       `Task running in background with task ID: ${taskId}\n` +
       `Agent ID: ${agentLocalId}\n` +
-      `Output file: ${logFile ?? `/tmp/letta-background/${taskId}.log`}`,
+      `Output file: ${logFile ?? `/tmp/letta-background/${taskId}.log`}` +
+      (workerPid ? `\nWorker PID: ${workerPid}` : ""),
   };
 }
 
@@ -402,6 +404,84 @@ test("subagent-registry: liveness sweep completes running entry when log already
   }
 });
 
+
+test("subagent-registry: started-only log with dead PID finalizes failed", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-dead-pid-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_dead_pid.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\n");
+    ingestParentFrame(dispatchFrame(tcid, "Dead worker"), "run-dead-pid");
+    ingestParentFrame(returnFrame(tcid, "task_95", "agent-local-abc12345-dddd-eeee-ffff-111111111111", logFile, 424242), "run-dead-pid");
+    __setSubagentProcessAliveCheckerForTest((pid) => {
+      assert.equal(pid, 424242);
+      return false;
+    });
+
+    const swept = sweepOrphanedSubagents(Date.now());
+
+    assert.equal(swept, 1);
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "worker_process_dead");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("subagent-registry: started-only log with alive PID stays running past old timeout", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-alive-pid-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_alive_pid.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\n");
+    const stale = new Date(Date.now() - 3_600_000);
+    utimesSync(logFile, stale, stale);
+    ingestParentFrame(dispatchFrame(tcid, "Quiet worker"), "run-alive-pid");
+    ingestParentFrame(returnFrame(tcid, "task_96", "agent-local-abc12345-eeee-ffff-1111-222222222222", logFile, 515151), "run-alive-pid");
+    __setSubagentProcessAliveCheckerForTest((pid) => {
+      assert.equal(pid, 515151);
+      return true;
+    });
+
+    const swept = sweepOrphanedSubagents(Date.now() + 3_600_000);
+
+    assert.equal(swept, 0);
+    assert.equal(getSubagent(tcid)?.status, "running");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("subagent-registry: boot rehydrate keeps started-only log with UNKNOWN pid running (silence != death)", () => {
+  // Process-liveness, not silence: a started-only log whose worker PID can't
+  // be verified must NOT be finalized as dead at rehydrate. A subagent can be
+  // legitimately quiet, and external (non-worker) entries have no PID. Only a
+  // CONFIRMED-dead PID finalizes; unknown-PID falls through to the normal
+  // watch path and stays running until a real terminal signal.
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-boot-unknown-pid-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_unknown_pid.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\n");
+    ingestParentFrame(dispatchFrame(tcid, "Unknown-pid worker"), "run-unknown-pid");
+    ingestParentFrame(returnFrame(tcid, "task_97", "agent-local-abc12345-ffff-1111-2222-333333333333", logFile), "run-unknown-pid");
+
+    rehydrateRunningSubagentWatchdogs();
+
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "running");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
 test("subagent-registry: liveness sweep leaves fresh running log active", () => {
   __resetSubagentRegistry();
   const stateDir = join(tmpdir(), `shim-fresh-sweep-${Math.random().toString(36).slice(2)}`);
@@ -424,7 +504,7 @@ test("subagent-registry: liveness sweep leaves fresh running log active", () => 
   }
 });
 
-test("subagent-registry: liveness sweep fails stale running log as orphaned", () => {
+test("subagent-registry: liveness sweep leaves stale started-only log active when PID is unknown", () => {
   __resetSubagentRegistry();
   const stateDir = join(tmpdir(), `shim-orphan-sweep-${Math.random().toString(36).slice(2)}`);
   const logFile = join(stateDir, "task_91.log");
@@ -436,15 +516,11 @@ test("subagent-registry: liveness sweep fails stale running log as orphaned", ()
     utimesSync(logFile, stale, stale);
     ingestParentFrame(dispatchFrame(tcid, "Stale worker"), "run-orphan");
     ingestParentFrame(returnFrame(tcid, "task_91", "agent-local-abc12345-aaaa-bbbb-cccc-dddddddddddd", logFile), "run-orphan");
-    const timeoutMs = Number(process.env["SHIM_SUBAGENT_TIMEOUT_MS"] ?? 600_000);
-    const nowAfterTimeout = statSync(logFile).mtimeMs + timeoutMs + 1_000;
 
-    const swept = sweepOrphanedSubagents(nowAfterTimeout);
+    const swept = sweepOrphanedSubagents(Date.now() + 3_600_000);
 
-    assert.equal(swept, 1);
-    const entry = getSubagent(tcid);
-    assert.equal(entry?.status, "failed");
-    assert.equal(entry?.failureReason, "orphaned");
+    assert.equal(swept, 0);
+    assert.equal(getSubagent(tcid)?.status, "running");
   } finally {
     __resetSubagentRegistry();
   }
