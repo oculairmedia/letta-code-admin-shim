@@ -457,7 +457,12 @@ test("subagent-registry: started-only log with alive PID stays running past old 
   }
 });
 
-test("subagent-registry: boot rehydrate finalizes started-only log without live owner", () => {
+test("subagent-registry: boot rehydrate keeps started-only log with UNKNOWN pid running (silence != death)", () => {
+  // Process-liveness, not silence: a started-only log whose worker PID can't
+  // be verified must NOT be finalized as dead at rehydrate. A subagent can be
+  // legitimately quiet, and external (non-worker) entries have no PID. Only a
+  // CONFIRMED-dead PID finalizes; unknown-PID falls through to the normal
+  // watch path and stays running until a real terminal signal.
   __resetSubagentRegistry();
   const stateDir = join(tmpdir(), `shim-boot-unknown-pid-${Math.random().toString(36).slice(2)}`);
   const logFile = join(stateDir, "task_unknown_pid.log");
@@ -465,15 +470,13 @@ test("subagent-registry: boot rehydrate finalizes started-only log without live 
   try {
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(logFile, "[Task started]\n");
-    ingestParentFrame(dispatchFrame(tcid, "Previous shim worker"), "run-unknown-pid");
+    ingestParentFrame(dispatchFrame(tcid, "Unknown-pid worker"), "run-unknown-pid");
     ingestParentFrame(returnFrame(tcid, "task_97", "agent-local-abc12345-ffff-1111-2222-333333333333", logFile), "run-unknown-pid");
 
     rehydrateRunningSubagentWatchdogs();
 
     const entry = getSubagent(tcid);
-    assert.equal(entry?.status, "failed");
-    assert.equal(entry?.failureReason, "worker_process_dead");
-    assert.equal(__getSubagentWatcherCounts().timeouts, 0);
+    assert.equal(entry?.status, "running");
   } finally {
     __resetSubagentRegistry();
   }

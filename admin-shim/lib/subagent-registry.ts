@@ -698,8 +698,14 @@ export function rehydrateRunningSubagentWatchdogs(): void {
       finalize(entry.toolCallId, "failed", "subagent_error");
       continue;
     }
+    // Process-liveness, NOT silence: only finalize when the worker PID is
+    // CONFIRMED dead. PID-unknown (alive === null) must NOT be treated as dead
+    // — a subagent can legitimately be quiet for a long time, and external
+    // (non-worker) entries have no PID at all. Unknown-PID entries fall through
+    // to the normal watch/footer/no-logfile-timeout path; a confirmed-dead PID
+    // is the only positive death signal at rehydrate.
     const alive = isWorkerProcessAlive(entry);
-    if (alive === false || alive === null) {
+    if (alive === false) {
       finalize(entry.toolCallId, "failed", "worker_process_dead");
       continue;
     }
