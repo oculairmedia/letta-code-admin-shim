@@ -736,39 +736,44 @@ test("ws: second send_message during in-flight turn → error{protocol_violation
 // ─── 10. cancel happy-ish path ──────────────────────────────────────
 
 test("ws: cancel with run_id flips the Run to cancelled", async (t) => {
-  // Slow the mock so we have a window to cancel.
-  const { shim, conn, agentId, convId } = await setupAuthed(t, { env: { LETTA_MOCK_DELAY_MS: "200" } });
+  const { shim, conn, agentId, convId } = await setupAuthed(t, {
+    env: { LETTA_MOCK_DELAY_MS: "200", SHIM_CANCEL_GRACE_MS: "100" },
+  });
   conn.send({
     type: "send_message",
     agent_id: agentId,
     conversation_id: convId,
-    text: "bullet list three things about TCP/IP", // multi-step → 6 chunks → long enough to cancel
+    text: "bullet list three things about TCP/IP",
     otid: "cm-ws-cancel",
   });
-  // Wait for the first frame that carries a run_id.
-  let runId: string | null = null;
-  const startWait = Date.now();
-  while (Date.now() - startWait < WS_TIMEOUT_MS) {
-    const f = conn.frames.find((x) => (x as { run_id?: unknown }).run_id);
-    if (f) { runId = (f as unknown as { run_id: string }).run_id; break; }
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  if (!runId) {
-    // The mock may already have finished — assert and move on.
-    t.diagnostic("could not capture run_id before turn ended; cancel race is a no-op");
-    return;
-  }
+  const started = await conn.waitFor("turn_started", { timeoutMs: WS_TIMEOUT_MS }) as unknown as { run_id?: string };
+  const runId = started.run_id;
+  assert.ok(runId, "turn_started must carry run_id so Stop can target it");
+  await conn.waitFor("assistant_message", { timeoutMs: WS_TIMEOUT_MS });
+
+  const beforeCancel = conn.frames.length;
+  const cancelAt = Date.now();
   conn.send({ type: "cancel", run_id: runId });
-  // Drain remaining frames briefly. The cancel may race with turn_done.
-  await new Promise((r) => setTimeout(r, 300));
-  // Query the run record — must be cancelled or completed (race).
+  const done = await conn.waitFor("turn_done", { timeoutMs: 1000 }) as unknown as { status?: string; stop_reason?: string; run_id?: string };
+  const afterDone = conn.frames.length;
+
+  assert.equal(done.status, "cancelled");
+  assert.equal(done.run_id, runId);
+  assert.ok(Date.now() - cancelAt < 1000, "turn_done(cancelled) must arrive within the grace window budget");
+  const postCancelFrames = conn.frames.slice(beforeCancel, afterDone);
+  assert.equal(
+    postCancelFrames.some((f) => ["assistant_message", "tool_call_message", "tool_return_message"].includes((f as { type?: string }).type ?? "")),
+    false,
+    "no assistant/tool frames should arrive after cancel",
+  );
+  const stop = postCancelFrames.find((f) => (f as { type?: string }).type === "stop_reason") as unknown as { stop_reason?: string } | undefined;
+  assert.equal(stop?.stop_reason, "user_cancelled");
+
   const res = await fetch(`${shim.url}/v1/runs/${runId}`);
   assert.equal(res.status, 200);
-  const run = await res.json() as { status: string };
-  assert.ok(
-    ["cancelled", "completed"].includes(run.status),
-    `run status should settle to cancelled or completed, got ${run.status}`,
-  );
+  const run = await res.json() as { status: string; stop_reason?: string | null };
+  assert.equal(run.status, "cancelled");
+  assert.equal(run.stop_reason, "user_cancelled");
 });
 
 // ─── 11. cancel without run_id → protocol_violation ────────────────

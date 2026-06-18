@@ -561,12 +561,12 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       // lcp-5o2: clear both watchdog timers introduced with the silence
       // watchdog refactor. Either or both may already have fired by now;
       // clearTimeout is idempotent on fired timers.
-      settled = true;
+      settled = !cancelled;
       if (silenceTimer) {
         clearTimeout(silenceTimer);
         silenceTimer = null;
       }
-      if (cancelGraceTimer) {
+      if (!cancelled && cancelGraceTimer) {
         clearTimeout(cancelGraceTimer);
         cancelGraceTimer = null;
       }
