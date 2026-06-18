@@ -769,10 +769,21 @@ export async function bridgeSendMessage(
       const { maybeContinue, configureGoalContinuationCancellation } = await import("./goal-continuation.js");
       configureGoalContinuationCancellation(cancelRun);
       void maybeContinue(effectiveConvId, effectiveAgentId, async (contArgs) => {
-        await bridgeSendMessage(contArgs, () => {}, contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {});
+        let tokensUsed = 0;
+        await bridgeSendMessage(
+          contArgs,
+          (frame) => {
+            if ((frame as { message_type?: unknown }).message_type !== "usage_statistics") return;
+            const totalTokens = (frame as { total_tokens?: unknown }).total_tokens;
+            if (typeof totalTokens === "number" && Number.isFinite(totalTokens)) {
+              tokensUsed += Math.max(0, Math.floor(totalTokens));
+            }
+          },
+          contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {},
+        );
         // Completion is detected via native goal status (update_goal); the
         // text-sentinel fallback is unused on this path.
-        return "";
+        return { assistantText: "", usage: { tokensUsed } };
       });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);

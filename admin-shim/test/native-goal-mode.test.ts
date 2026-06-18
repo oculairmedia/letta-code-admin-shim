@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  addNativeGoalUsage,
   applyNativeGoalCommandForAgent,
   getNativeGoalForAgent,
   getNativeGoalForConversation,
@@ -217,4 +218,47 @@ test("native goal command prefers resolvable local backend session over stale re
     if (prevBackend === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
     else process.env["LETTA_LOCAL_BACKEND_DIR"] = prevBackend;
   }
+});
+
+
+test("addNativeGoalUsage increments active goal tokens and persists", () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+    conversationGoalsByServer: {
+      "local:/tmp/backend": {
+        "conv-a": {
+          objective: "finish the migration",
+          status: "active",
+          activeTimeSeconds: 10,
+          tokensUsed: 25,
+          tokenBudget: 100,
+        },
+      },
+    },
+  });
+
+  const updated = addNativeGoalUsage({ conversationId: "conv-a", agentId: "agent-a", tokensUsed: 33, activeSeconds: 2 });
+
+  assert.equal(updated?.goal?.tokensUsed, 58);
+  assert.equal(updated?.goal?.activeTimeSeconds, 12);
+  assert.equal(readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"].tokensUsed, 58);
+});
+
+test("addNativeGoalUsage is no-op when no active goal exists", () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+    conversationGoalsByServer: {
+      "local:/tmp/backend": {
+        "conv-a": { objective: "paused work", status: "paused", tokensUsed: 25 },
+      },
+    },
+  });
+
+  assert.equal(addNativeGoalUsage({ conversationId: "conv-a", tokensUsed: 33 }), null);
+  assert.equal(readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"].tokensUsed, 25);
+  assert.equal(addNativeGoalUsage({ conversationId: "conv-missing", tokensUsed: 33 }), null);
 });

@@ -1873,8 +1873,19 @@ async function handleAgentNativeGoalCommand(req: IncomingMessage, res: ServerRes
         .then(({ maybeContinue, configureGoalContinuationCancellation }) => {
           configureGoalContinuationCancellation(cancelRun);
           return maybeContinue(convId, agentId, async (contArgs) => {
-            await bridgeSendMessage(contArgs, () => {}, contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {});
-            return "";
+            let tokensUsed = 0;
+            await bridgeSendMessage(
+              contArgs,
+              (frame) => {
+                if ((frame as { message_type?: unknown }).message_type !== "usage_statistics") return;
+                const totalTokens = (frame as { total_tokens?: unknown }).total_tokens;
+                if (typeof totalTokens === "number" && Number.isFinite(totalTokens)) {
+                  tokensUsed += Math.max(0, Math.floor(totalTokens));
+                }
+              },
+              contArgs.onRunCreated ? { onRunCreated: contArgs.onRunCreated } : {},
+            );
+            return { assistantText: "", usage: { tokensUsed } };
           });
         })
         .catch((err: unknown) => {
