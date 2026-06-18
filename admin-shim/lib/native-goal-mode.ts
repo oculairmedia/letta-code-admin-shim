@@ -324,6 +324,11 @@ export async function applyNativeGoalCommandForAgent(
   } else {
     if (existing && !replace) throw new Error("goal already exists; use /goal --replace <objective>");
     if (!objective) throw new Error("objective is required");
+    const toolsByServer = { ...(local.conversationGoalToolsByServer ?? {}) };
+    const tools = { ...(toolsByServer[session.serverKey] ?? {}) };
+    tools[session.conversationId] = true;
+    toolsByServer[session.serverKey] = tools;
+    local.conversationGoalToolsByServer = toolsByServer;
     goal = {
       objective,
       status: "active",
