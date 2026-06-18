@@ -149,6 +149,26 @@ function makeStubSession(messages: SDKMessage[]): { session: unknown; trace: Stu
   return { session, trace };
 }
 
+
+function makeBlockingStubSession(): { session: unknown; trace: StubSessionFrame } {
+  const trace: StubSessionFrame = { sent: [], aborted: false, closed: false };
+  const session = {
+    async send(m: unknown) { trace.sent.push(m); },
+    async *stream(): AsyncGenerator<SDKMessage> {
+      yield {
+        type: "stream_event",
+        event: { message_type: "assistant_message", id: "m1", date: "x", agent_id: "agent-x", conversation_id: "default", run_id: "r", seq_id: 0, otid: "o", content: [{ type: "text", text: "before" }] },
+        uuid: "u1",
+      } as SDKStreamEventMessage;
+      await new Promise<never>(() => {});
+    },
+    async abort() { trace.aborted = true; },
+    close() { trace.closed = true; },
+    initialize() { throw new Error("stub: not used"); },
+  };
+  return { session, trace };
+}
+
 test("sdk-adapter: runTurn pumps frames through onFrame and terminates on result", async () => {
   const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-x" });
   // Hand-set internals so we don't have to import the SDK transport.
@@ -210,6 +230,81 @@ test("sdk-adapter: runTurn surfaces dead state when stream ends without result",
   const out = await adapter.runTurn("partial");
   assert.equal(out.dead, true);
   assert.match(out.error ?? "", /stream ended/);
+});
+
+
+test("sdk-adapter: cancellation wakes stream wait and suppresses later frames", async (t) => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-cancel-"));
+  const prev = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  t.after(() => {
+    if (prev === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prev;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const { createRun, cancelRun, getRun } = await import("../lib/runs.js");
+  const runHandle = createRun({ agentId: "agent-x", conversationId: "default" });
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-x" });
+  const { session, trace } = makeBlockingStubSession();
+  (adapter as unknown as { session: unknown }).session = session;
+  (adapter as unknown as { ready: boolean }).ready = true;
+
+  const seen: LettaStreamFrame[] = [];
+  const started = Date.now();
+  const turn = adapter.runTurn("cancel me", { runHandle, onFrame: (f) => seen.push(f) });
+  while (seen.length === 0 && Date.now() - started < 500) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(seen.length, 1, "sanity: first assistant frame streamed before cancel");
+
+  assert.equal(cancelRun(runHandle.id), true);
+  const out = await Promise.race([
+    turn,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("cancel did not settle promptly")), 500)),
+  ]);
+
+  assert.equal(out.cancelled, true);
+  assert.equal(trace.aborted, true, "cancel must still send SDK interrupt");
+  assert.equal(seen.length, 1, "no assistant/tool frames should be forwarded after cancel");
+  const run = getRun(runHandle.id);
+  assert.equal(run?.status, "cancelled");
+  assert.equal(run?.stop_reason, "user_cancelled");
+});
+
+test("sdk-adapter: cancel grace expiry force-closes a wedged session", async (t) => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(tmpdir(), "sdk-adapter-force-"));
+  const prevState = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  const prevGrace = process.env["SHIM_CANCEL_GRACE_MS"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  process.env["SHIM_CANCEL_GRACE_MS"] = "25";
+  t.after(() => {
+    if (prevState === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prevState;
+    if (prevGrace === undefined) delete process.env["SHIM_CANCEL_GRACE_MS"];
+    else process.env["SHIM_CANCEL_GRACE_MS"] = prevGrace;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const { createRun, cancelRun } = await import("../lib/runs.js");
+  const runHandle = createRun({ agentId: "agent-x", conversationId: "default" });
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-x" });
+  const { session, trace } = makeBlockingStubSession();
+  (adapter as unknown as { session: unknown }).session = session;
+  (adapter as unknown as { ready: boolean }).ready = true;
+
+  const turn = adapter.runTurn("cancel me", { runHandle });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(cancelRun(runHandle.id), true);
+  const out = await turn;
+  assert.equal(out.cancelled, true);
+
+  await new Promise((r) => setTimeout(r, 75));
+  assert.equal(trace.closed, true, "wedged SDK session must be force-closed after grace window");
 });
 
 test("sdk-adapter: close marks adapter dead and drops the session", async () => {

@@ -202,6 +202,8 @@ export interface RunTurnOptions {
   runHandle?: RunHandle;
   /** A2UI capability negotiated for this session; absent keeps legacy prompts unchanged. */
   a2uiCapability?: A2uiCapability | null;
+  /** Called after user cancellation is requested but before the grace backstop fires. */
+  onCancelGraceExpired?: (runId: string) => void;
 }
 
 /**
@@ -714,6 +716,24 @@ export class AgentPool {
     return true;
   }
 
+  forceEvict(conversationId: string, agentId: string, reason = "cancel_grace_expired"): boolean {
+    const key = this._key(conversationId, agentId);
+    const worker = this.workers.get(key);
+    if (!worker) return false;
+    this.workers.delete(key);
+    try {
+      void Promise.resolve(worker.close()).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`force-evict close failed key=${key}: ${msg}`);
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logLine(`force-evict close threw key=${key}: ${msg}`);
+    }
+    logLine(`force-evicted key=${key} reason=${reason} size=${this.workers.size}`);
+    return true;
+  }
+
   /**
    * lcp-0vi: get-or-spawn a worker, run one turn, and auto-heal on the
    * dangling-tool-use failure mode.
@@ -780,7 +800,13 @@ export class AgentPool {
     }
     let result: AdapterRunTurnResult;
     try {
-      result = await adapter.runTurn(input, opts);
+      result = await adapter.runTurn(input, {
+        ...opts,
+        onCancelGraceExpired: (runId) => {
+          this.forceEvict(conversationId, agentId, `cancel_grace_expired run=${runId}`);
+          opts.onCancelGraceExpired?.(runId);
+        },
+      });
     } finally {
       if (opts.closeAfterTurn || (opts.tools && opts.tools.length > 0)) {
         await adapter.close();

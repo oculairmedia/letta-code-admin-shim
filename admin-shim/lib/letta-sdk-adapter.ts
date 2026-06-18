@@ -327,18 +327,44 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // lcp-sdk.4: same runHandle resolution as the direct adapter. Mobile
     // WS callers pre-create the handle so turn_started can carry run_id
     // before the first content frame (lcp-99a); REST/SSE callers don't.
-    // Cancellation: setRunCancelHandler binds a hook keyed by run id; for
-    // the SDK path the hook calls session.abort() (the SDK's `interrupt`
-    // control request), matching the direct adapter's SIGTERM semantics
-    // as closely as the SDK allows. SDK-level cancellation surface
-    // limitations are flagged in lcp-sdk.5 — for now best-effort.
+    // lcp-0tmo: Stop is authoritative. The SDK's abort() only writes an
+    // interrupt control request; it does not wake a local stream waiter. Keep
+    // a per-turn cancellation deferred and race every stream read against it
+    // so cancelRun() severs this turn immediately, then retain a close/evict
+    // backstop for any SDK worker that ignores the interrupt.
     let cancelled = false;
-    const cancelSession = (): void => {
-      cancelled = true;
+    let settled = false;
+    let cancelGraceTimer: NodeJS.Timeout | null = null;
+    let resolveCancellation: ((reason: string) => void) | null = null;
+    const cancellation = new Promise<string>((resolve) => {
+      resolveCancellation = resolve;
+    });
+    const cancelSession = (reason = "user_cancelled"): void => {
+      if (!cancelled) {
+        cancelled = true;
+        resolveCancellation?.(reason);
+      }
       void session.abort().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[sdk-adapter] session abort failed for ${this.conversationId}: ${msg}`);
       });
+      if (!cancelGraceTimer) {
+        const graceMs = Math.max(0, Number(process.env["SHIM_CANCEL_GRACE_MS"] ?? 1000));
+        cancelGraceTimer = setTimeout(() => {
+          if (settled) return;
+          try {
+            opts.onCancelGraceExpired?.(runHandle.id);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`[sdk-adapter] cancel grace handler failed for ${this.conversationId}: ${msg}`);
+          }
+          void this.close().catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn(`[sdk-adapter] cancel force-close failed for ${this.conversationId}: ${msg}`);
+          });
+        }, graceMs);
+        cancelGraceTimer.unref?.();
+      }
     };
     let runHandle: RunHandle;
     if (opts.runHandle) {
@@ -477,7 +503,16 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     try {
       await session.send(sendInput);
 
-      for await (const msg of session.stream()) {
+      const iterator = session.stream()[Symbol.asyncIterator]();
+      while (true) {
+        const next = await Promise.race([
+          iterator.next().then((value) => ({ kind: "message" as const, value })),
+          cancellation.then((reason) => ({ kind: "cancelled" as const, reason })),
+        ]);
+        if (next.kind === "cancelled") break;
+        const { value, done } = next.value;
+        if (done) break;
+        const msg = value as SDKMessage;
         if (cancelled) break;
         // lcp-5o2: any incoming SDK message is proof of life; reset the
         // silence watchdog whether or not the message produces a routable
@@ -485,7 +520,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         // messages still count as activity.
         resetSilenceTimer();
         const frame = sdkMessageToLettaFrame(msg, this.sessionId, this.agentId, this.conversationId);
-        if (frame) {
+        if (frame && !cancelled) {
           // Mirror the direct adapter: heartbeat lastUsedAt on every frame
           // so housekeep() doesn't idle-evict an in-flight long turn.
           this.lastUsedAt = Date.now();
@@ -505,6 +540,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
             }
           }
         }
+        if (cancelled) break;
         if (msg.type === "error") {
           // lcp-0vi: stash the error so the heal wrapper sees it after the
           // stream loop returns. The CLI may still emit a terminating result
@@ -525,9 +561,14 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       // lcp-5o2: clear both watchdog timers introduced with the silence
       // watchdog refactor. Either or both may already have fired by now;
       // clearTimeout is idempotent on fired timers.
+      settled = !cancelled;
       if (silenceTimer) {
         clearTimeout(silenceTimer);
         silenceTimer = null;
+      }
+      if (!cancelled && cancelGraceTimer) {
+        clearTimeout(cancelGraceTimer);
+        cancelGraceTimer = null;
       }
       clearTimeout(absoluteTimer);
       this.lastUsedAt = Date.now();
