@@ -586,6 +586,48 @@ test("dark-ship: flag OFF preserves the bypassPermissions default permission mod
 
 // ── Test 9 (Commit 2): silence-watchdog NOT tripped by a parked ask ────
 
+test("goal continuation lifecycle tools bypass approval gating narrowly", async (t) => {
+  const stateDir = mkdtempSync(join(tmpdir(), "permissions-goal-tools-"));
+  const prevDir = process.env["LETTA_LOCAL_BACKEND_DIR"];
+  const prevFlag = process.env["SHIM_SERVER_PERMISSIONS"];
+  process.env["LETTA_LOCAL_BACKEND_DIR"] = stateDir;
+  process.env["SHIM_SERVER_PERMISSIONS"] = "1";
+  __clearPermissionConfigCache();
+  t.after(() => {
+    if (prevDir === undefined) delete process.env["LETTA_LOCAL_BACKEND_DIR"];
+    else process.env["LETTA_LOCAL_BACKEND_DIR"] = prevDir;
+    if (prevFlag === undefined) delete process.env["SHIM_SERVER_PERMISSIONS"];
+    else process.env["SHIM_SERVER_PERMISSIONS"] = prevFlag;
+    __clearPermissionConfigCache();
+    try { rmSync(stateDir, { recursive: true, force: true }); } catch {}
+  });
+
+  writeGlobalConfig(cfg({ rules: [{ tool: "update_goal", action: "ask", reason: "review" }] }));
+  const adapter = new SdkBackedLettaSessionAdapter({ conversationId: "default", agentId: "agent-goal" });
+  (adapter as unknown as { ready: boolean }).ready = true;
+  const runHandle = createRun({ agentId: "agent-goal", conversationId: "default", background: true });
+  runHandle.record.metadata = { goal_continuation: true };
+  const result = await (adapter as unknown as {
+    _handleCanUseToolServerPermissions: (
+      n: string,
+      i: Record<string, unknown>,
+      h: typeof runHandle,
+      onFrame: ((f: LettaStreamFrame, m: { runId: string }) => void) | null,
+      cache: Map<string, unknown>,
+    ) => Promise<{ behavior: string; message?: string } | null>;
+  })._handleCanUseToolServerPermissions(
+    "update_goal",
+    { status: "complete" },
+    runHandle,
+    null,
+    loadApprovalScopeCache(runHandle.id, "default"),
+  );
+
+  assert.equal(result?.behavior, "allow");
+  assert.equal(result?.message, "goal_continuation_lifecycle_tool");
+  assert.equal(readPendingApproval(runHandle.id), null, "goal tool should not park for approval");
+});
+
 test("silence watchdog: a parked ask resets the watchdog and is not falsely timed out", async (t) => {
   // Drive the adapter's server-permissions canUseTool hook directly (the SDK
   // pump would normally invoke it). A short SHIM_POOL_TURN_SILENCE_MS makes

@@ -12,6 +12,8 @@ import {
   maybeContinue,
   stopContinuation,
   isContinuationActive,
+  buildContinuationPrompt,
+  configureGoalContinuationCancellation,
   __clearContinuationState,
   type GoalContinuationSendArgs,
 } from "../lib/goal-continuation.js";
@@ -46,6 +48,21 @@ function statusResponse(
       : null,
   } as NativeGoalStatusResponse;
 }
+
+test("continuation prompt matches native completion audit guidance", () => {
+  const prompt = buildContinuationPrompt({
+    objective: "Say OK <now>",
+    status: "active",
+    tokensUsed: 10,
+    tokenBudget: 100,
+    activeTimeSeconds: 3,
+  });
+  assert.match(prompt, /Build a prompt-to-artifact checklist/);
+  assert.match(prompt, /Do not rely on intent, partial progress/);
+  assert.match(prompt, /call update_goal with status "complete" so usage accounting is preserved/);
+  assert.match(prompt, /Do not call update_goal unless the goal is complete or blocked/);
+  assert.match(prompt, /Say OK &lt;now&gt;/);
+});
 
 test("continues while active, stops when status flips to complete", async () => {
   __clearContinuationState();
@@ -221,4 +238,26 @@ test("stopContinuation cancels a running loop", async () => {
   };
   await maybeContinue(conv, "agent-test", sendFn, () => status.value);
   assert.equal(calls, 1, "stopContinuation should halt after current iteration");
+});
+
+test("stopContinuation cancels current in-flight run", async () => {
+  __clearContinuationState();
+  const conv = "conv-cancel-run";
+  const cancelledRuns: string[] = [];
+  configureGoalContinuationCancellation((runId) => {
+    cancelledRuns.push(runId);
+    return true;
+  });
+  let release: (() => void) | null = null;
+  const sendFn = async (args: GoalContinuationSendArgs) => {
+    args.onRunCreated?.("run-current");
+    stopContinuation(conv);
+    await new Promise<void>((resolve) => { release = resolve; });
+    return "ok";
+  };
+  const promise = maybeContinue(conv, "agent-test", sendFn, () => statusResponse(conv, { status: "active" }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(cancelledRuns, ["run-current"]);
+  release!();
+  await promise;
 });

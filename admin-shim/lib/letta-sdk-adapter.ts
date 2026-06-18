@@ -153,6 +153,7 @@ function sdkErrorPayload(
  */
 const TURN_SILENCE_MS = Number(process.env["SHIM_POOL_TURN_SILENCE_MS"] ?? 120_000);
 const TURN_TIMEOUT_MS = Number(process.env["SHIM_POOL_TURN_TIMEOUT"] ?? 1_800_000);
+const GOAL_LIFECYCLE_TOOLS = new Set(["get_goal", "create_goal", "update_goal"]);
 
 /**
  * vibesync-uuas: permission mode for the spawned letta-code session.
@@ -630,6 +631,18 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       return { behavior: "allow" };
     }
 
+    if (runHandle.record?.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `goal-continuation-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: "Once",
+        reason: "goal_continuation_lifecycle_tool",
+        timestamp: new Date().toISOString(),
+      });
+      return { behavior: "allow", message: "goal_continuation_lifecycle_tool" };
+    }
+
     // lcp-indw / D6: server-side permissions path is gated behind
     // SHIM_SERVER_PERMISSIONS=1 (default OFF). When the flag is off, this
     // returns null and we fall through to the byte-identical legacy behavior
@@ -795,6 +808,18 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   ): Promise<CanUseToolResponse | null> {
     const a2ui = this.currentA2uiCapability;
     const timestamp = new Date().toISOString();
+
+    if (runHandle.record?.metadata?.["goal_continuation"] === true && GOAL_LIFECYCLE_TOOLS.has(toolName)) {
+      recordApprovalDecision(runHandle.id, {
+        action_id: `goal-continuation-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: "Once",
+        reason: "goal_continuation_lifecycle_tool",
+        timestamp,
+      });
+      return { behavior: "allow", message: "goal_continuation_lifecycle_tool" };
+    }
 
     // lcp-wd3i: evaluate with fork-verdict awareness, including
     // session-role based exemption (fork/subagent sessions always
