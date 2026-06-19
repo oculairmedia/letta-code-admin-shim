@@ -70,6 +70,7 @@ import type {
   LettaInnerEvent,
   UsageStatisticsEvent,
 } from "./types/letta-stream.js";
+import { runTurnWithLlmRetry } from "./llm-retry.js";
 
 const MAX_WORKERS = Number(process.env["SHIM_POOL_MAX"] ?? 10);
 const IDLE_EVICT_MS = Number(process.env["SHIM_POOL_IDLE_SEC"] ?? 300) * 1000;
@@ -591,6 +592,7 @@ export class AgentPool {
    * without spawning real SDK sessions. Production code never sets this.
    */
   _adapterFactory: ((opts: LettaSessionAdapterOptions) => Promise<LettaSessionAdapter>) | null = null;
+  _llmRetryDeps: Parameters<typeof runTurnWithLlmRetry>[0]["deps"] | null = null;
 
   constructor() {
     this.workers = new Map(); // key: conversationId → LettaSessionAdapter
@@ -798,14 +800,23 @@ export class AgentPool {
     } else {
       adapter = await this.get(conversationId, agentId);
     }
+    const turnOpts: RunTurnOptions = {
+      ...opts,
+      onCancelGraceExpired: (runId) => {
+        this.forceEvict(conversationId, agentId, `cancel_grace_expired run=${runId}`);
+        opts.onCancelGraceExpired?.(runId);
+      },
+    };
     let result: AdapterRunTurnResult;
     try {
-      result = await adapter.runTurn(input, {
-        ...opts,
-        onCancelGraceExpired: (runId) => {
-          this.forceEvict(conversationId, agentId, `cancel_grace_expired run=${runId}`);
-          opts.onCancelGraceExpired?.(runId);
-        },
+      result = await runTurnWithLlmRetry({
+        conversationId,
+        agentId,
+        input,
+        opts: turnOpts,
+        runOnce: (turnInput, retryOpts) => adapter.runTurn(turnInput, retryOpts),
+        log: logLine,
+        ...(this._llmRetryDeps ? { deps: this._llmRetryDeps } : {}),
       });
     } finally {
       if (opts.closeAfterTurn || (opts.tools && opts.tools.length > 0)) {
