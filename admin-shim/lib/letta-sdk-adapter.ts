@@ -93,6 +93,12 @@ import {
   createPendingApproval,
 } from "./pending-approval.js";
 import {
+  detachShimSelfRestartInput,
+  emitShimRestartNotice,
+  isShimSelfRestartTool,
+  resolveShimRestartApproval,
+} from "./restart-finalizer.js";
+import {
   getSessionRole,
   setSessionRole,
 } from "./runtime-introspection.js";
@@ -725,6 +731,33 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const toolCallId = `synthetic-${randomUUID()}`;
     const timestamp = new Date().toISOString();
 
+    if (isShimSelfRestartTool(toolName, toolInput)) {
+      emitShimRestartNotice({
+        onFrame,
+        sessionId: this.sessionId,
+        agentId: this.agentId,
+        conversationId: this.conversationId,
+        runId: runHandle.id,
+        seqId: ++this.syntheticSeqId,
+        toolName,
+        toolCallId,
+      });
+      const decision = resolveShimRestartApproval(runHandle.id, toolName);
+      recordApprovalDecision(runHandle.id, {
+        action_id: decision.actionId,
+        tool_name: toolName,
+        decision: "approve",
+        scope: "Once",
+        reason: "shim_self_restart_auto_approved",
+        timestamp,
+      });
+      return {
+        behavior: "allow",
+        message: decision.reason,
+        updatedInput: detachShimSelfRestartInput(toolInput),
+      };
+    }
+
     // 1. Scope cache: Session/Forever pre-approval → auto-allow without
     //    showing the approval card. This diverges (intentionally) from
     //    the direct adapter, which emits the upstream
@@ -853,6 +886,30 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   ): Promise<CanUseToolResponse | null> {
     const a2ui = this.currentA2uiCapability;
     const timestamp = new Date().toISOString();
+    if (isShimSelfRestartTool(toolName, toolInput)) {
+      emitShimRestartNotice({
+        onFrame,
+        sessionId: this.sessionId,
+        agentId: this.agentId,
+        conversationId: this.conversationId,
+        runId: runHandle.id,
+        seqId: ++this.syntheticSeqId,
+        toolName,
+      });
+      recordApprovalDecision(runHandle.id, {
+        action_id: `shim-restart-${randomUUID()}`,
+        tool_name: toolName,
+        decision: "approve",
+        scope: "Once",
+        reason: "shim_self_restart_auto_approved",
+        timestamp,
+      });
+      return {
+        behavior: "allow",
+        message: "shim_self_restart_auto_approved",
+        updatedInput: detachShimSelfRestartInput(toolInput),
+      };
+    }
 
     if (runHandle.record?.metadata?.["goal_continuation"] === true && toolName === GOAL_CONTROL_TOOL) {
       recordApprovalDecision(runHandle.id, {
