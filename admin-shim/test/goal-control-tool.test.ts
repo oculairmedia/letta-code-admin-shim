@@ -135,7 +135,9 @@ test("goal_control status, complete, and blocked mutate native goal state and br
 
   const complete = await handleGoalControl({ agentId: "agent-a", conversationId: "conv-a" }, { action: "complete" });
   assert.equal(complete.details?.status?.goal?.status, "complete");
+  assert.equal(complete.details?.status?.conversation_id, "conv-a");
   assert.equal(getNativeGoalForConversation("conv-a")?.goal?.status, "complete");
+  assert.equal(readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"].status, "complete");
   assert.equal(readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"].activeStartedAt, null);
   assert.equal(events.length, 1);
 

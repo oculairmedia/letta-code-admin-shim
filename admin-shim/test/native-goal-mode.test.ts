@@ -160,7 +160,7 @@ test("native goal command bridge creates, pauses, resumes, completes, and clears
 
 
 
-test("native goal command enables lifecycle tools on create, replace, and disables them on disable", async () => {
+test("native goal command suppresses lifecycle tools on create and replace, and disables them on disable", async () => {
   writeLocalSettings({
     sessionsByServer: {
       "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
@@ -169,13 +169,17 @@ test("native goal command enables lifecycle tools on create, replace, and disabl
 
   const created = await applyNativeGoalCommandForAgent("agent-a", "/goal finish the migration");
   assert.equal(created.action, "create");
-  assert.equal(created.tools_enabled, true);
-  assert.equal(readLocalSettings().conversationGoalToolsByServer["local:/tmp/backend"]["conv-a"], true);
+  assert.equal(created.tools_enabled, undefined);
+  assert.equal(readLocalSettings().conversationGoalToolsByServer, undefined);
+
+  const settings = readLocalSettings();
+  settings.conversationGoalToolsByServer = { "local:/tmp/backend": { "conv-a": true } };
+  writeLocalSettings(settings);
 
   const replaced = await applyNativeGoalCommandForAgent("agent-a", "/goal --replace finish the release");
   assert.equal(replaced.action, "replace");
-  assert.equal(replaced.tools_enabled, true);
-  assert.equal(readLocalSettings().conversationGoalToolsByServer["local:/tmp/backend"]["conv-a"], true);
+  assert.equal(replaced.tools_enabled, false);
+  assert.equal(readLocalSettings().conversationGoalToolsByServer["local:/tmp/backend"]["conv-a"], false);
 
   const disabled = await applyNativeGoalCommandForAgent("agent-a", "/goal disable");
   assert.equal(disabled.action, "disable");

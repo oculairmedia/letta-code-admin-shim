@@ -413,6 +413,19 @@ function accrueActiveSeconds(goal: NativeConversationGoal, now: string): NativeC
   return { ...goal, activeTimeSeconds: (goal.activeTimeSeconds ?? 0) + delta };
 }
 
+function suppressNativeGoalTools(local: LocalSettings, serverKey: string, conversationId: string): void {
+  const existingTools = local.conversationGoalToolsByServer?.[serverKey];
+  if (existingTools?.[conversationId] !== true) return;
+
+  local.conversationGoalToolsByServer = {
+    ...(local.conversationGoalToolsByServer ?? {}),
+    [serverKey]: {
+      ...existingTools,
+      [conversationId]: false,
+    },
+  };
+}
+
 function parseTokenBudget(argv: string[]): { tokenBudget: number | null; rest: string[]; replace: boolean } {
   let tokenBudget: number | null = null;
   let replace = false;
@@ -509,11 +522,7 @@ export async function applyNativeGoalCommandForAgent(
   } else {
     if (existing && !replace) throw new Error("goal already exists; use /goal --replace <objective>");
     if (!objective) throw new Error("objective is required");
-    const toolsByServer = { ...(local.conversationGoalToolsByServer ?? {}) };
-    const tools = { ...(toolsByServer[session.serverKey] ?? {}) };
-    tools[session.conversationId] = true;
-    toolsByServer[session.serverKey] = tools;
-    local.conversationGoalToolsByServer = toolsByServer;
+    suppressNativeGoalTools(local, session.serverKey, session.conversationId);
     goal = {
       objective,
       status: "active",
