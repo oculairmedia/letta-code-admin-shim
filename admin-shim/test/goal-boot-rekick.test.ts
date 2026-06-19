@@ -44,12 +44,14 @@ test("boot re-kick calls maybeContinue once for each active resolved goal only",
       "local:/tmp/two": { agentId: "agent-two", conversationId: "conv-two" },
       "local:/tmp/paused": { agentId: "agent-paused", conversationId: "conv-paused" },
       "local:/tmp/complete": { agentId: "agent-complete", conversationId: "conv-complete" },
+      "local:/tmp/cleared": { agentId: "agent-cleared", conversationId: "conv-cleared" },
     },
     conversationGoalsByServer: {
       "local:/tmp/one": { default: { objective: "one", status: "active" } },
       "local:/tmp/two": { "conv-two": { objective: "two", status: "active" } },
       "local:/tmp/paused": { "conv-paused": { objective: "paused", status: "paused" } },
       "local:/tmp/complete": { "conv-complete": { objective: "complete", status: "complete" } },
+      "local:/tmp/cleared": {},
     },
   });
   const calls: Array<{ conversationId: string; agentId: string }> = [];

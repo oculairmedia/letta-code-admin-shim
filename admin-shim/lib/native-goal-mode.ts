@@ -501,11 +501,7 @@ export async function applyNativeGoalCommandForAgent(
     action = "complete";
     message = "Goal marked complete.";
   } else if (sub === "clear") {
-    if (existing) {
-      goalsForServer[session.conversationId] = { ...accrueActiveSeconds(existing, now), status: "cleared", activeStartedAt: null, updatedAt: now, userStopped: true, stoppedReason: "cleared", stoppedAt: now };
-    } else {
-      delete goalsForServer[session.conversationId];
-    }
+    delete goalsForServer[session.conversationId];
     goal = null;
     action = "clear";
     message = "Goal cleared.";

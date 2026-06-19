@@ -151,11 +151,14 @@ test("native goal command bridge creates, pauses, resumes, completes, and clears
   const cleared = await applyNativeGoalCommandForAgent("agent-a", "/goal clear");
   assert.equal(cleared.action, "clear");
   assert.equal(cleared.goal, null);
-  const storedClearedGoal = readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"];
-  assert.equal(storedClearedGoal.status, "cleared");
-  assert.equal(storedClearedGoal.userStopped, true);
-  assert.equal(wasNativeGoalUserStopped(storedClearedGoal), true);
-  assert.equal(getNativeGoalForAgent("agent-a")?.goal?.status, "cleared");
+  assert.equal(readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"], undefined);
+  assert.equal(getNativeGoalForConversation("conv-a"), null);
+  assert.equal(getNativeGoalForAgent("agent-a")?.goal, null);
+
+  const recreated = await applyNativeGoalCommandForAgent("agent-a", "/goal next objective");
+  assert.equal(recreated.action, "create");
+  assert.equal(recreated.goal?.objective, "next objective");
+  assert.equal(recreated.goal?.status, "active");
 });
 
 
@@ -187,7 +190,7 @@ test("native goal command suppresses lifecycle tools on create and replace, and 
   assert.equal(readLocalSettings().conversationGoalToolsByServer["local:/tmp/backend"]["conv-a"], undefined);
 });
 
-test("native goal command bridge requires --replace when a goal already exists", async () => {
+test("native goal command bridge requires --replace when an active or paused goal already exists", async () => {
   writeLocalSettings({
     sessionsByServer: {
       "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
@@ -201,6 +204,14 @@ test("native goal command bridge requires --replace when a goal already exists",
   const replaced = await applyNativeGoalCommandForAgent("agent-a", "/goal --replace second objective");
   assert.equal(replaced.action, "replace");
   assert.equal(replaced.goal?.objective, "second objective");
+
+  const paused = await applyNativeGoalCommandForAgent("agent-a", "/goal pause");
+  assert.equal(paused.goal?.status, "paused");
+  assert.equal(wasNativeGoalUserStopped(paused.goal), true);
+  await assert.rejects(
+    () => applyNativeGoalCommandForAgent("agent-a", "/goal third objective"),
+    /goal already exists/,
+  );
 });
 
 
@@ -294,7 +305,7 @@ test("listActiveNativeGoals returns only active resolvable goals with drivable i
         default: { objective: "drive active default", status: "active", tokensUsed: 5, tokenBudget: 100 },
       },
       "local:/tmp/backend-paused": {
-        "conv-paused": { objective: "paused work", status: "paused" },
+        "conv-paused": { objective: "paused work", status: "paused", userStopped: true, stoppedReason: "paused" },
       },
       "local:/tmp/backend-complete": {
         "conv-complete": { objective: "complete work", status: "complete" },
