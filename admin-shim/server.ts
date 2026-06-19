@@ -138,6 +138,7 @@ import {
   resolveApproval,
   sweepPendingApprovalsOnBoot,
 } from "./lib/pending-approval.js";
+import { finalizeRestartingRunsOnShutdown } from "./lib/restart-finalizer.js";
 import { applyNativeGoalCommandForAgent, getNativeGoalForAgent, getNativeGoalForConversation } from "./lib/native-goal-mode.js";
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -2775,6 +2776,13 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
     process.exit(0);
   }, 4000);
   forceExit.unref();
+  try {
+    const finalized = finalizeRestartingRunsOnShutdown();
+    if (finalized > 0) console.log(`[shim] finalized ${finalized} restarting run(s) before shutdown`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[shim] restart finalizer failed: ${msg}`);
+  }
   try { stopCronScheduler(); } catch {}
   try { await getAgentPool().stopAll(); } catch {}
   try { await mobileAdapter?.stop?.(); } catch {}

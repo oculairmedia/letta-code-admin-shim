@@ -62,6 +62,12 @@ import {
 import { startShim } from "./helpers/index.js";
 import { SdkBackedLettaSessionAdapter } from "../lib/letta-sdk-adapter.js";
 import { loadApprovalScopeCache } from "../lib/runs.js";
+import {
+  detachShimSelfRestartInput,
+  finalizeRestartingRunsOnShutdown,
+  isShimSelfRestartTool,
+  SHIM_RESTART_REASON,
+} from "../lib/restart-finalizer.js";
 import type { LettaStreamFrame } from "../lib/types/letta-stream.js";
 
 // ── temp backend dir harness (mirrors frames-log.test.ts) ──────────────
@@ -373,6 +379,52 @@ test("restart survival: boot-sweep flips pending → expired + terminal frame + 
     assert.equal(sweepPendingApprovalsOnBoot(), 0);
     unsub();
   });
+});
+
+
+test("shutdown restart finalizer resolves pending approvals with terminal frames", async () => {
+  await withBackendDir(() => {
+    const run = createRun({ agentId: "agent-shutdown", conversationId: "conv-shutdown" });
+    createPendingApproval({
+      runId: run.id,
+      agentId: "agent-shutdown",
+      conversationId: "conv-shutdown",
+      toolCallId: "synthetic-shutdown",
+      toolName: "Bash",
+      toolInput: { command: "systemctl restart lettashim.service" },
+      reason: "requires approval",
+      ruleSource: "global",
+    });
+
+    const finalized = finalizeRestartingRunsOnShutdown();
+    assert.equal(finalized, 1);
+    assert.equal(readPendingApproval(run.id)!.status, "denied");
+    assert.equal(readPendingApproval(run.id)!.decision_reason, SHIM_RESTART_REASON);
+
+    const record = getRun(run.id);
+    assert.ok(record);
+    assert.notEqual(record!.status, "running");
+    assert.equal(record!.stop_reason, SHIM_RESTART_REASON);
+
+    const frames = readFileSync(getFramesFilePath(run.id), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { frame: Record<string, unknown> });
+    assert.ok(frames.some((entry) => (entry.frame["event"] as { message_type?: string; status?: string } | undefined)?.message_type === "approval_resolved"));
+    const done = frames.find((entry) => entry.frame["type"] === "turn_done")?.frame;
+    assert.ok(done, "shutdown finalizer appends turn_done");
+    assert.equal(done!["stop_reason"], SHIM_RESTART_REASON);
+  });
+});
+
+test("self-restart detection detaches only lettashim restart commands", () => {
+  assert.equal(isShimSelfRestartTool("Bash", { command: "sudo systemctl restart lettashim.service" }), true);
+  assert.equal(isShimSelfRestartTool("Bash", { command: "systemctl stop lettashim" }), true);
+  assert.equal(isShimSelfRestartTool("Bash", { command: "systemctl restart nginx" }), false);
+  assert.equal(isShimSelfRestartTool("Read", { command: "systemctl restart lettashim.service" }), false);
+
+  const detached = detachShimSelfRestartInput({ command: "systemctl restart lettashim.service" });
+  assert.match(detached["command"] as string, /^setsid sh -c 'sleep 0\.25; systemctl restart lettashim\.service'/);
 });
 
 // ── Test 8: WS-canonical / REST-mirror equivalence (one funnel) ────────
