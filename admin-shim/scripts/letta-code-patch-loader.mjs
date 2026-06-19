@@ -374,6 +374,110 @@ const TOOL_RETURN_CONTENT_REPLACEMENT =
   `  return globalThis.__lcpCoerceToolReturnContent(value);\n` +
   `}`;
 
+// lcp-8e41: restore the native image generation tool clobbered by divergent
+// patch-loader history. Patch the bundled local tool registry and model default
+// allowlists so agents can call image generation through the normal tool
+// pipeline without spending quota in startup/tests.
+const GENERATE_IMAGE_TOOL_HELPER_DEFINITION =
+  `globalThis.__lcpAddGenerateImageTool = globalThis.__lcpAddGenerateImageTool || function (toolDefinitions, defineToolFn) {\n` +
+  `  if (!toolDefinitions || typeof toolDefinitions !== "object" || toolDefinitions.generate_image) return toolDefinitions;\n` +
+  `  const schema = {\n` +
+  `    type: "object",\n` +
+  `    additionalProperties: false,\n` +
+  `    properties: {\n` +
+  `      prompt: { type: "string", description: "Detailed description of the image to generate." },\n` +
+  `      size: { type: "string", enum: ["1024x1024", "1024x1536", "1536x1024"], description: "Output dimensions. Defaults to 1024x1024." },\n` +
+  `      quality: { type: "string", enum: ["low", "medium", "high"], description: "Generation quality. Defaults to medium." },\n` +
+  `      model: { type: "string", description: "Image model handle. Defaults to gpt-image-2." },\n` +
+  `      output_dir: { type: "string", description: "Directory where the generated image should be saved. Defaults to .letta/generated-images under the current working directory." }\n` +
+  `    },\n` +
+  `    required: ["prompt"]\n` +
+  `  };\n` +
+  `  const description = "Generate an image from a text prompt using the local max proxy image endpoint. Saves the image to disk and returns the artifact path, metadata, and an inline image block.";\n` +
+  `  async function generateImage(args) {\n` +
+  `    const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";\n` +
+  `    if (!prompt) throw new Error("prompt required");\n` +
+  `    const size = typeof args?.size === "string" && ["1024x1024", "1024x1536", "1536x1024"].includes(args.size) ? args.size : "1024x1024";\n` +
+  `    const quality = typeof args?.quality === "string" && ["low", "medium", "high"].includes(args.quality) ? args.quality : "medium";\n` +
+  `    const model = typeof args?.model === "string" && args.model.trim() ? args.model.trim() : "gpt-image-2";\n` +
+  `    const endpoint = process.env.LETTA_IMAGE_GENERATION_URL || process.env.OPENAI_IMAGES_BASE_URL && process.env.OPENAI_IMAGES_BASE_URL.replace(/\\/$/, "") + "/images/generations" || "http://127.0.0.1:8082/v1/images/generations";\n` +
+  `    const response = await fetch(endpoint, {\n` +
+  `      method: "POST",\n` +
+  `      headers: { "content-type": "application/json", "authorization": "Bearer " + (process.env.LETTA_IMAGE_GENERATION_API_KEY || process.env.OPENAI_API_KEY || "dummy") },\n` +
+  `      body: JSON.stringify({ model, prompt, size, quality, n: 1, response_format: "b64_json" })\n` +
+  `    });\n` +
+  `    if (!response.ok) {\n` +
+  `      const detail = await response.text().catch(() => "");\n` +
+  `      throw new Error("image generation failed: HTTP " + response.status + (detail ? " " + detail.slice(0, 500) : ""));\n` +
+  `    }\n` +
+  `    const payload = await response.json();\n` +
+  `    const first = payload && Array.isArray(payload.data) ? payload.data[0] : undefined;\n` +
+  `    const b64 = first && typeof first.b64_json === "string" ? first.b64_json : undefined;\n` +
+  `    if (!b64) throw new Error("image generation response did not include data[0].b64_json");\n` +
+  `    const fs = await import("node:fs/promises");\n` +
+  `    const path = await import("node:path");\n` +
+  `    const crypto = await import("node:crypto");\n` +
+  `    const outputDir = typeof args?.output_dir === "string" && args.output_dir.trim() ? args.output_dir.trim() : path.join(process.cwd(), ".letta", "generated-images");\n` +
+  `    await fs.mkdir(outputDir, { recursive: true });\n` +
+  `    const digest = crypto.createHash("sha256").update(prompt + "\\0" + Date.now().toString() + "\\0" + b64.slice(0, 64)).digest("hex").slice(0, 16);\n` +
+  `    const filePath = path.join(outputDir, "generated-" + digest + ".png");\n` +
+  `    await fs.writeFile(filePath, Buffer.from(b64, "base64"));\n` +
+  `    const meta = { path: filePath, mime_type: "image/png", model, size, quality, prompt };\n` +
+  `    return {\n` +
+  `      content: [\n` +
+  `        { type: "text", text: JSON.stringify(meta, null, 2) },\n` +
+  `        { type: "image", source: { type: "base64", media_type: "image/png", data: b64 } }\n` +
+  `      ],\n` +
+  `      details: meta\n` +
+  `    };\n` +
+  `  }\n` +
+  `  return { ...toolDefinitions, generate_image: defineToolFn({ schema, description, impl: generateImage }) };\n` +
+  `};\n`;
+
+const TOOL_DEFINITIONS_ASSIGN_TOKEN = `  TOOL_DEFINITIONS = toolDefinitions;\n});`;
+const TOOL_DEFINITIONS_ASSIGN_REPLACEMENT =
+  `  TOOL_DEFINITIONS = globalThis.__lcpAddGenerateImageTool(toolDefinitions, defineTool);\n});`;
+
+const DEFAULT_TOOLS_TOKEN =
+  `  "TaskUpdate",\n` +
+  `  "Write"\n` +
+  `];`;
+const DEFAULT_TOOLS_REPLACEMENT =
+  `  "TaskUpdate",\n` +
+  `  "Write",\n` +
+  `  "generate_image"\n` +
+  `];`;
+
+const DEFAULT_TOOLS_INDENTED_TOKEN =
+  `    "TaskUpdate",\n` +
+  `    "Write"\n` +
+  `  ];`;
+const DEFAULT_TOOLS_INDENTED_REPLACEMENT =
+  `    "TaskUpdate",\n` +
+  `    "Write",\n` +
+  `    "generate_image"\n` +
+  `  ];`;
+
+const OPENAI_TOOLS_TOKEN =
+  `  "ApplyPatch",\n` +
+  `  "UpdatePlan"\n` +
+  `];`;
+const OPENAI_TOOLS_REPLACEMENT =
+  `  "ApplyPatch",\n` +
+  `  "UpdatePlan",\n` +
+  `  "generate_image"\n` +
+  `];`;
+
+const OPENAI_TOOLS_INDENTED_TOKEN =
+  `    "ApplyPatch",\n` +
+  `    "UpdatePlan"\n` +
+  `  ];`;
+const OPENAI_TOOLS_INDENTED_REPLACEMENT =
+  `    "ApplyPatch",\n` +
+  `    "UpdatePlan",\n` +
+  `    "generate_image"\n` +
+  `  ];`;
+
 let appliedOnce = false;
 
 /**
@@ -512,6 +616,41 @@ function patchLettaCodeSource(raw, path, warn) {
     process.stderr.write(
       `[letta-code-patch] WARN: tool-return content coercion token not found in ${path} — ` +
       `Read(image) approval turns may still be normalized to text only\n`,
+    );
+  }
+
+  let appliedGenerateImageTool = false;
+  if (patched.includes(TOOL_DEFINITIONS_ASSIGN_TOKEN)) {
+    patched = patched.replace(TOOL_DEFINITIONS_ASSIGN_TOKEN, TOOL_DEFINITIONS_ASSIGN_REPLACEMENT);
+    appliedPatches += 1;
+    appliedGenerateImageTool = true;
+  }
+  if (patched.includes(DEFAULT_TOOLS_TOKEN)) {
+    patched = patched.replaceAll(DEFAULT_TOOLS_TOKEN, DEFAULT_TOOLS_REPLACEMENT);
+    appliedPatches += 1;
+    appliedGenerateImageTool = true;
+  }
+  if (patched.includes(DEFAULT_TOOLS_INDENTED_TOKEN)) {
+    patched = patched.replaceAll(DEFAULT_TOOLS_INDENTED_TOKEN, DEFAULT_TOOLS_INDENTED_REPLACEMENT);
+    appliedPatches += 1;
+    appliedGenerateImageTool = true;
+  }
+  if (patched.includes(OPENAI_TOOLS_TOKEN)) {
+    patched = patched.replaceAll(OPENAI_TOOLS_TOKEN, OPENAI_TOOLS_REPLACEMENT);
+    appliedPatches += 1;
+    appliedGenerateImageTool = true;
+  }
+  if (patched.includes(OPENAI_TOOLS_INDENTED_TOKEN)) {
+    patched = patched.replaceAll(OPENAI_TOOLS_INDENTED_TOKEN, OPENAI_TOOLS_INDENTED_REPLACEMENT);
+    appliedPatches += 1;
+    appliedGenerateImageTool = true;
+  }
+  if (appliedGenerateImageTool) {
+    patched = injectHelperAfterShebang(patched, GENERATE_IMAGE_TOOL_HELPER_DEFINITION);
+  } else if (warn) {
+    process.stderr.write(
+      `[letta-code-patch] WARN: generate_image tool registry tokens not found in ${path} — ` +
+      `native image generation tool will not be registered\n`,
     );
   }
 

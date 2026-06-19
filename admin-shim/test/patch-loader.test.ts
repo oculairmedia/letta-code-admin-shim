@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { patchLettaCodeSourceForTest } from "../scripts/letta-code-patch-loader.mjs";
 
@@ -344,6 +345,55 @@ test("patch-loader: converts legacy Read image tool returns before approval norm
   );
 
   globalThis.__lcpCoerceToolReturnContent = undefined;
+});
+
+test("patch-loader: registers native generate_image tool in built-in registries", () => {
+  const input = [
+    "#!/usr/bin/env node",
+    "const toolDefinitions = {};",
+    "  TOOL_DEFINITIONS = toolDefinitions;",
+    "});",
+    "var ANTHROPIC_DEFAULT_TOOLS2 = [",
+    "  \"TaskUpdate\",",
+    "  \"Write\"",
+    "];",
+    "var OPENAI_PASCAL_TOOLS2 = [",
+    "  \"ApplyPatch\",",
+    "  \"UpdatePlan\"",
+    "];",
+  ].join("\n");
+
+  const patched = patchLettaCodeSourceForTest(input);
+
+  assert.match(patched, /globalThis\.__lcpAddGenerateImageTool =/);
+  assert.match(patched, /TOOL_DEFINITIONS = globalThis\.__lcpAddGenerateImageTool\(toolDefinitions, defineTool\);/);
+  assert.match(patched, /model = typeof args\?\.model === "string"[\s\S]*: "gpt-image-2";/);
+  assert.doesNotMatch(patched, /gpt-image-2-medium/);
+  assert.match(
+    patched,
+    /var ANTHROPIC_DEFAULT_TOOLS2 = \[[\s\S]*"Write",\n  "generate_image"\n\];/,
+  );
+  assert.match(
+    patched,
+    /var OPENAI_PASCAL_TOOLS2 = \[[\s\S]*"UpdatePlan",\n  "generate_image"\n\];/,
+  );
+});
+
+test("patch-loader: current letta.js bundle receives generate_image registration", () => {
+  const bundlePath = "/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js";
+  const bundle = readFileSync(bundlePath, "utf8");
+  const patched = patchLettaCodeSourceForTest(bundle);
+
+  assert.match(patched, /globalThis\.__lcpAddGenerateImageTool =/);
+  assert.match(patched, /TOOL_DEFINITIONS = globalThis\.__lcpAddGenerateImageTool\(toolDefinitions, defineTool\);/);
+  assert.match(
+    patched,
+    /var ANTHROPIC_DEFAULT_TOOLS2 = \[[\s\S]*"Write",\n  "generate_image"\n\];/,
+  );
+  assert.match(
+    patched,
+    /var OPENAI_PASCAL_TOOLS2 = \[[\s\S]*"UpdatePlan",\n  "generate_image"\n\];/,
+  );
 });
 
 test("patch-loader leaves unrelated source untouched", () => {
