@@ -48,7 +48,7 @@
  * on demand via `listActiveSubagents()` / `snapshotSubagents()`.
  */
 
-import { existsSync, mkdirSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 import { invalidateMessagesCache, messagesJsonlPath } from "./store.js";
 import { readSubagentTodos, type TodoItem, type TodoSnapshot } from "./subagent-todos.js";
@@ -106,6 +106,8 @@ export interface SubagentEntry {
   workerPid: number | null;
   /** Shim process that observed this entry in the current in-memory registry. */
   ownerShimPid: number | null;
+  /** Per-process shim instance that created/owns this background worker. */
+  ownerShimInstanceId: string | null;
   /** ISO timestamp the dispatch was first observed. */
   startedAt: string;
   /** ISO timestamp the entry reached a terminal status; null while running. */
@@ -138,6 +140,7 @@ const _todoWatchers = new Map<string, FSWatcher>(); // toolCallId → TodoWrite 
 const _todoDebounceTimers = new Map<string, NodeJS.Timeout>(); // toolCallId → TodoWrite debounce
 const _timeoutTimers = new Map<string, NodeJS.Timeout>(); // toolCallId → watchdog
 let _livenessSweepTimer: NodeJS.Timeout | null = null;
+let currentShimInstanceId: string | null = null;
 
 /**
  * Stream-timeout window. A background subagent still `running` after this
@@ -168,6 +171,10 @@ const SUBAGENT_NO_LOGFILE_TIMEOUT_MS = (() => {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+export function setSubagentRegistryInstanceId(instanceId: string | null): void {
+  currentShimInstanceId = instanceId && instanceId.trim() ? instanceId.trim() : null;
 }
 
 function clone(entry: SubagentEntry): SubagentEntry {
@@ -348,6 +355,7 @@ export function recordSubagentDispatch(input: {
     logFile: null,
     workerPid: null,
     ownerShimPid: process.pid,
+    ownerShimInstanceId: currentShimInstanceId,
     startedAt: nowIso(),
     endedAt: null,
   };
@@ -384,6 +392,9 @@ export function recordSubagentReturn(input: {
     entry.logFile = parsed.logFile ?? entry.logFile;
     entry.workerPid = parsed.workerPid ?? entry.workerPid ?? readLogWorkerPid(entry.logFile);
     entry.ownerShimPid = process.pid;
+    const persistedOwnerShimInstanceId = readLogOwnerShimInstanceId(entry.logFile);
+    entry.ownerShimInstanceId = persistedOwnerShimInstanceId ?? entry.ownerShimInstanceId ?? currentShimInstanceId;
+    if (!persistedOwnerShimInstanceId) persistLogOwnerShimInstanceId(entry.logFile, entry.ownerShimInstanceId);
     const pendingTimeout = _timeoutTimers.get(toolCallId);
     if (pendingTimeout) {
       clearTimeout(pendingTimeout);
@@ -577,6 +588,36 @@ function readLogWorkerPid(logFile: string | null): number | null {
   }
 }
 
+function ownerSidecarPath(logFile: string | null): string | null {
+  return logFile ? `${logFile}.shim-owner.json` : null;
+}
+
+function readLogOwnerShimInstanceId(logFile: string | null): string | null {
+  const sidecar = ownerSidecarPath(logFile);
+  if (!sidecar) return null;
+  try {
+    if (!existsSync(sidecar)) return null;
+    const parsed = JSON.parse(readFileSync(sidecar, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const owner = (parsed as Record<string, unknown>)["owner_shim_instance_id"];
+    return typeof owner === "string" && owner.trim() ? owner.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistLogOwnerShimInstanceId(logFile: string | null, ownerShimInstanceId: string | null): void {
+  if (!logFile || !ownerShimInstanceId) return;
+  const sidecar = ownerSidecarPath(logFile);
+  if (!sidecar) return;
+  try {
+    mkdirSync(dirname(sidecar), { recursive: true });
+    writeFileSync(sidecar, JSON.stringify({ owner_shim_instance_id: ownerShimInstanceId }) + "\n");
+  } catch {
+    // Best-effort: legacy unstamped entries fall back to PID/footer checks.
+  }
+}
+
 type ProcessAliveChecker = (pid: number) => boolean;
 let processAliveChecker: ProcessAliveChecker = (pid: number): boolean => {
   try {
@@ -707,6 +748,11 @@ export function rehydrateRunningSubagentWatchdogs(): void {
     const alive = isWorkerProcessAlive(entry);
     if (alive === false) {
       finalize(entry.toolCallId, "failed", "worker_process_dead");
+      continue;
+    }
+    entry.ownerShimInstanceId ??= readLogOwnerShimInstanceId(entry.logFile);
+    if (alive !== true && currentShimInstanceId && entry.ownerShimInstanceId && entry.ownerShimInstanceId !== currentShimInstanceId) {
+      finalize(entry.toolCallId, "failed", "prior_instance_dead");
       continue;
     }
     evaluateRunningSubagent(entry.toolCallId);
