@@ -117,6 +117,7 @@ import {
   finalizeSubagent,
   ingestParentFrame,
   rehydrateRunningSubagentWatchdogs,
+  setSubagentRegistryInstanceId,
   type TodoProgress,
 } from "./lib/subagent-registry.js";
 // lcp-c61s: lazy-load search module to avoid node:sqlite import failure on Node < 22.5.
@@ -243,6 +244,8 @@ function readOrCreateServerId(): string {
 const SERVER_ID = readOrCreateServerId();
 const SERVER_VERSION = "shim-0.2.0";
 const SERVER_STARTED_AT = new Date().toISOString();
+const SHIM_INSTANCE_ID = `${SERVER_ID}:${SERVER_STARTED_AT}`;
+setSubagentRegistryInstanceId(SHIM_INSTANCE_ID);
 const MOBILE_TRANSPORT_CONTRACT = Object.freeze({
   mobile_ws: true,
   ws_endpoint: "/shim/v1/mobile",

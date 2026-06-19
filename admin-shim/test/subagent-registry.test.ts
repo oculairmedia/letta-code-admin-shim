@@ -24,6 +24,7 @@ import {
   computeTodoProgress,
   subscribeSubagentEvents,
   rehydrateRunningSubagentWatchdogs,
+  setSubagentRegistryInstanceId,
   sweepOrphanedSubagents,
   __getSubagentWatcherCounts,
   __resetSubagentRegistry,
@@ -477,6 +478,60 @@ test("subagent-registry: boot rehydrate keeps started-only log with UNKNOWN pid 
 
     const entry = getSubagent(tcid);
     assert.equal(entry?.status, "running");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+
+
+test("subagent-registry: boot rehydrate finalizes prior-instance started-only log with unknown PID", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-boot-prior-instance-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_prior_instance.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\n");
+    setSubagentRegistryInstanceId("prior-instance");
+    ingestParentFrame(dispatchFrame(tcid, "Prior-instance worker"), "run-prior-instance");
+    ingestParentFrame(returnFrame(tcid, "task_98", "agent-local-abc12345-1212-3434-5656-787878787878", logFile), "run-prior-instance");
+
+    __resetSubagentRegistry();
+    setSubagentRegistryInstanceId("current-instance");
+    ingestParentFrame(dispatchFrame(tcid, "Prior-instance worker"), "run-prior-instance");
+    ingestParentFrame(returnFrame(tcid, "task_98", "agent-local-abc12345-1212-3434-5656-787878787878", logFile), "run-prior-instance");
+    rehydrateRunningSubagentWatchdogs();
+
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "prior_instance_dead");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("subagent-registry: boot rehydrate keeps current-instance started-only log with unknown PID running", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-boot-current-instance-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_current_instance.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\n");
+    setSubagentRegistryInstanceId("current-instance");
+    ingestParentFrame(dispatchFrame(tcid, "Current-instance worker"), "run-current-instance");
+    ingestParentFrame(returnFrame(tcid, "task_99", "agent-local-abc12345-9090-8080-7070-606060606060", logFile), "run-current-instance");
+
+    __resetSubagentRegistry();
+    setSubagentRegistryInstanceId("current-instance");
+    ingestParentFrame(dispatchFrame(tcid, "Current-instance worker"), "run-current-instance");
+    ingestParentFrame(returnFrame(tcid, "task_99", "agent-local-abc12345-9090-8080-7070-606060606060", logFile), "run-current-instance");
+    rehydrateRunningSubagentWatchdogs();
+
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "running");
+    assert.equal(entry?.ownerShimInstanceId, "current-instance");
   } finally {
     __resetSubagentRegistry();
   }
