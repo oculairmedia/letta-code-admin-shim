@@ -438,22 +438,22 @@ const TOOL_DEFINITIONS_ASSIGN_TOKEN = `  TOOL_DEFINITIONS = toolDefinitions;\n})
 const TOOL_DEFINITIONS_ASSIGN_REPLACEMENT =
   `  TOOL_DEFINITIONS = globalThis.__lcpAddGenerateImageTool(toolDefinitions, defineTool);\n});`;
 
+// Anchor only on the LAST entry before the array close. The entry preceding
+// "Write" drifts across letta.js versions (was "TaskUpdate", is now
+// "TodoWrite"), so do NOT depend on it — match `"Write"\n];` and insert
+// generate_image after it. (lcp-htu3 bundle-drift guard.)
 const DEFAULT_TOOLS_TOKEN =
-  `  "TaskUpdate",\n` +
   `  "Write"\n` +
   `];`;
 const DEFAULT_TOOLS_REPLACEMENT =
-  `  "TaskUpdate",\n` +
   `  "Write",\n` +
   `  "generate_image"\n` +
   `];`;
 
 const DEFAULT_TOOLS_INDENTED_TOKEN =
-  `    "TaskUpdate",\n` +
   `    "Write"\n` +
   `  ];`;
 const DEFAULT_TOOLS_INDENTED_REPLACEMENT =
-  `    "TaskUpdate",\n` +
   `    "Write",\n` +
   `    "generate_image"\n` +
   `  ];`;

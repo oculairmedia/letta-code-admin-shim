@@ -1,8 +1,33 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { patchLettaCodeSourceForTest } from "../scripts/letta-code-patch-loader.mjs";
+
+// Resolve the REAL letta.js bundle so the guard test works in CI
+// (admin-shim/node_modules/...) AND locally — never a machine-specific
+// absolute path. `letta.js` is NOT an exported subpath, so resolve the
+// package root via package.json and join the bundle filename to its dir.
+function resolveLettaBundle(): string | null {
+  // The package's strict `exports` map blocks require.resolve of subpaths
+  // (including package.json), so walk node_modules by filesystem: from this
+  // test file up to filesystem root, check <dir>/node_modules/@letta-ai/
+  // letta-code/letta.js. Covers admin-shim/node_modules (CI) and any parent.
+  const rel = "node_modules/@letta-ai/letta-code/letta.js";
+  let dir = dirname(new URL(import.meta.url).pathname);
+  for (;;) {
+    const candidate = join(dir, rel);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Fallback: the global bun install (local dev convenience).
+  const globalCandidate = "/root/.bun/install/global/" + rel;
+  if (existsSync(globalCandidate)) return globalCandidate;
+  return null;
+}
 
 type ThinkingPayload = {
   model?: string;
@@ -380,7 +405,11 @@ test("patch-loader: registers native generate_image tool in built-in registries"
 });
 
 test("patch-loader: current letta.js bundle receives generate_image registration", () => {
-  const bundlePath = "/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js";
+  const bundlePath = resolveLettaBundle();
+  assert.ok(
+    bundlePath,
+    "could not resolve @letta-ai/letta-code bundle — generate_image registration cannot be verified against the real bundle",
+  );
   const bundle = readFileSync(bundlePath, "utf8");
   const patched = patchLettaCodeSourceForTest(bundle);
 
