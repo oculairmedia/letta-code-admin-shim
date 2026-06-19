@@ -65,6 +65,14 @@ export interface NativeGoalUsageDelta {
   activeSeconds?: number;
 }
 
+export interface ActiveNativeGoalEntry {
+  agentId: string;
+  conversationId: string;
+  serverKey: string;
+  storageConversationId: string;
+  goal: NativeConversationGoal;
+}
+
 interface GoalStorageTarget {
   serverKey: string;
   conversationId: string;
@@ -239,24 +247,6 @@ export function wasNativeGoalUserStopped(goal: NativeConversationGoal | null | u
   return goal?.userStopped === true || goal?.status === "paused" || goal?.status === "cleared";
 }
 
-export function listActiveNativeGoals(): NativeGoalStatusResponse[] {
-  const settings = mergedSettings();
-  const out: NativeGoalStatusResponse[] = [];
-  for (const [serverKey, goalsByConversation] of Object.entries(settings.conversationGoalsByServer ?? {})) {
-    for (const [conversationId, goal] of Object.entries(goalsByConversation)) {
-      if (goal.status !== "active" || wasNativeGoalUserStopped(goal)) continue;
-      const toolsEnabled = settings.conversationGoalToolsByServer?.[serverKey]?.[conversationId];
-      out.push({
-        source: "letta_code_goal_mode",
-        server_key: serverKey,
-        conversation_id: conversationId,
-        goal,
-        ...(toolsEnabled !== undefined ? { tools_enabled: toolsEnabled } : {}),
-      });
-    }
-  }
-  return out;
-}
 
 export function addNativeGoalUsage(delta: NativeGoalUsageDelta): NativeGoalStatusResponse | null {
   const tokensUsed = Number.isFinite(delta.tokensUsed) ? Math.max(0, Math.floor(delta.tokensUsed ?? 0)) : 0;
@@ -303,6 +293,10 @@ interface AgentSession {
 
 export type ConversationResolver = (conversationId: string) => Promise<ResolvedConversation | null>;
 
+export interface NativeGoalListLogger {
+  warn?: (...args: unknown[]) => void;
+}
+
 function localBackendServerKey(): string | null {
   const dir = process.env["LETTA_LOCAL_BACKEND_DIR"];
   return dir ? `local:${dir}` : null;
@@ -339,6 +333,62 @@ function sortSessionsForAgent(settings: LocalSettings, sessions: AgentSession[])
 
     return 0;
   });
+}
+
+function sessionsForStorageConversation(settings: LocalSettings, serverKey: string, conversationId: string): Array<AgentSession & { agentId: string }> {
+  const sessions: Array<AgentSession & { agentId: string }> = [];
+  for (const [sessionServerKey, session] of Object.entries(settings.sessionsByServer ?? {})) {
+    if (sessionServerKey !== serverKey) continue;
+    if (!session.agentId || session.conversationId !== conversationId) continue;
+    sessions.push({ serverKey: sessionServerKey, conversationId: session.conversationId, agentId: session.agentId });
+  }
+  return sortSessionsForAgent(settings, sessions) as Array<AgentSession & { agentId: string }>;
+}
+
+function goalBudgetExhausted(goal: NativeConversationGoal): boolean {
+  return goal.tokenBudget != null && (goal.tokensUsed ?? 0) >= goal.tokenBudget;
+}
+
+export async function listActiveNativeGoals(
+  resolver: ConversationResolver = resolveConversationId,
+  logger: NativeGoalListLogger = console,
+): Promise<ActiveNativeGoalEntry[]> {
+  const settings = mergedSettings();
+  const activeGoals: ActiveNativeGoalEntry[] = [];
+
+  for (const [serverKey, goalsByConversation] of Object.entries(settings.conversationGoalsByServer ?? {})) {
+    for (const [storageConversationId, goal] of Object.entries(goalsByConversation)) {
+      if (goal.status !== "active" || wasNativeGoalUserStopped(goal)) continue;
+      if (goalBudgetExhausted(goal)) continue;
+
+      const sessions = sessionsForStorageConversation(settings, serverKey, storageConversationId);
+      if (sessions.length === 0) {
+        logger.warn?.(`[goal] skip active goal without session server=${serverKey} conv=${storageConversationId}`);
+        continue;
+      }
+
+      let resolvedEntry: ActiveNativeGoalEntry | null = null;
+      for (const session of sessions) {
+        const conversationId = externalConversationId(session.agentId, storageConversationId);
+        const resolved = await resolver(conversationId);
+        if (resolved?.agentId === session.agentId && resolved.conversationId === storageConversationId) {
+          resolvedEntry = {
+            agentId: session.agentId,
+            conversationId,
+            serverKey,
+            storageConversationId,
+            goal,
+          };
+          break;
+        }
+      }
+
+      if (resolvedEntry) activeGoals.push(resolvedEntry);
+      else logger.warn?.(`[goal] skip active goal with unresolved conversation server=${serverKey} conv=${storageConversationId}`);
+    }
+  }
+
+  return activeGoals;
 }
 
 async function sessionForAgent(
