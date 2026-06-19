@@ -17,9 +17,9 @@
  *   2. Categorize each ID:
  *      a. NO toolResult exists on disk → the genuine "interrupted tool
  *         call" case (worker SIGTERM mid-stream, manual cancel, watchdog
- *         timeout). Settle by appending a synthetic error toolResult
- *         record. The next API request includes it; the agent sees the
- *         tool ran and errored.
+ *         timeout). Settle by inserting a synthetic error toolResult
+ *         record immediately after the assistant message that declared the
+ *         tool call. Strict OpenAI-shaped providers require this adjacency.
  *      b. matching toolResult DOES exist on disk → letta-code is
  *         dropping it from the API request despite the disk record. We
  *         can't fix that from outside the CLI, so the only durable repair
@@ -75,10 +75,11 @@ export function detectDanglingToolUses(errorPayload: unknown): string[] {
   // Bail unless this is the specific dangling-tool_use pattern. We don't
   // want to fire on generic API errors or unrelated invalid_request_error
   // variants (rate limit, content-policy, etc.).
-  if (!/tool_use[^]+?tool_result/i.test(text)) return [];
+  const isAnthropic = /tool_use[^]+?tool_result/i.test(text);
+  const isOpenAi = /role .?tool.?[^]+?must be a response[^]+?preceding message[^]+?.?tool_calls?/i.test(text);
+  if (!isAnthropic && !isOpenAi) return [];
   const colonIdx = text.indexOf("after:");
-  if (colonIdx < 0) return [];
-  const tail = text.slice(colonIdx);
+  const tail = isAnthropic && colonIdx >= 0 ? text.slice(colonIdx) : text;
   const matches = extractToolCallIds(tail);
   // De-dupe while preserving order — same ID can appear in both the
   // human-readable list and a later "Each tool_use block ..." sentence.
@@ -241,15 +242,19 @@ export async function healConversation(
   });
 
   for (const id of danglingIds) {
-    if (!toolCallSites.has(id)) {
+    const sites = toolCallSites.get(id) ?? [];
+    if (sites.length === 0) {
       report.unresolved.push(id);
       continue;
     }
     if (toolResultSites.has(id)) {
       report.removed.push(id);
-    } else {
-      report.settled.push(id);
+      continue;
     }
+    const parentIdx = sites[sites.length - 1]!;
+    const staleSites = staleSyntheticSites.get(id) ?? [];
+    const alreadyAdjacent = staleSites.length === 1 && staleSites[0] === parentIdx + 1;
+    if (!alreadyAdjacent) report.settled.push(id);
   }
 
   if (report.removed.length === 0 && report.settled.length === 0) {
@@ -315,14 +320,7 @@ export async function healConversation(
     const parentRecord = edited[sites[sites.length - 1]!];
     const parent = localMessagePayload(parentRecord);
     if (!parent) continue;
-    // Try to recover the tool name from the parent's toolCall part.
-    let toolName = "<unknown>";
-    for (const p of pickPartsArray(parent)) {
-      if (isToolCallPart(p) && p.id === id) {
-        toolName = p.name ?? toolName;
-        break;
-      }
-    }
+    const toolName = assistantToolCallName(parent, id) ?? "<unknown>";
     const parentId = typeof parent["id"] === "string" ? parent["id"] : "synth-parent";
     const parentIdx = sites[sites.length - 1]!;
     const synth = {
@@ -596,6 +594,23 @@ function assistantToolCallIds(message: Record<string, unknown>): string[] {
   return [...new Set(ids)];
 }
 
+function assistantToolCallName(message: Record<string, unknown>, id: string): string | null {
+  for (const part of pickPartsArray(message)) {
+    if (isToolCallPart(part) && part.id === id && typeof part.name === "string") return part.name;
+  }
+  for (const key of ["tool_calls", "toolCalls"] as const) {
+    const calls = message[key];
+    if (!Array.isArray(calls)) continue;
+    for (const call of calls) {
+      if (!isRecord(call) || call["id"] !== id) continue;
+      if (typeof call["name"] === "string") return call["name"];
+      const fn = call["function"];
+      if (isRecord(fn) && typeof fn["name"] === "string") return fn["name"];
+    }
+  }
+  return null;
+}
+
 function isToolResultMessage(message: Record<string, unknown>): boolean {
   return message["role"] === "toolResult" || message["role"] === "tool";
 }
@@ -610,7 +625,7 @@ function toolResultCallId(message: Record<string, unknown>): string | null {
 
 function isSyntheticToolResult(message: Record<string, unknown>): boolean {
   const id = message["id"];
-  return typeof id === "string" && (id.startsWith("synth-settle:") || id.includes(":heal-tool-result:"));
+  return typeof id === "string" && (id.startsWith("heal-") || id.startsWith("synth-settle:") || id.includes(":heal-tool-result:"));
 }
 
 function conversationFilePath(

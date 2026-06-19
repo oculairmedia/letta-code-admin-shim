@@ -92,6 +92,11 @@ test("detectDanglingToolUses: handles the nested {api_error:{detail:...}} wire s
   assert.deepEqual(detectDanglingToolUses(wire), ["toolu_abc", "toolu_def"]);
 });
 
+test("detectDanglingToolUses: pulls OpenAI call ids from role tool adjacency errors", () => {
+  const detail = "Invalid parameter: messages with role 'tool' must be a response to a preceding message with 'tool_calls'. Missing tool_call_id call_abc123 and call_def456.";
+  assert.deepEqual(detectDanglingToolUses({ error: { message: detail } }), ["call_abc123", "call_def456"]);
+});
+
 test("detectDanglingToolUses: returns [] for unrelated errors", () => {
   assert.deepEqual(detectDanglingToolUses("rate limited; try again later"), []);
   assert.deepEqual(detectDanglingToolUses({ message: "context window exceeded" }), []);
@@ -349,6 +354,78 @@ test("healConversation: repositions stale synthetic results after OpenAI tool_ca
     assert.deepEqual(after.map((m) => m["id"]), ["u0", "a1", "a1:heal-tool-result:call_OPENAI", "u1"]);
     assert.equal(after[2]?.["role"], "toolResult");
     assert.equal(after[2]?.["toolCallId"], "call_OPENAI");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
+  }
+});
+
+test("healConversation: second pass after OpenAI reposition is byte-identical no-op", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agentId = "agent-openai-idempotent-test";
+    seedAgent(stateDir, agentId);
+    const convDir = seedConv(stateDir, "default", agentId);
+
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: "run tool" },
+      {
+        id: "a1",
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "call_IDEM", type: "function", function: { name: "Bash", arguments: "{}" } }],
+      },
+      { id: "u1", role: "user", content: "interleaved" },
+      { id: "heal-call_IDEM", role: "tool", tool_call_id: "call_IDEM", content: "old synthetic result" },
+    ]);
+
+    await healConversation("default", agentId, ["call_IDEM"], { stateDir, now: 1779500000000 });
+    const once = readFileSync(join(convDir, "messages.jsonl"), "utf8");
+    const r2 = await healConversation("default", agentId, ["call_IDEM"], { stateDir, now: 1779500000000 });
+    const twice = readFileSync(join(convDir, "messages.jsonl"), "utf8");
+
+    assert.deepEqual(r2.settled, []);
+    assert.deepEqual(r2.removed, []);
+    assert.deepEqual(r2.unresolved, []);
+    assert.equal(twice, once);
+    const after = readMessages(convDir);
+    assert.equal(after[1]?.["id"], "a1");
+    assert.equal(after[2]?.["toolCallId"], "call_IDEM");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
+  }
+});
+
+test("healConversation: healed OpenAI transcript has zero tool adjacency violations", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agentId = "agent-openai-e2e-test";
+    seedAgent(stateDir, agentId);
+    const convDir = seedConv(stateDir, "default", agentId);
+
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: "run tools" },
+      { id: "a1", role: "assistant", content: "", tool_calls: [{ id: "call_A", type: "function", function: { name: "Bash", arguments: "{}" } }] },
+      { id: "u1", role: "user", content: "next" },
+      { id: "heal-call_A", role: "tool", tool_call_id: "call_A", content: "misplaced synth" },
+      { id: "a2", role: "assistant", content: "", tool_calls: [{ id: "call_B", type: "function", function: { name: "Edit", arguments: "{}" } }] },
+    ]);
+
+    await healConversation("default", agentId, ["call_A", "call_B"], { stateDir, now: 1779500000000 });
+    const after = readMessages(convDir);
+    const violations = after.flatMap((message, index) => {
+      if (message["role"] !== "toolResult" && message["role"] !== "tool") return [];
+      const toolCallId = message["toolCallId"] ?? message["tool_call_id"];
+      const previous = after[index - 1];
+      const calls = Array.isArray(previous?.["tool_calls"]) ? previous["tool_calls"] as Array<Record<string, unknown>> : [];
+      const content = Array.isArray(previous?.["content"]) ? previous["content"] as Array<Record<string, unknown>> : [];
+      const previousIds = [...calls.map((call) => call["id"]), ...content.filter((part) => part["type"] === "toolCall").map((part) => part["id"])];
+      return previous?.["role"] === "assistant" && previousIds.includes(toolCallId) ? [] : [toolCallId];
+    });
+
+    assert.deepEqual(violations, []);
+    assert.deepEqual(after.map((m) => m["id"]), ["u0", "a1", "a1:heal-tool-result:call_A", "u1", "a2", "a2:heal-tool-result:call_B"]);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
