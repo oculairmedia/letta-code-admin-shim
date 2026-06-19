@@ -84,6 +84,62 @@ test("continues while active, stops when status flips to complete", async () => 
   assert.equal(isContinuationActive(conv), false);
 });
 
+
+test("stops next iteration after goal_control complete persists complete status", async () => {
+  __clearContinuationState();
+  const prevCwd = process.cwd();
+  const prevHome = process.env["HOME"];
+  const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { handleGoalControl } = await import("../lib/goal-control-tool.js");
+  const { getNativeGoalForConversation } = await import("../lib/native-goal-mode.js");
+  const cwd = mkdtempSync(join(tmpdir(), "goal-cont-real-cwd-"));
+  const home = mkdtempSync(join(tmpdir(), "goal-cont-real-home-"));
+  try {
+    mkdirSync(join(cwd, ".letta"), { recursive: true });
+    mkdirSync(join(home, ".letta"), { recursive: true });
+    process.chdir(cwd);
+    process.env["HOME"] = home;
+    writeFileSync(join(cwd, ".letta", "settings.local.json"), JSON.stringify({
+      sessionsByServer: {
+        "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+      },
+      conversationGoalsByServer: {
+        "local:/tmp/backend": {
+          "conv-a": {
+            objective: "finish the migration",
+            status: "active",
+            activeStartedAt: new Date(Date.now() - 2500).toISOString(),
+            activeTimeSeconds: 7,
+            tokensUsed: 0,
+            tokenBudget: 1000,
+          },
+        },
+      },
+    }, null, 2));
+
+    let calls = 0;
+    const sendFn = async () => {
+      calls += 1;
+      await handleGoalControl({ agentId: "agent-a", conversationId: "conv-a" }, { action: "complete" });
+      return "done";
+    };
+
+    await maybeContinue("conv-a", "agent-a", sendFn, getNativeGoalForConversation);
+
+    assert.equal(calls, 1);
+    assert.equal(getNativeGoalForConversation("conv-a")?.goal?.status, "complete");
+    assert.equal(isContinuationActive("conv-a"), false);
+  } finally {
+    process.chdir(prevCwd);
+    if (prevHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = prevHome;
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("stops when status flips to paused", async () => {
   __clearContinuationState();
   const conv = "conv-p";
