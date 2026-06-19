@@ -202,20 +202,19 @@ export async function settleDanglingToolCallsFromFrames(
     rebuilt.push(record);
     const payload = localMessagePayload(record);
     if (!payload || payload["role"] !== "assistant") continue;
-    for (const part of pickPartsArray(payload)) {
-      if (!isToolCallPart(part)) continue;
-      const synthetic = syntheticById.get(part.id);
-      if (synthetic && remaining.has(part.id)) {
+    for (const id of assistantToolCallIds(payload)) {
+      const synthetic = syntheticById.get(id);
+      if (synthetic && remaining.has(id)) {
         rebuilt.push(synthetic);
-        remaining.delete(part.id);
+        remaining.delete(id);
       }
     }
   }
-  // Any dangling id whose declaring assistant isn't on disk (rare) — append at
-  // end as a last resort so the call is at least settled.
   for (const id of remaining) {
-    rebuilt.push(syntheticById.get(id));
+    report.settled = report.settled.filter((entry) => entry.tool_call_id !== id);
+    syntheticById.delete(id);
   }
+  if (syntheticById.size === 0) return report;
   await atomicWriteJsonl(messagesPath, rebuilt);
   report.messagesAppended = syntheticById.size;
 
@@ -246,6 +245,25 @@ function readToolCall(ev: unknown): { tool_call_id?: unknown; name?: unknown } |
   return null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assistantToolCallIds(message: Record<string, unknown>): string[] {
+  const ids: string[] = [];
+  for (const part of pickPartsArray(message)) {
+    if (isToolCallPart(part)) ids.push(part.id);
+  }
+  for (const key of ["tool_calls", "toolCalls"] as const) {
+    const calls = message[key];
+    if (!Array.isArray(calls)) continue;
+    for (const call of calls) {
+      if (isRecord(call) && typeof call["id"] === "string") ids.push(call["id"]);
+    }
+  }
+  return [...new Set(ids)];
+}
+
 function conversationFilePath(
   conversationId: string,
   agentId: string,
@@ -255,19 +273,6 @@ function conversationFilePath(
   const stateDir = stateDirOverride ?? storeInternals.storageDir();
   const key = conversationId === "default" ? `default:${agentId}` : `conversation:${conversationId}`;
   return join(stateDir, "conversations", storeInternals.b64url(key), filename);
-}
-
-async function appendJsonl(path: string, records: unknown[]): Promise<void> {
-  if (records.length === 0) return;
-  // Append, not full rewrite — settlement adds a tail of new records to
-  // an otherwise-untouched transcript. Atomicity at the line level: each
-  // JSON.stringify is one line, written in one appendFile call. A crash
-  // mid-append could truncate the last line, which readJsonlOrEmpty
-  // tolerates (it filters blank/parse-fail lines).
-  const dir = dirname(path);
-  await fsMkdir(dir, { recursive: true });
-  const payload = records.map((r) => JSON.stringify(r)).join("\n") + "\n";
-  await fsAppendFile(path, payload);
 }
 
 async function writeSettlementAudit(args: {

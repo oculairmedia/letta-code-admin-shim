@@ -56,6 +56,15 @@ function assistantToolCall(id: string, name = "Bash"): Record<string, unknown> {
   };
 }
 
+function openAiAssistantToolCall(id: string, name = "Bash"): Record<string, unknown> {
+  return {
+    id: `assistant-${id}`,
+    role: "assistant",
+    content: "",
+    tool_calls: [{ id, type: "function", function: { name, arguments: "{}" } }],
+  };
+}
+
 function toolCallFrame(toolName: string, toolCallId: string): LettaStreamFrame {
   return {
     type: "stream_event",
@@ -180,6 +189,38 @@ test("settle: synthetic toolResult is inserted IMMEDIATELY AFTER its declaring a
     assert.ok(String(synth["id"]).startsWith("synth-settle:run-pos-1:"));
     // NOT at the end
     assert.notEqual(onDisk[onDisk.length - 1]!["role"], "toolResult");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("settle: OpenAI call_ synthetic result is adjacent to tool_calls assistant", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agent = "agent-openai-pos-1";
+    const conv = seedConv(stateDir, "default", agent);
+    writeMessages(conv, [
+      { id: "u1", role: "user", content: "do it" },
+      openAiAssistantToolCall("call_openai_x", "Bash"),
+      { id: "u2", role: "user", content: "are you done?" },
+    ]);
+
+    const report = await settleDanglingToolCallsFromFrames({
+      frames: [toolCallFrame("Bash", "call_openai_x")],
+      conversationId: "default",
+      agentId: agent,
+      runId: "run-openai-pos-1",
+      reason: "stream_dropped",
+      messageIdsBefore: new Set<string>(["u1", "assistant-call_openai_x", "u2"]),
+      stateDir,
+    });
+
+    assert.equal(report.messagesAppended, 1);
+    const onDisk = readMessages(conv);
+    assert.equal(onDisk[1]?.["id"], "assistant-call_openai_x");
+    assert.equal(onDisk[2]?.["role"], "toolResult");
+    assert.equal(onDisk[2]?.["toolCallId"], "call_openai_x");
+    assert.equal(onDisk[3]?.["id"], "u2");
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
