@@ -62,6 +62,7 @@ import {
 import { handleSendMessage } from "./lib/chat.js";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.js";
 import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
+import { broadcastAgentEvent, type AgentEventReason } from "./lib/agent-events.js";
 import {
   aggregateUsage,
   buildMessageRunMap,
@@ -485,6 +486,15 @@ function modelHandleFromUpdate(body: Record<string, unknown>, current: OnDiskAge
   return configModel;
 }
 
+function broadcastAgentUpdated(agentId: string, reason: AgentEventReason, version?: string): void {
+  broadcastAgentEvent({
+    agent_id: agentId,
+    reason,
+    at: new Date().toISOString(),
+    ...(version ? { version } : {}),
+  });
+}
+
 function applyAgentUpdate(current: OnDiskAgentRecord, body: Record<string, unknown>): OnDiskAgentRecord {
   const next: OnDiskAgentRecord = { ...current };
   const model = modelHandleFromUpdate(body, current);
@@ -520,6 +530,7 @@ async function handleAgentUpdate(req: IncomingMessage, res: ServerResponse, agen
   const next = applyAgentUpdate(current, body);
   await writeAgentRecord(next);
   const updated = getAgentRecord(next.id) ?? next;
+  broadcastAgentUpdated(updated.id, "updated", typeof updated["updated_at"] === "string" ? updated["updated_at"] : undefined);
   const messages = await listMessages("default", updated.id);
   const blocks = readBlocksForAgent(updated.id);
   json(res, 200, agentToLettaState(updated, { messages, blocks }));
@@ -611,6 +622,7 @@ async function handleAgentCreate(req: IncomingMessage, res: ServerResponse): Pro
   }
 
   const created = getAgentRecord(id) ?? record;
+  broadcastAgentUpdated(created.id, "created", typeof created["updated_at"] === "string" ? created["updated_at"] : undefined);
   const messages = await listMessages("default", created.id);
   const outBlocks = readBlocksForAgent(created.id);
   json(res, 201, agentToLettaState(created, { messages, blocks: outBlocks }));
@@ -1799,6 +1811,7 @@ async function handleAgentSkillInstall(req: IncomingMessage, res: ServerResponse
     return notFound(res, `skill ${skillName} not found in global store`);
   }
   const skill = getInstalledSkillDetail(agentId, skillName);
+  broadcastAgentUpdated(agentId, "skill_installed");
   json(res, 201, skill);
 }
 
@@ -1808,6 +1821,7 @@ async function handleAgentSkillUninstall(_req: IncomingMessage, res: ServerRespo
   if (!ok) {
     return notFound(res, `skill ${skillName} not installed for agent ${agentId}`);
   }
+  broadcastAgentUpdated(agentId, "skill_uninstalled");
   json(res, 200, { name: skillName, uninstalled: true });
 }
 

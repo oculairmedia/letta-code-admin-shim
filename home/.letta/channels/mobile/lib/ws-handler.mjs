@@ -140,6 +140,7 @@ export function handleConnection(ws, request, host) {
   const activeSubscriptions = new Map(); // key: run_id, value: { unsubscribe }
   // lcp-2gx: per-socket subscription to crons_updated push events.
   let cronEventsUnsubscribe = null;
+  let agentEventsUnsubscribe = null;
   let goalEventsUnsubscribe = null;
   // lcp-indw: per-socket subscription to approval_resolved push events.
   let approvalEventsUnsubscribe = null;
@@ -171,6 +172,10 @@ export function handleConnection(ws, request, host) {
     if (cronEventsUnsubscribe) {
       safeUnsubscribe("cron events", cronEventsUnsubscribe);
       cronEventsUnsubscribe = null;
+    }
+    if (agentEventsUnsubscribe) {
+      safeUnsubscribe("agent events", agentEventsUnsubscribe);
+      agentEventsUnsubscribe = null;
     }
     if (goalEventsUnsubscribe) {
       safeUnsubscribe("goal events", goalEventsUnsubscribe);
@@ -606,6 +611,17 @@ export function handleConnection(ws, request, host) {
             reason: event.reason,
             tasks_active: event.tasks_active,
             at: event.at,
+          }), log);
+        });
+      }
+      if (typeof host.subscribeAgentEvents === "function") {
+        agentEventsUnsubscribe = host.subscribeAgentEvents((event) => {
+          if (closed) return;
+          safeSend(ws, makeFrame("agent_updated", {
+            agent_id: event.agent_id,
+            reason: event.reason,
+            at: event.at,
+            ...(event.version ? { version: event.version } : {}),
           }), log);
         });
       }
