@@ -407,7 +407,10 @@ export interface Run {
   completed_at: string | null;
   conversation_id: string | null;
   created_at: string | null;
-  metadata: Record<string, unknown>;
+  metadata: {
+    user_stopped?: boolean;
+    [k: string]: unknown;
+  };
   request_config: RunRequestConfig | null;
   /** `"running" | "completed" | "failed" | "cancelled"` — see runs.mjs:188-210. */
   status: string | null;

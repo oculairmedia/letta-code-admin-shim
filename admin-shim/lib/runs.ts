@@ -371,6 +371,10 @@ function readRunFromDisk(runId: string): RunRecord | null {
   return isRunRecord(parsed) ? parsed : null;
 }
 
+function runRecordHasUserStopIntent(record: RunRecord | null | undefined): boolean {
+  return record?.stop_reason === "user_cancelled" || record?.metadata?.user_stopped === true;
+}
+
 // lcp-r6lb: per-file parse cache for run.json. listRuns readdirs the runs
 // root and reads EVERY run.json on each call — and buildMessageRunMap (hit on
 // every GET /messages) drives that walk over what is now ~1700+ run files,
@@ -524,6 +528,15 @@ function nanosSince(hrStart: [number, number]): number {
  */
 export function toWireRun(record: RunRecord): Run {
   return record;
+}
+
+/**
+ * Durable user-stop predicate for reconnect/re-kick safety. This is true only
+ * for work explicitly stopped by the user, not involuntary disconnects or
+ * shim restart orphaning.
+ */
+export function isRunUserStopped(runId: string): boolean {
+  return runRecordHasUserStopIntent(getRun(runId));
 }
 
 /**
@@ -1385,6 +1398,9 @@ export function cancelRun(
   // a concurrent finalize doesn't race us back to "completed".
   handle.record.status = "cancelled";
   handle.record.stop_reason = reason;
+  if (reason === "user_cancelled") {
+    handle.record.metadata = { ...handle.record.metadata, user_stopped: true };
+  }
   handle.record.completed_at = nowIso();
   handle.record.total_duration_ns = nanosSince(handle.hrStart);
   writeJsonAtomic(runFile(handle.id), handle.record);

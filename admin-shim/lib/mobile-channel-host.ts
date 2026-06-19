@@ -32,7 +32,7 @@ import {
   type A2uiBlock,
   type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
-import { appendRunFrame, createRun, getFramesFilePath, getRun, recordA2uiUserAction, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
+import { appendRunFrame, createRun, getFramesFilePath, getRun, isRunUserStopped, recordA2uiUserAction, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
 import {
   getSubagent,
   ingestParentFrame,
@@ -994,7 +994,7 @@ function normalizeApprovalScope(value: string): ApprovalScope | null {
  */
 export interface SubscribeToRunCallbacks {
   onFrame: (frame: unknown, seq: number) => void;
-  onDone: (info: { last_seq: number; status: string }) => void;
+  onDone: (info: { last_seq: number; status: string; user_stopped?: boolean }) => void;
   onError: (info: { code: string; message: string }) => void;
 }
 
@@ -1086,6 +1086,16 @@ export function subscribeToRun(
       }
       watcher = null;
     }
+  }
+
+  // A user-cancelled terminal run is authoritative stop intent, not resumable
+  // work. Do not replay or live-tail stale frames back into mobile; just mark
+  // the subscription terminal so clients clear their active cursor.
+  const initialRun = getRun(runId);
+  const initialTerminal = initialRun?.status === "completed" || initialRun?.status === "failed" || initialRun?.status === "cancelled" || initialRun?.status === "expired";
+  if (initialTerminal && isRunUserStopped(runId)) {
+    cbs.onDone({ last_seq: lastSeqSent, status: initialRun?.status ?? "cancelled", user_stopped: true });
+    return { unsubscribe: stop };
   }
 
   // Initial replay + immediate terminal check (handles already-completed runs).
