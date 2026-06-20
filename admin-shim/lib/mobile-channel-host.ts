@@ -48,6 +48,7 @@ import {
   mobileConversationCursorCapabilities,
   resumeConversation,
   stampConversationFrame,
+  subscribeConversationEvents,
 } from "./mobile-conversation-cursors.js";
 import {
   findUnmappedTailUserMessageId,
@@ -1523,6 +1524,7 @@ interface MobileChannelHost {
   stampConversationFrame: typeof stampConversationFrame;
   resumeConversation: typeof resumeConversation;
   ackConversation: typeof ackConversation;
+  subscribeConversationEvents: typeof subscribeConversationEvents;
   subscribeToRun: typeof subscribeToRun;
   handleCronList: typeof handleCronList;
   handleCronAdd: typeof handleCronAdd;
@@ -1644,6 +1646,7 @@ async function createMobileChannelAdapter(
     stampConversationFrame,
     resumeConversation,
     ackConversation,
+    subscribeConversationEvents,
     subscribeToRun,
     handleCronList,
     handleCronAdd,

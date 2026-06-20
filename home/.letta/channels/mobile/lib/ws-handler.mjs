@@ -138,6 +138,10 @@ export function handleConnection(ws, request, host) {
   // lcp-p74.2: track active subscribeToRun handles so they're released when
   // the WS closes (or the client subscribes to the same run again).
   const activeSubscriptions = new Map(); // key: run_id, value: { unsubscribe }
+  // lcp-convpush: persistent conversation subscriptions receive every stamped
+  // conversation frame, including out-of-band cron/background turns that this
+  // socket did not initiate and therefore cannot subscribe to by run_id.
+  const activeConversationSubscriptions = new Map(); // key: conversation_id, value: { unsubscribe }
   // lcp-2gx: per-socket subscription to crons_updated push events.
   let cronEventsUnsubscribe = null;
   let agentEventsUnsubscribe = null;
@@ -169,6 +173,10 @@ export function handleConnection(ws, request, host) {
       safeUnsubscribe("run subscription", () => sub.unsubscribe());
     }
     activeSubscriptions.clear();
+    for (const sub of activeConversationSubscriptions.values()) {
+      safeUnsubscribe("conversation subscription", () => sub.unsubscribe());
+    }
+    activeConversationSubscriptions.clear();
     if (cronEventsUnsubscribe) {
       safeUnsubscribe("cron events", cronEventsUnsubscribe);
       cronEventsUnsubscribe = null;
@@ -1138,6 +1146,39 @@ export function handleConnection(ws, request, host) {
           break;
         }
         emitConversationResume(conversationId, frame.after_seq ?? frame.last_conv_seq ?? 0);
+        break;
+      }
+      case "subscribe_conversation": {
+        // lcp-convpush: subscribe to conversation-scoped frames, not a run.
+        // This covers out-of-band turns started by cron/other clients where
+        // this socket does not know the run_id up front. Replay first from the
+        // durable conversation cursor, then stay attached for live stamped
+        // frames from any producer in this shim process.
+        const conversationId = typeof frame.conversation_id === "string" && frame.conversation_id.length > 0 ? frame.conversation_id : null;
+        if (!conversationId) {
+          sendError(ERROR_CODES.PROTOCOL_VIOLATION, "subscribe_conversation requires conversation_id", { close: false });
+          break;
+        }
+        if (typeof host.subscribeConversationEvents !== "function") {
+          sendError(ERROR_CODES.INTERNAL, "conversation subscription handler not wired", { close: false });
+          break;
+        }
+        const existing = activeConversationSubscriptions.get(conversationId);
+        if (existing) {
+          safeUnsubscribe(`conversation ${conversationId}`, () => existing.unsubscribe());
+          activeConversationSubscriptions.delete(conversationId);
+        }
+        emitConversationResume(conversationId, frame.after_seq ?? frame.last_conv_seq ?? 0);
+        const unsubscribe = host.subscribeConversationEvents((event) => {
+          if (closed) return;
+          if (!event || event.conversationId !== conversationId || !event.frame) return;
+          safeSend(ws, event.frame, log);
+        });
+        activeConversationSubscriptions.set(conversationId, { unsubscribe });
+        safeSend(ws, makeFrame("conversation_subscribed", {
+          conversation_id: conversationId,
+          after_seq: normalizeCursorSeq(frame.after_seq ?? frame.last_conv_seq ?? 0),
+        }), log);
         break;
       }
       case "a2ui_frame":

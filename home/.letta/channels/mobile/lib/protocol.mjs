@@ -42,6 +42,9 @@ export const CLIENT_FRAMES = Object.freeze([
   "resume_conversation", // { conversation_id, after_seq }
                   // lcp-2hf.1: replay mobile WS frames with conv_seq > after_seq.
                   // May also be supplied as hello.resume for reconnect bootstraps.
+  "subscribe_conversation", // { conversation_id, after_seq? }
+                  // lcp-convpush: replay then live-tail conversation-scoped
+                  // frames so out-of-band runs reach clients without run_id.
   "cron_list", // { request_id?, agent_id?, conversation_id? } — read crons.json
   "cron_add", // { request_id?, agent_id, conversation_id?, name, description,
               //   prompt, recurring, cron? | every? | at?, timezone? }
@@ -99,6 +102,7 @@ export const SERVER_FRAMES = Object.freeze([
                   // expired) AND the tail has caught up. `last_seq` is the
                   // largest seq the server has emitted for this subscription.
   "conversation_resume_done", // { conversation_id, after_seq, last_seq, replayed }
+  "conversation_subscribed", // { conversation_id, after_seq }
   "cron_list_response", // { request_id?, success, tasks?, error? }
   "cron_add_response", // { request_id?, success, task?, error?, warning? }
   "cron_get_response", // { request_id?, success, task?, error? }

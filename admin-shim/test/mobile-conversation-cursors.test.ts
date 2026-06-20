@@ -153,3 +153,21 @@ test("compaction removes the log when every frame is acked", async () => {
     assert.equal(stale.cursorExpired, true);
   });
 });
+
+test("subscribeConversationEvents receives stamped conversation frames", () => {
+  const conv = `conv-live-${Date.now()}`;
+  const observed: Array<{ conversationId: string; frame: Record<string, unknown> }> = [];
+  const unsubscribe = subscribeConversationEvents((event) => observed.push(event));
+  try {
+    const stamped = stampConversationFrame(conv, { type: "assistant_message", content: "background update" });
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0]?.conversationId, conv);
+    assert.deepEqual(observed[0]?.frame, stamped);
+    assert.equal(observed[0]?.frame["conversation_id"], conv);
+    assert.equal(typeof observed[0]?.frame["conv_seq"], "number");
+  } finally {
+    unsubscribe();
+  }
+  stampConversationFrame(conv, { type: "assistant_message", content: "after unsubscribe" });
+  assert.equal(observed.length, 1, "unsubscribe should stop live conversation delivery");
+});

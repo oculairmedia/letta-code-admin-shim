@@ -1544,3 +1544,45 @@ test("ws: stop_reason frame carries stop_reason field (`end_turn` on clean turn)
   assert.equal(stop.stop_reason, "end_turn");
   assert.ok(stop.turn_id, "stop_reason must carry turn_id");
 });
+
+test("ws: subscribe_conversation receives out-of-band stamped frames", async (t) => {
+  const { shim, conn, convId } = await setupAuthed(t);
+
+  const subscribeStart = conn.frames.length;
+  conn.send({ type: "subscribe_conversation", conversation_id: convId, after_seq: 0 });
+  const subscribed = await waitForFrameAfter(conn, subscribeStart, "conversation_subscribed", WS_TIMEOUT_MS) as unknown as {
+    conversation_id?: string;
+    after_seq?: number;
+  };
+  assert.equal(subscribed.conversation_id, convId);
+  assert.equal(subscribed.after_seq, 0);
+
+  const liveStart = conn.frames.length;
+  const injected = {
+    v: 1,
+    type: "assistant_message",
+    id: "server-out-of-band-1",
+    ts: new Date().toISOString(),
+    message_id: "msg-out-of-band-1",
+    content: "background cron completed",
+  };
+  const res = await fetch(`${shim.url}/__test/stamp-conversation-frame`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ conversation_id: convId, frame: injected }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { frame?: { conv_seq?: number } };
+  assert.equal(typeof body.frame?.conv_seq, "number");
+
+  const pushed = await waitForFrameAfter(conn, liveStart, "assistant_message", WS_TIMEOUT_MS) as unknown as {
+    conversation_id?: string;
+    conv_seq?: number;
+    content?: string;
+    id?: string;
+  };
+  assert.equal(pushed.conversation_id, convId);
+  assert.equal(pushed.conv_seq, body.frame?.conv_seq);
+  assert.equal(pushed.content, "background cron completed");
+  assert.equal(pushed.id, "server-out-of-band-1");
+});
