@@ -113,6 +113,7 @@ import {
   markSubagentCompleted,
   markSubagentFailed,
   snapshotSubagents,
+  sweepOrphanedSubagents,
   getSubagent,
   updateSubagentTodoProgress,
   finalizeSubagent,
@@ -2487,7 +2488,16 @@ const server = createServer((req, res) => {
   // /v1/work-activity — external work ingest (lcp-zncq)
   if (pathname === "/v1/work-activity" || pathname === "/v1/work-activity/") {
     if (req.method === "POST") return handleWorkActivityIngest(req, res);
-    if (req.method === "GET") return json(res, 200, snapshotSubagents());
+    if (req.method === "GET") {
+      // letta-mobile-73o2h.4: the mobile chat bar binds to this snapshot via
+      // WS (handleSubagentList). Sweep BEFORE serializing so a stranded
+      // "running" entry with a dead/unknown PID can never leak into the
+      // user-visible chip list. Without this, a worker process that died
+      // without writing a [Task completed]/[Task failed] footer would
+      // surface as still-running and the chat bar would never clear it.
+      sweepOrphanedSubagents();
+      return json(res, 200, snapshotSubagents());
+    }
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     res.setHeader("Allow", "POST, GET, OPTIONS");
     return json(res, 405, { detail: `${req.method} not allowed on /v1/work-activity` });

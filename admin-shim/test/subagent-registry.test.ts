@@ -559,7 +559,12 @@ test("subagent-registry: liveness sweep leaves fresh running log active", () => 
   }
 });
 
-test("subagent-registry: liveness sweep leaves stale started-only log active when PID is unknown", () => {
+test("subagent-registry: liveness sweep finalizes stale started-only log as orphaned when PID is unknown (letta-mobile-73o2h.4)", () => {
+  // Without a parseable worker PID we cannot prove the entry is alive; the
+  // log file existing does not by itself mean a worker is running. After
+  // SUBAGENT_NO_LOGFILE_TIMEOUT_MS the entry is swept as orphaned so the
+  // mobile chat bar never surfaces a stranded "running" chip. This is
+  // exactly the bug that motivated letta-mobile-73o2h.4.
   __resetSubagentRegistry();
   const stateDir = join(tmpdir(), `shim-orphan-sweep-${Math.random().toString(36).slice(2)}`);
   const logFile = join(stateDir, "task_91.log");
@@ -574,9 +579,112 @@ test("subagent-registry: liveness sweep leaves stale started-only log active whe
 
     const swept = sweepOrphanedSubagents(Date.now() + 3_600_000);
 
-    assert.equal(swept, 0);
-    assert.equal(getSubagent(tcid)?.status, "running");
+    assert.equal(swept, 1, "stale started-only entries with unknown PID must be swept as orphaned");
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "orphaned");
+    assert.equal(
+      listActiveSubagents().find((s) => s.toolCallId === tcid),
+      undefined,
+      "listActiveSubagents must NEVER include an orphaned entry",
+    );
   } finally {
     __resetSubagentRegistry();
   }
+});
+
+// ── Regression: dead-PID running subagent MUST NOT survive in the snapshot
+//    surfaced to mobile UI. letta-mobile-73o2h.4.
+//
+//    Reproduces the user-facing "stranded subagent chip" bug: a background
+//    dispatch whose worker process dies (or whose PID is unparseable) must be
+//    finalized before the snapshot is read. The test sets up an entry with a
+//    log file but a dead PID, then verifies:
+//      1. sweepOrphanedSubagents() flips the entry to failed/worker_process_dead.
+//      2. snapshotSubagents() never returns it with status="running".
+//      3. listActiveSubagents() filters it out.
+//    Without this guarantee, the mobile chat bar shows a chip for a worker
+//    that no longer exists, which is the exact "user trust destroying bug"
+//    this test exists to prevent.
+
+test("subagent-registry: dead-PID running entry is never surfaced as running", () => {
+  __resetSubagentRegistry();
+  __setSubagentProcessAliveCheckerForTest(() => false);
+
+  const stateDir = join(tmpdir(), `shim-dead-snapshot-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(stateDir, { recursive: true });
+  const logFile = join(stateDir, "task_dead_snapshot.log");
+  writeFileSync(
+    logFile,
+    "[Task started: Stranded subagent (snap)]\n[subagent_type: general-purpose]\n",
+    "utf8",
+  );
+
+  const tcid = "tc-dead-snapshot-1";
+  ingestParentFrame(dispatchFrame(tcid, "Stranded subagent"), "run-dead-snapshot");
+  ingestParentFrame(
+    returnFrame(tcid, "task_dead_snap", "agent-local-dead-snap-aaaa-bbbb-cccc-dddddddddddd", logFile, 999999),
+    "run-dead-snapshot",
+  );
+
+  const beforeSweep = getSubagent(tcid);
+  assert.equal(beforeSweep?.status, "running", "should start as running so we can prove the sweep fixes it");
+  assert.ok(beforeSweep?.workerPid);
+
+  const swept = sweepOrphanedSubagents(Date.now());
+  assert.equal(swept, 1, "sweep must finalize exactly the dead-PID running entry");
+
+  const after = getSubagent(tcid);
+  assert.notEqual(after?.status, "running", "running entries with dead PIDs must be finalized");
+  assert.equal(after?.failureReason, "worker_process_dead");
+
+  const snapshot = snapshotSubagents();
+  const stillRunning = snapshot.find((s) => s.toolCallId === tcid && s.status === "running");
+  assert.equal(stillRunning, undefined, "snapshot must NEVER surface a dead-PID entry as running");
+
+  const active = listActiveSubagents();
+  assert.equal(
+    active.find((s) => s.toolCallId === tcid),
+    undefined,
+    "listActiveSubagents must NEVER include a dead-PID entry",
+  );
+
+  __setSubagentProcessAliveCheckerForTest(null);
+  __resetSubagentRegistry();
+});
+
+test("subagent-registry: GET /v1/work-activity never serves dead-PID running entries", async () => {
+  // Drives the registry through the public surface that mobile consumes, so a
+  // future regression that bypasses the sweep at the HTTP edge also fails.
+  // The test does not start a full shim; it imports snapshotSubagents (the
+  // function called by GET /v1/work-activity) and asserts its output.
+  __resetSubagentRegistry();
+  __setSubagentProcessAliveCheckerForTest(() => false);
+
+  const stateDir = join(tmpdir(), `shim-rest-dead-${Math.random().toString(36).slice(2)}`);
+  mkdirSync(stateDir, { recursive: true });
+  const logFile = join(stateDir, "task_rest_dead.log");
+  writeFileSync(
+    logFile,
+    "[Task started: Stranded subagent (rest)]\n[subagent_type: general-purpose]\n",
+    "utf8",
+  );
+
+  const tcid = "tc-rest-dead-1";
+  ingestParentFrame(dispatchFrame(tcid, "Stranded subagent (rest)"), "run-rest-dead");
+  ingestParentFrame(
+    returnFrame(tcid, "task_rest_dead", "agent-local-rest-dead-aaaa-bbbb-cccc-dddddddddddd", logFile, 424242),
+    "run-rest-dead",
+  );
+
+  sweepOrphanedSubagents(Date.now());
+
+  // Equivalent to GET /v1/work-activity's snapshotSubagents() return.
+  const snapshot = snapshotSubagents();
+  const entry = snapshot.find((s) => s.toolCallId === tcid);
+  assert.ok(entry, "entry should still exist (terminal entries remain in snapshot)");
+  assert.notEqual(entry?.status, "running", "GET /v1/work-activity must NEVER serve a dead-PID entry as running");
+
+  __setSubagentProcessAliveCheckerForTest(null);
+  __resetSubagentRegistry();
 });

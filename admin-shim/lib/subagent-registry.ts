@@ -791,12 +791,24 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
       continue;
     }
     if (alive === true) continue;
+    // letta-mobile-73o2h.4: the PID is unknown (the log was started before
+    // the worker stamped its pid, or the worker exited without writing
+    // one). Without a positive liveness signal we cannot prove the entry
+    // is alive — silence is not life. Finalize as orphaned once the log
+    // is stale past SUBAGENT_NO_LOGFILE_TIMEOUT_MS so the mobile chat bar
+    // never surfaces a stranded "running" chip.
     if (!existsSync(entry.logFile)) {
       const startedMs = Date.parse(entry.startedAt);
       if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
         finalize(entry.toolCallId, "failed", "orphaned");
         swept += 1;
       }
+      continue;
+    }
+    const startedMs = Date.parse(entry.startedAt);
+    if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
+      finalize(entry.toolCallId, "failed", "orphaned");
+      swept += 1;
     }
   }
   return swept;
