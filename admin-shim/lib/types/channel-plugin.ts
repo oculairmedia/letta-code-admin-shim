@@ -208,6 +208,8 @@ export interface ChannelHost {
   mobileConversationCursorCapabilities?: () => MobileConversationCursorCapabilities;
   /** Stamp a per-conversation monotonic cursor onto an outbound mobile frame. */
   stampConversationFrame?: (conversationId: string, frame: Record<string, unknown>) => Record<string, unknown>;
+  /** Subscribe to live per-conversation frames after they are stamped/durably appended. */
+  subscribeConversationEvents?: (listener: (event: { conversationId: string; frame: Record<string, unknown> }) => void) => () => void;
   /** Replay buffered frames after a per-conversation cursor. */
   resumeConversation?: (conversationId: string, afterSeq: unknown) => MobileConversationResumeResult;
   /** Record the highest per-conversation cursor acknowledged by a client. */

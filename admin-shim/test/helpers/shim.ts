@@ -151,6 +151,7 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
     SHIM_PORT: "0",
     SHIM_HOST: "127.0.0.1",
     MOBILE_CHANNEL_TOKEN: mobileToken,
+    NODE_ENV: "test",
     NODE_PATH: join(ADMIN_SHIM_ROOT, "node_modules"),
     ...opts.env,
   };

@@ -165,6 +165,9 @@ function createMobileAdapter(account, host) {
         stampConversationFrame: host.stampConversationFrame
           ? (conversationId, frame) => host.stampConversationFrame(conversationId, frame)
           : undefined,
+        subscribeConversationEvents: host.subscribeConversationEvents
+          ? (listener) => host.subscribeConversationEvents(listener)
+          : undefined,
         registerPushClient,
         resumeConversation: host.resumeConversation
           ? (conversationId, afterSeq) => host.resumeConversation(conversationId, afterSeq)

@@ -87,7 +87,7 @@ import {
   kickGoalContinuation,
   rekickActiveGoalContinuationsOnBoot,
 } from "./lib/mobile-channel-host.js";
-import { mobileConversationCursorCapabilities } from "./lib/mobile-conversation-cursors.js";
+import { mobileConversationCursorCapabilities, stampConversationFrame } from "./lib/mobile-conversation-cursors.js";
 import {
   getCronSchedulerStatus,
   startCronScheduler,
@@ -2253,6 +2253,24 @@ const server = createServer((req, res) => {
       `req=${reqBytesHeader}B res=${respBytes}B ${auth} ${pathname}${url.search} ua="${ua}"`,
     );
   });
+
+  if (process.env["NODE_ENV"] === "test" && req.method === "POST" && pathname === "/__test/stamp-conversation-frame") {
+    void (async () => {
+      try {
+        const body = await readJsonBody(req);
+        const conversationId = typeof body["conversation_id"] === "string" ? body["conversation_id"] : null;
+        const frame = body["frame"];
+        if (!conversationId || !frame || typeof frame !== "object" || Array.isArray(frame)) {
+          return badRequest(res, "conversation_id and object frame are required");
+        }
+        return json(res, 200, { frame: stampConversationFrame(conversationId, frame as Record<string, unknown>) });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return json(res, 500, { detail: msg });
+      }
+    })();
+    return;
+  }
 
   if (req.method === "OPTIONS") {
     res.writeHead(204, {

@@ -36,6 +36,13 @@ interface CursorState {
   appendsSinceCompactCheck: number;
 }
 
+export interface ConversationFrameEvent {
+  conversationId: string;
+  frame: Record<string, unknown>;
+}
+
+type ConversationFrameListener = (event: ConversationFrameEvent) => void;
+
 export interface ConversationResumeResult {
   ok: boolean;
   cursorExpired: boolean;
@@ -58,6 +65,7 @@ export interface MobileConversationCursorCapabilities {
 }
 
 const states = new Map<string, CursorState>();
+const conversationListeners = new Set<ConversationFrameListener>();
 
 export function mobileConversationCursorCapabilities(): MobileConversationCursorCapabilities {
   return {
@@ -91,7 +99,27 @@ export function stampConversationFrame(
     state.appendsSinceCompactCheck = 0;
     maybeCompactReplayLog(conversationId, state.sidecar.last_ack_seq);
   }
+  emitConversationFrame(conversationId, stamped);
   return stamped;
+}
+
+export function subscribeConversationEvents(listener: ConversationFrameListener): () => void {
+  conversationListeners.add(listener);
+  return () => {
+    conversationListeners.delete(listener);
+  };
+}
+
+function emitConversationFrame(conversationId: string, frame: Record<string, unknown>): void {
+  const event: ConversationFrameEvent = { conversationId, frame };
+  for (const listener of [...conversationListeners]) {
+    try {
+      listener(event);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[mobile-conversation-cursors] conversation listener failed conversation=${conversationId}: ${msg}`);
+    }
+  }
 }
 
 export function resumeConversation(conversationId: string, afterSeqInput: unknown): ConversationResumeResult {
