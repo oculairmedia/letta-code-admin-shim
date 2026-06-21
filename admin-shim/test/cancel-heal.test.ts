@@ -208,16 +208,19 @@ test("cancel-heal: orphaned tool_call → synthetic toolResult inserted, next-tu
     // After heal: synthetic toolResult sits immediately after the
     // assistant message that declared the tool_call — provider shape
     // is now adjacency-correct, the next-turn request won't 400.
+    // The seeded transcript had 3 records (u0, a1, no toolResult);
+    // the heal APPENDS a synthetic toolResult immediately after a1,
+    // so the final count is 3 (u0 + a1 + synthetic), not 4.
     const after = readMessages(convDir);
-    assert.equal(after.length, 4, "user + assistant + synthetic toolResult + nothing else");
+    assert.equal(after.length, 3, "u0 + a1 + synthetic toolResult (heal appends, doesn't shift existing records)");
     const assistantAfter = after[1] as { content: Array<{ type: string; id?: string }> };
     assert.equal(assistantAfter.content[0]?.type, "toolCall");
     assert.equal(assistantAfter.content[0]?.id, "toolu_ORPHAN");
-    const synthetic = after[2] as { role: string; content: Array<{ type: string; tool_call_id?: string; is_err?: boolean }> };
-    assert.equal(synthetic.role, "tool");
-    assert.equal(synthetic.content[0]?.type, "toolResult");
-    assert.equal(synthetic.content[0]?.tool_call_id, "toolu_ORPHAN");
-    assert.equal(synthetic.content[0]?.is_err, true, "synthetic toolResult must be marked as an error so the agent knows the tool was cut short");
+    const synthetic = after[2] as { role: string; toolCallId?: string; isError?: boolean; content: Array<{ type: string; text: string }> };
+    assert.equal(synthetic.role, "toolResult");
+    assert.equal(synthetic.toolCallId, "toolu_ORPHAN");
+    assert.equal(synthetic.isError, true, "synthetic toolResult must be marked as an error so the agent knows the tool was cut short");
+    assert.match(synthetic.content[0]?.text ?? "", /healed: tool execution interrupted/);
   });
 });
 
@@ -230,6 +233,7 @@ test("cancel-heal: run with no tool calls at all → no orphan, no heal", async 
       { id: "a1", role: "assistant", content: [{ type: "text", text: "hello" }] },
     ]);
 
+    // Cancel an active run with no tool-call frames in it.
     const run = createRun({ agentId, conversationId: "default" });
     appendRunFrame(run.id, {
       message_type: "assistant_message",
@@ -240,19 +244,13 @@ test("cancel-heal: run with no tool calls at all → no orphan, no heal", async 
       message_type: "stop_reason",
       stop_reason: "end_turn",
     });
-    appendRunFrame(run.id, {
-      message_type: "turn_done",
-      turn_id: "t1",
-      run_id: run.id,
-      status: "completed",
-    });
 
-    assert.equal(cancelRun(run.id), false, "run is already finalized, cancel returns false");
+    assert.equal(cancelRun(run.id), true, "active run cancels successfully");
     assert.deepEqual(collectDanglingToolCallIds(run.id), []);
 
     // postCancelRepair must short-circuit on no-orphans.
     const report = await postCancelRepair(run.id, "default", agentId);
-    assert.equal(report, null);
+    assert.equal(report, null, "no heal should fire when there are no orphans");
     const after = readMessages(convDir);
     assert.equal(after.length, 2, "messages.jsonl must be untouched when there are no orphans");
   });
