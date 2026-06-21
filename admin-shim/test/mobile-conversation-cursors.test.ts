@@ -366,3 +366,24 @@ test("compaction drops entries with non-numeric sequence ids (string, null, unde
     assert.deepEqual(seqs, [1, 5]);
   });
 });
+
+test("normalizeSeq treats non-finite and non-scalar resume boundaries as 0", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-boundaries";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+    stampConversationFrame(conv, { type: "ping", n: 2 });
+
+    const boundaries: unknown[] = ["", null, NaN, Infinity, -Infinity, -5, -10.5, 0, "abc", {}, []];
+    for (const boundary of boundaries) {
+      const resumed = resumeConversation(conv, boundary);
+      assert.equal(resumed.ok, true, `resume should succeed for boundary: ${String(boundary)}`);
+      assert.equal(resumed.afterSeq, 0, `afterSeq should normalize to 0 for boundary: ${String(boundary)}`);
+      assert.deepEqual(
+        resumed.frames.map((frame) => frame["conv_seq"]),
+        [1, 2],
+        `resume should replay all frames for boundary: ${String(boundary)}`,
+      );
+    }
+  });
+});
+
