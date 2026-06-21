@@ -21,6 +21,7 @@ import {
   ackConversation,
   resumeConversation,
   stampConversationFrame,
+  subscribeConversationEvents,
 } from "../lib/mobile-conversation-cursors.js";
 import { _internals as storeInternals } from "../lib/store.js";
 

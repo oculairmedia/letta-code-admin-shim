@@ -21,7 +21,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { startShim, openMobileWs } from "./helpers/index.js";
@@ -584,7 +584,7 @@ test("GET /v1/work-activity never returns a stranded started-only-log subagent a
       "utf8",
     );
     const stale = new Date(Date.now() - 3 * 60 * 60 * 1000);
-    require("node:fs").utimesSync(logFile, stale, stale);
+    utimesSync(logFile, stale, stale);
 
     const framesPath = join(shim.stateDir, "runs", runId, "frames.jsonl");
     const toolCallFrame = {

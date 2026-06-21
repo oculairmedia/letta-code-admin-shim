@@ -714,6 +714,105 @@ export function getFramesFilePath(runId: string): string {
 }
 
 /**
+ * letta-mobile-ja4xe: scan a run's frames.jsonl and return the set of
+ * tool_call ids that were EMITTED by an assistant message but never
+ * RETURNED in a matching tool_return frame. These are the orphan
+ * tool_use / tool_calls that strict providers (OpenAI / Anthropic)
+ * reject on the FOLLOWING turn when they replay the conversation
+ * transcript.
+ *
+ * Best-effort and lenient:
+ *   - Missing files, malformed JSON lines, frames with no message_type,
+ *     and frames whose tool_call has no id are all silently skipped —
+ *     a cancel must NEVER throw out of this helper. The next-turn
+ *     error is the better failure surface than a hang in cancel.
+ *   - Dedupe by first-seen order so the caller can build a stable
+ *     "this was the id we observed" report.
+ *
+ * Frame shapes handled:
+ *   tool_call_message  → frame.tool_call.tool_call_id (singular)
+ *                       → frame.tool_calls[].tool_call_id (plural)
+ *   tool_return_message → frame.tool_call_id (singular)
+ *                       → frame.tool_returns[].tool_call_id (plural)
+ *
+ * The frames stored in frames.jsonl are POST-reshape (see
+ * mobile-channel-host.emit + chat.reshapeFrame), so message_type sits
+ * at the top of the frame, not nested under `stream_event.event`.
+ */
+export function collectDanglingToolCallIds(runId: string): string[] {
+  const emitted = new Set<string>();
+  const returned = new Set<string>();
+  let path: string;
+  try {
+    path = getFramesFilePath(runId);
+  } catch {
+    return [];
+  }
+  if (!existsSync(path)) return [];
+  let body: string;
+  try {
+    body = readFileSync(path, "utf8");
+  } catch {
+    return [];
+  }
+  for (const rawLine of body.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") continue;
+    const wrapper = parsed as Record<string, unknown>;
+    const frame = (wrapper["frame"] && typeof wrapper["frame"] === "object"
+      ? wrapper["frame"]
+      : wrapper) as Record<string, unknown>;
+    const mt = frame["message_type"];
+    if (mt === "tool_call_message") {
+      collectCallIds(frame, emitted);
+    } else if (mt === "tool_return_message") {
+      collectReturnIds(frame, returned);
+    }
+  }
+  const dangling: string[] = [];
+  for (const id of emitted) {
+    if (!returned.has(id)) dangling.push(id);
+  }
+  return dangling;
+}
+
+function collectCallIds(frame: Record<string, unknown>, out: Set<string>): void {
+  const tc = frame["tool_call"];
+  if (tc && typeof tc === "object") {
+    const id = (tc as Record<string, unknown>)["tool_call_id"];
+    if (typeof id === "string" && id.length > 0) out.add(id);
+  }
+  const tcs = frame["tool_calls"];
+  if (Array.isArray(tcs)) {
+    for (const call of tcs) {
+      if (!call || typeof call !== "object") continue;
+      const id = (call as Record<string, unknown>)["tool_call_id"];
+      if (typeof id === "string" && id.length > 0) out.add(id);
+    }
+  }
+}
+
+function collectReturnIds(frame: Record<string, unknown>, out: Set<string>): void {
+  const id = frame["tool_call_id"];
+  if (typeof id === "string" && id.length > 0) out.add(id);
+  const trs = frame["tool_returns"];
+  if (Array.isArray(trs)) {
+    for (const tr of trs) {
+      if (!tr || typeof tr !== "object") continue;
+      const tid = (tr as Record<string, unknown>)["tool_call_id"];
+      if (typeof tid === "string" && tid.length > 0) out.add(tid);
+    }
+  }
+}
+
+/**
  * lcp-2oxb.3: max entries kept in the in-memory ring buffer per run.
  * 256 entries covers ~8 seconds of heavy streaming (30 fps assistant deltas)
  * and gives reconnecting subscribers a comfortable reattach window without
