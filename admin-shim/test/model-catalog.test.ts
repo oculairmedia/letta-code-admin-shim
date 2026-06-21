@@ -24,6 +24,9 @@ import {
   KNOWN_PROVIDERS,
   PROVIDER_TO_ENDPOINT_TYPE,
   type ProviderCatalog,
+  getDefaultOpenAIModels,
+  getDefaultAnthropicModels,
+  getDefaultDeepSeekModels,
 } from "../lib/model-catalog.js";
 
 function catalogFor(provider: string): ProviderCatalog {
@@ -126,15 +129,33 @@ test("isKnownProvider: unknown providers", () => {
 });
 
 test("normalizeAnthropicVersion: dot to dash", () => {
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4.6"), "claude-opus-4-6");
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4.7"), "claude-opus-4-7");
-  assert.strictEqual(normalizeAnthropicVersion("claude-sonnet-4.6"), "claude-sonnet-4-6");
-  assert.strictEqual(normalizeAnthropicVersion("claude-haiku-4.5"), "claude-haiku-4-5");
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4.6"),
+    "claude-opus-4-6",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4.7"),
+    "claude-opus-4-7",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-sonnet-4.6"),
+    "claude-sonnet-4-6",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-haiku-4.5"),
+    "claude-haiku-4-5",
+  );
 });
 
 test("normalizeAnthropicVersion: already dash", () => {
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4-6"), "claude-opus-4-6");
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4-7"), "claude-opus-4-7");
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4-6"),
+    "claude-opus-4-6",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4-7"),
+    "claude-opus-4-7",
+  );
 });
 
 test("findNearestModel: exact match", () => {
@@ -146,8 +167,14 @@ test("findNearestModel: exact match", () => {
 test("findNearestModel: Anthropic version normalization", () => {
   const catalog = catalogFor("anthropic");
   // Dot notation should normalize to dash
-  assert.strictEqual(findNearestModel("claude-opus-4.6", catalog), "claude-opus-4-6");
-  assert.strictEqual(findNearestModel("claude-opus-4.7", catalog), "claude-opus-4-7");
+  assert.strictEqual(
+    findNearestModel("claude-opus-4.6", catalog),
+    "claude-opus-4-6",
+  );
+  assert.strictEqual(
+    findNearestModel("claude-opus-4.7", catalog),
+    "claude-opus-4-7",
+  );
 });
 
 test("findNearestModel: fallback to first available", () => {
@@ -222,9 +249,16 @@ test("FALLBACK_MODEL_CATALOG: structure validation", () => {
   // Check that all models have required metadata
   for (const [provider, models] of Object.entries(FALLBACK_MODEL_CATALOG)) {
     for (const [modelId, metadata] of Object.entries(models)) {
-      assert.strictEqual(metadata.id, modelId, `Model ID mismatch in ${provider}/${modelId}`);
+      assert.strictEqual(
+        metadata.id,
+        modelId,
+        `Model ID mismatch in ${provider}/${modelId}`,
+      );
       assert.ok(metadata.name, `Missing name for ${provider}/${modelId}`);
-      assert.ok(metadata.contextWindow > 0, `Invalid contextWindow for ${provider}/${modelId}`);
+      assert.ok(
+        metadata.contextWindow > 0,
+        `Invalid contextWindow for ${provider}/${modelId}`,
+      );
     }
   }
 });
@@ -271,4 +305,30 @@ test("Model catalog: Ollama models", () => {
 test("Model catalog: LM Studio models", () => {
   const lmstudio = catalogFor("lmstudio");
   assert.ok(lmstudio["opus-4-7"] !== undefined);
+});
+
+test("getDefaultOpenAIModels: returns expected hardcoded models", () => {
+  const models = getDefaultOpenAIModels();
+  assert.ok(Array.isArray(models), "Should return an array");
+  assert.ok(models.length > 0, "Should return at least one model");
+  assert.ok(models.includes("gpt-4o"));
+  assert.ok(models.includes("gpt-4-turbo"));
+  assert.ok(models.includes("gpt-4"));
+});
+
+test("getDefaultAnthropicModels: returns expected hardcoded models", () => {
+  const models = getDefaultAnthropicModels();
+  assert.ok(Array.isArray(models), "Should return an array");
+  assert.ok(models.length > 0, "Should return at least one model");
+  assert.ok(models.includes("claude-fable-5"));
+  assert.ok(models.includes("claude-opus-4-8"));
+  assert.ok(models.includes("claude-sonnet-4-6"));
+});
+
+test("getDefaultDeepSeekModels: returns expected hardcoded models", () => {
+  const models = getDefaultDeepSeekModels();
+  assert.ok(Array.isArray(models), "Should return an array");
+  assert.ok(models.length > 0, "Should return at least one model");
+  assert.ok(models.includes("deepseek-v4-flash"));
+  assert.ok(models.includes("deepseek-v3"));
 });
