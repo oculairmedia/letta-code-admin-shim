@@ -383,9 +383,16 @@ test("patch-loader: vision input is default-safe when LETTA_VISION_MODELS is uns
 test("patch-loader: fallback regex covers every VISION_MODEL_PATTERNS entry", () => {
   const previousExperimental = process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
   const previousVisionModels = process.env["LETTA_VISION_MODELS"];
+  // NOTE: this must match the patch-loader's LOCAL_VISION_INPUT_TOKEN exactly
+  // (`input: input.model.input,` — trailing comma, on its own line) so the
+  // helper is actually injected. A single-line body without the trailing
+  // comma does NOT match and the helper is never installed.
   const input = [
     "function registeredModelToPiModel(input) {",
-    "  return { id: input.model.id, input: input.model.input };",
+    "  return {",
+    "    id: input.model.id,",
+    "    input: input.model.input,",
+    "  };",
     "}",
   ].join("\n");
   try {
@@ -394,6 +401,8 @@ test("patch-loader: fallback regex covers every VISION_MODEL_PATTERNS entry", ()
     const patched = patchLettaCodeSourceForTest(input);
     const helperStart = patched.indexOf("globalThis.__lcpFixLocalVisionInput =");
     const helperEnd = patched.indexOf("\nfunction registeredModelToPiModel", helperStart);
+    assert.notEqual(helperStart, -1, "vision helper must be injected");
+    assert.notEqual(helperEnd, -1);
     const helperSource = patched.slice(helperStart, helperEnd);
     globalThis.__lcpFixLocalVisionInput = undefined;
     eval(helperSource);
@@ -402,6 +411,9 @@ test("patch-loader: fallback regex covers every VISION_MODEL_PATTERNS entry", ()
       m: string,
       i: string[],
     ) => string[];
+    if (typeof fixInput !== "function") {
+      assert.fail("expected __lcpFixLocalVisionInput helper to be installed");
+    }
 
     for (const pattern of VISION_MODEL_PATTERNS) {
       // Build a model id that contains the pattern verbatim (lowercased).
