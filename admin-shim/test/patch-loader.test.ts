@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { patchLettaCodeSourceForTest } from "../scripts/letta-code-patch-loader.mjs";
+import { VISION_MODEL_PATTERNS } from "../lib/model-catalog.js";
 
 // Resolve the REAL letta.js bundle so the guard test works in CI
 // (admin-shim/node_modules/...) AND locally — never a machine-specific
@@ -288,6 +289,151 @@ test("patch-loader: adds local vision input for discovered Claude-style models",
       delete process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
     } else {
       process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"] = previousExperimental;
+    }
+    globalThis.__lcpFixLocalVisionInput = undefined;
+  }
+});
+
+// lcp-9d76: REGRESSION GUARD — the vision image flag must NOT depend on
+// LETTA_VISION_MODELS being present in the environment. The shim sets that
+// env var at runtime (server.ts, from VISION_MODEL_PATTERNS), but if it is
+// ever dropped from the service environment (as happened 2026-06-21 when the
+// systemd unit lacked it and the runtime process.env assignment did not
+// propagate to the spawned letta.js child), images would be silently stripped
+// with "(image omitted: model does not support images)". The patch-loader
+// helper MUST fall back to a hardcoded vision-model regex so an unset/empty
+// LETTA_VISION_MODELS still enables image input for known vision families.
+// This test FAILS if someone removes that fallback and makes the helper
+// rely solely on the env var.
+test("patch-loader: vision input is default-safe when LETTA_VISION_MODELS is unset", () => {
+  const previousExperimental = process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
+  const previousVisionModels = process.env["LETTA_VISION_MODELS"];
+  const input = [
+    "function registeredModelToPiModel(input) {",
+    "  return {",
+    "    id: input.model.id,",
+    "    input: input.model.input,",
+    "  };",
+    "}",
+  ].join("\n");
+
+  try {
+    process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"] = "1";
+    // The exact failure mode from lcp-9d76: env var absent entirely.
+    delete process.env["LETTA_VISION_MODELS"];
+
+    const patched = patchLettaCodeSourceForTest(input);
+    const helperStart = patched.indexOf("globalThis.__lcpFixLocalVisionInput =");
+    const helperEnd = patched.indexOf("\nfunction registeredModelToPiModel", helperStart);
+    assert.notEqual(helperStart, -1);
+    assert.notEqual(helperEnd, -1);
+
+    const helperSource = patched.slice(helperStart, helperEnd);
+    globalThis.__lcpFixLocalVisionInput = undefined;
+    eval(helperSource);
+
+    const fixInput = readInjectedLocalVisionInputHelper();
+    if (typeof fixInput !== "function") {
+      assert.fail("expected __lcpFixLocalVisionInput helper to be installed");
+    }
+
+    // Known vision families must still get "image" with NO env list present.
+    assert.deepEqual(
+      fixInput("lmstudio", "opus-4-8", ["text"]),
+      ["text", "image"],
+      "opus must be vision-capable even with LETTA_VISION_MODELS unset",
+    );
+    assert.deepEqual(
+      fixInput("lmstudio", "claude-sonnet-4-5", ["text"]),
+      ["text", "image"],
+      "claude/sonnet must be vision-capable even with LETTA_VISION_MODELS unset",
+    );
+    assert.deepEqual(
+      fixInput("lmstudio", "minimax-m3", ["text"]),
+      ["text", "image"],
+      "minimax must be vision-capable even with LETTA_VISION_MODELS unset",
+    );
+    // Non-vision model must NOT be promoted.
+    assert.deepEqual(
+      fixInput("lmstudio", "plain-text-model", ["text"]),
+      ["text"],
+      "non-vision model must not get image input",
+    );
+  } finally {
+    if (previousExperimental === undefined) {
+      delete process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
+    } else {
+      process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"] = previousExperimental;
+    }
+    if (previousVisionModels === undefined) {
+      delete process.env["LETTA_VISION_MODELS"];
+    } else {
+      process.env["LETTA_VISION_MODELS"] = previousVisionModels;
+    }
+    globalThis.__lcpFixLocalVisionInput = undefined;
+  }
+});
+
+// lcp-9d76: the patch-loader's hardcoded fallback regex (used when
+// LETTA_VISION_MODELS is unset) must stay in sync with the canonical
+// VISION_MODEL_PATTERNS in lib/model-catalog.ts. If a new vision family is
+// added to VISION_MODEL_PATTERNS but not to the fallback regex, an env-less
+// process would silently strip images for that family. This test FAILS on
+// that drift.
+test("patch-loader: fallback regex covers every VISION_MODEL_PATTERNS entry", () => {
+  const previousExperimental = process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
+  const previousVisionModels = process.env["LETTA_VISION_MODELS"];
+  // NOTE: this must match the patch-loader's LOCAL_VISION_INPUT_TOKEN exactly
+  // (`input: input.model.input,` — trailing comma, on its own line) so the
+  // helper is actually injected. A single-line body without the trailing
+  // comma does NOT match and the helper is never installed.
+  const input = [
+    "function registeredModelToPiModel(input) {",
+    "  return {",
+    "    id: input.model.id,",
+    "    input: input.model.input,",
+    "  };",
+    "}",
+  ].join("\n");
+  try {
+    process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"] = "1";
+    delete process.env["LETTA_VISION_MODELS"];
+    const patched = patchLettaCodeSourceForTest(input);
+    const helperStart = patched.indexOf("globalThis.__lcpFixLocalVisionInput =");
+    const helperEnd = patched.indexOf("\nfunction registeredModelToPiModel", helperStart);
+    assert.notEqual(helperStart, -1, "vision helper must be injected");
+    assert.notEqual(helperEnd, -1);
+    const helperSource = patched.slice(helperStart, helperEnd);
+    globalThis.__lcpFixLocalVisionInput = undefined;
+    eval(helperSource);
+    const fixInput = readInjectedLocalVisionInputHelper() as (
+      p: string,
+      m: string,
+      i: string[],
+    ) => string[];
+    if (typeof fixInput !== "function") {
+      assert.fail("expected __lcpFixLocalVisionInput helper to be installed");
+    }
+
+    for (const pattern of VISION_MODEL_PATTERNS) {
+      // Build a model id that contains the pattern verbatim (lowercased).
+      const modelId = `test-${pattern}-model`;
+      assert.deepEqual(
+        fixInput("lmstudio", modelId, ["text"]),
+        ["text", "image"],
+        `fallback regex must match VISION_MODEL_PATTERNS entry "${pattern}" (model id "${modelId}")`,
+      );
+    }
+  } finally {
+    if (previousExperimental === undefined) {
+      delete process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"];
+    } else {
+      process.env["LETTA_LOCAL_BACKEND_EXPERIMENTAL"] = previousExperimental;
+    }
+    if (previousVisionModels === undefined) {
+      delete process.env["LETTA_VISION_MODELS"];
+    } else {
+      process.env["LETTA_VISION_MODELS"] = previousVisionModels;
     }
     globalThis.__lcpFixLocalVisionInput = undefined;
   }
