@@ -274,7 +274,7 @@ const LOCAL_VISION_INPUT_HELPER_DEFINITION =
   `      if (envList.some((p) => haystack.includes(p)) || /\\bvl\\b/.test(haystack)) {\n` +
   `        return [...current, "image"];\n` +
   `      }\n` +
-  `    } else if (/llava|vision|\\bvl\\b|opus|sonnet|haiku|claude|fable|gpt-|gpt5|gemini|grok|minimax/i.test(haystack)) {\n` +
+  `    } else if (/llava|vision|\\bvl\\b|qwen-vl|qwen2-vl|qwen2\\.5-vl|opus|sonnet|haiku|claude|fable|gpt-|gpt5|gemini|grok|minimax/i.test(haystack)) {\n` +
   `      return [...current, "image"];\n` +
   `    }\n` +
   `  } catch {}\n` +
