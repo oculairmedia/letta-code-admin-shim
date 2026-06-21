@@ -224,3 +224,119 @@ test("compaction gracefully catches and logs file system write/rename errors", a
     }
   });
 });
+
+
+test("resumeConversation on an unknown conversationId returns an empty ok result", async () => {
+  await withBackendDir(async () => {
+    // Never stamped; sidecar gets a fresh default state on read.
+    const resumed = resumeConversation("conv-never-stamped", 0);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.cursorExpired, false);
+    assert.equal(resumed.conversationId, "conv-never-stamped");
+    assert.equal(resumed.lastSeq, 0);
+    assert.equal(resumed.oldestSeq, null);
+    assert.equal(resumed.frames.length, 0);
+
+    // resumeConversation must tolerate unknown ids without throwing even with
+    // a non-numeric seq (normalizeSeq("not-a-number") === 0).
+    const resumed2 = resumeConversation("conv-never-stamped-2", "not-a-number" as unknown as number);
+    assert.equal(resumed2.ok, true);
+    assert.equal(resumed2.afterSeq, 0);
+    assert.equal(resumed2.frames.length, 0);
+  });
+});
+
+test("resumeConversation normalizes null afterSeq to 0 (resume from beginning)", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-null-seq";
+    for (let i = 1; i <= 3; i++) {
+      stampConversationFrame(conv, { type: "ping", n: i });
+    }
+    const resumed = resumeConversation(conv, null as unknown as number);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.afterSeq, 0);
+    assert.equal(resumed.lastSeq, 3);
+    assert.deepEqual(
+      resumed.frames.map((f) => f["conv_seq"]),
+      [1, 2, 3],
+    );
+  });
+});
+
+test("resumeConversation normalizes negative afterSeq to 0", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-negative-seq";
+    for (let i = 1; i <= 3; i++) {
+      stampConversationFrame(conv, { type: "ping", n: i });
+    }
+    const resumed = resumeConversation(conv, -5);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.afterSeq, 0);
+    assert.deepEqual(
+      resumed.frames.map((f) => f["conv_seq"]),
+      [1, 2, 3],
+    );
+  });
+});
+
+test("resumeConversation normalizes non-numeric afterSeq strings to 0", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-nonnumeric-seq";
+    for (let i = 1; i <= 2; i++) {
+      stampConversationFrame(conv, { type: "ping", n: i });
+    }
+    const resumed = resumeConversation(conv, "abc" as unknown as number);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.afterSeq, 0);
+    assert.deepEqual(
+      resumed.frames.map((f) => f["conv_seq"]),
+      [1, 2],
+    );
+  });
+});
+
+test("resumeConversation handles very large afterSeq by returning no future frames", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-large-seq";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+    stampConversationFrame(conv, { type: "ping", n: 2 });
+    const big = Number.MAX_SAFE_INTEGER;
+    const resumed = resumeConversation(conv, big);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.cursorExpired, false);
+    assert.equal(resumed.afterSeq, big);
+    assert.equal(resumed.lastSeq, 2);
+    assert.equal(resumed.frames.length, 0);
+  });
+});
+
+test("resumeConversation reports cursorExpired when afterSeq is before the oldest retained seq", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-cursor-expired";
+    // Stamp 5 frames then ack 3 → only frames 4 and 5 remain in the replay log.
+    for (let i = 1; i <= 5; i++) {
+      stampConversationFrame(conv, { type: "ping", n: i });
+    }
+    ackConversation(conv, 3);
+
+    // Asking for everything strictly after seq=1 is older than the oldest
+    // retained seq (4), so the cursor is expired.
+    const stale = resumeConversation(conv, 1);
+    assert.equal(stale.ok, false);
+    assert.equal(stale.cursorExpired, true);
+    assert.equal(stale.conversationId, conv);
+    assert.equal(stale.afterSeq, 1);
+    assert.equal(stale.lastSeq, 5);
+    assert.equal(stale.oldestSeq, 4);
+    assert.equal(stale.frames.length, 0);
+
+    // The boundary: afterSeq equal to oldestSeq-1 is NOT expired.
+    const boundary = resumeConversation(conv, 3);
+    assert.equal(boundary.ok, true);
+    assert.equal(boundary.cursorExpired, false);
+    assert.deepEqual(
+      boundary.frames.map((f) => f["conv_seq"]),
+      [4, 5],
+    );
+  });
+});
