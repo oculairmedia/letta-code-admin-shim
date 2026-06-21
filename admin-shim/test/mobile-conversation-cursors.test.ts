@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync, statSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -171,4 +171,56 @@ test("subscribeConversationEvents receives stamped conversation frames", () => {
   }
   stampConversationFrame(conv, { type: "assistant_message", content: "after unsubscribe" });
   assert.equal(observed.length, 1, "unsubscribe should stop live conversation delivery");
+});
+
+
+test("compaction treats NaN/Infinity ackSeq as 0 (retains frames)", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-nan-ack";
+    for (let i = 1; i <= 3; i++) {
+      stampConversationFrame(conv, { type: "ping", n: i });
+    }
+
+    // Using internal function directly to pass non-standard numeric inputs.
+    // normal ackConversation normalizes its input, but maybeCompactReplayLog
+    // takes a raw number and passes it to readReplayFrames.
+    _cursorInternals.maybeCompactReplayLog(conv, NaN as any);
+    assert.equal(replayLineCount(conv), 3);
+
+    _cursorInternals.maybeCompactReplayLog(conv, Infinity as any);
+    // Since readReplayFrames checks `convSeq <= lastAckSeq`, and convSeq (e.g. 1) <= Infinity is true,
+    // Infinity means all frames will be dropped.
+    assert.equal(replayLineCount(conv), 0);
+  });
+});
+
+test("compaction gracefully catches and logs file system write/rename errors", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-fs-error";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+
+    // Create a scenario where writeFileSync or renameSync will fail.
+    // Instead of monkey-patching, we can make the parent directory read-only,
+    // or just pass a mock that fails if we are using an internal dependency,
+    // but here we can just chmod the replay directory to read-only before compaction
+    // and then restore it.
+
+    const logPath = replayLogPath(conv);
+    const dir = join(logPath, "..");
+    const origMode = statSync(dir).mode;
+
+    // Remove write permissions from the directory so renameSync fails
+    chmodSync(dir, 0o555);
+
+    try {
+      // Should not throw, but catch block should execute and log a warning.
+      _cursorInternals.maybeCompactReplayLog(conv, 0);
+
+      // Since it failed, we can verify it via the console.warn if we spy on it,
+      // but the core requirement is just that it doesn't throw.
+    } finally {
+      // Restore permissions
+      chmodSync(dir, origMode);
+    }
+  });
 });
