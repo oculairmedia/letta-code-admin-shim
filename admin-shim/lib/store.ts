@@ -424,10 +424,22 @@ const _listAllConversationsCached = makeDirMtimeCache(
     const root = join(storageDir(), "conversations");
     const out: OnDiskConversation[] = [];
     if (!existsSync(root)) return out;
-    for (const dirName of await fsReaddir(root)) {
-      const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
-      if (!isConversationOnDisk(conv)) continue;
-      out.push(await withRealTimes(conv));
+    const dirNames = await fsReaddir(root);
+    const BATCH_SIZE = 32;
+    for (let i = 0; i < dirNames.length; i += BATCH_SIZE) {
+      const batch = dirNames.slice(i, i + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map(async (dirName) => {
+          const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
+          if (!isConversationOnDisk(conv)) return null;
+          return withRealTimes(conv);
+        })
+      );
+      for (const conv of results) {
+        if (conv) {
+          out.push(conv);
+        }
+      }
     }
     return out;
   },
@@ -526,10 +538,22 @@ const convIdMap = makeDirMtimeCache(
     const map = new Map<string, ResolvedConversation>();
     const root = join(storageDir(), "conversations");
     if (existsSync(root)) {
-      for (const dirName of await fsReaddir(root)) {
-        const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
-        if (!isConversationOnDisk(conv)) continue;
-        map.set(conv.id, { conversationId: conv.id, agentId: conv.agent_id });
+      const dirNames = await fsReaddir(root);
+      const BATCH_SIZE = 32;
+      for (let i = 0; i < dirNames.length; i += BATCH_SIZE) {
+        const batch = dirNames.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(
+          batch.map(async (dirName) => {
+            const conv = await readJsonOrNullAsync(join(root, dirName, "conversation.json"));
+            if (!isConversationOnDisk(conv)) return null;
+            return conv;
+          })
+        );
+        for (const conv of results) {
+          if (conv) {
+            map.set(conv.id, { conversationId: conv.id, agentId: conv.agent_id });
+          }
+        }
       }
     }
     return map;
