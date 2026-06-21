@@ -27,6 +27,8 @@ import {
   getDefaultOpenAIModels,
   getDefaultAnthropicModels,
   getDefaultDeepSeekModels,
+  getOpenAICompatibleModelsFromEnv,
+  discoverOpenAICompatibleModels,
 } from "../lib/model-catalog.js";
 
 function catalogFor(provider: string): ProviderCatalog {
@@ -331,4 +333,139 @@ test("getDefaultDeepSeekModels: returns expected hardcoded models", () => {
   assert.ok(models.length > 0, "Should return at least one model");
   assert.ok(models.includes("deepseek-v4-flash"));
   assert.ok(models.includes("deepseek-v3"));
+});
+
+
+// ──────────────────────────────────────────────────────────────────────
+// discoverOpenAICompatibleModels — async discovery via /models endpoint.
+// Mocks globalThis.fetch; restores original fetch on test teardown.
+// ──────────────────────────────────────────────────────────────────────
+
+type FetchFn = (input: unknown, init?: unknown) => Promise<{
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}>;
+
+function withMockFetch<T>(
+  t: { mock: { restoreAll?: () => void } } | unknown,
+  fake: FetchFn,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = fake as typeof globalThis.fetch;
+  return Promise.resolve()
+    .then(() => fn())
+    .finally(() => {
+      globalThis.fetch = original;
+    });
+}
+
+test("discoverOpenAICompatibleModels: returns parsed model ids on a 200 /models response", async () => {
+  const fake: FetchFn = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: [{ id: "gpt-4o" }, { id: "gpt-4-turbo" }, { id: "custom-1" }] }),
+  });
+  await withMockFetch(null, fake, async () => {
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "custom-1"]);
+  });
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults when /models returns empty data array", async () => {
+  const fake: FetchFn = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: [] }),
+  });
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  delete process.env["OPENAI_LIKE_API_MODELS"];
+  try {
+    await withMockFetch(null, fake, async () => {
+      const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+      assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+    });
+  } finally {
+    if (prev !== undefined) process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults on non-OK status", async () => {
+  const fake: FetchFn = async () => ({
+    ok: false,
+    status: 500,
+    json: async () => ({}),
+  });
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify(["env-fallback-1"]);
+  try {
+    await withMockFetch(null, fake, async () => {
+      const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+      assert.deepStrictEqual(models, ["env-fallback-1"]);
+    });
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults when fetch throws (network error)", async () => {
+  const fake: FetchFn = async () => {
+    throw new Error("ECONNREFUSED");
+  };
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  delete process.env["OPENAI_LIKE_API_MODELS"];
+  try {
+    await withMockFetch(null, fake, async () => {
+      const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+      assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+    });
+  } finally {
+    if (prev !== undefined) process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults on response payload shape mismatch", async () => {
+  // /models returns something that isn't the OpenAI { data: [{id}] } shape.
+  const fake: FetchFn = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ models: ["x", "y"] }), // wrong shape
+  });
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  delete process.env["OPENAI_LIKE_API_MODELS"];
+  try {
+    await withMockFetch(null, fake, async () => {
+      const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+      assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+    });
+  } finally {
+    if (prev !== undefined) process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("discoverOpenAICompatibleModels: respects a small timeoutMs and falls back when aborted", async () => {
+  // Simulate an AbortError-style rejection from fetch when the timeout fires.
+  const fake: FetchFn = async (_input, init) => {
+    const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
+    if (signal) {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => reject(new Error("aborted"));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+    throw new Error("should not reach");
+  };
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  delete process.env["OPENAI_LIKE_API_MODELS"];
+  try {
+    await withMockFetch(null, fake, async () => {
+      const models = await discoverOpenAICompatibleModels("https://example.com/v1", 25);
+      assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+    });
+  } finally {
+    if (prev !== undefined) process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
 });
