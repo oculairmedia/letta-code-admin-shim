@@ -27,6 +27,7 @@ import {
   getDefaultOpenAIModels,
   getDefaultAnthropicModels,
   getDefaultDeepSeekModels,
+  getOpenAICompatibleModelsFromEnv,
 } from "../lib/model-catalog.js";
 
 function catalogFor(provider: string): ProviderCatalog {
@@ -331,4 +332,102 @@ test("getDefaultDeepSeekModels: returns expected hardcoded models", () => {
   assert.ok(models.length > 0, "Should return at least one model");
   assert.ok(models.includes("deepseek-v4-flash"));
   assert.ok(models.includes("deepseek-v3"));
+});
+
+
+test("getOpenAICompatibleModelsFromEnv: returns defaults when env var is unset", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  delete process.env["OPENAI_LIKE_API_MODELS"];
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.ok(Array.isArray(models));
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev !== undefined) process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: returns defaults when env var is empty string", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = "";
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: parses a single-model JSON array", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify(["custom-model-x"]);
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["custom-model-x"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: parses a multi-model JSON array preserving order", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify(["alpha", "beta", "gamma", "delta"]);
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["alpha", "beta", "gamma", "delta"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: falls back to defaults on malformed JSON", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = "this is not valid json {[";
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: falls back to defaults on valid JSON that is not a string array", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  // Object instead of array.
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify({ model: "x" });
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: falls back to defaults when array contains non-string entries", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify(["ok", 42, true, null]);
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: empty JSON array yields empty result (no defaults)", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = "[]";
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, []);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
 });
