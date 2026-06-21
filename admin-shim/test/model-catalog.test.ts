@@ -499,7 +499,7 @@ test("discoverOpenAICompatibleModels: respects a small timeoutMs and falls back 
     signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
   });
   await withMockFetch(fake, async () => {
-    const models = await discoverOpenAICompatibleModels("https://example.com/v1", undefined, 1);
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1", 1);
     assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
   });
 });
