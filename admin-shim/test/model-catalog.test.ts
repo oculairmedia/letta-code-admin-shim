@@ -28,6 +28,7 @@ import {
   getDefaultAnthropicModels,
   getDefaultDeepSeekModels,
   getOpenAICompatibleModelsFromEnv,
+  discoverOpenAICompatibleModels,
 } from "../lib/model-catalog.js";
 
 function catalogFor(provider: string): ProviderCatalog {
@@ -431,3 +432,75 @@ test("getOpenAICompatibleModelsFromEnv: empty JSON array yields empty result (no
     else process.env["OPENAI_LIKE_API_MODELS"] = prev;
   }
 });
+
+type FetchFn = (input: unknown, init?: unknown) => Promise<{
+  ok: boolean;
+  status: number;
+  json(): Promise<unknown>;
+}>;
+
+async function withMockFetch<T>(fake: FetchFn, fn: () => Promise<T>): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = fake as typeof globalThis.fetch;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test("discoverOpenAICompatibleModels: returns parsed model ids on a 200 /models response", async () => {
+  const fake: FetchFn = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ data: [{ id: "gpt-4o" }, { id: "gpt-4-turbo" }, { id: "custom-1" }] }),
+  });
+  await withMockFetch(fake, async () => {
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "custom-1"]);
+  });
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults when /models returns empty data array", async () => {
+  const fake: FetchFn = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
+  await withMockFetch(fake, async () => {
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  });
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults on non-OK status", async () => {
+  const fake: FetchFn = async () => ({ ok: false, status: 503, json: async () => ({ error: "unavailable" }) });
+  await withMockFetch(fake, async () => {
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  });
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults when fetch throws", async () => {
+  const fake: FetchFn = async () => { throw new Error("network down"); };
+  await withMockFetch(fake, async () => {
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  });
+});
+
+test("discoverOpenAICompatibleModels: falls back to env defaults on response payload shape mismatch", async () => {
+  const fake: FetchFn = async () => ({ ok: true, status: 200, json: async () => ({ models: [{ name: "not-data" }] }) });
+  await withMockFetch(fake, async () => {
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1");
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  });
+});
+
+test("discoverOpenAICompatibleModels: respects a small timeoutMs and falls back when aborted", async () => {
+  const fake: FetchFn = async (_input, init) => new Promise((_resolve, reject) => {
+    const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
+    signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+  });
+  await withMockFetch(fake, async () => {
+    const models = await discoverOpenAICompatibleModels("https://example.com/v1", undefined, 1);
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  });
+});
+
