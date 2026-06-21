@@ -215,16 +215,6 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       capabilities: ["text"],
       releaseDate: "2023-03-14",
     },
-    "gpt-3.5-turbo": {
-      id: "gpt-3.5-turbo",
-      name: "GPT-3.5 Turbo",
-      contextWindow: 4096,
-      maxTokens: 2048,
-      family: "gpt-3.5",
-      capabilities: ["text"],
-      releaseDate: "2022-11-30",
-      deprecated: true,
-    },
     "o1": {
       id: "o1",
       name: "O1",
@@ -563,7 +553,7 @@ export function getOpenAICompatibleModelsFromEnv(): string[] {
  * Get default OpenAI models (hardcoded fallback).
  */
 export function getDefaultOpenAIModels(): string[] {
-  return ["gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"];
+  return ["gpt-4o", "gpt-4-turbo", "gpt-4"];
 }
 
 /**
