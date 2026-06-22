@@ -130,6 +130,7 @@ export const VISION_MODEL_PATTERNS: readonly string[] = [
 
 /** True when the handle/model-id names a known vision-capable family. */
 export function isVisionCapableModel(handleOrId: string): boolean {
+  if (typeof handleOrId !== "string") return false;
   const haystack = handleOrId.toLowerCase();
   if (VISION_MODEL_PATTERNS.some((p) => haystack.includes(p))) return true;
   // "vl" needs word-boundary semantics so e.g. "vllm" doesn't match.

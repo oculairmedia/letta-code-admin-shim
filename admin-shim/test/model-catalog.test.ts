@@ -20,10 +20,15 @@ import {
   findNearestModel,
   validateModelHandle,
   getSafeFallbackModel,
+  isVisionCapableModel,
   FALLBACK_MODEL_CATALOG,
   KNOWN_PROVIDERS,
   PROVIDER_TO_ENDPOINT_TYPE,
   type ProviderCatalog,
+  getDefaultOpenAIModels,
+  getDefaultAnthropicModels,
+  getDefaultDeepSeekModels,
+  getOpenAICompatibleModelsFromEnv,
 } from "../lib/model-catalog.js";
 
 function catalogFor(provider: string): ProviderCatalog {
@@ -126,15 +131,33 @@ test("isKnownProvider: unknown providers", () => {
 });
 
 test("normalizeAnthropicVersion: dot to dash", () => {
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4.6"), "claude-opus-4-6");
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4.7"), "claude-opus-4-7");
-  assert.strictEqual(normalizeAnthropicVersion("claude-sonnet-4.6"), "claude-sonnet-4-6");
-  assert.strictEqual(normalizeAnthropicVersion("claude-haiku-4.5"), "claude-haiku-4-5");
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4.6"),
+    "claude-opus-4-6",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4.7"),
+    "claude-opus-4-7",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-sonnet-4.6"),
+    "claude-sonnet-4-6",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-haiku-4.5"),
+    "claude-haiku-4-5",
+  );
 });
 
 test("normalizeAnthropicVersion: already dash", () => {
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4-6"), "claude-opus-4-6");
-  assert.strictEqual(normalizeAnthropicVersion("claude-opus-4-7"), "claude-opus-4-7");
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4-6"),
+    "claude-opus-4-6",
+  );
+  assert.strictEqual(
+    normalizeAnthropicVersion("claude-opus-4-7"),
+    "claude-opus-4-7",
+  );
 });
 
 test("findNearestModel: exact match", () => {
@@ -146,8 +169,14 @@ test("findNearestModel: exact match", () => {
 test("findNearestModel: Anthropic version normalization", () => {
   const catalog = catalogFor("anthropic");
   // Dot notation should normalize to dash
-  assert.strictEqual(findNearestModel("claude-opus-4.6", catalog), "claude-opus-4-6");
-  assert.strictEqual(findNearestModel("claude-opus-4.7", catalog), "claude-opus-4-7");
+  assert.strictEqual(
+    findNearestModel("claude-opus-4.6", catalog),
+    "claude-opus-4-6",
+  );
+  assert.strictEqual(
+    findNearestModel("claude-opus-4.7", catalog),
+    "claude-opus-4-7",
+  );
 });
 
 test("findNearestModel: fallback to first available", () => {
@@ -222,9 +251,16 @@ test("FALLBACK_MODEL_CATALOG: structure validation", () => {
   // Check that all models have required metadata
   for (const [provider, models] of Object.entries(FALLBACK_MODEL_CATALOG)) {
     for (const [modelId, metadata] of Object.entries(models)) {
-      assert.strictEqual(metadata.id, modelId, `Model ID mismatch in ${provider}/${modelId}`);
+      assert.strictEqual(
+        metadata.id,
+        modelId,
+        `Model ID mismatch in ${provider}/${modelId}`,
+      );
       assert.ok(metadata.name, `Missing name for ${provider}/${modelId}`);
-      assert.ok(metadata.contextWindow > 0, `Invalid contextWindow for ${provider}/${modelId}`);
+      assert.ok(
+        metadata.contextWindow > 0,
+        `Invalid contextWindow for ${provider}/${modelId}`,
+      );
     }
   }
 });
@@ -271,4 +307,174 @@ test("Model catalog: Ollama models", () => {
 test("Model catalog: LM Studio models", () => {
   const lmstudio = catalogFor("lmstudio");
   assert.ok(lmstudio["opus-4-7"] !== undefined);
+});
+
+test("isVisionCapableModel: empty string", () => {
+  assert.strictEqual(isVisionCapableModel(""), false);
+});
+
+test("isVisionCapableModel: non-string inputs", () => {
+  // Although TS types catch this, at runtime we shouldn't throw when fed bad data
+  assert.strictEqual(isVisionCapableModel(null as any), false);
+  assert.strictEqual(isVisionCapableModel(undefined as any), false);
+  assert.strictEqual(isVisionCapableModel(123 as any), false);
+  assert.strictEqual(isVisionCapableModel({} as any), false);
+});
+
+test("isVisionCapableModel: NaN and Infinity", () => {
+  assert.strictEqual(isVisionCapableModel(NaN as any), false);
+  assert.strictEqual(isVisionCapableModel(Infinity as any), false);
+});
+
+test("isVisionCapableModel: true for known vision patterns", () => {
+  assert.strictEqual(isVisionCapableModel("gpt-4-vision"), true);
+  assert.strictEqual(isVisionCapableModel("claude-3-opus"), true);
+  assert.strictEqual(isVisionCapableModel("llava-1.5"), true);
+  assert.strictEqual(isVisionCapableModel("gemini-1.5-pro"), true);
+  assert.strictEqual(isVisionCapableModel("qwen-vl-max"), true);
+  assert.strictEqual(isVisionCapableModel("minimax-m3"), true);
+});
+
+test("isVisionCapableModel: false for text-only models", () => {
+  assert.strictEqual(isVisionCapableModel("llama-3"), false);
+  assert.strictEqual(isVisionCapableModel("mixtral-8x7b"), false);
+  assert.strictEqual(isVisionCapableModel("command-r"), false);
+  assert.strictEqual(isVisionCapableModel("deepseek-coder"), false);
+});
+
+test("isVisionCapableModel: case insensitive", () => {
+  assert.strictEqual(isVisionCapableModel("GPT-4-VISION"), true);
+  assert.strictEqual(isVisionCapableModel("Claude-3-Opus"), true);
+});
+
+test("isVisionCapableModel: word-boundary 'vl' logic", () => {
+  // Should match "vl"
+  assert.strictEqual(isVisionCapableModel("qwen-vl"), true);
+  assert.strictEqual(isVisionCapableModel("qwen2-vl"), true);
+  // Shouldn't match vllm
+  assert.strictEqual(isVisionCapableModel("meta-llama/Meta-Llama-3-8B-Instruct-vllm"), false);
+});
+
+test("getDefaultOpenAIModels: returns expected hardcoded models", () => {
+  const models = getDefaultOpenAIModels();
+  assert.ok(Array.isArray(models), "Should return an array");
+  assert.ok(models.length > 0, "Should return at least one model");
+  assert.ok(models.includes("gpt-4o"));
+  assert.ok(models.includes("gpt-4-turbo"));
+  assert.ok(models.includes("gpt-4"));
+});
+
+test("getDefaultAnthropicModels: returns expected hardcoded models", () => {
+  const models = getDefaultAnthropicModels();
+  assert.ok(Array.isArray(models), "Should return an array");
+  assert.ok(models.length > 0, "Should return at least one model");
+  assert.ok(models.includes("claude-fable-5"));
+  assert.ok(models.includes("claude-opus-4-8"));
+  assert.ok(models.includes("claude-sonnet-4-6"));
+});
+
+test("getDefaultDeepSeekModels: returns expected hardcoded models", () => {
+  const models = getDefaultDeepSeekModels();
+  assert.ok(Array.isArray(models), "Should return an array");
+  assert.ok(models.length > 0, "Should return at least one model");
+  assert.ok(models.includes("deepseek-v4-flash"));
+  assert.ok(models.includes("deepseek-v3"));
+});
+
+
+test("getOpenAICompatibleModelsFromEnv: returns defaults when env var is unset", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  delete process.env["OPENAI_LIKE_API_MODELS"];
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.ok(Array.isArray(models));
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev !== undefined) process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: returns defaults when env var is empty string", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = "";
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: parses a single-model JSON array", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify(["custom-model-x"]);
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["custom-model-x"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: parses a multi-model JSON array preserving order", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify(["alpha", "beta", "gamma", "delta"]);
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["alpha", "beta", "gamma", "delta"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: falls back to defaults on malformed JSON", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = "this is not valid json {[";
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: falls back to defaults on valid JSON that is not a string array", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  // Object instead of array.
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify({ model: "x" });
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: falls back to defaults when array contains non-string entries", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = JSON.stringify(["ok", 42, true, null]);
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, ["gpt-4o", "gpt-4-turbo", "gpt-4"]);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
+});
+
+test("getOpenAICompatibleModelsFromEnv: empty JSON array yields empty result (no defaults)", () => {
+  const prev = process.env["OPENAI_LIKE_API_MODELS"];
+  process.env["OPENAI_LIKE_API_MODELS"] = "[]";
+  try {
+    const models = getOpenAICompatibleModelsFromEnv();
+    assert.deepStrictEqual(models, []);
+  } finally {
+    if (prev === undefined) delete process.env["OPENAI_LIKE_API_MODELS"];
+    else process.env["OPENAI_LIKE_API_MODELS"] = prev;
+  }
 });

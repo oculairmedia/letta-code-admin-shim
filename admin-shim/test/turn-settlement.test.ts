@@ -460,3 +460,124 @@ test("settle: writes settlements.jsonl audit entry alongside run state", async (
     rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });
   }
 });
+
+// ── Edge cases ─────────────────────────────────────────────────────────
+
+test("settle: handles empty messageIdsBefore collection gracefully", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agent = "agent-edge-1";
+    const convDir = seedConv(stateDir, "default", agent);
+
+    // Simulate some on-disk messages but messageIdsBefore is completely empty
+    writeMessages(convDir, [
+      assistantToolCall("toolu_edge", "Bash")
+    ]);
+
+    const report = await settleDanglingToolCallsFromFrames({
+      frames: [toolCallFrame("Bash", "toolu_edge")],
+      conversationId: "default",
+      agentId: agent,
+      runId: "run-edge-1",
+      reason: "stream_dropped",
+      messageIdsBefore: new Set<string>(), // Empty collection
+      stateDir,
+    });
+
+    assert.deepEqual(report.emitted, ["toolu_edge"]);
+    assert.equal(report.settled.length, 1);
+    assert.equal(report.messagesAppended, 1);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("settle: ignores invalid toolResult records with null/missing IDs", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agent = "agent-edge-2";
+    const convDir = seedConv(stateDir, "default", agent);
+
+    writeMessages(convDir, [
+      assistantToolCall("toolu_edge_2", "Bash"),
+      // Invalid toolResult with null toolCallId
+      { id: "msg-1", role: "toolResult", toolCallId: null, content: "err" } as any,
+      // Invalid toolResult with missing id
+      { role: "toolResult", toolCallId: "toolu_edge_2", content: "err" } as any,
+      // Invalid toolResult with numeric id
+      { id: 123, role: "toolResult", toolCallId: "toolu_edge_2", content: "err" } as any
+    ]);
+
+    const before = new Set<string>();
+
+    const report = await settleDanglingToolCallsFromFrames({
+      frames: [toolCallFrame("Bash", "toolu_edge_2")],
+      conversationId: "default",
+      agentId: agent,
+      runId: "run-edge-2",
+      reason: "turn_timeout",
+      messageIdsBefore: before,
+      stateDir,
+    });
+
+    // Because the invalid toolResult records were skipped, it still thinks toolu_edge_2 is dangling
+    assert.deepEqual(report.emitted, ["toolu_edge_2"]);
+    assert.equal(report.returned.length, 0); // No valid returns found
+    assert.equal(report.settled.length, 1);
+    assert.equal(report.messagesAppended, 1);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("settle: handles NaN and Infinity for now parameter by rejecting RangeError", async () => {
+  const stateDir = makeTempStateDir();
+  try {
+    const agent = "agent-edge-3";
+    const convDir = seedConv(stateDir, "default", agent);
+
+    writeMessages(convDir, [
+      assistantToolCall("toolu_edge_3", "Bash")
+    ]);
+
+    const before = new Set<string>();
+
+    // Test with NaN
+    await assert.rejects(
+      async () => {
+        await settleDanglingToolCallsFromFrames({
+          frames: [toolCallFrame("Bash", "toolu_edge_3")],
+          conversationId: "default",
+          agentId: agent,
+          runId: "run-edge-3",
+          reason: "cancelled",
+          messageIdsBefore: before,
+          now: NaN,
+          stateDir,
+        });
+      },
+      /RangeError: Invalid time value/,
+      "Expected to throw RangeError for NaN date"
+    );
+
+    // Test with Infinity
+    await assert.rejects(
+      async () => {
+        await settleDanglingToolCallsFromFrames({
+          frames: [toolCallFrame("Bash", "toolu_edge_3")],
+          conversationId: "default",
+          agentId: agent,
+          runId: "run-edge-3",
+          reason: "cancelled",
+          messageIdsBefore: before,
+          now: Infinity,
+          stateDir,
+        });
+      },
+      /RangeError: Invalid time value/,
+      "Expected to throw RangeError for Infinity date"
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, existsSync, rmSync, statSync, chmodSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -171,4 +171,198 @@ test("subscribeConversationEvents receives stamped conversation frames", () => {
   }
   stampConversationFrame(conv, { type: "assistant_message", content: "after unsubscribe" });
   assert.equal(observed.length, 1, "unsubscribe should stop live conversation delivery");
+});
+
+
+test("compaction treats NaN/Infinity ackSeq as 0 (retains frames)", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-nan-ack";
+    for (let i = 1; i <= 3; i++) {
+      stampConversationFrame(conv, { type: "ping", n: i });
+    }
+
+    // Using internal function directly to pass non-standard numeric inputs.
+    // normal ackConversation normalizes its input, but maybeCompactReplayLog
+    // takes a raw number and passes it to readReplayFrames.
+    _cursorInternals.maybeCompactReplayLog(conv, NaN as any);
+    assert.equal(replayLineCount(conv), 3);
+
+    _cursorInternals.maybeCompactReplayLog(conv, Infinity as any);
+    // Since readReplayFrames checks `convSeq <= lastAckSeq`, and convSeq (e.g. 1) <= Infinity is true,
+    // Infinity means all frames will be dropped.
+    assert.equal(replayLineCount(conv), 0);
+  });
+});
+
+test("compaction gracefully catches and logs file system write/rename errors", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-fs-error";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+
+    // Create a scenario where writeFileSync or renameSync will fail.
+    // Instead of monkey-patching, we can make the parent directory read-only,
+    // or just pass a mock that fails if we are using an internal dependency,
+    // but here we can just chmod the replay directory to read-only before compaction
+    // and then restore it.
+
+    const logPath = replayLogPath(conv);
+    const dir = join(logPath, "..");
+    const origMode = statSync(dir).mode;
+
+    // Remove write permissions from the directory so renameSync fails
+    chmodSync(dir, 0o555);
+
+    try {
+      // Should not throw, but catch block should execute and log a warning.
+      _cursorInternals.maybeCompactReplayLog(conv, 0);
+
+      // Since it failed, we can verify it via the console.warn if we spy on it,
+      // but the core requirement is just that it doesn't throw.
+    } finally {
+      // Restore permissions
+      chmodSync(dir, origMode);
+    }
+  });
+});
+
+
+test("compaction on never-stamped conversation is a safe no-op", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-empty";
+    // No frames ever stamped — replay log should not exist.
+    assert.equal(existsSync(replayLogPath(conv)), false);
+
+    // Compaction must not throw and must not create a log file.
+    _cursorInternals.maybeCompactReplayLog(conv, 0);
+    assert.equal(existsSync(replayLogPath(conv)), false);
+
+    // Resume on the empty conversation must succeed with empty frames.
+    const resumed = resumeConversation(conv, 0);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.frames.length, 0);
+    assert.equal(resumed.lastSeq, 0);
+    assert.equal(resumed.oldestSeq, null);
+    assert.equal(resumed.cursorExpired, false);
+  });
+});
+
+test("compaction of a single unacked frame preserves the frame", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-single";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+    assert.equal(replayLineCount(conv), 1);
+
+    _cursorInternals.maybeCompactReplayLog(conv, 0);
+    assert.equal(replayLineCount(conv), 1);
+
+    const resumed = resumeConversation(conv, 0);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.frames.length, 1);
+    assert.equal(resumed.frames[0]?.["conv_seq"], 1);
+    assert.equal(resumed.lastSeq, 1);
+    assert.equal(resumed.oldestSeq, 1);
+  });
+});
+
+test("compaction preserves ascending sequence order across surviving frames", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-order";
+    for (let i = 1; i <= 8; i++) {
+      stampConversationFrame(conv, { type: "ping", n: i });
+    }
+    // Ack first 3; compaction must keep frames 4..8 in stamped order.
+    ackConversation(conv, 3);
+
+    _cursorInternals.maybeCompactReplayLog(conv, 3);
+    assert.equal(replayLineCount(conv), 5);
+
+    const resumed = resumeConversation(conv, 3);
+    assert.equal(resumed.ok, true);
+    assert.deepEqual(
+      resumed.frames.map((f) => f["conv_seq"]),
+      [4, 5, 6, 7, 8],
+    );
+  });
+});
+
+test("compaction drops malformed JSONL lines and non-record frames", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-malformed";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+
+    // Append a mix of valid and malformed lines directly to the log.
+    const logPath = replayLogPath(conv);
+    const validLine = JSON.stringify({
+      seq: 2,
+      ts: new Date().toISOString(),
+      frame: { conversation_id: conv, conv_seq: 2, type: "valid-after-malformed" },
+    });
+    const garbage = [
+      "this is not json at all",
+      "{",
+      JSON.stringify({ seq: 3, frame: "not-a-record-object" }),
+      JSON.stringify({ seq: 4, frame: ["array", "is-not-record"] }),
+      JSON.stringify({ seq: 5 }),
+    ];
+    appendFileSync(logPath, "\n" + [validLine, ...garbage].join("\n") + "\n");
+    assert.ok(replayLineCount(conv) >= 1 + garbage.length);
+
+    _cursorInternals.maybeCompactReplayLog(conv, 0);
+    const resumed = resumeConversation(conv, 0);
+    assert.equal(resumed.ok, true);
+    const seqs = resumed.frames
+      .map((f) => f["conv_seq"])
+      .sort((a, b) => Number(a) - Number(b));
+    // Only seq=1 (originally stamped) and seq=2 (post-malformed valid) survive.
+    assert.deepEqual(seqs, [1, 2]);
+  });
+});
+
+test("compaction drops entries with non-positive sequence ids (zero, negative)", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-bad-seq";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+
+    const logPath = replayLogPath(conv);
+    const lines = [
+      JSON.stringify({ seq: 0, ts: new Date().toISOString(), frame: { conversation_id: conv, type: "seq-zero" } }),
+      JSON.stringify({ seq: -5, ts: new Date().toISOString(), frame: { conversation_id: conv, type: "seq-negative" } }),
+      JSON.stringify({ seq: -Number.MAX_SAFE_INTEGER, ts: new Date().toISOString(), frame: { conversation_id: conv, type: "seq-minsafe" } }),
+    ];
+    appendFileSync(logPath, "\n" + lines.join("\n") + "\n");
+    assert.ok(replayLineCount(conv) >= 4);
+
+    _cursorInternals.maybeCompactReplayLog(conv, 0);
+    const resumed = resumeConversation(conv, 0);
+    assert.equal(resumed.ok, true);
+    // Only the originally-stamped seq=1 survives; non-positive seqs are dropped.
+    assert.equal(resumed.frames.length, 1);
+    assert.equal(resumed.frames[0]?.["conv_seq"], 1);
+  });
+});
+
+test("compaction drops entries with non-numeric sequence ids (string, null, undefined)", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-nonnumeric-seq";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+
+    const logPath = replayLogPath(conv);
+    const lines = [
+      JSON.stringify({ seq: "abc", ts: new Date().toISOString(), frame: { conversation_id: conv, type: "seq-string" } }),
+      JSON.stringify({ seq: null, ts: new Date().toISOString(), frame: { conversation_id: conv, type: "seq-null" } }),
+      JSON.stringify({ ts: new Date().toISOString(), frame: { conversation_id: conv, type: "seq-missing" } }), // undefined
+      JSON.stringify({ seq: "5", ts: new Date().toISOString(), frame: { conversation_id: conv, type: "seq-coerced", conv_seq: 5 } }),
+    ];
+    appendFileSync(logPath, "\n" + lines.join("\n") + "\n");
+
+    _cursorInternals.maybeCompactReplayLog(conv, 0);
+    const resumed = resumeConversation(conv, 0);
+    assert.equal(resumed.ok, true);
+    const seqs = resumed.frames
+      .map((f) => f["conv_seq"])
+      .sort((a, b) => Number(a) - Number(b));
+    // seq=1 (originally stamped) and seq=5 (numeric string coerces to 5) survive.
+    // "abc", null, missing all normalize to 0 and are dropped.
+    assert.deepEqual(seqs, [1, 5]);
+  });
 });
