@@ -104,7 +104,15 @@ function storageDir(): string {
 }
 
 /** Per-agent derived-index directory, kept out of the git-backed memory tree. */
+
+function validateAgentId(agentId: string): void {
+  if (!/^[a-zA-Z0-9._-]+$/.test(agentId) || /^\.+$/.test(agentId)) {
+    throw new Error(`Invalid agentId: ${agentId}`);
+  }
+}
+
 export function searchDir(agentId: string): string {
+  validateAgentId(agentId);
   return join(storageDir(), "search", agentId);
 }
 
@@ -277,6 +285,7 @@ interface SourceFile {
 
 /** memfs/<agent>/memory/system/*.md — the memory blocks. */
 function blockSourceFiles(agentId: string): SourceFile[] {
+  validateAgentId(agentId);
   const dir = join(storageDir(), "memfs", agentId, "memory", "system");
   if (!existsSync(dir)) return [];
   const out: SourceFile[] = [];
