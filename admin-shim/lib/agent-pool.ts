@@ -295,6 +295,8 @@ export interface LettaSessionAdapter {
   readonly spawnedAt: number;
   /** lcp-rfb: true while a turn is in flight. housekeep() skips eviction. */
   readonly busy?: boolean;
+  /** Currently executing run ID, if any. Useful for cleaning up dangling state on eviction. */
+  readonly activeRunId?: string | null;
   start(): Promise<LettaSessionInit>;
   runTurn(input: string | unknown[], opts?: RunTurnOptions): Promise<AdapterRunTurnResult>;
   abort(reason?: string): Promise<void> | void;
@@ -664,6 +666,9 @@ export class AgentPool {
         const [oldestKey, victim] = victimEntry;
         logLine(`evicting (cap) conv=${oldestKey}`);
         this.workers.delete(oldestKey);
+        if (victim.activeRunId) {
+          rejectApprovalGate(victim.activeRunId, new Error("worker_evicted"));
+        }
         victim.close();
       }
 
@@ -708,6 +713,9 @@ export class AgentPool {
     const worker = this.workers.get(key);
     if (!worker) return false;
     this.workers.delete(key);
+    if (worker.activeRunId) {
+      rejectApprovalGate(worker.activeRunId, new Error("worker_evicted"));
+    }
     try {
       await worker.close();
     } catch (err) {
@@ -723,6 +731,9 @@ export class AgentPool {
     const worker = this.workers.get(key);
     if (!worker) return false;
     this.workers.delete(key);
+    if (worker.activeRunId) {
+      rejectApprovalGate(worker.activeRunId, new Error("worker_evicted"));
+    }
     try {
       void Promise.resolve(worker.close()).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
@@ -939,6 +950,9 @@ export class AgentPool {
         }
         logLine(`evicting (idle) conv=${key} idle=${(now - w.lastUsedAt) / 1000}s`);
         this.workers.delete(key);
+        if (w.activeRunId) {
+          rejectApprovalGate(w.activeRunId, new Error("worker_evicted"));
+        }
         w.close();
       }
     }
@@ -948,7 +962,12 @@ export class AgentPool {
     if (this.housekeepTimer) clearInterval(this.housekeepTimer);
     const all = [...this.workers.values()];
     this.workers.clear();
-    await Promise.allSettled(all.map((w) => w.close()));
+    await Promise.allSettled(all.map((w) => {
+      if (w.activeRunId) {
+        rejectApprovalGate(w.activeRunId, new Error("worker_evicted"));
+      }
+      return w.close();
+    }));
   }
 
   stats(): PoolStats {
