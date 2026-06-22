@@ -20,6 +20,7 @@ import {
   findNearestModel,
   validateModelHandle,
   getSafeFallbackModel,
+  isVisionCapableModel,
   FALLBACK_MODEL_CATALOG,
   KNOWN_PROVIDERS,
   PROVIDER_TO_ENDPOINT_TYPE,
@@ -307,6 +308,52 @@ test("Model catalog: Ollama models", () => {
 test("Model catalog: LM Studio models", () => {
   const lmstudio = catalogFor("lmstudio");
   assert.ok(lmstudio["opus-4-7"] !== undefined);
+});
+
+test("isVisionCapableModel: empty string", () => {
+  assert.strictEqual(isVisionCapableModel(""), false);
+});
+
+test("isVisionCapableModel: non-string inputs", () => {
+  // Although TS types catch this, at runtime we shouldn't throw when fed bad data
+  assert.strictEqual(isVisionCapableModel(null as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel(undefined as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel(123 as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel({} as unknown as string), false);
+});
+
+test("isVisionCapableModel: NaN and Infinity", () => {
+  assert.strictEqual(isVisionCapableModel(NaN as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel(Infinity as unknown as string), false);
+});
+
+test("isVisionCapableModel: true for known vision patterns", () => {
+  assert.strictEqual(isVisionCapableModel("gpt-4-vision"), true);
+  assert.strictEqual(isVisionCapableModel("claude-3-opus"), true);
+  assert.strictEqual(isVisionCapableModel("llava-1.5"), true);
+  assert.strictEqual(isVisionCapableModel("gemini-1.5-pro"), true);
+  assert.strictEqual(isVisionCapableModel("qwen-vl-max"), true);
+  assert.strictEqual(isVisionCapableModel("minimax-m3"), true);
+});
+
+test("isVisionCapableModel: false for text-only models", () => {
+  assert.strictEqual(isVisionCapableModel("llama-3"), false);
+  assert.strictEqual(isVisionCapableModel("mixtral-8x7b"), false);
+  assert.strictEqual(isVisionCapableModel("command-r"), false);
+  assert.strictEqual(isVisionCapableModel("deepseek-coder"), false);
+});
+
+test("isVisionCapableModel: case insensitive", () => {
+  assert.strictEqual(isVisionCapableModel("GPT-4-VISION"), true);
+  assert.strictEqual(isVisionCapableModel("Claude-3-Opus"), true);
+});
+
+test("isVisionCapableModel: word-boundary 'vl' logic", () => {
+  // Should match "vl"
+  assert.strictEqual(isVisionCapableModel("qwen-vl"), true);
+  assert.strictEqual(isVisionCapableModel("qwen2-vl"), true);
+  // Shouldn't match vllm
+  assert.strictEqual(isVisionCapableModel("meta-llama/Meta-Llama-3-8B-Instruct-vllm"), false);
 });
 
 test("getDefaultOpenAIModels: returns expected hardcoded models", () => {
