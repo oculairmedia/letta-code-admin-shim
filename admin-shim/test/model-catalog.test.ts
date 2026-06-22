@@ -316,15 +316,15 @@ test("isVisionCapableModel: empty string", () => {
 
 test("isVisionCapableModel: non-string inputs", () => {
   // Although TS types catch this, at runtime we shouldn't throw when fed bad data
-  assert.strictEqual(isVisionCapableModel(null as any), false);
-  assert.strictEqual(isVisionCapableModel(undefined as any), false);
-  assert.strictEqual(isVisionCapableModel(123 as any), false);
-  assert.strictEqual(isVisionCapableModel({} as any), false);
+  assert.strictEqual(isVisionCapableModel(null as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel(undefined as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel(123 as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel({} as unknown as string), false);
 });
 
 test("isVisionCapableModel: NaN and Infinity", () => {
-  assert.strictEqual(isVisionCapableModel(NaN as any), false);
-  assert.strictEqual(isVisionCapableModel(Infinity as any), false);
+  assert.strictEqual(isVisionCapableModel(NaN as unknown as string), false);
+  assert.strictEqual(isVisionCapableModel(Infinity as unknown as string), false);
 });
 
 test("isVisionCapableModel: true for known vision patterns", () => {
