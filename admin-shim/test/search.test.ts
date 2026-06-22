@@ -369,3 +369,38 @@ test("ensureIndex is a no-op when nothing changed (fresh)", { skip: skipNoSqlite
     assert.equal(second.manifest.last_indexed, ts1, "fresh path does not rebuild");
   });
 });
+
+// ── 9. strict agentId validation prevents path traversal ───────────────
+
+test("rejects malicious agentId to prevent path traversal", { skip: skipNoSqlite }, async () => {
+  await withBackendDir(async () => {
+    const maliciousPayloads = [
+      "../",
+      "..%2f",
+      "/etc/passwd",
+      ".",
+      "..",
+      "...",
+      "agent/../id"
+    ];
+
+    for (const payload of maliciousPayloads) {
+      assert.throws(
+        () => _searchInternals.searchDir(payload),
+        /Invalid agentId/,
+        `searchDir should reject payload: ${payload}`
+      );
+
+      // Also ensure public APIs throw before doing any file ops
+      await assert.rejects(
+        async () => search(payload, "query", 20),
+        /Invalid agentId/,
+        `search should reject payload: ${payload}`
+      );
+    }
+
+    // Valid agentId should pass
+    const validId = "valid-agent_1.0";
+    assert.doesNotThrow(() => _searchInternals.searchDir(validId));
+  });
+});
