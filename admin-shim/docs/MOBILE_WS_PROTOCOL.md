@@ -2209,3 +2209,18 @@ active run. Tests in `admin-shim/test/ws-protocol.test.ts`
 - `/opt/stacks/letta-code-parallel/admin-shim/test/ws-protocol.test.ts`
   — the 23 tests that defend everything in §4 (some are `todo` —
   reasoning_message in particular).
+
+## 13. Headless clients
+
+**Status:** Stable. Documented as part of `lcp-auo`.
+
+The `/shim/v1/mobile` WS is the canonical live transport for *all* clients, including headless test clients. The protocol was originally designed alongside the Android app, but the server contains no implicit Android-only assumptions. Any client-type-specific behavior is opt-in via headers or capability negotiation.
+
+To build a headless test client (e.g. `letta-mobile:cli`), you must implement the following contract surfaces:
+
+- **Connection**: Connect to the `/shim/v1/mobile` endpoint and handle the `welcome` frame structure, which advertises capabilities (see §12).
+- **Opt-in Capabilities**: Provide `a2ui_version` or `theme_hints` in the `hello` frame if you need dynamic UI flows. Otherwise, use a vanilla WS connection.
+- **Run Sequencing**: Follow the per-run `seq` and `run_id` stamping on incoming frames.
+- **Minimal Loop**: Implement the sequence `hello` → `welcome` → `send_message` → receive response frames until `turn_done`.
+
+For a reference implementation of a minimal headless diagnostic client, see `admin-shim/scripts/ws-probe.mjs`.
