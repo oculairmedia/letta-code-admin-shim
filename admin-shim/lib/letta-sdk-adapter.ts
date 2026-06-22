@@ -227,6 +227,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   // serialized by `chain`, so at most one runTurn is in flight; these are
   // set at the top of _runTurnInner and cleared in its finally block.
   get busy(): boolean { return this.currentRunHandle !== null; }
+  get activeRunId(): string | null { return this.currentRunHandle?.id ?? null; }
   private currentRunHandle: RunHandle | null = null;
   private currentOnFrame: ((frame: LettaStreamFrame, meta: { runId: string }) => void) | null = null;
   private currentApprovalScopeCache: Map<string, ApprovalScopeCacheEntry> | null = null;

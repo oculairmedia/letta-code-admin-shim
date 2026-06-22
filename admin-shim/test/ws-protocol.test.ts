@@ -1586,3 +1586,21 @@ test("ws: subscribe_conversation receives out-of-band stamped frames", async (t)
   assert.equal(pushed.content, "background cron completed");
   assert.equal(pushed.id, "server-out-of-band-1");
 });
+
+test("ws: headless clients (non-Android) can connect and receive a welcome frame", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  // Prove that /shim/v1/mobile does not restrict connections to just "android"
+  // client versions by using a headless CLI version.
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    deviceId: "headless-test-client-1",
+    clientVersion: "headless-cli/1.0"
+  });
+  t.after(() => conn.close());
+
+  const welcome = conn.frames.find((f) => f.type === "welcome") as { type: "welcome"; device_id: string } | undefined;
+  assert.ok(welcome, "welcome frame must be present after hello for a headless client");
+  assert.equal(welcome.device_id, "headless-test-client-1", "device_id is echoed properly");
+});
