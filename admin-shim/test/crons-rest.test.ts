@@ -573,3 +573,76 @@ test("trailing slash forms route the same as canonical form", async () => {
     await shim.stop();
   }
 });
+
+
+test("GET /v1/agents/{agent}/schedule returns Letta-compatible scheduled messages", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [
+      makeTask({ id: "sched-a", agent_id: "agent-a", prompt: "daily summary", cron: "0 8 * * *" }),
+      makeTask({ id: "sched-b", agent_id: "agent-b", prompt: "other agent" }),
+    ]);
+    const res = await fetch(`${shim.url}/v1/agents/agent-a/schedule`);
+    assert.equal(res.status, 200);
+    const body = await res.json() as {
+      has_next_page: boolean;
+      scheduled_messages: Array<{
+        id: string;
+        agent_id: string;
+        message: { messages: Array<{ role: string; content: string }> };
+        schedule: { type: string; cron_expression?: string };
+      }>;
+    };
+    assert.equal(body.has_next_page, false);
+    assert.deepEqual(body.scheduled_messages.map((s) => s.id), ["sched-a"]);
+    assert.equal(body.scheduled_messages[0]!.agent_id, "agent-a");
+    assert.equal(body.scheduled_messages[0]!.message.messages[0]!.content, "daily summary");
+    assert.equal(body.scheduled_messages[0]!.schedule.type, "recurring");
+    assert.equal(body.scheduled_messages[0]!.schedule.cron_expression, "0 8 * * *");
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("GET /v1/agents/{agent}/schedule/{id} scopes schedules by agent", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, [makeTask({ id: "sched-a", agent_id: "agent-a" })]);
+    const ok = await fetch(`${shim.url}/v1/agents/agent-a/schedule/sched-a`);
+    assert.equal(ok.status, 200);
+    const missingForOtherAgent = await fetch(`${shim.url}/v1/agents/agent-b/schedule/sched-a`);
+    assert.equal(missingForOtherAgent.status, 404);
+  } finally {
+    await shim.stop();
+  }
+});
+
+test("POST and DELETE /v1/agents/{agent}/schedule bridge to cron store", async () => {
+  const shim = await startShim();
+  try {
+    seedCrons(shim, []);
+    const create = await fetch(`${shim.url}/v1/agents/agent-a/schedule`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "write the weekly summary" }],
+        schedule: { type: "recurring", cron_expression: "0 9 * * 1" },
+      }),
+    });
+    assert.equal(create.status, 201);
+    const created = await create.json() as { id: string; agent_id: string; schedule: { cron_expression?: string } };
+    assert.equal(created.agent_id, "agent-a");
+    assert.equal(created.schedule.cron_expression, "0 9 * * 1");
+
+    const crons = await (await fetch(`${shim.url}/v1/crons?agent_id=agent-a`)).json() as { tasks: CronTask[] };
+    assert.equal(crons.tasks.length, 1);
+    assert.equal(crons.tasks[0]!.prompt, "write the weekly summary");
+
+    const del = await fetch(`${shim.url}/v1/agents/agent-a/schedule/${created.id}`, { method: "DELETE" });
+    assert.equal(del.status, 200);
+    const after = await (await fetch(`${shim.url}/v1/agents/agent-a/schedule`)).json() as { scheduled_messages: unknown[] };
+    assert.equal(after.scheduled_messages.length, 0);
+  } finally {
+    await shim.stop();
+  }
+});
