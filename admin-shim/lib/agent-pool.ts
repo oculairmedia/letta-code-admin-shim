@@ -632,65 +632,77 @@ export class AgentPool {
     const inFlight = this.spawning.get(key);
     if (inFlight) return inFlight;
 
-    const p = (async (): Promise<LettaSessionAdapter> => {
-      // lcp-2oxb.2: Evict LRU idle worker(s) when at/over cap.
-      //
-      // The original loop always evicted the absolute stalest worker by
-      // lastUsedAt, even when that worker had a turn in flight (busy===true).
-      // Closing a busy worker terminates the SDK session mid-turn, causing
-      // the in-flight turn to resolve with dead:true — worst-case when the
-      // parked turn is exactly the stalest (a "ask" keepalive refreshes the
-      // silence watchdog but NOT lastUsedAt, so a parked approval is always
-      // the LRU victim under churn).
-      //
-      // Fix: sort workers LRU-first but skip any where busy===true. If ALL
-      // workers at/over cap are busy, break out of the loop and spawn anyway
-      // (temporary overflow bounded by the number of concurrent turns).
-      // housekeep() naturally drains overflow as each busy turn finishes —
-      // it already skips busy workers and evicts idle ones on the next tick.
-      //
-      // Invariant preserved: a busy worker is NEVER closed here.
-      while (this.workers.size >= MAX_WORKERS) {
-        // Sort all pool entries LRU-first (oldest lastUsedAt first).
-        const entries = [...this.workers.entries()].sort(
-          (a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
-        );
-        // Find the least-recently-used entry that is not busy.
-        const victimEntry = entries.find(([, w]) => !w.busy);
-        if (!victimEntry) {
-          // All workers at/over cap are busy with in-flight turns. Allow a
-          // temporary overflow rather than killing any busy worker.
-          logLine(`pool overflow (all busy) size=${this.workers.size} max=${MAX_WORKERS}`);
-          break;
-        }
-        const [oldestKey, victim] = victimEntry;
-        logLine(`evicting (cap) conv=${oldestKey}`);
-        this.workers.delete(oldestKey);
-        if (victim.activeRunId) {
-          rejectApprovalGate(victim.activeRunId, new Error("worker_evicted"));
-        }
-        victim.close();
-      }
-
-      const factory = this._adapterFactory ?? createAdapter;
-      const w = await factory({ conversationId, agentId });
-      try {
-        await w.start();
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logLine(`spawn failed key=${key}: ${msg}`);
-        // LettaSessionAdapter#dead is readonly on the interface; the SDK
-        // adapter owns a mutable backing field. Cast through unknown so
-        // the public seam stays read-only.
-        (w as unknown as { dead: boolean }).dead = true;
-        throw err;
-      }
-      this.workers.set(key, w);
-      logLine(`spawned key=${key} size=${this.workers.size}`);
-      return w;
-    })();
+    let resolveSpawn!: (w: LettaSessionAdapter) => void;
+    let rejectSpawn!: (err: any) => void;
+    const p = new Promise<LettaSessionAdapter>((resolve, reject) => {
+      resolveSpawn = resolve;
+      rejectSpawn = reject;
+    });
 
     this.spawning.set(key, p);
+
+    (async (): Promise<void> => {
+      try {
+        // lcp-2oxb.2: Evict LRU idle worker(s) when at/over cap.
+        //
+        // The original loop always evicted the absolute stalest worker by
+        // lastUsedAt, even when that worker had a turn in flight (busy===true).
+        // Closing a busy worker terminates the SDK session mid-turn, causing
+        // the in-flight turn to resolve with dead:true — worst-case when the
+        // parked turn is exactly the stalest (a "ask" keepalive refreshes the
+        // silence watchdog but NOT lastUsedAt, so a parked approval is always
+        // the LRU victim under churn).
+        //
+        // Fix: sort workers LRU-first but skip any where busy===true. If ALL
+        // workers at/over cap are busy, break out of the loop and spawn anyway
+        // (temporary overflow bounded by the number of concurrent turns).
+        // housekeep() naturally drains overflow as each busy turn finishes —
+        // it already skips busy workers and evicts idle ones on the next tick.
+        //
+        // Invariant preserved: a busy worker is NEVER closed here.
+        while (this.workers.size >= MAX_WORKERS) {
+          // Sort all pool entries LRU-first (oldest lastUsedAt first).
+          const entries = [...this.workers.entries()].sort(
+            (a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
+          );
+          // Find the least-recently-used entry that is not busy.
+          const victimEntry = entries.find(([, w]) => !w.busy);
+          if (!victimEntry) {
+            // All workers at/over cap are busy with in-flight turns. Allow a
+            // temporary overflow rather than killing any busy worker.
+            logLine(`pool overflow (all busy) size=${this.workers.size} max=${MAX_WORKERS}`);
+            break;
+          }
+          const [oldestKey, victim] = victimEntry;
+          logLine(`evicting (cap) conv=${oldestKey}`);
+          this.workers.delete(oldestKey);
+          if (victim.activeRunId) {
+            rejectApprovalGate(victim.activeRunId, new Error("worker_evicted"));
+          }
+          victim.close();
+        }
+
+        const factory = this._adapterFactory ?? createAdapter;
+        const w = await factory({ conversationId, agentId });
+        try {
+          await w.start();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logLine(`spawn failed key=${key}: ${msg}`);
+          // LettaSessionAdapter#dead is readonly on the interface; the SDK
+          // adapter owns a mutable backing field. Cast through unknown so
+          // the public seam stays read-only.
+          (w as unknown as { dead: boolean }).dead = true;
+          throw err;
+        }
+        this.workers.set(key, w);
+        logLine(`spawned key=${key} size=${this.workers.size}`);
+        resolveSpawn(w);
+      } catch (err) {
+        rejectSpawn(err);
+      }
+    })();
+
     try {
       const w = await p;
       return w;
