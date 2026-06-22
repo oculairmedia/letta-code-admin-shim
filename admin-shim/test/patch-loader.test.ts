@@ -50,7 +50,10 @@ declare global {
     | undefined;
   var __lcpCoerceToolReturnContent: ((value: unknown) => unknown) | undefined;
   var __lcpAddGenerateImageTool:
-    | ((toolDefinitions: any, defineToolFn: any) => any)
+    | ((
+        toolDefinitions: Record<string, unknown>,
+        defineToolFn: (cfg: { schema: unknown; description: unknown; impl: unknown }) => unknown,
+      ) => Record<string, unknown>)
     | undefined;
 }
 
@@ -593,16 +596,27 @@ test("patch-loader: generate_image impl applies default model and handles HTTP e
   globalThis.__lcpAddGenerateImageTool = undefined;
   eval(helperSource);
 
-  const addGenerateImageTool = globalThis.__lcpAddGenerateImageTool;
-  assert.ok(addGenerateImageTool);
+  type AddGenerateImageTool = (
+    toolDefinitions: Record<string, unknown>,
+    defineToolFn: (cfg: { schema: unknown; description: unknown; impl: unknown }) => unknown,
+  ) => Record<string, unknown>;
+  const addGenerateImageTool = globalThis.__lcpAddGenerateImageTool as AddGenerateImageTool | undefined;
+  if (typeof addGenerateImageTool !== "function") {
+    throw new Error("__lcpAddGenerateImageTool was not injected");
+  }
+  const invokeAddGenerateImageTool: AddGenerateImageTool = addGenerateImageTool;
 
-  const mockToolDefinitions = { existing: true };
-  const mockDefineToolFn = ({ schema, description, impl }: any) => impl;
-  const result = addGenerateImageTool(mockToolDefinitions, mockDefineToolFn);
+  const mockToolDefinitions: Record<string, unknown> = { existing: true };
+  const mockDefineToolFn = (cfg: { schema: unknown; description: unknown; impl: unknown }) => cfg.impl;
+  const result = invokeAddGenerateImageTool(mockToolDefinitions, mockDefineToolFn);
 
-  assert.equal(result.existing, true);
-  const generateImage = result.generate_image;
+  assert.equal(result["existing"], true);
+  const generateImage = result["generate_image"];
   assert.equal(typeof generateImage, "function");
+  if (typeof generateImage !== "function") {
+    throw new Error("generate_image tool was not added");
+  }
+  const invokeGenerateImage = generateImage as (args: { prompt: string; output_dir: string }) => Promise<{ details: { model: string } }>;
 
   const originalFetch = globalThis.fetch;
   const originalEnv = { ...process.env };
@@ -616,7 +630,7 @@ test("patch-loader: generate_image impl applies default model and handles HTTP e
     };
 
     const args = { prompt: "A test image", output_dir: "/tmp/letta-test-output-dir-img" };
-    const response = await generateImage(args);
+    const response = await invokeGenerateImage(args);
 
     assert.equal(capturedBody.model, "gpt-image-2", "Should default to gpt-image-2");
     assert.equal(capturedBody.prompt, "A test image");
@@ -628,7 +642,7 @@ test("patch-loader: generate_image impl applies default model and handles HTTP e
     };
 
     await assert.rejects(
-      async () => { await generateImage({ prompt: "Another test", output_dir: "/tmp/letta-test-output-dir-img" }); },
+      async () => { await invokeGenerateImage({ prompt: "Another test", output_dir: "/tmp/letta-test-output-dir-img" }); },
       (err: Error) => {
         assert.match(err.message, /image generation failed: HTTP 503 Provider overloaded/);
         return true;
