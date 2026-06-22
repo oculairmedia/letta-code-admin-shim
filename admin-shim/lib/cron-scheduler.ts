@@ -22,6 +22,7 @@
 
 import { existsSync, watch, type FSWatcher } from "node:fs";
 
+import { dirname, basename } from "node:path";
 import {
   broadcastCronEvent,
   type CronEvent,
@@ -394,11 +395,13 @@ function setupMtimeWatcher(s: SchedulerState): void {
   const path = getCronFilePath();
   if (!existsSync(path)) return; // first fs.watch fires when file appears; tick re-checks anyway
   try {
-    const watcher = watch(path, () => {
+    const watcher = watch(dirname(path), (event, filename) => {
+      if (filename && filename !== basename(path)) return;
       if (s.watcherDebounce) clearTimeout(s.watcherDebounce);
       s.watcherDebounce = setTimeout(() => {
         s.watcherDebounce = null;
         if (!state) return;
+        s.lastMtime = 0; // Force refresh due to sub-ms precision
         const refreshed = refreshTaskCache(s);
         if (refreshed) {
           emitEvent("external_write", s.options.now(), s);
