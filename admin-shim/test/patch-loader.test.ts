@@ -49,6 +49,9 @@ declare global {
     | ((providerName: string, modelId: string, input: string[]) => string[])
     | undefined;
   var __lcpCoerceToolReturnContent: ((value: unknown) => unknown) | undefined;
+  var __lcpAddGenerateImageTool:
+    | ((toolDefinitions: any, defineToolFn: any) => any)
+    | undefined;
 }
 
 function readInjectedThinkingHelper(): unknown {
@@ -569,6 +572,73 @@ test("patch-loader: current letta.js bundle receives generate_image registration
     patched,
     /var OPENAI_PASCAL_TOOLS2 = \[[\s\S]*"UpdatePlan",\n  "generate_image"\n\];/,
   );
+});
+
+test("patch-loader: generate_image impl applies default model and handles HTTP errors", async () => {
+  const input = [
+    "#!/usr/bin/env node",
+    "const toolDefinitions = {};",
+    "  TOOL_DEFINITIONS = toolDefinitions;",
+    "});",
+  ].join("\n");
+
+  const patched = patchLettaCodeSourceForTest(input);
+  const helperStart = patched.indexOf("globalThis.__lcpAddGenerateImageTool =");
+  const helperEnd = patched.indexOf("\n  TOOL_DEFINITIONS = globalThis.__lcpAddGenerateImageTool");
+  assert.notEqual(helperStart, -1, "__lcpAddGenerateImageTool definition missing");
+  assert.notEqual(helperEnd, -1, "helperEnd missing");
+
+  // Isolate the function definition and eval it
+  const helperSource = patched.slice(helperStart, helperEnd);
+  globalThis.__lcpAddGenerateImageTool = undefined;
+  eval(helperSource);
+
+  const addGenerateImageTool = globalThis.__lcpAddGenerateImageTool;
+  assert.ok(addGenerateImageTool);
+
+  const mockToolDefinitions = { existing: true };
+  const mockDefineToolFn = ({ schema, description, impl }: any) => impl;
+  const result = addGenerateImageTool(mockToolDefinitions, mockDefineToolFn);
+
+  assert.equal(result.existing, true);
+  const generateImage = result.generate_image;
+  assert.equal(typeof generateImage, "function");
+
+  const originalFetch = globalThis.fetch;
+  const originalEnv = { ...process.env };
+
+  try {
+    // Test 1: Default model selection
+    let capturedBody: any;
+    globalThis.fetch = async (url: string | URL | Request, options?: RequestInit) => {
+      capturedBody = JSON.parse(options?.body as string);
+      return new Response(JSON.stringify({ data: [{ b64_json: "fakebase64" }] }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+
+    const args = { prompt: "A test image", output_dir: "/tmp/letta-test-output-dir-img" };
+    const response = await generateImage(args);
+
+    assert.equal(capturedBody.model, "gpt-image-2", "Should default to gpt-image-2");
+    assert.equal(capturedBody.prompt, "A test image");
+    assert.equal(response.details.model, "gpt-image-2");
+
+    // Test 2: Error handling (non-200 status)
+    globalThis.fetch = async () => {
+      return new Response("Provider overloaded", { status: 503 });
+    };
+
+    await assert.rejects(
+      async () => { await generateImage({ prompt: "Another test", output_dir: "/tmp/letta-test-output-dir-img" }); },
+      (err: Error) => {
+        assert.match(err.message, /image generation failed: HTTP 503 Provider overloaded/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    process.env = originalEnv;
+    globalThis.__lcpAddGenerateImageTool = undefined;
+  }
 });
 
 test("patch-loader leaves unrelated source untouched", () => {
