@@ -1224,12 +1224,15 @@ interface ScheduledMessageCompat {
 
 function cronTaskToScheduledMessage(task: CronTask): ScheduledMessageCompat {
   const firstContent = task.prompt || task.description || task.name;
-  const schedule: ScheduleDefinitionCompat = task.recurring
-    ? { type: "recurring", cron_expression: task.cron }
-    : {
-        type: "one-time",
-        scheduled_at: task.scheduled_for ? Date.parse(task.scheduled_for) / 1000 : undefined,
-      };
+  let schedule: ScheduleDefinitionCompat;
+  if (task.recurring) {
+    schedule = { type: "recurring", cron_expression: task.cron };
+  } else {
+    schedule = { type: "one-time" };
+    if (task.scheduled_for) {
+      schedule.scheduled_at = Date.parse(task.scheduled_for) / 1000;
+    }
+  }
   return {
     id: task.id,
     agent_id: task.agent_id,
@@ -1265,7 +1268,9 @@ function cronExpressionForDate(date: Date): string {
   return `${date.getMinutes()} ${date.getHours()} ${date.getDate()} ${date.getMonth() + 1} *`;
 }
 
-function scheduleCreateParamsToCronBody(agentId: string, body: Record<string, unknown>): Record<string, unknown> | { error: string } {
+type CronBodyResult = { ok: true; body: Record<string, unknown> } | { error: string };
+
+function scheduleCreateParamsToCronBody(agentId: string, body: Record<string, unknown>): CronBodyResult {
   const schedule = isRecord(body["schedule"]) ? body["schedule"] as Record<string, unknown> : null;
   if (!schedule) return { error: "schedule is required" };
   const messages = Array.isArray(body["messages"]) ? body["messages"] as unknown[] : [];
@@ -1287,7 +1292,7 @@ function scheduleCreateParamsToCronBody(agentId: string, body: Record<string, un
     }
     result["cron"] = cronExpression;
     result["recurring"] = true;
-    return result;
+    return { ok: true, body: result };
   }
   if (type === "one-time") {
     const scheduledAt = schedule["scheduled_at"];
@@ -1298,15 +1303,16 @@ function scheduleCreateParamsToCronBody(agentId: string, body: Record<string, un
     result["cron"] = cronExpressionForDate(scheduledFor);
     result["recurring"] = false;
     result["scheduled_for"] = scheduledFor;
-    return result;
+    return { ok: true, body: result };
   }
   return { error: "schedule.type must be recurring or one-time" };
 }
 
 async function handleAgentScheduleCreate(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
   const body = await readJsonBody(req);
-  const cronBody = scheduleCreateParamsToCronBody(agentId, body);
-  if ("error" in cronBody) return badRequest(res, cronBody.error);
+  const cronResult = scheduleCreateParamsToCronBody(agentId, body);
+  if ("error" in cronResult) return badRequest(res, cronResult.error);
+  const cronBody = cronResult.body;
   const schedule = resolveSchedule(cronBody);
   if ("error" in schedule) return badRequest(res, schedule.error);
   const input: AddTaskInput = {
@@ -1318,7 +1324,8 @@ async function handleAgentScheduleCreate(req: IncomingMessage, res: ServerRespon
     prompt: cronBody["prompt"] as string,
   };
   if (schedule.scheduledFor !== undefined) input.scheduled_for = schedule.scheduledFor;
-  if (cronBody["scheduled_for"] instanceof Date) input.scheduled_for = cronBody["scheduled_for"];
+  const scheduledForVal = cronBody["scheduled_for"];
+  if (scheduledForVal instanceof Date) input.scheduled_for = scheduledForVal;
   try {
     const result = addCronTask(input);
     broadcastCronMutation();
