@@ -72,6 +72,7 @@ class FakeAdapter implements LettaSessionAdapter {
   spawnedAt = Date.now();
   tools: string[];
   closed = false;
+  activeRunId: string | null = null;
 
   constructor(opts: LettaSessionAdapterOptions) {
     this.conversationId = opts.conversationId;
