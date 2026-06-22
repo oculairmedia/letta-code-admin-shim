@@ -1198,6 +1198,145 @@ function handleCronScheduler(_req: IncomingMessage, res: ServerResponse): void {
   json(res, 200, getCronSchedulerStatus());
 }
 
+interface ScheduleMessageCompat {
+  content: string;
+  role: string;
+}
+
+interface ScheduleDefinitionCompat {
+  type: "recurring" | "one-time";
+  scheduled_at?: number;
+  cron_expression?: string;
+}
+
+interface ScheduledMessageCompat {
+  id: string;
+  agent_id: string;
+  message: {
+    messages: ScheduleMessageCompat[];
+    callback_url: null;
+    include_return_message_types: string[];
+    max_steps: null;
+  };
+  next_scheduled_time: string | null;
+  schedule: ScheduleDefinitionCompat;
+}
+
+function cronTaskToScheduledMessage(task: CronTask): ScheduledMessageCompat {
+  const firstContent = task.prompt || task.description || task.name;
+  const schedule: ScheduleDefinitionCompat = task.recurring
+    ? { type: "recurring", cron_expression: task.cron }
+    : {
+        type: "one-time",
+        scheduled_at: task.scheduled_for ? Date.parse(task.scheduled_for) / 1000 : undefined,
+      };
+  return {
+    id: task.id,
+    agent_id: task.agent_id,
+    message: {
+      messages: [{ role: "user", content: firstContent }],
+      callback_url: null,
+      include_return_message_types: [],
+      max_steps: null,
+    },
+    next_scheduled_time: task.scheduled_for,
+    schedule,
+  };
+}
+
+function handleAgentScheduleList(_req: IncomingMessage, res: ServerResponse, url: URL, agentId: string): void {
+  const limitRaw = url.searchParams.get("limit");
+  const limit = limitRaw ? Math.max(0, Number.parseInt(limitRaw, 10)) : null;
+  const after = url.searchParams.get("after");
+  const all = listCronTasks({ agent_id: agentId }).map(cronTaskToScheduledMessage);
+  const start = after ? Math.max(0, all.findIndex((schedule) => schedule.id === after) + 1) : 0;
+  const page = Number.isInteger(limit) && limit !== null ? all.slice(start, start + limit) : all.slice(start);
+  const hasNextPage = Number.isInteger(limit) && limit !== null ? start + limit < all.length : false;
+  json(res, 200, { has_next_page: hasNextPage, scheduled_messages: page });
+}
+
+function handleAgentScheduleDetail(_req: IncomingMessage, res: ServerResponse, agentId: string, scheduleId: string): void {
+  const task = getCronTask(scheduleId);
+  if (!task || task.agent_id !== agentId) return notFound(res, `scheduled message ${scheduleId}`);
+  json(res, 200, cronTaskToScheduledMessage(task));
+}
+
+function cronExpressionForDate(date: Date): string {
+  return `${date.getMinutes()} ${date.getHours()} ${date.getDate()} ${date.getMonth() + 1} *`;
+}
+
+function scheduleCreateParamsToCronBody(agentId: string, body: Record<string, unknown>): Record<string, unknown> | { error: string } {
+  const schedule = isRecord(body["schedule"]) ? body["schedule"] as Record<string, unknown> : null;
+  if (!schedule) return { error: "schedule is required" };
+  const messages = Array.isArray(body["messages"]) ? body["messages"] as unknown[] : [];
+  const first = messages.find(isRecord) as Record<string, unknown> | undefined;
+  const content = typeof first?.["content"] === "string" ? first["content"] as string : "";
+  if (!content) return { error: "messages[0].content is required" };
+
+  const type = schedule["type"];
+  const result: Record<string, unknown> = {
+    agent_id: agentId,
+    prompt: content,
+    name: content.slice(0, 80) || `schedule-${Date.now()}`,
+    description: "created via /v1/agents/{agent_id}/schedule compatibility route",
+  };
+  if (type === "recurring") {
+    const cronExpression = schedule["cron_expression"];
+    if (typeof cronExpression !== "string" || cronExpression.length === 0) {
+      return { error: "schedule.cron_expression is required for recurring schedules" };
+    }
+    result["cron"] = cronExpression;
+    result["recurring"] = true;
+    return result;
+  }
+  if (type === "one-time") {
+    const scheduledAt = schedule["scheduled_at"];
+    if (typeof scheduledAt !== "number" || !Number.isFinite(scheduledAt)) {
+      return { error: "schedule.scheduled_at is required for one-time schedules" };
+    }
+    const scheduledFor = new Date(scheduledAt * 1000);
+    result["cron"] = cronExpressionForDate(scheduledFor);
+    result["recurring"] = false;
+    result["scheduled_for"] = scheduledFor;
+    return result;
+  }
+  return { error: "schedule.type must be recurring or one-time" };
+}
+
+async function handleAgentScheduleCreate(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  const body = await readJsonBody(req);
+  const cronBody = scheduleCreateParamsToCronBody(agentId, body);
+  if ("error" in cronBody) return badRequest(res, cronBody.error);
+  const schedule = resolveSchedule(cronBody);
+  if ("error" in schedule) return badRequest(res, schedule.error);
+  const input: AddTaskInput = {
+    agent_id: agentId,
+    name: typeof cronBody["name"] === "string" ? cronBody["name"] as string : `schedule-${Date.now()}`,
+    description: typeof cronBody["description"] === "string" ? cronBody["description"] as string : "",
+    cron: schedule.cron,
+    recurring: schedule.recurring,
+    prompt: cronBody["prompt"] as string,
+  };
+  if (schedule.scheduledFor !== undefined) input.scheduled_for = schedule.scheduledFor;
+  if (cronBody["scheduled_for"] instanceof Date) input.scheduled_for = cronBody["scheduled_for"];
+  try {
+    const result = addCronTask(input);
+    broadcastCronMutation();
+    json(res, 201, cronTaskToScheduledMessage(result.task));
+  } catch (err) {
+    badRequest(res, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function handleAgentScheduleDelete(res: ServerResponse, agentId: string, scheduleId: string): void {
+  const task = getCronTask(scheduleId);
+  if (!task || task.agent_id !== agentId) return notFound(res, `scheduled message ${scheduleId}`);
+  const removed = deleteCronTask(scheduleId);
+  if (!removed) return notFound(res, `scheduled message ${scheduleId}`);
+  broadcastCronMutation();
+  json(res, 200, { deleted: true, id: scheduleId });
+}
+
 // 405 retained for the scheduler sub-resource (read-only; no mutations).
 function handleCronMethodNotAllowed(req: IncomingMessage, res: ServerResponse): void {
   res.setHeader("Allow", "GET, OPTIONS");
@@ -2379,6 +2518,24 @@ const server = createServer((req, res) => {
 
   const agentContext = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/context\/?$/);
   if (agentContext && req.method === "GET") return handleAgentContext(req, res, url, agentContext[1]!);
+
+  const agentScheduleCollection = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/schedule\/?$/);
+  if (agentScheduleCollection) {
+    if (req.method === "GET") return handleAgentScheduleList(req, res, url, agentScheduleCollection[1]!);
+    if (req.method === "POST") return handleAgentScheduleCreate(req, res, agentScheduleCollection[1]!);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    res.setHeader("Allow", "GET, POST, OPTIONS");
+    return json(res, 405, { detail: `${req.method} not allowed on /v1/agents/:agentId/schedule` });
+  }
+  const agentScheduleDetail = pathname.match(/^\/v1\/agents\/(agent-[^/]+)\/schedule\/([^/]+)\/?$/);
+  if (agentScheduleDetail) {
+    const scheduleId = decodeURIComponent(agentScheduleDetail[2]!);
+    if (req.method === "GET") return handleAgentScheduleDetail(req, res, agentScheduleDetail[1]!, scheduleId);
+    if (req.method === "DELETE") return handleAgentScheduleDelete(res, agentScheduleDetail[1]!, scheduleId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    res.setHeader("Allow", "GET, DELETE, OPTIONS");
+    return json(res, 405, { detail: `${req.method} not allowed on /v1/agents/:agentId/schedule/:scheduleId` });
+  }
 
   // lcp-4d5f: read-only mirror of reflection (sleeptime) settings. Mutations
   // are WS-only (reflection_settings_set on /shim/v1/mobile) per the
