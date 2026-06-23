@@ -1103,7 +1103,14 @@ async function handleConversationSendMessage(req: IncomingMessage, res: ServerRe
   await sendMessage(req, res, resolved.agentId, resolved.conversationId);
 }
 
-function handleConversationStream(req: IncomingMessage, res: ServerResponse, externalConvId: string): void {
+async function handleConversationStream(req: IncomingMessage, res: ServerResponse, externalConvId: string): Promise<void> {
+  let resolved: { conversationId: string; agentId: string } | null = null;
+  try {
+    resolved = await resolveConversationId(externalConvId);
+  } catch (err) {
+    // ignore
+  }
+
   // Ambient stream stub. Mobile polls this even for conversations that
   // don't exist locally (e.g. cached from a prior Python-Letta-server
   // session). Always return 200 with a keep-alive SSE so mobile's
@@ -1117,10 +1124,14 @@ function handleConversationStream(req: IncomingMessage, res: ServerResponse, ext
   // SSE comment line as heartbeat (mobile treats lines beginning with `:` as
   // heartbeat, won't error).
   res.write(`: connected ${externalConvId}\n\n`);
+  const PING_MS = Number(process.env["SHIM_STREAM_PING_MS"] ?? 25_000);
   const ping = setInterval(() => {
     if (res.writableEnded) return;
-    try { res.write(`: ping\n\n`); } catch { /* socket closed */ }
-  }, 25_000);
+    try {
+      res.write(`: ping\n\n`);
+      if (resolved) getAgentPool().touch(resolved.conversationId, resolved.agentId);
+    } catch { /* socket closed */ }
+  }, PING_MS);
   if (ping.unref) ping.unref();
   // Hard cap the SSE keep-alive duration. Without this, half-closed sockets
   // (Android backgrounding, NAT timeout, wifi flap) keep the request alive
