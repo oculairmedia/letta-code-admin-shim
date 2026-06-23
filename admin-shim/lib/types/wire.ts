@@ -64,6 +64,14 @@
 // LettaMessage discriminated union
 // ──────────────────────────────────────────────────────────────────────
 
+export interface MessageAttachmentRef {
+  kind: "image";
+  ref: string;
+  sha256: string;
+  media_type: string;
+  size_bytes: number;
+}
+
 /**
  * Common fields present on every wire message variant. The shim's reshape
  * and projection paths fill every field (sometimes with `null`) — they're
@@ -96,6 +104,8 @@ export interface LettaMessageBase {
 export interface UserMessage extends LettaMessageBase {
   message_type: "user_message";
   content: string;
+  /** Optional shim-owned client-read refs; never raw image bytes. */
+  attachments?: MessageAttachmentRef[];
 }
 
 /** @see Message.kt `AssistantMessage`
