@@ -71,6 +71,7 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
 
 import type { Block } from "./types/wire.js";
 import type { LocalMessage } from "./types/letta-stream.js";
+import { isAttachmentSidecar, type AttachmentRef, type AttachmentSidecar } from "./attachments.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // On-disk shapes (NOT identical to wire types — see translate.mjs)
@@ -146,6 +147,13 @@ export type TimestampSidecar = Record<string, string>;
  * Lives at `<convDir>/_otid-map.json`. See `writeOtidForLocalId`.
  */
 export type OtidSidecar = Record<string, string>;
+
+/**
+ * Sidecar map: LocalMessage id → lightweight client attachment refs.
+ * Lives at `<convDir>/_attachments.json`. It intentionally stores metadata
+ * only; raw image bytes stay out of replay/context/prompt history.
+ */
+export type MessageAttachmentSidecar = AttachmentSidecar;
 
 /** Pair returned by `resolveConversationId` — the LocalStore-internal key. */
 export interface ResolvedConversation {
@@ -966,6 +974,11 @@ function otidSidecarPath(conversationId: string, agentId: string): string {
   return join(storageDir(), "conversations", b64url(key), "_otid-map.json");
 }
 
+function attachmentsSidecarPath(conversationId: string, agentId: string): string {
+  const key = conversationKey(conversationId, agentId);
+  return join(storageDir(), "conversations", b64url(key), "_attachments.json");
+}
+
 // lcp-66pv: in-memory cache of the _real-times.json sidecar, mirroring the
 // otidMapCache write-through pattern below. Every GET /messages reads this
 // (readMessageTimestamps) and the conversations list reads it via
@@ -1121,6 +1134,42 @@ export async function writeOtidForLocalId(
     // Evict so the next reader doesn't trust an in-memory state that didn't
     // make it to disk; subsequent loadOtidMap will reread the file.
     otidMapCache.delete(key);
+  }
+}
+
+const attachmentMapCache = new Map<string, MessageAttachmentSidecar>();
+
+function attachmentCacheKey(conversationId: string, agentId: string): string {
+  return `${conversationId}|${agentId}`;
+}
+
+export async function readAttachmentMap(conversationId: string, agentId: string): Promise<MessageAttachmentSidecar> {
+  const key = attachmentCacheKey(conversationId, agentId);
+  const cached = attachmentMapCache.get(key);
+  if (cached) return cached;
+  const raw = await readJsonOrNullAsync(attachmentsSidecarPath(conversationId, agentId));
+  const map: MessageAttachmentSidecar = isAttachmentSidecar(raw) ? raw : {};
+  attachmentMapCache.set(key, map);
+  return map;
+}
+
+export async function writeAttachmentsForLocalId(
+  conversationId: string,
+  agentId: string,
+  localId: string | null | undefined,
+  refs: readonly AttachmentRef[],
+): Promise<void> {
+  if (!localId || refs.length === 0) return;
+  const path = attachmentsSidecarPath(conversationId, agentId);
+  const key = attachmentCacheKey(conversationId, agentId);
+  const current = await readAttachmentMap(conversationId, agentId);
+  current[localId] = [...refs];
+  try {
+    await atomicWriteJson(path, current);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[store] attachment sidecar write failed for ${conversationId}: ${msg}`);
+    attachmentMapCache.delete(key);
   }
 }
 

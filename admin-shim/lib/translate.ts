@@ -32,6 +32,7 @@ import type {
   LocalMessageRole,
 } from "./types/letta-stream.js";
 import type { OnDiskAgentRecord, OnDiskConversation } from "./store.js";
+import { attachRefsToWireMessage, type AttachmentSidecar } from "./attachments.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // Model handle parsing
@@ -309,6 +310,11 @@ export interface LocalMessageScope {
    * over runs whose message_ids[] claimed each persisted message.
    */
   runIdsByMessageId?: Record<string, string> | null;
+  /**
+   * Shim-owned client-read attachment refs keyed by source LocalMessage id.
+   * Joined only onto outbound API/WS projections; never used for replay or prompts.
+   */
+  attachmentsByMessageId?: AttachmentSidecar | null;
 }
 
 /**
@@ -382,6 +388,9 @@ export function localMessageToConversationMessages(
     scope.runIdsByMessageId && localMsg?.id
       ? (scope.runIdsByMessageId[localMsg.id] ?? null)
       : null;
+  const attachmentRefs = scope.attachmentsByMessageId && localMsg?.id
+    ? scope.attachmentsByMessageId[localMsg.id]
+    : null;
 
   // User / system messages: collapse all text parts into one wire message.
   // Strip system-reminder envelopes from user-role messages so mobile's
@@ -392,21 +401,20 @@ export function localMessageToConversationMessages(
     if (role === "user") text = stripSystemReminders(text);
     if (!text) return [];
     const wireType: "user_message" | "system_message" = role === "user" ? "user_message" : "system_message";
-    return [
-      {
-        id: localMsg.id,
-        date: withTypeOffset(created, wireType),
-        name: null,
-        message_type: wireType,
-        otid: projectedOtid,
-        sender_id: null,
-        step_id: null,
-        is_err: null,
-        seq_id: null,
-        run_id: projectedRunId,
-        content: text,
-      },
-    ];
+    const wireMessage = {
+      id: localMsg.id,
+      date: withTypeOffset(created, wireType),
+      name: null,
+      message_type: wireType,
+      otid: projectedOtid,
+      sender_id: null,
+      step_id: null,
+      is_err: null,
+      seq_id: null,
+      run_id: projectedRunId,
+      content: text,
+    } satisfies LettaMessage;
+    return [attachRefsToWireMessage(wireMessage, attachmentRefs)];
   }
 
   // lcp-kul: post-pi-backup letta-code (0.25.x) writes each tool result as

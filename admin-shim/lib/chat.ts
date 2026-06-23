@@ -20,8 +20,9 @@ import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 
 import { getAgentPool } from "./agent-pool.js";
-import { findUnmappedTailUserMessageId, writeOtidForLocalId, syncSkillsBlockForAgent } from "./store.js";
+import { findUnmappedTailUserMessageId, writeAttachmentsForLocalId, writeOtidForLocalId, syncSkillsBlockForAgent } from "./store.js";
 import { toStringArrayOrNull } from "./translate.js";
+import { extractAttachmentRefsFromMessageBody } from "./attachments.js";
 import type {
   LettaMessage,
   AssistantMessage,
@@ -642,6 +643,7 @@ export async function handleSendMessage(
   // extractContent() returns the full ordered parts array when an image is
   // present, else the same plain string — so text-only sends are unchanged.
   const content = extractContent(body);
+  const attachmentRefs = extractAttachmentRefsFromMessageBody(body);
   // Original chained `explicitConv ?? body.conversation_id ?? body.conversationId ?? undefined`.
   // Keep the exact nullish chain — including the possibility that body.conversation_id
   // could be a non-string truthy value (it always is a string in mobile, but
@@ -930,18 +932,19 @@ export async function handleSendMessage(
       // on the server-fetched user message; without this mapping it finds
       // none, leaves the Local in place, and the disk-fetched copy
       // ALSO appears — user sees two prompt bubbles.
-      if (userOtid) {
+      if (userOtid || attachmentRefs.length > 0) {
         try {
-          const localId = await findUnmappedTailUserMessageId(
+          const localId = turn?.newUserMessageId ?? await findUnmappedTailUserMessageId(
             conversationId ?? "default",
             agentId,
           );
           if (localId) {
             await writeOtidForLocalId(conversationId ?? "default", agentId, localId, userOtid);
+            await writeAttachmentsForLocalId(conversationId ?? "default", agentId, localId, attachmentRefs);
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(`[chat] otid bind failed: ${msg}`);
+          console.error(`[chat] user-message sidecar bind failed: ${msg}`);
         }
       }
       finalizeResponse({

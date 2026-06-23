@@ -56,8 +56,10 @@ import {
   listMessages,
   listMessagesSync,
   resolveConversationId,
+  writeAttachmentsForLocalId,
   writeOtidForLocalId,
 } from "./store.js";
+import { extractAttachmentRefsFromMessageBody } from "./attachments.js";
 import type { LettaMessage, ToolReturn, ToolReturnMessage } from "./types/wire.js";
 import type {
   A2uiFrameMessage,
@@ -441,6 +443,20 @@ export async function bridgeSendMessage(
   let userInput: string | unknown[] =
     Array.isArray(content_parts) && content_parts.length > 0 ? content_parts : text;
 
+  // lcp-67lp: content-address + bound any client-submitted image parts BEFORE
+  // they're forwarded to (and stripped by) the model. Refs are persisted to
+  // the per-conversation attachment sidecar in the post-turn bind block below
+  // so a later GET /messages can rehydrate stable image refs even though the
+  // upstream Letta server only persists/returns text-only message parts. This
+  // mirrors the SSE handler (chat.ts handleSendMessage); the WS bridge is
+  // mobile's primary send transport, so without this reload silently drops
+  // locally-sent images. extractAttachmentRefsFromMessageBody enforces the
+  // media-type allowlist and MAX_ATTACHMENT_BYTES; oversize/disallowed parts
+  // are skipped (they still reach the model verbatim, but produce no ref).
+  const attachmentRefs = extractAttachmentRefsFromMessageBody(
+    Array.isArray(content_parts) && content_parts.length > 0 ? { content: content_parts } : null,
+  );
+
   // lcp-d0za: passive runtime introspection — inject serving model,
   // context utilization, and session role as a system-reminder so
   // the agent always knows its runtime state without a tool call.
@@ -797,7 +813,7 @@ export async function bridgeSendMessage(
   // path the SSE handler runs so the disk projection echoes the otid back
   // for mobile's reconcileAfterSend. Without this, WS-sent turns leave
   // the optimistic Local user bubble next to the Confirmed disk twin.
-  if (otid) {
+  if (otid || attachmentRefs.length > 0) {
     try {
       // Fast path (lcp-y88): the worker already captured the new user_message
       // id during its post-turn listMessages diff (which it does anyway for
@@ -805,10 +821,15 @@ export async function bridgeSendMessage(
       // surface one — defensive for older worker code paths.
       const localId = (turn as { newUserMessageId?: string | null }).newUserMessageId
         ?? await findUnmappedTailUserMessageId(effectiveConvId, effectiveAgentId);
-      if (localId) await writeOtidForLocalId(effectiveConvId, effectiveAgentId, localId, otid);
+      if (localId) {
+        if (otid) await writeOtidForLocalId(effectiveConvId, effectiveAgentId, localId, otid);
+        // lcp-67lp: persist the content-addressed image refs against the same
+        // LocalMessage id so GET /messages rehydrates them on reload.
+        await writeAttachmentsForLocalId(effectiveConvId, effectiveAgentId, localId, attachmentRefs);
+      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[mobile-channel] otid bind failed: ${errMsg}`);
+      console.error(`[mobile-channel] user-message sidecar bind failed: ${errMsg}`);
     }
   }
 

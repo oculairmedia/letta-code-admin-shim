@@ -34,6 +34,7 @@ import {
   listConversationsForAgent,
   listMessages,
   readBlocksForAgent,
+  readAttachmentMap,
   readMessageTimestamps,
   readOtidMap,
   readSystemPrompt,
@@ -705,6 +706,7 @@ async function handleAgentMessages(
   // otids onto the projected messages.
   const realTimes = await readMessageTimestamps(conversationId, agentId);
   const otidMap = await readOtidMap(conversationId, agentId);
+  const attachmentsByMessageId = await readAttachmentMap(conversationId, agentId);
   const runIdsByMessageId = buildMessageRunMap({ agentId, conversationId });
   const projected: ReturnType<typeof localMessageToConversationMessages> = [];
   for (const m of items) {
@@ -712,6 +714,7 @@ async function handleAgentMessages(
       realTimes,
       otidMap,
       runIdsByMessageId,
+      attachmentsByMessageId,
     })) {
       projected.push(p);
     }
@@ -1112,6 +1115,7 @@ async function handleConversationMessagesList(
   if (order === "desc") items = [...items].reverse();
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
+  const attachmentsByMessageId = await readAttachmentMap(resolved.conversationId, resolved.agentId);
   // lcp-nwd: build messageId -> runId index once per request so each
   // projected message carries the run that attributed it. Mobile groups
   // chat bubbles by run_id for the collapsible run-block affordance;
@@ -1128,6 +1132,7 @@ async function handleConversationMessagesList(
       realTimes,
       otidMap,
       runIdsByMessageId,
+      attachmentsByMessageId,
     };
     const projected = localMessageToConversationMessages(m, scope);
     for (const p of projected) out.push(p);
@@ -2159,6 +2164,7 @@ async function handleRunMessages(_req: IncomingMessage, res: ServerResponse, url
   const items = await listMessages(resolved.conversationId, resolved.agentId, {});
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
+  const attachmentsByMessageId = await readAttachmentMap(resolved.conversationId, resolved.agentId);
   const runMessageIds = new Set(run.message_ids ?? []);
   // lcp-nwd: this endpoint already knows the run id, so build a trivial
   // single-run map rather than walking all runs. Every message we emit
@@ -2176,6 +2182,7 @@ async function handleRunMessages(_req: IncomingMessage, res: ServerResponse, url
       realTimes,
       otidMap,
       runIdsByMessageId,
+      attachmentsByMessageId,
     };
     const projected = localMessageToConversationMessages(m, scope);
     for (const p of projected) out.push(p as { id?: string });
