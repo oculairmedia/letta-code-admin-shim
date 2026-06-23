@@ -30,6 +30,7 @@ import {
   getDefaultDeepSeekModels,
   getOpenAICompatibleModelsFromEnv,
   discoverOpenAICompatibleModels,
+  VISION_MODEL_PATTERNS,
 } from "../lib/model-catalog.js";
 
 function catalogFor(provider: string): ProviderCatalog {
@@ -354,6 +355,27 @@ test("isVisionCapableModel: word-boundary 'vl' logic", () => {
   assert.strictEqual(isVisionCapableModel("qwen2-vl"), true);
   // Shouldn't match vllm
   assert.strictEqual(isVisionCapableModel("meta-llama/Meta-Llama-3-8B-Instruct-vllm"), false);
+});
+
+test("isVisionCapableModel: VISION_MODEL_PATTERNS detected with provider prefixes case-insensitively", () => {
+  // Ensure we can iterate over the patterns array exported from model-catalog
+  assert.ok(VISION_MODEL_PATTERNS.length > 0, "VISION_MODEL_PATTERNS should not be empty");
+
+  for (const pattern of VISION_MODEL_PATTERNS) {
+    // If the pattern is word boundary dependent like 'vl', skip basic includes checks
+    // or handle specially. Since qwen-vl and qwen2-vl are explicitly in the patterns array,
+    // they act as standard substrings here.
+
+    // Test lowercase
+    assert.strictEqual(isVisionCapableModel(`provider/prefix-${pattern}-suffix`), true);
+
+    // Test uppercase
+    assert.strictEqual(isVisionCapableModel(`PROVIDER/PREFIX-${pattern.toUpperCase()}-SUFFIX`), true);
+
+    // Test mixed case
+    const mixedCasePattern = pattern.split('').map((c, i) => i % 2 === 0 ? c.toUpperCase() : c.toLowerCase()).join('');
+    assert.strictEqual(isVisionCapableModel(`Provider/Prefix-${mixedCasePattern}-Suffix`), true);
+  }
 });
 
 test("getDefaultOpenAIModels: returns expected hardcoded models", () => {

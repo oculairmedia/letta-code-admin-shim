@@ -108,6 +108,9 @@ export interface SubagentEntry {
   ownerShimPid: number | null;
   /** Per-process shim instance that created/owns this background worker. */
   ownerShimInstanceId: string | null;
+  /** Exit code/signal if the worker process was observed exiting. */
+  exitCode: number | null;
+  exitSignal: string | null;
   /** ISO timestamp the dispatch was first observed. */
   startedAt: string;
   /** ISO timestamp the entry reached a terminal status; null while running. */
@@ -356,6 +359,8 @@ export function recordSubagentDispatch(input: {
     workerPid: null,
     ownerShimPid: process.pid,
     ownerShimInstanceId: currentShimInstanceId,
+    exitCode: null,
+    exitSignal: null,
     startedAt: nowIso(),
     endedAt: null,
   };
@@ -467,6 +472,14 @@ export function markSubagentCompleted(toolCallId: string): void {
 }
 export function markSubagentFailed(toolCallId: string, reason = "failed"): void {
   finalize(toolCallId, "failed", reason);
+}
+
+export function updateSubagentExitStatus(toolCallId: string, exitCode: number | null, exitSignal: string | null): void {
+  const entry = _subagents.get(toolCallId);
+  if (entry) {
+    entry.exitCode = exitCode;
+    entry.exitSignal = exitSignal;
+  }
 }
 
 export function finalizeSubagent(
