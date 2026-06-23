@@ -37,3 +37,19 @@ test("routeModel: standard jobs use default model", () => {
   assert.strictEqual(routeModel({ jobType: "standard" }), "gpt-4o");
   assert.strictEqual(routeModel({ jobType: "standard", defaultModel: "custom-base-model" }), "custom-base-model");
 });
+
+test("routeModel: unknown jobs use default model", () => {
+  assert.strictEqual(routeModel({ jobType: "unknown" }), "gpt-4o");
+  assert.strictEqual(routeModel({ jobType: "unknown", defaultModel: "custom-base-model" }), "custom-base-model");
+});
+
+test("routeModel: case and whitespace insensitive matching", () => {
+  assert.strictEqual(routeModel({ jobType: " MECHANICAL " }), "gpt-4o-mini");
+  assert.strictEqual(routeModel({ jobType: "TeSt" }), "gpt-4o-mini");
+  assert.strictEqual(routeModel({ jobType: "\thigh-risk\n" }), "o1-preview");
+});
+
+test("routeModel: config override wins even over unknown or oddly cased job types", () => {
+  assert.strictEqual(routeModel({ overrideModel: "gpt-4", jobType: "UNKNOWN" }), "gpt-4");
+  assert.strictEqual(routeModel({ overrideModel: "gpt-4", jobType: "  MeChAnIcAl  " }), "gpt-4");
+});
