@@ -96,7 +96,40 @@ for (const sig of signals) {
   });
 }
 
-child.on("exit", (code, sig) => {
+/**
+ * @param {number|null} code
+ * @param {string|null} sig
+ */
+async function reportExit(code, sig) {
+  const taskId = process.env["LETTA_TASK_ID"] || null; // Will be set by SDK/harness if available
+  // To avoid breaking if SHIM_PORT isn't set, default to 8291
+  const port = process.env["SHIM_PORT"] || 8291;
+  const url = `http://127.0.0.1:${port}/v1/worker-events`;
+
+  if (taskId) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          event: "child_exit",
+          taskId,
+          pid: child.pid,
+          code,
+          signal: sig,
+          at: new Date().toISOString()
+        })
+      });
+      await res.text(); // consume body
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[letta-cli-sdk-wrapper] failed to report exit to registry: ${msg}`);
+    }
+  }
+}
+
+child.on("exit", async (code, sig) => {
+  await reportExit(code, sig);
   if (sig) {
     process.kill(process.pid, sig);
   } else {

@@ -29,6 +29,8 @@ import {
   __getSubagentWatcherCounts,
   __resetSubagentRegistry,
   __setSubagentProcessAliveCheckerForTest,
+  updateSubagentExitStatus,
+  finalizeSubagent,
 } from "../lib/subagent-registry.js";
 import { messagesJsonlPath } from "../lib/store.js";
 
@@ -88,6 +90,27 @@ test("subagent-registry: Agent tool_return correlates task_id + subagent agent i
   assert.equal(entry!.subagentAgentId, "agent-local-abc12345-0000-0000-0000-000000000000");
   // Still running until a terminal signal arrives.
   assert.equal(entry!.status, "running");
+});
+
+test("subagent-registry: updateSubagentExitStatus and finalizeSubagent stores exit code and signal", () => {
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  ingestParentFrame(dispatchFrame(tcid, "Exit code test"), "run-parent-exit");
+  ingestParentFrame(
+    returnFrame(tcid, "task_exit", "agent-local-exit", "/tmp/exit.log"),
+    "run-parent-exit",
+  );
+
+  let entry = getSubagent(tcid);
+  assert.ok(entry, "entry should exist");
+  assert.equal(entry!.status, "running");
+
+  updateSubagentExitStatus(tcid, 143, "SIGTERM");
+  finalizeSubagent(tcid, "failed", "worker_exit (signal SIGTERM)");
+
+  entry = getSubagent(tcid);
+  assert.equal(entry!.status, "failed");
+  assert.equal(entry!.exitCode, 143);
+  assert.equal(entry!.exitSignal, "SIGTERM");
 });
 
 test("subagent-registry: non-Agent frames are ignored", () => {
