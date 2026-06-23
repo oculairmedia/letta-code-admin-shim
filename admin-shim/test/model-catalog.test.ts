@@ -347,6 +347,15 @@ test("isVisionCapableModel: false for text-only models", () => {
 test("isVisionCapableModel: case insensitive", () => {
   assert.strictEqual(isVisionCapableModel("GPT-4-VISION"), true);
   assert.strictEqual(isVisionCapableModel("Claude-3-Opus"), true);
+  assert.strictEqual(isVisionCapableModel("MiniMax-M3"), true);
+  assert.strictEqual(isVisionCapableModel("Opus-4"), true);
+  assert.strictEqual(isVisionCapableModel("Gpt-4o"), true);
+  assert.strictEqual(isVisionCapableModel("GEMINI-1.5-pro"), true);
+  assert.strictEqual(isVisionCapableModel("QWEN-VL-MAX"), true);
+});
+
+test("isVisionCapableModel: false for unrelated handles containing vision keywords", () => {
+  assert.strictEqual(isVisionCapableModel("gpt-oss-text-only-stub"), false);
 });
 
 test("isVisionCapableModel: word-boundary 'vl' logic", () => {
