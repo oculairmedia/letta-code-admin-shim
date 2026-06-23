@@ -255,3 +255,69 @@ test("cancel-heal: run with no tool calls at all → no orphan, no heal", async 
     assert.equal(after.length, 2, "messages.jsonl must be untouched when there are no orphans");
   });
 });
+
+test("cancel-heal: partial completion preserves valid tool_return while healing orphan", async () => {
+  await withBackendDir(async (stateDir) => {
+    const agentId = "agent-partial";
+    const { convDir } = seedAgentAndConv(stateDir, agentId);
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: [{ type: "text", text: "do two things" }] },
+      {
+        id: "a1",
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "toolu_DONE", name: "Bash", arguments: { command: "echo 1" } },
+          { type: "toolCall", id: "toolu_ORPHAN", name: "Bash", arguments: { command: "sleep 999" } },
+        ],
+      },
+      {
+        id: "a1:tr:DONE",
+        role: "toolResult",
+        toolCallId: "toolu_DONE",
+        toolName: "Bash",
+        content: [{ type: "text", text: "1" }],
+        isError: false,
+      },
+    ]);
+
+    const run = createRun({ agentId, conversationId: "default" });
+    appendRunFrame(run.id, {
+      message_type: "tool_call_message",
+      tool_calls: [
+        { tool_call_id: "toolu_DONE", name: "Bash", arguments: "{}" },
+        { tool_call_id: "toolu_ORPHAN", name: "Bash", arguments: "{}" },
+      ],
+    });
+    appendRunFrame(run.id, {
+      message_type: "tool_return_message",
+      tool_call_id: "toolu_DONE",
+      tool_return: "1",
+      status: "success",
+    });
+
+    assert.equal(cancelRun(run.id), true);
+    assert.deepEqual(collectDanglingToolCallIds(run.id), ["toolu_ORPHAN"], "only the incomplete tool call should be flagged");
+
+    const report = await postCancelRepair(run.id, "default", agentId);
+    assert.ok(report);
+    assert.deepEqual(report!.settled, ["toolu_ORPHAN"]);
+    assert.deepEqual(report!.removed, []);
+    assert.equal(report!.messagesAppended, 1);
+
+    const after = readMessages(convDir);
+    // u0, a1, synth:ORPHAN, tr:DONE
+    assert.equal(after.length, 4);
+
+    const assistantAfter = after[1] as { content: Array<{ type: string; id?: string }> };
+    assert.equal(assistantAfter.content[0]?.id, "toolu_DONE");
+    assert.equal(assistantAfter.content[1]?.id, "toolu_ORPHAN");
+
+    const syntheticTr = after[2] as { role: string; toolCallId: string; isError: boolean };
+    assert.equal(syntheticTr.role, "toolResult");
+    assert.equal(syntheticTr.toolCallId, "toolu_ORPHAN");
+    assert.equal(syntheticTr.isError, true);
+
+    const originalTr = after[3] as { toolCallId: string };
+    assert.equal(originalTr.toolCallId, "toolu_DONE");
+  });
+});
