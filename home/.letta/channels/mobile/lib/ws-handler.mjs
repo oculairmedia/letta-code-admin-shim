@@ -605,8 +605,13 @@ export function handleConnection(ws, request, host) {
           sessionId,
           deviceId,
           sendFrame: (outFrame) => {
-            if (closed) return;
+            if (closed) return false;
+            const cid = outFrame?.conversation_id ?? outFrame?.conversationId;
+            if (typeof cid === "string" && !activeConversationSubscriptions.has(cid)) {
+              return false;
+            }
             safeSend(ws, outFrame, log);
+            return true;
           },
         });
       }
@@ -1179,6 +1184,19 @@ export function handleConnection(ws, request, host) {
           conversation_id: conversationId,
           after_seq: normalizeCursorSeq(frame.after_seq ?? frame.last_conv_seq ?? 0),
         }), log);
+        break;
+      }
+      case "unsubscribe_conversation": {
+        const conversationId = typeof frame.conversation_id === "string" && frame.conversation_id.length > 0 ? frame.conversation_id : null;
+        if (!conversationId) {
+          sendError(ERROR_CODES.PROTOCOL_VIOLATION, "unsubscribe_conversation requires conversation_id", { close: false });
+          break;
+        }
+        const existing = activeConversationSubscriptions.get(conversationId);
+        if (existing) {
+          safeUnsubscribe(`conversation ${conversationId}`, () => existing.unsubscribe());
+          activeConversationSubscriptions.delete(conversationId);
+        }
         break;
       }
       case "a2ui_frame":
