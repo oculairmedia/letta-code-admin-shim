@@ -858,6 +858,31 @@ test("ws: client protocol ping receives protocol pong", async (t) => {
   });
 });
 
+test("ws: active streams stay alive without fixed no-traffic timeout", async (t) => {
+  const shim = await startShim({
+    env: {
+      SHIM_MOBILE_WS_PING_INTERVAL_MS: "100",
+      SHIM_MOBILE_WS_PONG_TIMEOUT_MS: "1000",
+    },
+  });
+  t.after(() => shim.stop());
+  const conn = await openMobileWs(shim.url!, {
+    token: shim.mobileToken,
+    timeoutMs: WS_TIMEOUT_MS,
+    autoPong: true,
+  });
+  t.after(() => conn.close());
+
+  await new Promise<void>((resolve, reject) => {
+    // Wait longer than the timeout to ensure autoPong keeps it alive
+    const timer = setTimeout(() => resolve(), 2_000);
+    conn.ws.once("close", (code: number) => {
+      clearTimeout(timer);
+      reject(new Error(`socket closed unexpectedly with code ${code}`));
+    });
+  });
+});
+
 test("ws: missing protocol pong closes with keepalive code", async (t) => {
   const shim = await startShim({
     env: {
