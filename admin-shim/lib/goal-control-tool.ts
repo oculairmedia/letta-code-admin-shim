@@ -9,7 +9,7 @@ import { broadcastGoalEvent } from "./goal-events.js";
 
 export const GOAL_CONTROL_TOOL_NAME = "goal_control";
 
-export type GoalControlAction = "status" | "complete" | "blocked" | "clear";
+export type GoalControlAction = "status" | "complete" | "blocked";
 
 export interface GoalControlArgs {
   action?: GoalControlAction;
@@ -54,8 +54,8 @@ export async function handleGoalControl(
 ): Promise<AgentToolResult<GoalControlResult>> {
   const args = parseGoalControlArgs(rawArgs);
   const action = args.action;
-  if (action !== "status" && action !== "complete" && action !== "blocked" && action !== "clear") {
-    throw new Error('goal_control action must be "status", "complete", "blocked", or "clear"');
+  if (action !== "status" && action !== "complete" && action !== "blocked") {
+    throw new Error('goal_control action must be "status", "complete", or "blocked"');
   }
 
   if (action === "status") {
@@ -67,9 +67,7 @@ export async function handleGoalControl(
   broadcastGoalEvent({ reason: "client_mutation", at: new Date().toISOString(), status: updated });
   const message = action === "complete"
     ? "Goal marked complete."
-    : action === "clear"
-      ? "Goal cleared."
-      : "Goal marked blocked." + (args.reason ? " Reason: " + args.reason : "");
+    : "Goal marked blocked." + (args.reason ? " Reason: " + args.reason : "");
   return textResult({
     ok: true,
     action,
@@ -89,8 +87,8 @@ export function makeGoalControlTool(context: GoalControlContext): AnyAgentTool {
       properties: {
         action: {
           type: "string",
-          enum: ["status", "complete", "blocked", "clear"],
-          description: "status returns current goal summary; complete marks the active goal complete; blocked marks the active goal blocked after the repeated-blocker rule; clear removes the active goal entirely.",
+          enum: ["status", "complete", "blocked"],
+          description: "status returns current goal summary; complete marks the active goal complete; blocked marks the active goal blocked after the repeated-blocker rule.",
         },
         reason: {
           type: "string",

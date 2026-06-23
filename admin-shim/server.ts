@@ -24,7 +24,6 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import zlib from "node:zlib";
 
 import {
   getAgentRecord,
@@ -193,35 +192,15 @@ function json(
   body: unknown,
   extraHeaders: Record<string, string> = {},
 ): void {
-  let payload = Buffer.from(JSON.stringify(body));
-
-  const req = (res as any).req;
-  const acceptEncodingRaw = req ? req.headers["accept-encoding"] : undefined;
-  const acceptEncoding = Array.isArray(acceptEncodingRaw) ? acceptEncodingRaw.join(", ") : (acceptEncodingRaw || "");
-  let encoding = null;
-
-  if (acceptEncoding.includes("br")) {
-    encoding = "br";
-    payload = zlib.brotliCompressSync(payload);
-  } else if (acceptEncoding.includes("gzip")) {
-    encoding = "gzip";
-    payload = zlib.gzipSync(payload);
-  }
-
-  const headers: Record<string, string> = {
+  const payload = Buffer.from(JSON.stringify(body));
+  res.writeHead(status, {
     "Content-Type": "application/json",
     "Content-Length": String(payload.length),
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,PATCH,OPTIONS",
     ...extraHeaders,
-  };
-
-  if (encoding) {
-    headers["Content-Encoding"] = encoding;
-  }
-
-  res.writeHead(status, headers);
+  });
   res.end(payload);
 }
 

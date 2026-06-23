@@ -151,16 +151,3 @@ test("goal_control status, complete, and blocked mutate native goal state and br
   assert.equal(blocked.details?.reason, "waiting on external approval");
   assert.equal(events.length, 2);
 });
-
-test("goal_control clear clears native goal state and broadcasts", async () => {
-  seedActiveGoal();
-  const events: unknown[] = [];
-  subscribeGoalEvents((event) => events.push(event));
-
-  const cleared = await handleGoalControl({ agentId: "agent-a", conversationId: "conv-a" }, { action: "clear" });
-  assert.equal(cleared.details?.status?.goal, null);
-  assert.equal(cleared.details?.message, "Goal cleared.");
-  assert.equal(getNativeGoalForConversation("conv-a"), null);
-  assert.equal(readLocalSettings().conversationGoalsByServer["local:/tmp/backend"]["conv-a"], undefined);
-  assert.equal(events.length, 1);
-});
