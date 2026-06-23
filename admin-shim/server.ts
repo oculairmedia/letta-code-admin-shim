@@ -4,7 +4,7 @@
  *
  * Phase 1 endpoints (read + chat):
  *   GET    /v1/health/
- *   GET    /v1/agents                            list
+ *   GET    /v1/agents                            list (?slim=true → {id,name,description} only, for picker UIs)
  *   GET    /v1/agents/count                      count
  *   GET    /v1/agents/{id}                       single
  *   GET    /v1/agents/{id}/messages              messages list
@@ -420,6 +420,16 @@ async function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url:
   const { limit, offset } = parsePagination(url.searchParams);
   const tagFilter = url.searchParams.getAll("tags");
   const nameFilter = url.searchParams.get("name");
+  // lcp/letta-mobile-3ra3n: opt-in slim projection for picker UIs (Schedules,
+  // etc.). The default `/v1/agents` response synthesizes the full Letta
+  // AgentState per row (system prompt, message_ids, llm/embedding config,
+  // memory blocks) — ~12KB/agent, ~621KB for 50. A picker only needs
+  // {id, name, description}. `?slim=true` short-circuits BEFORE the expensive
+  // per-agent expansion below: no defaultConversationForAgent, no listMessages,
+  // no readBlocksForAgent, no agentToLettaState. The 621KB originates HERE in
+  // the shim (it is not an upstream passthrough), so this slims the payload at
+  // the source. Default (non-slim) behavior is unchanged.
+  const slim = parseBoolParam(url.searchParams, "slim") === true;
   let agents = await listAgents();
   if (tagFilter.length > 0) {
     agents = agents.filter((a) => (a.tags ?? []).some((t) => tagFilter.includes(t)));
@@ -430,6 +440,15 @@ async function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url:
     );
   }
   const sliced = agents.slice(offset, offset + limit);
+  if (slim) {
+    const slimList = sliced.map((a) => ({
+      id: a.id,
+      name: a.name ?? "Untitled",
+      description: a.description ?? null,
+    }));
+    json(res, 200, slimList);
+    return;
+  }
   const projected = await Promise.all(sliced.map(async (a) => {
     await defaultConversationForAgent(a.id);
     const messages = await listMessages("default", a.id);

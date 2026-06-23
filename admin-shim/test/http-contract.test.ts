@@ -251,6 +251,105 @@ test("GET /v1/agents lists seeded agents with vanilla AgentState shape", async (
   assert.equal(a.llm_config.model_endpoint_type, "openai");
 });
 
+// lcp/letta-mobile-3ra3n: `?slim=true` projection for picker UIs.
+// Returns only {id, name, description}; omits the heavy AgentState fields
+// (system, message_ids, llm_config, embedding_config, memory, tool_rules,
+// model_settings, compaction_settings, ...). Default path stays unchanged.
+test("GET /v1/agents?slim=true returns only {id,name,description} and omits heavy fields", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const id = seedAgent(shim.stateDir, {
+    id: "agent-slim-001",
+    name: "Picker Me",
+    description: "A pickable agent.",
+    systemPrompt: "This is a long system prompt that should NOT appear in slim.",
+    blocks: { persona: "I am slim.", human: "User is human." },
+    tools: ["Bash", "Read"],
+  });
+  seedConversation(shim.stateDir, id);
+
+  const { res, body } = await getJson(`${shim.url}/v1/agents?slim=true`);
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(body));
+  const arr = body as Array<Record<string, unknown>>;
+  assert.equal(arr.length, 1);
+  const a = arr[0]!;
+
+  // Exactly the picker fields, nothing else.
+  assert.deepEqual(Object.keys(a).sort(), ["description", "id", "name"]);
+  assert.equal(a["id"], id);
+  assert.equal(a["name"], "Picker Me");
+  assert.equal(a["description"], "A pickable agent.");
+
+  // Heavy fields must be absent (not just empty) — this is the whole point.
+  for (const heavy of [
+    "system",
+    "message_ids",
+    "llm_config",
+    "embedding_config",
+    "tool_rules",
+    "compaction_settings",
+    "model_settings",
+    "response_format",
+    "memory",
+    "blocks",
+    "tools",
+    "metadata",
+  ]) {
+    assert.ok(!(heavy in a), `slim row must omit heavy field "${heavy}"`);
+  }
+});
+
+test("GET /v1/agents?slim=true defaults: name->Untitled, description->null", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  // Seed an agent record with no name/description so we exercise the defaults.
+  // These must match agentToLettaState's defaults ("Untitled" / null) so the
+  // slim and full paths agree on id/name/description.
+  mkdirSync(join(shim.stateDir, "agents"), { recursive: true });
+  writeFileSync(
+    join(shim.stateDir, "agents", `${Buffer.from("agent-slim-bare", "utf8").toString("base64url")}.json`),
+    JSON.stringify({ id: "agent-slim-bare" }),
+  );
+
+  const { res, body } = await getJson(`${shim.url}/v1/agents?slim=true`);
+  assert.equal(res.status, 200);
+  const arr = body as Array<Record<string, unknown>>;
+  const bare = arr.find((a) => a["id"] === "agent-slim-bare");
+  assert.ok(bare, "bare agent present in slim list");
+  assert.equal(bare!["name"], "Untitled");
+  assert.equal(bare!["description"], null);
+});
+
+test("GET /v1/agents (default, no slim) is unchanged — full AgentState shape", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const id = seedAgent(shim.stateDir, {
+    id: "agent-nonslim-001",
+    name: "Full",
+    systemPrompt: "Full system prompt.",
+  });
+  seedConversation(shim.stateDir, id);
+
+  // No slim param, and explicit slim=false, both yield the full shape.
+  for (const qs of ["", "?slim=false"]) {
+    const { res, body } = await getJson(`${shim.url}/v1/agents${qs}`);
+    assert.equal(res.status, 200);
+    const arr = body as Array<Record<string, unknown>>;
+    assert.equal(arr.length, 1);
+    const a = arr[0]!;
+    assert.equal(a["id"], id);
+    assert.equal(a["system"], "Full system prompt.");
+    // Heavy fields present on the default path.
+    assert.ok("llm_config" in a, `default path keeps llm_config (qs="${qs}")`);
+    assert.ok("memory" in a, `default path keeps memory (qs="${qs}")`);
+    assert.ok("message_ids" in a, `default path keeps message_ids (qs="${qs}")`);
+  }
+});
+
 test("GET /v1/agents orders by mtime descending", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
