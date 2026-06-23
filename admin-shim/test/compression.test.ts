@@ -60,6 +60,23 @@ test("GET /v1/health/ returns identity when no encoding accepted", async (t) => 
   assert.equal(body.status, "ok");
 });
 
+test("GET /v1/health/ returns identity when Accept-Encoding omits gzip/br", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const res = await fetch(`${shim.url}/v1/health/`, {
+    headers: {
+      "Accept-Encoding": "deflate",
+    },
+  });
+
+  const contentEncoding = res.headers.get("content-encoding");
+  assert.equal(contentEncoding, null);
+
+  const body = await res.json();
+  assert.equal(body.status, "ok");
+});
+
 test("SSE framing does not use compression if unsafe", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
@@ -73,4 +90,10 @@ test("SSE framing does not use compression if unsafe", async (t) => {
 
   const contentEncoding = res.headers.get("content-encoding");
   assert.equal(contentEncoding, null); // Streaming should be uncompressed
+
+  // node fetch will not auto-decompress if content-encoding is null,
+  // so we assert the raw body is plaintext SSE framing and not compressed binary gibberish
+  const buffer = await res.arrayBuffer();
+  const rawBody = Buffer.from(buffer).toString("utf8");
+  assert.ok(rawBody.startsWith(": connected conv-123"), "Body should be raw SSE plaintext, not compressed binary");
 });
