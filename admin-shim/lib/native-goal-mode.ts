@@ -605,6 +605,7 @@ export async function updateNativeGoalStatusForAgent(
 }
 
 export const _nativeGoalModeInternals = Object.freeze({
+  parseTokenBudget,
   readLocalSettings,
   readGlobalSettings,
   writeLocalSettings,

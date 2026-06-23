@@ -11,6 +11,7 @@ import {
   getNativeGoalForConversation,
   listActiveNativeGoals,
   wasNativeGoalUserStopped,
+  _nativeGoalModeInternals,
 } from "../lib/native-goal-mode.js";
 
 let cwd: string;
@@ -348,4 +349,110 @@ test("listActiveNativeGoals returns only active resolvable goals with drivable i
     objective: "drive active default",
   }]);
   assert.equal(warnings.length, 1);
+});
+
+test("parseTokenBudget parses args correctly", () => {
+  const { parseTokenBudget } = _nativeGoalModeInternals;
+  assert.deepEqual(parseTokenBudget(["--token-budget", "100", "my", "goal"]), {
+    tokenBudget: 100,
+    rest: ["my", "goal"],
+    replace: false
+  });
+  assert.deepEqual(parseTokenBudget(["--replace", "another", "goal"]), {
+    tokenBudget: null,
+    rest: ["another", "goal"],
+    replace: true
+  });
+  assert.deepEqual(parseTokenBudget(["--replace", "--token-budget", "500", "goal", "with", "budget"]), {
+    tokenBudget: 500,
+    rest: ["goal", "with", "budget"],
+    replace: true
+  });
+  assert.deepEqual(parseTokenBudget(["simple", "goal"]), {
+    tokenBudget: null,
+    rest: ["simple", "goal"],
+    replace: false
+  });
+  assert.throws(() => parseTokenBudget(["--token-budget"]), /--token-budget requires a positive number/);
+  assert.throws(() => parseTokenBudget(["--token-budget", "abc"]), /--token-budget requires a positive number/);
+  assert.throws(() => parseTokenBudget(["--token-budget", "-10"]), /--token-budget requires a positive number/);
+  assert.throws(() => parseTokenBudget(["--token-budget", "0"]), /--token-budget requires a positive number/);
+});
+
+test("native goal command bridge status", async () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+  });
+
+  await applyNativeGoalCommandForAgent("agent-a", "/goal --token-budget 50000 finish the migration");
+
+  const status = await applyNativeGoalCommandForAgent("agent-a", "/goal status");
+  assert.equal(status.action, "status");
+  assert.equal(status.goal?.objective, "finish the migration");
+  assert.equal(status.goal?.tokenBudget, 50000);
+  assert.equal(status.goal?.status, "active");
+});
+
+test("native goal command bridge implicit status", async () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+  });
+
+  await applyNativeGoalCommandForAgent("agent-a", "/goal --token-budget 50000 finish the migration");
+
+  const status = await applyNativeGoalCommandForAgent("agent-a", "/goal");
+  assert.equal(status.action, "status");
+  assert.equal(status.goal?.objective, "finish the migration");
+  assert.equal(status.goal?.tokenBudget, 50000);
+  assert.equal(status.goal?.status, "active");
+});
+
+test("native goal command bridge parses all lifecycle actions correctly", async () => {
+  writeLocalSettings({
+    sessionsByServer: {
+      "local:/tmp/backend": { agentId: "agent-a", conversationId: "conv-a" },
+    },
+  });
+
+  // /goal --token-budget N <obj>
+  const createRes = await applyNativeGoalCommandForAgent("agent-a", "/goal --token-budget 100 my objective");
+  assert.equal(createRes.action, "create");
+  assert.equal(createRes.goal?.objective, "my objective");
+  assert.equal(createRes.goal?.tokenBudget, 100);
+
+  // /goal pause
+  const pauseRes = await applyNativeGoalCommandForAgent("agent-a", "/goal pause");
+  assert.equal(pauseRes.action, "pause");
+
+  // /goal resume
+  const resumeRes = await applyNativeGoalCommandForAgent("agent-a", "/goal resume");
+  assert.equal(resumeRes.action, "resume");
+
+  // /goal complete
+  const completeRes = await applyNativeGoalCommandForAgent("agent-a", "/goal complete");
+  assert.equal(completeRes.action, "complete");
+
+  // /goal clear
+  const clearRes = await applyNativeGoalCommandForAgent("agent-a", "/goal clear");
+  assert.equal(clearRes.action, "clear");
+
+  // Re-create to test replace
+  await applyNativeGoalCommandForAgent("agent-a", "/goal new objective");
+
+  // /goal --replace
+  const replaceRes = await applyNativeGoalCommandForAgent("agent-a", "/goal --replace replaced objective");
+  assert.equal(replaceRes.action, "replace");
+  assert.equal(replaceRes.goal?.objective, "replaced objective");
+
+  // /goal status
+  const statusRes = await applyNativeGoalCommandForAgent("agent-a", "/goal status");
+  assert.equal(statusRes.action, "status");
+
+  // /goal (implicit status)
+  const implicitStatusRes = await applyNativeGoalCommandForAgent("agent-a", "/goal");
+  assert.equal(implicitStatusRes.action, "status");
 });
