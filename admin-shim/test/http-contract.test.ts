@@ -1500,3 +1500,67 @@ test("lcp-0xm: malformed record (neither parts nor content) is filtered out", as
   assert.equal(arr.length, 1);
   assert.equal(arr[0]!.id, "ui-msg-ok");
 });
+
+test("GET /v1/agents/{id}/goal and /v1/conversations/{id}/goal read native goal state", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-goal-001" });
+  const extId = externalConvId(agentId, "default");
+  seedConversation(shim.stateDir, agentId);
+
+  const localBackendDir = shim.stateDir;
+  mkdirSync(join(shim.homeDir, ".letta"), { recursive: true });
+  writeFileSync(
+    join(shim.homeDir, ".letta", "settings.json"),
+    JSON.stringify({
+      sessionsByServer: {
+        [`local:${localBackendDir}`]: { agentId, conversationId: "default" },
+      },
+      conversationGoalsByServer: {
+        [`local:${localBackendDir}`]: {
+          "default": {
+            objective: "finish the http tests",
+            status: "active",
+            tokenBudget: 42000,
+          },
+        },
+      },
+    }),
+  );
+
+  mkdirSync(join(localBackendDir, ".letta"), { recursive: true });
+  writeFileSync(
+    join(localBackendDir, ".letta", "settings.local.json"),
+    JSON.stringify({
+      sessionsByServer: {
+        [`local:${localBackendDir}`]: { agentId, conversationId: "default" },
+      },
+      conversationGoalsByServer: {
+        [`local:${localBackendDir}`]: {
+          "default": {
+            objective: "finish the http tests",
+            status: "active",
+            tokenBudget: 42000,
+          },
+        },
+      },
+    }),
+  );
+
+  const byConv = await getJson(`${shim.url}/v1/conversations/${extId}/goal`);
+  assert.equal(byConv.res.status, 200);
+  assert.equal((byConv.body as any).goal?.objective, "finish the http tests");
+  assert.equal((byConv.body as any).goal?.status, "active");
+  assert.equal((byConv.body as any).goal?.tokenBudget, 42000);
+
+  const byAgent = await getJson(`${shim.url}/v1/agents/${agentId}/goal`);
+  assert.equal(byAgent.res.status, 200);
+  assert.equal((byAgent.body as any).goal?.objective, "finish the http tests");
+  assert.equal((byAgent.body as any).goal?.status, "active");
+  assert.equal((byAgent.body as any).goal?.tokenBudget, 42000);
+
+  const emptyConv = await getJson(`${shim.url}/v1/conversations/conv-unseeded/goal`);
+  assert.equal(emptyConv.res.status, 200);
+  assert.equal((emptyConv.body as any).goal, null);
+});
