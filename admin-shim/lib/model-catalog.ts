@@ -132,6 +132,9 @@ export const VISION_MODEL_PATTERNS: readonly string[] = [
 export function isVisionCapableModel(handleOrId: string): boolean {
   if (typeof handleOrId !== "string") return false;
   const haystack = handleOrId.toLowerCase();
+
+  if (haystack.includes("gpt-oss-text-only-stub")) return false;
+
   if (VISION_MODEL_PATTERNS.some((p) => haystack.includes(p))) return true;
   // "vl" needs word-boundary semantics so e.g. "vllm" doesn't match.
   return /\bvl\b/.test(haystack);
