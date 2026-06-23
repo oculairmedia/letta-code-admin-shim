@@ -1435,6 +1435,32 @@ async function handleWorkActivityOverride(req: IncomingMessage, res: ServerRespo
   return json(res, 200, entry);
 }
 
+async function handleWorkerEvents(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = await readJsonBody(req);
+  const event = body["event"];
+  if (typeof event !== "string" || event.length === 0) {
+    return badRequest(res, "event is required (string)");
+  }
+  if (event === "child_exit") {
+    const taskId = body["taskId"];
+    if (typeof taskId === "string" && taskId.length > 0) {
+      const running = snapshotSubagents().find((s) => s.taskId === taskId && s.status === "running");
+      if (running) {
+        const code = typeof body["code"] === "number" ? body["code"] : null;
+        const signal = typeof body["signal"] === "string" ? body["signal"] : null;
+        const detail = signal ? `signal ${signal}` : `code ${code}`;
+        const { updateSubagentExitStatus } = await import("./lib/subagent-registry.js");
+        updateSubagentExitStatus(running.toolCallId, code, signal);
+        finalizeSubagent(running.toolCallId, "failed", `worker_exit (${detail})`);
+      }
+    }
+    return json(res, 200, { success: true });
+  }
+
+  // Ignore other events for now.
+  return json(res, 200, { success: true });
+}
+
 async function handleWorkActivityIngest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJsonBody(req);
 
@@ -2741,6 +2767,14 @@ const server = createServer((req, res) => {
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     res.setHeader("Allow", "PATCH, OPTIONS");
     return json(res, 405, { detail: `${req.method} not allowed on /v1/work-activity/:toolCallId` });
+  }
+
+  // /v1/worker-events — internal child process lifecycle supervision
+  if (pathname === "/v1/worker-events" || pathname === "/v1/worker-events/") {
+    if (req.method === "POST") return handleWorkerEvents(req, res);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    res.setHeader("Allow", "POST, OPTIONS");
+    return json(res, 405, { detail: `${req.method} not allowed on /v1/worker-events` });
   }
 
   // /v1/skills/* — skill discovery, search, install, uninstall
