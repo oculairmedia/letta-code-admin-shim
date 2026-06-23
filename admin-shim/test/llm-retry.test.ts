@@ -5,6 +5,8 @@ import {
   appendVisibleLlmFailure,
   isRetriableLlmError,
   runTurnWithLlmRetry,
+  computeRetryDelayMs,
+  llmRetryConfigFromEnv,
 } from "../lib/llm-retry.js";
 import type { AdapterRunTurnResult, RunTurnOptions } from "../lib/agent-pool.js";
 import type { LettaStreamFrame } from "../lib/types/letta-stream.js";
@@ -165,4 +167,93 @@ test("appendVisibleLlmFailure does not add frames after usable output", () => {
     errorPayload: { message: "Overloaded" },
   });
   assert.equal(result.frames.length, 1);
+});
+
+test("computeRetryDelayMs calculates exponential backoff with bounded jitter", () => {
+  const config = { maxAttempts: 5, baseMs: 1000, capMs: 5000 };
+
+  // Min jitter (-25%)
+  assert.equal(computeRetryDelayMs(1, config, () => 0.0), 750);
+  assert.equal(computeRetryDelayMs(2, config, () => 0.0), 1500);
+  assert.equal(computeRetryDelayMs(3, config, () => 0.0), 3000);
+
+  // Max jitter (+25%)
+  assert.equal(computeRetryDelayMs(1, config, () => 0.99999), 1250);
+  assert.equal(computeRetryDelayMs(2, config, () => 0.99999), 2500);
+  assert.equal(computeRetryDelayMs(3, config, () => 0.99999), 5000);
+
+  // Capping
+  assert.equal(computeRetryDelayMs(4, config, () => 0.5), 5000); // 1000 * 2^3 = 8000 -> 5000
+});
+
+test("appendVisibleLlmFailure extracts clearest available error message", () => {
+  const runHandle = { id: "run-err", record: { agent_id: "agent-a", conversation_id: "conv-a" } };
+
+  // Test fallback chain: apiError.detail > errorDetail > message > error > fallback
+
+  // 1. apiError.detail
+  let res = appendVisibleLlmFailure(
+    { frames: [], stderr: "", done: false, errorPayload: { apiError: { detail: "api detail error" }, errorDetail: "error detail", message: "message error" } },
+    { runHandle: runHandle as any }
+  );
+  assert.equal((res.frames[0] as any).event.content[0].text, "Model provider error: api detail error");
+
+  // 2. errorDetail
+  res = appendVisibleLlmFailure(
+    { frames: [], stderr: "", done: false, errorPayload: { errorDetail: "error detail", message: "message error" } },
+    { runHandle: runHandle as any }
+  );
+  assert.equal((res.frames[0] as any).event.content[0].text, "Model provider error: error detail");
+
+  // 3. message
+  res = appendVisibleLlmFailure(
+    { frames: [], stderr: "", done: false, errorPayload: { message: "message error" } },
+    { runHandle: runHandle as any }
+  );
+  assert.equal((res.frames[0] as any).event.content[0].text, "Model provider error: message error");
+
+  // 4. result.error
+  res = appendVisibleLlmFailure(
+    { frames: [], stderr: "", done: false, error: "root error" },
+    { runHandle: runHandle as any }
+  );
+  assert.equal((res.frames[0] as any).event.content[0].text, "Model provider error: root error");
+
+  // 5. fallback
+  res = appendVisibleLlmFailure(
+    { frames: [], stderr: "", done: false, errorPayload: {} },
+    { runHandle: runHandle as any }
+  );
+  assert.equal((res.frames[0] as any).event.content[0].text, "Model provider error: model provider error");
+});
+
+test("llmRetryConfigFromEnv parses environment and falls back correctly", () => {
+  // Defaults
+  assert.deepEqual(llmRetryConfigFromEnv({}), {
+    maxAttempts: 4,
+    baseMs: 1000,
+    capMs: 15_000,
+  });
+
+  // Valid overrides
+  assert.deepEqual(llmRetryConfigFromEnv({
+    SHIM_LLM_RETRY_MAX: "10",
+    SHIM_LLM_RETRY_BASE_MS: "2000",
+    SHIM_LLM_RETRY_CAP_MS: "30000",
+  }), {
+    maxAttempts: 10,
+    baseMs: 2000,
+    capMs: 30000,
+  });
+
+  // Invalid overrides (negative, NaN) fall back to defaults
+  assert.deepEqual(llmRetryConfigFromEnv({
+    SHIM_LLM_RETRY_MAX: "-1",
+    SHIM_LLM_RETRY_BASE_MS: "invalid",
+    SHIM_LLM_RETRY_CAP_MS: "0",
+  }), {
+    maxAttempts: 4,
+    baseMs: 1000,
+    capMs: 15_000,
+  });
 });
