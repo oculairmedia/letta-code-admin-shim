@@ -70,7 +70,7 @@ function extractUserOtid(body: MessageRequestBody | null | undefined): string | 
   return null;
 }
 
-function extractText(body: unknown): string {
+export function extractText(body: unknown): string {
   // Mobile sends MessageCreateRequest with either:
   //   { messages: [{role:"user", content:"..."}], ... }
   //   { messages: [{role:"user", content:[{type:"text",text:"..."}]}], ... }
@@ -95,7 +95,12 @@ function extractText(body: unknown): string {
               .map((c: unknown) => {
                 if (c && typeof c === "object") {
                   const cr = c as Record<string, unknown>;
-                  return typeof cr["text"] === "string" ? cr["text"] : "";
+                  if (typeof cr["text"] === "string") return cr["text"];
+                  const t = cr["type"];
+                  if (t === "image" || t === "image_url" || t === "input_image") {
+                    return "[image]";
+                  }
+                  return "";
                 }
                 return "";
               })
@@ -119,9 +124,9 @@ function extractText(body: unknown): string {
 // local backend already accept as `string | unknown[]`); otherwise we fall
 // back to the plain string so text-only sends behave exactly as before.
 // (lcp-qi2f — restored after the fix was lost to a divergent branch.)
-type InboundContentPart = { type: string; [k: string]: unknown };
+export type InboundContentPart = { type: string; [k: string]: unknown };
 
-function extractContent(body: unknown): string | InboundContentPart[] {
+export function extractContent(body: unknown): string | InboundContentPart[] {
   if (!body || typeof body !== "object") return extractText(body);
   const rec = body as Record<string, unknown>;
   // Legacy scalar inputs never carry images.
