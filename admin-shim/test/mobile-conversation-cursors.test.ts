@@ -456,3 +456,18 @@ test("resumeConversation reports cursorExpired when afterSeq is before the oldes
   });
 });
 
+
+test("resume after a high cursor near the tail returns exactly the new frames", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-resume-tail";
+    const TOTAL = 2_000;
+    for (let i = 0; i < TOTAL; i += 1) {
+      stampConversationFrame(conv, { message_type: "assistant_message", content: "y" });
+    }
+    // Cursor 3 frames behind the tail -> exactly the last 3 frames replay.
+    const result = resumeConversation(conv, TOTAL - 3);
+    assert.equal(result.ok, true);
+    const seqs = result.frames.map((f) => f["conv_seq"]);
+    assert.deepEqual(seqs, [TOTAL - 2, TOTAL - 1, TOTAL]);
+  });
+});
