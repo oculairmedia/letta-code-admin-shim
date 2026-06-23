@@ -563,7 +563,7 @@ export async function applyNativeGoalCommandForAgent(
 
 export async function updateNativeGoalStatusForAgent(
   agentId: string,
-  status: "complete" | "blocked",
+  status: "complete" | "blocked" | "clear",
   resolver: ConversationResolver = resolveConversationId,
 ): Promise<NativeGoalCommandResult> {
   const local = readLocalSettings();
@@ -581,8 +581,13 @@ export async function updateNativeGoalStatusForAgent(
   if (!existing) throw new Error(`no active goal to mark ${status}`);
 
   const now = new Date().toISOString();
-  const goal = { ...accrueActiveSeconds(existing, now), status, activeStartedAt: null, updatedAt: now };
-  goalsForServer[session.conversationId] = goal;
+  let goal: NativeConversationGoal | null = null;
+  if (status === "clear") {
+    delete goalsForServer[session.conversationId];
+  } else {
+    goal = { ...accrueActiveSeconds(existing, now), status, activeStartedAt: null, updatedAt: now };
+    goalsForServer[session.conversationId] = goal;
+  }
   byServer[session.serverKey] = goalsForServer;
   local.conversationGoalsByServer = byServer;
   writeLocalSettings(local);
@@ -594,7 +599,7 @@ export async function updateNativeGoalStatusForAgent(
   return {
     ok: true,
     action: status,
-    message: status === "complete" ? "Goal marked complete." : "Goal marked blocked.",
+    message: status === "complete" ? "Goal marked complete." : status === "clear" ? "Goal cleared." : "Goal marked blocked.",
     ...statusForSession(local, session.serverKey, session.conversationId, agentId),
   };
 }
