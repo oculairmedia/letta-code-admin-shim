@@ -95,6 +95,8 @@ function runningSubagent(input: Partial<SubagentEntry> & { toolCallId: string; s
     workerPid: input.workerPid ?? null,
     ownerShimPid: input.ownerShimPid ?? null,
     ownerShimInstanceId: input.ownerShimInstanceId ?? null,
+    exitCode: null,
+    exitSignal: null,
     startedAt: input.startedAt,
     endedAt: null,
   };
