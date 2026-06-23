@@ -64,8 +64,10 @@ function createMobileAdapter(account, host) {
     let delivered = 0;
     for (const [sessionId, client] of clients.entries()) {
       try {
-        client.sendFrame(frame);
-        delivered += 1;
+        const sent = client.sendFrame(frame);
+        if (sent !== false) {
+          delivered += 1;
+        }
       } catch (err) {
         host.log?.(`[mobile:${accountId}] channel push failed session=${sessionId}: ${err.message}`);
       }

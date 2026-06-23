@@ -71,6 +71,10 @@ async function loadMobileAdapter(t: { after: (fn: () => unknown) => void }): Pro
         ...frame,
         conv_seq: ++convSeq,
       }),
+      subscribeConversationEvents: () => {
+        // Return a mock unsubscribe function
+        return () => undefined;
+      },
     },
   );
 }
@@ -91,6 +95,13 @@ test("mobile channel: sendMessage pushes assistant frames to authenticated WS cl
   })));
 
   assert.ok(ws.sent.some((frame) => frame.type === "welcome"), "hello should authenticate before push registration");
+
+  ws.emit("message", Buffer.from(JSON.stringify({
+    v: 1,
+    type: "subscribe_conversation",
+    id: "sub-1",
+    conversation_id: "conv-1",
+  })));
 
   const result = await adapter.sendMessage({
     agent_id: "agent-1",
@@ -113,4 +124,73 @@ test("mobile channel: sendMessage pushes assistant frames to authenticated WS cl
   ws.close();
   const afterClose = await adapter.sendDirectReply("conv-1", "No live client.", { agent_id: "agent-1" });
   assert.equal(afterClose.delivered, 0, "closed clients should be released from the push registry");
+});
+
+test("mobile channel: push routing sends only to subscribed conversation clients", async (t) => {
+  const adapter = await loadMobileAdapter(t);
+
+  const ws1 = new FakeWs();
+  adapter.acceptConnection(ws1, {});
+  ws1.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "hello", id: "h1", ts: new Date().toISOString(), token: "token", device_id: "d1" })));
+
+  const ws2 = new FakeWs();
+  adapter.acceptConnection(ws2, {});
+  ws2.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "hello", id: "h2", ts: new Date().toISOString(), token: "token", device_id: "d2" })));
+
+  // ws1 subscribes to conv-1
+  ws1.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "subscribe_conversation", id: "sub1", conversation_id: "conv-1" })));
+  // ws2 subscribes to conv-2
+  ws2.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "subscribe_conversation", id: "sub2", conversation_id: "conv-2" })));
+
+  ws1.sent = [];
+  ws2.sent = [];
+
+  const res1 = await adapter.sendMessage({ agent_id: "agent-1", conversation_id: "conv-1", text: "To conv-1" });
+  assert.equal(res1.delivered, 1, "Should deliver to ws1");
+  assert.equal(ws1.sent.length, 1);
+  assert.equal(ws1.sent[0]?.["conversation_id"], "conv-1");
+  assert.equal(ws2.sent.length, 0, "ws2 should not receive conv-1 message");
+
+  ws1.sent = [];
+  ws2.sent = [];
+
+  const res2 = await adapter.sendMessage({ agent_id: "agent-1", conversation_id: "conv-2", text: "To conv-2" });
+  assert.equal(res2.delivered, 1, "Should deliver to ws2");
+  assert.equal(ws2.sent.length, 1);
+  assert.equal(ws2.sent[0]?.["conversation_id"], "conv-2");
+  assert.equal(ws1.sent.length, 0, "ws1 should not receive conv-2 message");
+
+  ws1.close();
+  ws2.close();
+});
+
+test("mobile channel: unsubscribe stops push routing for that conversation", async (t) => {
+  const adapter = await loadMobileAdapter(t);
+
+  const ws = new FakeWs();
+  adapter.acceptConnection(ws, {});
+  ws.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "hello", id: "h1", ts: new Date().toISOString(), token: "token", device_id: "d1" })));
+
+  ws.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "subscribe_conversation", id: "sub1", conversation_id: "conv-1" })));
+
+  let res = await adapter.sendMessage({ agent_id: "agent-1", conversation_id: "conv-1", text: "Delivery 1" });
+  assert.equal(res.delivered, 1);
+
+  // Unsubscribe
+  ws.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "unsubscribe_conversation", id: "unsub1", conversation_id: "conv-1" })));
+
+  res = await adapter.sendMessage({ agent_id: "agent-1", conversation_id: "conv-1", text: "Delivery 2" });
+  assert.equal(res.delivered, 0, "Should not deliver after unsubscribe");
+
+  // Reconnect ws2 and subscribe
+  const ws2 = new FakeWs();
+  adapter.acceptConnection(ws2, {});
+  ws2.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "hello", id: "h2", ts: new Date().toISOString(), token: "token", device_id: "d1" })));
+  ws2.emit("message", Buffer.from(JSON.stringify({ v: 1, type: "subscribe_conversation", id: "sub2", conversation_id: "conv-1" })));
+
+  res = await adapter.sendMessage({ agent_id: "agent-1", conversation_id: "conv-1", text: "Delivery 3" });
+  assert.equal(res.delivered, 1, "Should deliver to new connection after subscribe");
+
+  ws.close();
+  ws2.close();
 });
