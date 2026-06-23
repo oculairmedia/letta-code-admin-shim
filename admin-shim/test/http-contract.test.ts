@@ -175,6 +175,11 @@ test("GET /v1/slash-commands returns compact skill command descriptors", async (
     installed: false,
   }]);
 
+  // Explicitly verify the full body is not leaked
+  const alphaCmd = commands.find(c => c["name"] === "alpha");
+  assert.ok(alphaCmd);
+  assert.equal((alphaCmd as any).body, undefined);
+
   // GET /v1/skills surfaces the resolved skills directory (LETTA_SKILLS_DIR).
   const list = await getJson(`${shim.url}/v1/skills`);
   const listBody = list.body as { skills: unknown[]; skills_dir: string };
@@ -1499,4 +1504,51 @@ test("lcp-0xm: malformed record (neither parts nor content) is filtered out", as
   const arr = body as Array<{ id: string }>;
   assert.equal(arr.length, 1);
   assert.equal(arr[0]!.id, "ui-msg-ok");
+});
+
+test("GET /v1/agents/{id}/slash-commands returns per-agent slash commands", async (t) => {
+  const skillsDir = mkdtempSync(join(tmpdir(), "shim-http-agent-skills-"));
+  t.after(() => rmSync(skillsDir, { recursive: true, force: true }));
+
+  // Create an installed skill
+  const installedSkillDir = join(skillsDir, "charlie");
+  mkdirSync(installedSkillDir, { recursive: true });
+  writeFileSync(
+    join(installedSkillDir, "SKILL.md"),
+    "---\nname: charlie\ndescription: Charlie helper\n---\n\n# charlie\n\nINSTALLED_MARKER\n",
+  );
+
+  const shim = await startShim({ env: { LETTA_SKILLS_DIR: skillsDir } });
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-test-slash" });
+
+  const agentSkillsPath = join(shim.stateDir, "agents", agentId, "skills");
+  mkdirSync(agentSkillsPath, { recursive: true });
+  mkdirSync(join(agentSkillsPath, "charlie"), { recursive: true });
+  writeFileSync(
+    join(agentSkillsPath, "charlie", "SKILL.md"),
+    "---\nname: charlie\ndescription: Charlie helper\n---\n\n# charlie\n\nINSTALLED_MARKER\n"
+  );
+  writeFileSync(join(agentSkillsPath, "charlie.json"), JSON.stringify({ installed_at: new Date().toISOString() }));
+
+  const { res, body } = await getJson(`${shim.url}/v1/agents/${agentId}/slash-commands`);
+  assert.equal(res.status, 200);
+  const commands = (body as { commands: Array<Record<string, unknown>> }).commands;
+
+  assert.ok(commands.some((cmd) => cmd["name"] === "charlie" && cmd["source"] === "agent_skill" && cmd["installed"] === true));
+
+  const charlieCmd = commands.find(c => c["name"] === "charlie");
+  assert.ok(charlieCmd);
+  assert.equal(charlieCmd["description"], "Charlie helper");
+  assert.equal(charlieCmd["command"], "/charlie");
+  assert.equal((charlieCmd as any).body, undefined);
+});
+
+test("GET /v1/agents/{unknown}/slash-commands returns 404", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const { res } = await getJson(`${shim.url}/v1/agents/agent-unknown-123/slash-commands`);
+  assert.equal(res.status, 404);
 });
