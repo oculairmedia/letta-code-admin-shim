@@ -908,3 +908,8 @@ export function __getSubagentWatcherCounts(): { logs: number; todos: number; tod
     livenessSweep: _livenessSweepTimer ? 1 : 0,
   };
 }
+
+/** Test-only: expose readLogTerminalStatus for direct testing. */
+export function __readLogTerminalStatus(logFile: string): "completed" | "failed" | null {
+  return readLogTerminalStatus(logFile);
+}
