@@ -74,6 +74,43 @@ jobs:
         working-directory: admin-shim
         run: npm run typecheck
 
+  # Build the deployable artifact and parse-validate every emitted file.
+  # `typecheck` (tsc --noEmit) catches source errors, but the host runs the
+  # EMITTED dist/, and nothing previously verified that the emitted JS even
+  # parses. This job builds dist and runs the same whole-tree parse gate the
+  # systemd ExecStartPre uses, so a broken artifact fails CI rather than
+  # crash-looping on boot (the 2026-06-23 incident).
+  verify-dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache shim node_modules
+        id: shim-cache
+        uses: actions/cache@v4
+        with:
+          path: admin-shim/node_modules
+          key: shim-node-modules-${{ runner.os }}-node20-${{ hashFiles('admin-shim/package-lock.json') }}
+
+      - name: Install shim deps
+        if: steps.shim-cache.outputs.cache-hit != 'true'
+        working-directory: admin-shim
+        run: npm ci
+
+      - name: Build dist
+        working-directory: admin-shim
+        run: npm run build
+
+      - name: Verify emitted dist parses
+        working-directory: admin-shim
+        run: npm run check:dist
+
   # Channel plugin smokes run against a real `letta` binary, so they live
   # behind a manual trigger for now. CI runs the mocked shim tests above
   # which exercise the same protocol surface via captured stream traces.
