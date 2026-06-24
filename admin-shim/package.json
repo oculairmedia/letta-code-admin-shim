@@ -12,6 +12,7 @@
     "test:watch": "node --import tsx/esm --test --test-concurrency=1 --watch test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
+    "check:dist": "node scripts/check-dist.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
