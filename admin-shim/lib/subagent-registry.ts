@@ -651,8 +651,9 @@ function readLogTerminalStatus(logFile: string): "completed" | "failed" | null {
   try {
     if (!existsSync(logFile)) return null;
     const text = readFileSync(logFile, "utf8");
-    if (text.includes(TASK_COMPLETED_MARKER)) return "completed";
-    if (TASK_FAILED_MARKERS.some((m) => text.includes(m))) return "failed";
+    const lines = text.split("\n");
+    if (lines.some((line) => line.trim() === TASK_COMPLETED_MARKER)) return "completed";
+    if (TASK_FAILED_MARKERS.some((m) => lines.some((line) => line.trim() === m))) return "failed";
     return null;
   } catch {
     return null;
