@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdirSync, writeFileSync, utimesSync, unlinkSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -31,6 +31,7 @@ import {
   __setSubagentProcessAliveCheckerForTest,
   updateSubagentExitStatus,
   finalizeSubagent,
+  __readLogTerminalStatus,
 } from "../lib/subagent-registry.js";
 import { messagesJsonlPath } from "../lib/store.js";
 
@@ -674,6 +675,135 @@ test("subagent-registry: dead-PID running entry is never surfaced as running", (
 
   __setSubagentProcessAliveCheckerForTest(null);
   __resetSubagentRegistry();
+});
+
+// ── Regression: premature subagent chip termination fix (PR #139, 8403bd8f) ─
+
+test("readLogTerminalStatus: false positive - substring in tool output does NOT trigger completion", () => {
+  // The bug: text.includes("[Task completed]") would match tool output like
+  // "Task completed: 3/5" even though it's NOT a standalone footer line.
+  // The fix: split into lines, trim each, exact-match against TASK_COMPLETED_MARKER.
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_false_positive.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nSome output\nTask completed: 3/5\nMore output\nstill running\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, null, "substring match 'Task completed: 3/5' must NOT return 'completed'");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("readLogTerminalStatus: real completion marker works", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_real_completion.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nSome output\n[Task completed]\nMore output\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, "completed", "exact line match '[Task completed]' must return 'completed'");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("readLogTerminalStatus: real failure marker works", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_real_failure.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nSome output\n[Task failed]\nMore output\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, "failed", "exact line match '[Task failed]' must return 'failed'");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("readLogTerminalStatus: alt failure marker subagent_status=error works", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_alt_failure.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nWorking\nsubagent_status=error\nStopped\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, "failed", "exact line match 'subagent_status=error' must return 'failed'");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("readLogTerminalStatus: no markers returns null", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_no_markers.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nNormal output\nstill running\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, null, "log with no terminal markers must return null");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("readLogTerminalStatus: empty file returns null", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_empty.log");
+  try {
+    writeFileSync(logFile, "", "utf8");
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, null, "empty log file must return null");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("readLogTerminalStatus: completion marker with surrounding whitespace works", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_whitespace_completion.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nSome output\n  [Task completed]  \nMore output\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, "completed", "completion marker with whitespace must work due to trim()");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("readLogTerminalStatus: multiple false positives do NOT trigger", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-premature-chip-"));
+  const logFile = join(tmpDir, "task_multiple_false.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nTask completed: 1/10\nTask completed: 5/10\nTask completed: 9/10\nstill working\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, null, "multiple substring matches must NOT trigger completion");
+  } finally {
+    unlinkSync(logFile);
+  }
 });
 
 test("subagent-registry: GET /v1/work-activity never serves dead-PID running entries", async () => {
