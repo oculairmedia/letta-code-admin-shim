@@ -40,6 +40,7 @@ import {
   readSystemPrompt,
   resolveConversationId,
   writeAgentRecord,
+  invalidateConversationsListCache,
   listAvailableSkills,
   skillsStoreDir,
   getSkillDetail,
@@ -1001,6 +1002,13 @@ async function sendMessage(
 
 // ── /v1/conversations namespace ────────────────────────────────────
 
+/**
+ * GET /v1/conversations — list conversations, optionally filtered by
+ * `archive_status` (`active` is the default). Filters are applied AFTER the
+ * store read so writers that invalidate the list cache (PATCH/DELETE) are the
+ * only way the next read sees fresh archive state — see
+ * invalidateConversationsListCache.
+ */
 async function handleConversationsList(_req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const { limit, offset } = parsePagination(url.searchParams);
   const agentId = url.searchParams.get("agent_id") ?? undefined;
@@ -1060,14 +1068,23 @@ async function handleConversationCreate(req: IncomingMessage, res: ServerRespons
   json(res, 201, conversationToLetta(conv));
 }
 
+/**
+ * PATCH /v1/conversations/{id} — applies partial updates (summary, archived).
+ * Boundary fields are guarded: only valid types enter `next`, anything else is
+ * rejected by the `typeof`/null check so the wire shape can never be polluted
+ * by malformed JSON.
+ */
 async function handleConversationUpdate(req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
   const conv = await getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   const body = await readJsonBody(req);
-  const archived = typeof body["archived"] === "boolean" ? body["archived"] as boolean : undefined;
+  const archivedRaw = body["archived"];
+  const archived = typeof archivedRaw === "boolean" ? archivedRaw : undefined;
+  const summaryRaw = body["summary"];
+  const summary = typeof summaryRaw === "string" || summaryRaw === null ? summaryRaw : undefined;
   const next: OnDiskConversation = {
     ...conv,
-    summary: (body["summary"] as string | null | undefined) ?? conv.summary,
+    summary: summary ?? conv.summary,
     archived: archived ?? ((conv as Record<string, unknown>)["archived"] as boolean | null | undefined),
     archived_at: archived === true
       ? new Date().toISOString()
@@ -1079,6 +1096,10 @@ async function handleConversationUpdate(req: IncomingMessage, res: ServerRespons
   const key = conv.id === "default" ? `default:${conv.agent_id}` : `conversation:${conv.id}`;
   const dir = join(storeInternals.storageDir(), "conversations", storeInternals.b64url(key));
   writeFileSync(join(dir, "conversation.json"), JSON.stringify(next, null, 2) + "\n");
+  // conversation.json rewrite alone doesn't change the conversations dir mtime,
+  // so drop the cached list snapshot or the next GET /v1/conversations will
+  // keep serving the pre-archive archived-status filter.
+  invalidateConversationsListCache();
   json(res, 200, conversationToLetta(next));
 }
 
@@ -1098,6 +1119,10 @@ async function handleConversationDelete(_req: IncomingMessage, res: ServerRespon
     updated_at: now,
   };
   writeFileSync(join(dir, "conversation.json"), JSON.stringify(next, null, 2) + "\n");
+  // Same rationale as handleConversationUpdate: the list cache key is the
+  // conversations dir mtime, which doesn't change when we rewrite the child
+  // conversation.json in place.
+  invalidateConversationsListCache();
   json(res, 200, { id: conv.id, archived: true, deleted: false });
 }
 

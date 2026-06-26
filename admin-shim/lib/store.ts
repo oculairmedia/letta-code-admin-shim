@@ -879,6 +879,16 @@ export function invalidateMessagesCache(conversationId: string, agentId: string)
   messagesCache.delete(join(storageDir(), "conversations", b64url(key), "messages.jsonl"));
 }
 
+/**
+ * Drop the cached `listAllConversations()` snapshot so the next read reflects
+ * writes that happened out-of-band of the cache key (the dir mtime doesn't
+ * change when only `conversation.json` is rewritten in place). Shim-side
+ * writers — archive PATCH, archive DELETE — must call this after writing.
+ */
+export function invalidateConversationsListCache(): void {
+  _listAllConversationsCached.invalidate();
+}
+
 export async function listMessages(
   conversationId: string,
   agentId: string,

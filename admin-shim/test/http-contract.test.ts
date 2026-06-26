@@ -1358,6 +1358,90 @@ test("DELETE /v1/conversations archives without deleting transcript files", asyn
   assert.equal(typeof archived.updated_at, "string");
 });
 
+test("PATCH/DELETE invalidates the cached list so archive_status is fresh on the next read", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-cache-invalidate" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-cache-active" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-cache-to-archive" });
+
+  // Warm the list cache so any subsequent read would otherwise serve it.
+  const before = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.equal(before.res.status, 200);
+  assert.equal((before.body as Array<{ id: string }>).length, 2);
+
+  const archive = await fetch(`${shim.url}/v1/conversations/conv-cache-to-archive`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived: true }),
+  });
+  assert.equal(archive.status, 200);
+
+  const afterPatch = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.deepEqual(
+    (afterPatch.body as Array<{ id: string }>).map((c) => c.id),
+    ["conv-cache-active"],
+    "PATCH must invalidate the list cache",
+  );
+
+  const archiveList = await getJson(`${shim.url}/v1/conversations?archive_status=archived&agent_id=${agentId}`);
+  assert.deepEqual((archiveList.body as Array<{ id: string }>).map((c) => c.id), ["conv-cache-to-archive"]);
+
+  const restore = await fetch(`${shim.url}/v1/conversations/conv-cache-to-archive`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived: false }),
+  });
+  assert.equal(restore.status, 200);
+  const restoredActive = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.deepEqual(
+    (restoredActive.body as Array<{ id: string }>).map((c) => c.id).sort(),
+    ["conv-cache-active", "conv-cache-to-archive"],
+    "restore PATCH must invalidate the list cache",
+  );
+});
+
+test("PATCH /v1/conversations ignores non-string summary without dropping conversation state", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-bad-summary" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-bad-summary" });
+
+  const res = await fetch(`${shim.url}/v1/conversations/conv-bad-summary`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ summary: 42, archived: true }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { archived?: boolean };
+  assert.equal(body.archived, true);
+});
+
+test("DELETE /v1/conversations/{other} invalidates the list cache", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-delete-cache" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-delete-cache-1" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-delete-cache-2" });
+
+  await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+
+  const del = await fetch(`${shim.url}/v1/conversations/conv-delete-cache-2`, { method: "DELETE" });
+  assert.equal(del.status, 200);
+
+  const active = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.deepEqual(
+    (active.body as Array<{ id: string }>).map((c) => c.id),
+    ["conv-delete-cache-1"],
+    "DELETE must invalidate the list cache",
+  );
+  const archived = await getJson(`${shim.url}/v1/conversations?archive_status=archived&agent_id=${agentId}`);
+  assert.deepEqual((archived.body as Array<{ id: string }>).map((c) => c.id), ["conv-delete-cache-2"]);
+});
+
 // ── models / providers / tools ─────────────────────────────────────
 
 test("GET /v1/models returns non-empty list with handle/model_endpoint_type", async (t) => {
