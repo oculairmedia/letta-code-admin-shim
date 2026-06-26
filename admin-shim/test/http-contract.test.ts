@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1280,6 +1280,166 @@ test("POST /v1/conversations without agent_id returns 400", async (t) => {
   assert.equal(res.status, 400);
   const body = await res.json() as { detail: string };
   assert.equal(typeof body.detail, "string");
+});
+
+test("PATCH /v1/conversations persists archived state and archive_status filters lists", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-conv-archive" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-archive-me" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-stay-active" });
+
+  const archive = await fetch(`${shim.url}/v1/conversations/conv-archive-me`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived: true }),
+  });
+  assert.equal(archive.status, 200);
+  const archiveBody = await archive.json() as { archived?: boolean; archived_at?: string };
+  assert.equal(archiveBody.archived, true);
+  assert.equal(typeof archiveBody.archived_at, "string");
+
+  const detail = await getJson(`${shim.url}/v1/conversations/conv-archive-me`);
+  const detailBody = detail.body as { archived?: boolean; archived_at?: string };
+  assert.equal(detail.res.status, 200);
+  assert.equal(detailBody.archived, true);
+  assert.equal(typeof detailBody.archived_at, "string");
+
+  const active = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.deepEqual((active.body as Array<{ id: string }>).map((c) => c.id), ["conv-stay-active"]);
+
+  const archived = await getJson(`${shim.url}/v1/conversations?archive_status=archived&agent_id=${agentId}`);
+  assert.deepEqual((archived.body as Array<{ id: string }>).map((c) => c.id), ["conv-archive-me"]);
+
+  const all = await getJson(`${shim.url}/v1/conversations?archive_status=all&agent_id=${agentId}`);
+  assert.deepEqual((all.body as Array<{ id: string }>).map((c) => c.id).sort(), ["conv-archive-me", "conv-stay-active"]);
+
+  const restore = await fetch(`${shim.url}/v1/conversations/conv-archive-me`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived: false }),
+  });
+  assert.equal(restore.status, 200);
+  const restoreBody = await restore.json() as { archived?: boolean; archived_at?: string | null };
+  assert.equal(restoreBody.archived, false);
+  assert.equal(restoreBody.archived_at, null);
+});
+
+test("DELETE /v1/conversations archives without deleting transcript files", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-conv-delete" });
+  const { conversationId, dir } = seedConversation(shim.stateDir, agentId, { id: "conv-delete-me" });
+  seedMessage(shim.stateDir, agentId, conversationId, { id: "msg-survives", content: "keep me" });
+
+  const messagesPath = join(dir, "messages.jsonl");
+  assert.ok(existsSync(messagesPath), "messages file exists before delete");
+
+  const res = await fetch(`${shim.url}/v1/conversations/${conversationId}`, { method: "DELETE" });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { id: string; archived?: boolean; deleted?: boolean };
+  assert.equal(body.id, conversationId);
+  assert.equal(body.archived, true);
+  assert.equal(body.deleted, false);
+
+  assert.ok(existsSync(dir), "conversation directory must remain archived on disk");
+  assert.ok(existsSync(messagesPath), "messages file must survive archive delete");
+  assert.match(readFileSync(messagesPath, "utf8"), /msg-survives/);
+
+  const archived = JSON.parse(readFileSync(join(dir, "conversation.json"), "utf8")) as {
+    archived?: boolean;
+    archived_at?: string;
+    updated_at?: string;
+  };
+  assert.equal(archived.archived, true);
+  assert.equal(typeof archived.archived_at, "string");
+  assert.equal(typeof archived.updated_at, "string");
+});
+
+test("PATCH/DELETE invalidates the cached list so archive_status is fresh on the next read", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-cache-invalidate" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-cache-active" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-cache-to-archive" });
+
+  // Warm the list cache so any subsequent read would otherwise serve it.
+  const before = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.equal(before.res.status, 200);
+  assert.equal((before.body as Array<{ id: string }>).length, 2);
+
+  const archive = await fetch(`${shim.url}/v1/conversations/conv-cache-to-archive`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived: true }),
+  });
+  assert.equal(archive.status, 200);
+
+  const afterPatch = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.deepEqual(
+    (afterPatch.body as Array<{ id: string }>).map((c) => c.id),
+    ["conv-cache-active"],
+    "PATCH must invalidate the list cache",
+  );
+
+  const archiveList = await getJson(`${shim.url}/v1/conversations?archive_status=archived&agent_id=${agentId}`);
+  assert.deepEqual((archiveList.body as Array<{ id: string }>).map((c) => c.id), ["conv-cache-to-archive"]);
+
+  const restore = await fetch(`${shim.url}/v1/conversations/conv-cache-to-archive`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ archived: false }),
+  });
+  assert.equal(restore.status, 200);
+  const restoredActive = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.deepEqual(
+    (restoredActive.body as Array<{ id: string }>).map((c) => c.id).sort(),
+    ["conv-cache-active", "conv-cache-to-archive"],
+    "restore PATCH must invalidate the list cache",
+  );
+});
+
+test("PATCH /v1/conversations ignores non-string summary without dropping conversation state", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-bad-summary" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-bad-summary" });
+
+  const res = await fetch(`${shim.url}/v1/conversations/conv-bad-summary`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ summary: 42, archived: true }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { archived?: boolean };
+  assert.equal(body.archived, true);
+});
+
+test("DELETE /v1/conversations/{other} invalidates the list cache", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-delete-cache" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-delete-cache-1" });
+  seedConversation(shim.stateDir, agentId, { id: "conv-delete-cache-2" });
+
+  await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+
+  const del = await fetch(`${shim.url}/v1/conversations/conv-delete-cache-2`, { method: "DELETE" });
+  assert.equal(del.status, 200);
+
+  const active = await getJson(`${shim.url}/v1/conversations?archive_status=active&agent_id=${agentId}`);
+  assert.deepEqual(
+    (active.body as Array<{ id: string }>).map((c) => c.id),
+    ["conv-delete-cache-1"],
+    "DELETE must invalidate the list cache",
+  );
+  const archived = await getJson(`${shim.url}/v1/conversations?archive_status=archived&agent_id=${agentId}`);
+  assert.deepEqual((archived.body as Array<{ id: string }>).map((c) => c.id), ["conv-delete-cache-2"]);
 });
 
 // ── models / providers / tools ─────────────────────────────────────
