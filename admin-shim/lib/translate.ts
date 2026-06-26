@@ -234,8 +234,6 @@ export function externalConversationId(conv: OnDiskConversation | null | undefin
 
 export function conversationToLetta(conv: OnDiskConversation | null | undefined): Conversation | null {
   if (!conv) return null;
-  // Match vanilla Letta server's Conversation shape exactly. Do NOT add
-  // archived/archived_at — vanilla doesn't expose them on this response.
   const externalId = externalConversationId(conv);
   if (externalId === null) return null;
   return {
@@ -247,6 +245,8 @@ export function conversationToLetta(conv: OnDiskConversation | null | undefined)
     created_by_id: "user-00000000-0000-4000-8000-000000000000",
     last_updated_by_id: "user-00000000-0000-4000-8000-000000000000",
     summary: conv.summary ?? null,
+    archived: typeof conv["archived"] === "boolean" ? conv["archived"] : null,
+    archived_at: typeof conv["archived_at"] === "string" ? conv["archived_at"] : null,
     in_context_message_ids: conv.in_context_message_ids ?? [],
     isolated_block_ids: [],
     model: null,

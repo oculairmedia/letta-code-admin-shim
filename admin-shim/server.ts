@@ -20,7 +20,7 @@ import { createServer, request as httpRequest, type IncomingMessage, type Server
 import type { Duplex } from "node:stream";
 import { URL } from "node:url";
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
@@ -1004,9 +1004,19 @@ async function sendMessage(
 async function handleConversationsList(_req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const { limit, offset } = parsePagination(url.searchParams);
   const agentId = url.searchParams.get("agent_id") ?? undefined;
+  const archiveStatus = (url.searchParams.get("archive_status") ?? "active").toLowerCase();
+  if (!["active", "archived", "all"].includes(archiveStatus)) {
+    return json(res, 400, { detail: "archive_status must be one of active, archived, all" });
+  }
   const items = await (agentId ? listConversationsForAgent(agentId) : listAllConversations());
-  items.sort((a, b) => (b.last_message_at ?? "").localeCompare(a.last_message_at ?? ""));
-  json(res, 200, items.slice(offset, offset + limit).map(conversationToLetta));
+  const filtered = items.filter((conv) => {
+    const archived = conv["archived"] === true;
+    if (archiveStatus === "archived") return archived;
+    if (archiveStatus === "all") return true;
+    return !archived;
+  });
+  filtered.sort((a, b) => (b.last_message_at ?? "").localeCompare(a.last_message_at ?? ""));
+  json(res, 200, filtered.slice(offset, offset + limit).map(conversationToLetta));
 }
 
 async function handleConversationDetail(_req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
@@ -1054,11 +1064,16 @@ async function handleConversationUpdate(req: IncomingMessage, res: ServerRespons
   const conv = await getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
   const body = await readJsonBody(req);
+  const archived = typeof body["archived"] === "boolean" ? body["archived"] as boolean : undefined;
   const next: OnDiskConversation = {
     ...conv,
     summary: (body["summary"] as string | null | undefined) ?? conv.summary,
-    archived: (body["archived"] as unknown) ?? (conv as Record<string, unknown>)["archived"],
-    archived_at: body["archived"] === true ? new Date().toISOString() : (conv as Record<string, unknown>)["archived_at"] as string | null | undefined,
+    archived: archived ?? ((conv as Record<string, unknown>)["archived"] as boolean | null | undefined),
+    archived_at: archived === true
+      ? new Date().toISOString()
+      : archived === false
+        ? null
+        : (conv as Record<string, unknown>)["archived_at"] as string | null | undefined,
     updated_at: new Date().toISOString(),
   };
   const key = conv.id === "default" ? `default:${conv.agent_id}` : `conversation:${conv.id}`;
@@ -1075,8 +1090,15 @@ async function handleConversationDelete(_req: IncomingMessage, res: ServerRespon
   }
   const key = `conversation:${conv.id}`;
   const dir = join(storeInternals.storageDir(), "conversations", storeInternals.b64url(key));
-  rmSync(dir, { recursive: true, force: true });
-  json(res, 200, { id: conv.id, deleted: true });
+  const now = new Date().toISOString();
+  const next: OnDiskConversation = {
+    ...conv,
+    archived: true,
+    archived_at: (conv as Record<string, unknown>)["archived_at"] as string | null | undefined ?? now,
+    updated_at: now,
+  };
+  writeFileSync(join(dir, "conversation.json"), JSON.stringify(next, null, 2) + "\n");
+  json(res, 200, { id: conv.id, archived: true, deleted: false });
 }
 
 async function handleConversationMessagesList(

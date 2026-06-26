@@ -684,6 +684,8 @@ export interface Conversation {
   created_by_id: string;
   last_updated_by_id: string;
   summary: string | null;
+  archived: boolean | null;
+  archived_at: string | null;
   in_context_message_ids: string[];
   isolated_block_ids: string[];
   model: string | null;
