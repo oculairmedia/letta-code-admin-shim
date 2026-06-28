@@ -1,4 +1,4 @@
-const AGENT_ID_ALIASES: Record<string, string> = {
+export const AGENT_ID_ALIASES: Record<string, string> = {
   // pre-rev6 migrator generated these from a name-hash; rev6 onward used
   // original Letta-server UUIDs. The local backend used by this dev shim now
   // exposes the default Letta Code id, so keep both legacy ids routable.
