@@ -248,6 +248,15 @@ export const FALLBACK_MODEL_CATALOG: ModelCatalog = {
       capabilities: ["text", "vision"],
       releaseDate: "2026-06-01",
     },
+    "claude-sonnet-5": {
+      id: "claude-sonnet-5",
+      name: "Claude Sonnet 5",
+      contextWindow: 1000000,
+      maxTokens: 16384,
+      family: "claude-sonnet",
+      capabilities: ["text", "vision"],
+      releaseDate: "2026-07-01",
+    },
     "claude-opus-4-8": {
       id: "claude-opus-4-8",
       name: "Claude Opus 4.8",
@@ -564,7 +573,7 @@ export function getDefaultOpenAIModels(): string[] {
  * Get default Anthropic models (hardcoded fallback).
  */
 export function getDefaultAnthropicModels(): string[] {
-  return ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"];
+  return ["claude-fable-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"];
 }
 
 /**

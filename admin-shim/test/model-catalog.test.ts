@@ -288,6 +288,7 @@ test("Model catalog: OpenAI models", () => {
 
 test("Model catalog: Anthropic models", () => {
   const anthropic = catalogFor("anthropic");
+  assert.ok(anthropic["claude-sonnet-5"] !== undefined);
   assert.ok(anthropic["claude-opus-4-7"] !== undefined);
   assert.ok(anthropic["claude-opus-4-6"] !== undefined);
   assert.ok(anthropic["claude-sonnet-4-6"] !== undefined);
@@ -401,6 +402,7 @@ test("getDefaultAnthropicModels: returns expected hardcoded models", () => {
   assert.ok(Array.isArray(models), "Should return an array");
   assert.ok(models.length > 0, "Should return at least one model");
   assert.ok(models.includes("claude-fable-5"));
+  assert.ok(models.includes("claude-sonnet-5"));
   assert.ok(models.includes("claude-opus-4-8"));
   assert.ok(models.includes("claude-sonnet-4-6"));
 });
