@@ -4,7 +4,8 @@
  *
  * Phase 1 endpoints (read + chat):
  *   GET    /v1/health/
- *   GET    /v1/agents                            list (?slim=true → {id,name,description} only, for picker UIs)
+ *   GET    /v1/agents                            list (?slim=true → {id,name,description} only, for picker UIs;
+ *                                                default: message_ids=[] — ?include=transcripts opts back in)
  *   GET    /v1/agents/count                      count
  *   GET    /v1/agents/{id}                       single
  *   GET    /v1/agents/{id}/messages              messages list
@@ -273,10 +274,6 @@ function parsePagination(searchParams: URLSearchParams): Pagination {
   return { limit: Number.isFinite(limit) ? limit : 50, offset: Number.isFinite(offset) ? offset : 0 };
 }
 
-function defaultConversationForAgent(agentId: string): Promise<OnDiskConversation | null> {
-  return getConversation("default", agentId);
-}
-
 // ── handlers ──────────────────────────────────────────────────────
 
 // Server identity — a UUID generated on first run, persisted to disk, returned
@@ -455,14 +452,24 @@ async function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url:
   const nameFilter = url.searchParams.get("name");
   // lcp/letta-mobile-3ra3n: opt-in slim projection for picker UIs (Schedules,
   // etc.). The default `/v1/agents` response synthesizes the full Letta
-  // AgentState per row (system prompt, message_ids, llm/embedding config,
-  // memory blocks) — ~12KB/agent, ~621KB for 50. A picker only needs
-  // {id, name, description}. `?slim=true` short-circuits BEFORE the expensive
-  // per-agent expansion below: no defaultConversationForAgent, no listMessages,
-  // no readBlocksForAgent, no agentToLettaState. The 621KB originates HERE in
-  // the shim (it is not an upstream passthrough), so this slims the payload at
-  // the source. Default (non-slim) behavior is unchanged.
+  // AgentState per row (system prompt, llm/embedding config, memory blocks)
+  // — ~12KB/agent, ~621KB for 50. A picker only needs {id, name,
+  // description}. `?slim=true` short-circuits BEFORE the expensive
+  // per-agent expansion below: no listMessages, no readBlocksForAgent, no
+  // agentToLettaState. The 621KB originates HERE in the shim (it is not an
+  // upstream passthrough), so this slims the payload at the source.
+  //
+  // lcp zt3vm: the default (fat) branch no longer hydrates transcripts.
+  // Its only transcript-derived output field was `message_ids`, which no
+  // client reads from the LIST endpoint (mobile & desktop consume `blocks`;
+  // Agent.messageIds deserializes into a defaulted emptyList() with zero
+  // read sites). Hydrating it cost a full messages.jsonl parse per agent
+  // per poll (~143MB parsed / request at 600 agents) and thrashed the
+  // messagesCache LRU. Default response is byte-identical except
+  // `message_ids: []`; pass `?include=transcripts` to restore the old
+  // behavior. Per-agent detail (`handleAgentDetail`) still hydrates.
   const slim = parseBoolParam(url.searchParams, "slim") === true;
+  const includeTranscripts = url.searchParams.getAll("include").includes("transcripts");
   let agents = await listAgents();
   if (tagFilter.length > 0) {
     agents = agents.filter((a) => (a.tags ?? []).some((t) => tagFilter.includes(t)));
@@ -483,8 +490,10 @@ async function handleAgentsList(_req: IncomingMessage, res: ServerResponse, url:
     return;
   }
   const projected = await Promise.all(sliced.map(async (a) => {
-    await defaultConversationForAgent(a.id);
-    const messages = await listMessages("default", a.id);
+    // lcp zt3vm: transcripts are opt-in (`?include=transcripts`). Blocks
+    // stay — they are load-bearing for mobile's blockCount badge + Block
+    // Library and desktop's EditAgent.
+    const messages = includeTranscripts ? await listMessages("default", a.id) : [];
     const blocks = readBlocksForAgent(a.id);
     return agentToLettaState(a, { messages, blocks });
   }));

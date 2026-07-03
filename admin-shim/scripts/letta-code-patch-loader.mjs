@@ -478,23 +478,131 @@ const OPENAI_TOOLS_INDENTED_REPLACEMENT =
   `    "generate_image"\n` +
   `  ];`;
 
+// lcp-aioi8-p1 (patch #18): system-prompt dirty-check write.
+//
+// `persistCompiledSystemPrompt` rewrites the full ~670KB system-prompt.json on
+// EVERY message append (it is called unconditionally at the end of
+// persistConversationState), even when the compiled prompt is byte-identical.
+// Patch: serialize once, compare against a per-conversation-key memo of the
+// last-written JSON string (globalThis.__lcpSysPromptJson, injected after the
+// shebang), and return without touching disk when unchanged. `deleteAgent` not
+// clearing the memo is harmless — one string per live conversation key,
+// bounded, and small relative to the writes being removed.
+//
+// The anchor is the entire method body through the writeFileSync17 tail; the
+// tail's template literal contains a REAL newline (see SETTLE_BUG_LITERAL
+// pattern note), hence the explicit "\n" split below. Verified unique in
+// letta-code 0.27.22 — the loader additionally enforces exactly-one occurrence
+// at apply time (fail-open skip otherwise).
+const SYS_PROMPT_MEMO_HELPER_DEFINITION =
+  "globalThis.__lcpSysPromptJson = globalThis.__lcpSysPromptJson || new Map();\n";
+
+const SYS_PROMPT_PERSIST_TOKEN =
+  "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
+  "    if (!this.storageDir)\n" +
+  "      return;\n" +
+  "    const key = this.conversationKey(conversationId, agentId);\n" +
+  "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
+  "    if (!prompt)\n" +
+  "      return;\n" +
+  "    const conversationDir = join39(this.storageDir, \"conversations\", encodePathSegment(key));\n" +
+  "    mkdirSync23(conversationDir, { recursive: true });\n" +
+  "    writeFileSync17(join39(conversationDir, \"system-prompt.json\"), `${JSON.stringify(prompt, null, 2)}\n" +
+  "`);\n" +
+  "  }";
+
+const SYS_PROMPT_PERSIST_REPLACEMENT =
+  "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
+  "    if (!this.storageDir)\n" +
+  "      return;\n" +
+  "    const key = this.conversationKey(conversationId, agentId);\n" +
+  "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
+  "    if (!prompt)\n" +
+  "      return;\n" +
+  "    const json = JSON.stringify(prompt, null, 2);\n" +
+  "    if (globalThis.__lcpSysPromptJson.get(key) === json)\n" +
+  "      return;\n" +
+  "    const conversationDir = join39(this.storageDir, \"conversations\", encodePathSegment(key));\n" +
+  "    mkdirSync23(conversationDir, { recursive: true });\n" +
+  "    writeFileSync17(join39(conversationDir, \"system-prompt.json\"), json + \"\\n\");\n" +
+  "    globalThis.__lcpSysPromptJson.set(key, json);\n" +
+  "  }";
+
+// lcp-aioi8-p2 (patch #19): dehydrate the persisted-message dedupe map.
+//
+// `persistedMessageByMessageIdByConversationKey` holds a structuredClone of
+// EVERY message ever persisted per conversation (multi-hundred-MB clone graphs
+// on large transcripts). Its only value-read site is the dedupe check in
+// appendConversationSessionMessageEntry, which compares via
+// JSON.stringify(a) === JSON.stringify(b) (localMessagesHaveSameSnapshot).
+// Do NOT evict entries (a miss falls through the guard and appends a duplicate
+// transcript line) — DEHYDRATE them: store the JSON string instead of the
+// clone, and compare stored-string === JSON.stringify(message). Semantics are
+// identical because the original comparator is stringify-equality and
+// structuredClone preserves key order.
+//
+// The three sub-replacements below MUST apply atomically — a partial apply
+// changes the type of the map values for only some writers/readers and breaks
+// dedupe. The bulk-rebuild anchor is deliberately the full multi-line
+// `new Map(Array.from(...))` literal: the bare token `cloneLocalMessage(message)`
+// occurs more than once in the bundle and must never be used as an anchor.
+const CLONE_MAP_BULK_TOKEN =
+  "    this.persistedMessageByMessageIdByConversationKey.set(key, new Map(Array.from(transcript.messageById, ([messageId, message]) => [\n" +
+  "      messageId,\n" +
+  "      cloneLocalMessage(message)\n" +
+  "    ])));";
+
+const CLONE_MAP_BULK_REPLACEMENT =
+  "    this.persistedMessageByMessageIdByConversationKey.set(key, new Map(Array.from(transcript.messageById, ([messageId, message]) => [\n" +
+  "      messageId,\n" +
+  "      JSON.stringify(message)\n" +
+  "    ])));";
+
+const CLONE_MAP_APPEND_TOKEN =
+  ".set(entry.message.id, cloneLocalMessage(entry.message));";
+
+const CLONE_MAP_APPEND_REPLACEMENT =
+  ".set(entry.message.id, JSON.stringify(entry.message));";
+
+const CLONE_MAP_COMPARE_TOKEN =
+  "localMessagesHaveSameSnapshot(persistedMessage, message)";
+
+const CLONE_MAP_COMPARE_REPLACEMENT =
+  "persistedMessage === JSON.stringify(message)";
+
 let appliedOnce = false;
+
+/**
+ * Exact-occurrence counter used for anchor uniqueness assertions. A drifted
+ * anchor that happens to match an unintended second site would otherwise be
+ * patched silently at the wrong location; patches that declare an expected
+ * count of 1 are skipped (fail-open) when the count differs.
+ *
+ * @param {string} source
+ * @param {string} token
+ * @returns {number}
+ */
+function countOccurrences(source, token) {
+  return source.split(token).length - 1;
+}
 
 /**
  * @param {string} raw
  * @param {string} path
  * @param {boolean} warn
- * @returns {{ source: string; appliedPatches: number }}
+ * @returns {{ source: string; appliedPatches: number; skippedPatches: number }}
  */
 function patchLettaCodeSource(raw, path, warn) {
   let patched = raw;
   let appliedPatches = 0;
+  let skippedPatches = 0;
 
   if (patched.includes(SETTLE_BUG_LITERAL)) {
     patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
     appliedPatches += 1;
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: settle-bug literal not found in ${path} — ` +
       `running unpatched (letta-code likely upgraded past 0.26.1)\n`,
     );
@@ -503,8 +611,9 @@ function patchLettaCodeSource(raw, path, warn) {
   if (patched.includes(THINKING_SETTINGS_BUG_LITERAL)) {
     patched = patched.replaceAll(THINKING_SETTINGS_BUG_LITERAL, THINKING_SETTINGS_FIX_LITERAL);
     appliedPatches += 1;
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: thinking-settings literal not found in ${path} — ` +
       `running without lcp-9pn settings guard\n`,
     );
@@ -513,8 +622,9 @@ function patchLettaCodeSource(raw, path, warn) {
   if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
     patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
     appliedPatches += 1;
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: thinking-request guard anchor not found in ${path} — ` +
       `running without lcp-9pn request guard\n`,
     );
@@ -534,8 +644,9 @@ function patchLettaCodeSource(raw, path, warn) {
   }
   if (appliedThinkingChokepoint) {
     patched = injectHelperAfterShebang(patched, THINKING_HELPER_DEFINITION);
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: thinking chokepoint token not found in ${path} — ` +
       `running without lcp-7kk request normalizer\n`,
     );
@@ -554,8 +665,9 @@ function patchLettaCodeSource(raw, path, warn) {
   }
   if (appliedModelSettingsGuard) {
     patched = injectHelperAfterShebang(patched, MODEL_SETTINGS_HELPER_DEFINITION);
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: model_settings thinking guard token not found in ${path} — ` +
       `running without lcp-0u15 settings normalizer\n`,
     );
@@ -565,8 +677,9 @@ function patchLettaCodeSource(raw, path, warn) {
     patched = patched.replace(LOCAL_VISION_INPUT_TOKEN, LOCAL_VISION_INPUT_REPLACEMENT);
     appliedPatches += 1;
     patched = injectHelperAfterShebang(patched, LOCAL_VISION_INPUT_HELPER_DEFINITION);
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: local vision input token not found in ${path} — ` +
       `Read(image) may still be placeholdered by model.input gates\n`,
     );
@@ -579,8 +692,9 @@ function patchLettaCodeSource(raw, path, warn) {
     // Ensure the helper is present even if the input-construction token above
     // was absent (idempotent: the helper uses `|| function` guard).
     patched = injectHelperAfterShebang(patched, LOCAL_VISION_INPUT_HELPER_DEFINITION);
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: vision gate token (toChatMessages supportsImages) not found in ${path} — ` +
       `inbound user images may still be omitted\n`,
     );
@@ -591,8 +705,9 @@ function patchLettaCodeSource(raw, path, warn) {
     patched = patched.replace(DOWNGRADE_IMAGES_TOKEN, DOWNGRADE_IMAGES_REPLACEMENT);
     appliedPatches += 1;
     patched = injectHelperAfterShebang(patched, LOCAL_VISION_INPUT_HELPER_DEFINITION);
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: downgradeUnsupportedImages token not found in ${path} — ` +
       `inbound user images may still be omitted\n`,
     );
@@ -601,8 +716,9 @@ function patchLettaCodeSource(raw, path, warn) {
   if (patched.includes(MULTIMODAL_TOOL_RETURN_TOKEN)) {
     patched = patched.replace(MULTIMODAL_TOOL_RETURN_TOKEN, MULTIMODAL_TOOL_RETURN_REPLACEMENT);
     appliedPatches += 1;
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: multimodal tool-return token not found in ${path} — ` +
       `Read(image) may still be reduced to display text before storage\n`,
     );
@@ -612,8 +728,9 @@ function patchLettaCodeSource(raw, path, warn) {
     patched = patched.replace(TOOL_RETURN_CONTENT_TOKEN, TOOL_RETURN_CONTENT_REPLACEMENT);
     appliedPatches += 1;
     patched = injectHelperAfterShebang(patched, TOOL_RETURN_CONTENT_HELPER_DEFINITION);
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: tool-return content coercion token not found in ${path} — ` +
       `Read(image) approval turns may still be normalized to text only\n`,
     );
@@ -647,14 +764,56 @@ function patchLettaCodeSource(raw, path, warn) {
   }
   if (appliedGenerateImageTool) {
     patched = injectHelperAfterShebang(patched, GENERATE_IMAGE_TOOL_HELPER_DEFINITION);
-  } else if (warn) {
-    process.stderr.write(
+  } else {
+    skippedPatches += 1;
+    if (warn) process.stderr.write(
       `[letta-code-patch] WARN: generate_image tool registry tokens not found in ${path} — ` +
       `native image generation tool will not be registered\n`,
     );
   }
 
-  return { source: patched, appliedPatches };
+  // lcp-aioi8-p1 (patch #18): dirty-check system-prompt.json writes.
+  // FAIL-OPEN with a unique-match assertion: anchor absent OR matched more
+  // than once → warn + skip, never throw at boot.
+  {
+    const occurrences = countOccurrences(patched, SYS_PROMPT_PERSIST_TOKEN);
+    if (occurrences === 1) {
+      patched = patched.replace(SYS_PROMPT_PERSIST_TOKEN, SYS_PROMPT_PERSIST_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, SYS_PROMPT_MEMO_HELPER_DEFINITION);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: persistCompiledSystemPrompt anchor matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-aioi8-p1 dirty-check (every append rewrites system-prompt.json)\n`,
+      );
+    }
+  }
+
+  // lcp-aioi8-p2 (patch #19): dehydrate the persisted-message dedupe map.
+  // ATOMIC: all three anchors must each match exactly once or NONE are
+  // applied — a partial apply would mix clone-objects and JSON strings in the
+  // same map and break the duplicate-append guard. FAIL-OPEN on any mismatch.
+  {
+    const bulkOccurrences = countOccurrences(patched, CLONE_MAP_BULK_TOKEN);
+    const appendOccurrences = countOccurrences(patched, CLONE_MAP_APPEND_TOKEN);
+    const compareOccurrences = countOccurrences(patched, CLONE_MAP_COMPARE_TOKEN);
+    if (bulkOccurrences === 1 && appendOccurrences === 1 && compareOccurrences === 1) {
+      patched = patched.replace(CLONE_MAP_BULK_TOKEN, CLONE_MAP_BULK_REPLACEMENT);
+      patched = patched.replace(CLONE_MAP_APPEND_TOKEN, CLONE_MAP_APPEND_REPLACEMENT);
+      patched = patched.replace(CLONE_MAP_COMPARE_TOKEN, CLONE_MAP_COMPARE_REPLACEMENT);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: clone-map anchors matched bulk=${bulkOccurrences} append=${appendOccurrences} compare=${compareOccurrences} ` +
+        `(expected exactly 1 each) in ${path} — skipping all of lcp-aioi8-p2 atomically ` +
+        `(persisted-message dedupe map keeps full structuredClone graphs)\n`,
+      );
+    }
+  }
+
+  return { source: patched, appliedPatches, skippedPatches };
 }
 
 /**
@@ -663,6 +822,17 @@ function patchLettaCodeSource(raw, path, warn) {
  */
 export function patchLettaCodeSourceForTest(raw) {
   return patchLettaCodeSource(raw, "<test>", false).source;
+}
+
+/**
+ * Full result (applied/skipped counts) for tests that assert the fail-open
+ * and unique-match-assertion behavior.
+ *
+ * @param {string} raw
+ * @returns {{ source: string; appliedPatches: number; skippedPatches: number }}
+ */
+export function patchLettaCodeSourceResultForTest(raw) {
+  return patchLettaCodeSource(raw, "<test>", false);
 }
 
 // Insert injected source after a leading `#!` shebang (which must remain line 1
@@ -700,7 +870,16 @@ export async function load(url, context, nextLoad) {
         : null;
   if (raw === null) return result;
 
-  const { source: patched, appliedPatches } = patchLettaCodeSource(raw, path, !appliedOnce);
+  const { source: patched, appliedPatches, skippedPatches } = patchLettaCodeSource(raw, path, !appliedOnce);
+
+  if (!appliedOnce) {
+    // Boot-summary drift alert: after any bundle update the runbook check is
+    // that `applied=` matches the expected patch count — a silent fail-open
+    // shows up here instead of only as a buried per-patch stderr warn.
+    process.stderr.write(
+      `[letta-code-patch] lcp-patches applied=${appliedPatches} skipped=${skippedPatches}\n`,
+    );
+  }
 
   if (appliedPatches === 0) return result;
 

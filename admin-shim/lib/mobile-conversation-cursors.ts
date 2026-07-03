@@ -132,6 +132,38 @@ export function resumeConversation(conversationId: string, afterSeqInput: unknow
   if (cursorExpired) {
     return { ok: false, cursorExpired: true, conversationId, afterSeq, oldestSeq, lastSeq, frames: [] };
   }
+  // lcp xwi3z (§2b): implicit ack on successful resume — shim-side only,
+  // no protocol change (the Android client never sends `ack` frames; it
+  // only presents `after_seq` in the hello resume block). A resume cursor
+  // `after_seq = N` means "the client has SEEN every frame ≤ N" (mobile
+  // records the cursor at the top of handleInbound, before dispatch), not
+  // "persisted durably". That is acceptable ONLY because mobile's
+  // cursor_expired handler clears cursors and does a cold REST hydrate
+  // (CursorResumeCoordinator) — REST is the recovery path for anything
+  // this ack over-promises. Without this ack, sidecars never advance past
+  // last_ack_seq=0 and compaction never shrinks the replay JSONL.
+  //
+  // Clamp: min(after_seq, last_assigned_seq). A corrupt/foreign after_seq
+  // greater than anything we ever assigned must not permanently suppress
+  // replay for all devices — compaction is destructive, so an over-ack is
+  // unrecoverable by revert.
+  //
+  // Known multi-device regression (accepted, owned by the xwi3z design):
+  // last_ack_seq is per-conversation, not per-device. When device A
+  // resumes at seq 500, device B still at seq 200 gets cursor_expired on
+  // its next resume — degraded (full REST refetch), not data loss.
+  // Per-device cursors are the full fix and are explicitly out of scope.
+  //
+  // Ack strictly AFTER the success determination above (never before the
+  // cursor_expired branch) and after the replay set is materialized, via
+  // the existing max()-only ackConversation.
+  const frames = replay
+    .filter((entry) => entry.convSeq > afterSeq)
+    .map((entry) => ({ ...entry.frame, replayed: true }));
+  const impliedAck = Math.min(afterSeq, lastSeq);
+  if (impliedAck > state.sidecar.last_ack_seq) {
+    ackConversation(conversationId, impliedAck);
+  }
   return {
     ok: true,
     cursorExpired: false,
@@ -139,7 +171,7 @@ export function resumeConversation(conversationId: string, afterSeqInput: unknow
     afterSeq,
     oldestSeq,
     lastSeq,
-    frames: replay.filter((entry) => entry.convSeq > afterSeq).map((entry) => ({ ...entry.frame, replayed: true })),
+    frames,
   };
 }
 

@@ -22,7 +22,7 @@ import { channelDir as resolveChannelDir } from "./channel-paths.js";
 import { buildChannelHost } from "./channel-host-capabilities.js";
 
 import { reshapeFrame, attachReadImageToToolReturn } from "./chat.js";
-import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
+import { cancelRun, getAgentPool, poolCapacityErrorCode, resolveApprovalGate } from "./agent-pool.js";
 import { readPendingApproval, resolveApproval } from "./pending-approval.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
@@ -34,7 +34,7 @@ import {
   type A2uiBlock,
   type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
-import { appendRunFrame, createRun, getFramesFilePath, getRun, isRunUserStopped, recordA2uiUserAction, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
+import { appendRunFrame, createRun, finalizeRun, getFramesFilePath, getRun, isRunUserStopped, recordA2uiUserAction, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
 import {
   getSubagent,
   ingestParentFrame,
@@ -62,7 +62,9 @@ import {
   writeOtidForLocalId,
 } from "./store.js";
 import { extractAttachmentRefsFromMessageBody } from "./attachments.js";
+import { StreamCoalescer, type CoalescerTimers } from "./stream-coalescer.js";
 import type { LettaMessage, ToolReturn, ToolReturnMessage } from "./types/wire.js";
+import type { AdapterRunTurnResult } from "./agent-pool.js";
 import type {
   A2uiFrameMessage,
   A2uiUserAction,
@@ -140,6 +142,28 @@ export async function rekickActiveGoalContinuationsOnBoot(
 function channelDir(): string {
   return resolveChannelDir("mobile");
 }
+
+/**
+ * lcp xwi3z (§2a): server-side stream coalescing gate. Default ON; kill
+ * switch is `SHIM_STREAM_COALESCE=0` (env flip + restart — module-level
+ * const, matching the design). When on, each turn gets a fresh
+ * StreamCoalescer inserted at the pre-body seam: reshaped frames go into
+ * `coalescer.handle()` and its onFlush invokes the SAME pipeline body the
+ * `=0` passthrough calls directly — no duplicated logic. The first
+ * coalescible delta of each turn bypasses the window entirely so TTFT is
+ * unchanged (the concern that originally shelved this module).
+ */
+const STREAM_COALESCE = process.env["SHIM_STREAM_COALESCE"] !== "0";
+
+/**
+ * Test-only seams for the coalescer wiring: inject fake timers / a custom
+ * window without threading options through bridgeSendMessage's public
+ * signature. Production never touches this.
+ */
+export const _streamCoalesceTestHooks: {
+  timers: CoalescerTimers | null;
+  windowMs: number | null;
+} = { timers: null, windowMs: null };
 
 /**
  * Account record shape we read out of accounts.json. The file is
@@ -430,14 +454,14 @@ export async function bridgeSendMessage(
     onFrame(frame);
   };
 
-  // Smoothing intentionally NOT done server-side. lcp-cv3 contract:
-  // forward every chunk as a pure delta. The mobile renderer (Android
-  // app/src/main/java/com/letta/mobile/ui/screens/chat/
-  // StreamingDisplayTextSmoother.kt) already implements char-velocity
-  // smoothing with a 60fps reveal loop — adding server-side batching
-  // would introduce first-chunk latency without UX win. A no-op
-  // StreamCoalescer module remains in lib/ for non-smoothing clients
-  // (future web channel etc.) to opt into; not wired into this path.
+  // lcp xwi3z (§2a): server-side coalescing IS wired now (see the
+  // STREAM_COALESCE const + coalescer construction below). The lcp-cv3
+  // pure-delta contract is preserved — the coalescer merges deltas into
+  // fewer, LARGER deltas with the same stable per-otid ids, so mobile's
+  // dedup/merge path is unchanged, just fed at a bounded cadence. The
+  // original shelving rationale (first-chunk latency) is addressed by the
+  // first-delta passthrough in the onFrame wrapper below; the client-side
+  // smoother (StreamingDisplayTextSmoother.kt) remains active on top.
   //
   // lcp-dlj: content_parts wins over text when present and non-empty.
   // letta-code's headless stdin accepts either shape on MessageCreate.content.
@@ -505,23 +529,18 @@ export async function bridgeSendMessage(
     ? [makeGoalControlTool({ agentId: effectiveAgentId, conversationId: effectiveConvId })]
     : undefined;
 
-  const turn = await pool.runTurnWithHeal(effectiveConvId, effectiveAgentId, userInput, {
-    a2uiCapability: a2ui_capability ?? null,
-    ...(goalControlTools ? { tools: goalControlTools, closeAfterTurn: true } : {}),
-    // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
-    // patches the SIGTERM hook onto it via setRunCancelHandler. The
-    // worker will NOT call onRunCreated when a handle is provided —
-    // the caller already knows the id (we fired onRunCreated above).
-    runHandle,
-    onFrame: (raw, meta) => {
-      let reshaped = reshapeFrame(raw);
-      if (!reshaped) return;
-      // Stamp the run_id on every reshaped frame for mobile-side correlation
-      // with /v1/runs/{id}. The pool exposes it via the meta callback arg.
-      // Bare-shape variants (StopReasonMessage, UsageStatisticsMessage) do
-      // not declare `run_id`, but the .mjs unconditionally added it at
-      // runtime; mirror that exactly by writing through a Record cast.
-      if (meta?.runId) (reshaped as unknown as Record<string, unknown>)["run_id"] = meta.runId;
+  // lcp xwi3z (§2a): the ~150-line stateful frame pipeline below
+  // (pendingStop/pendingUsage capture, inline tool_return disk sync, A2UI
+  // splitter with per-otid state, cm-stream id stamping, emit()) is
+  // extracted into ONE named function so both the coalescer's onFlush and
+  // the SHIM_STREAM_COALESCE=0 passthrough run the identical code.
+  // `framesEmitted` counts pipeline invocations (frames on the wire from
+  // this stage); `framesIn` counts reshaped frames entering the stage.
+  let framesIn = 0;
+  let framesEmitted = 0;
+  const pipelineBody = (reshapedIn: LettaMessage): void => {
+      framesEmitted += 1;
+      let reshaped = reshapedIn;
       const mt = reshaped.message_type;
       if (mt === "stop_reason") {
         // lcp-8ri: last-wins for the WS emission. Multi-step turns emit
@@ -664,8 +683,109 @@ export async function bridgeSendMessage(
         }
       }
       emit(reshaped);
-    },
-  });
+  };
+
+  // lcp xwi3z (§2a): per-turn coalescer. onFlush feeds the extracted
+  // pipeline body above, so coalesced and passthrough frames take exactly
+  // the same code path. conv_seq is stamped downstream (in the plugin) at
+  // flush/emit time, so seq stays monotonic per EMITTED frame; tool_call
+  // replace-by-id is safe because reshapeFrame emits complete snapshots
+  // with stable ids that mobile dedups by id.
+  const coalescer = STREAM_COALESCE
+    ? new StreamCoalescer({
+        onFlush: (frame) => pipelineBody(frame),
+        ...(_streamCoalesceTestHooks.windowMs !== null ? { windowMs: _streamCoalesceTestHooks.windowMs } : {}),
+        ...(_streamCoalesceTestHooks.timers !== null ? { timers: _streamCoalesceTestHooks.timers } : {}),
+      })
+    : null;
+  // First-token passthrough: scheduleFlush is trailing-edge only, which
+  // would delay the first delta of every turn by up to a full window. The
+  // FIRST coalescible delta of the turn bypasses the coalescer entirely
+  // (emitted immediately via pipelineBody); subsequent deltas coalesce.
+  let firstTextDeltaSent = false;
+
+  let turn!: AdapterRunTurnResult;
+  try {
+    turn = await pool.runTurnWithHeal(effectiveConvId, effectiveAgentId, userInput, {
+      a2uiCapability: a2ui_capability ?? null,
+      ...(goalControlTools ? { tools: goalControlTools, closeAfterTurn: true } : {}),
+      // lcp-99a: hand the pre-created run to the worker. agent-pool.ts
+      // patches the SIGTERM hook onto it via setRunCancelHandler. The
+      // worker will NOT call onRunCreated when a handle is provided —
+      // the caller already knows the id (we fired onRunCreated above).
+      runHandle,
+      onFrame: (raw, meta) => {
+        const reshaped = reshapeFrame(raw);
+        if (!reshaped) return;
+        // Stamp the run_id on every reshaped frame for mobile-side correlation
+        // with /v1/runs/{id}. The pool exposes it via the meta callback arg.
+        // Bare-shape variants (StopReasonMessage, UsageStatisticsMessage) do
+        // not declare `run_id`, but the .mjs unconditionally added it at
+        // runtime; mirror that exactly by writing through a Record cast.
+        if (meta?.runId) (reshaped as unknown as Record<string, unknown>)["run_id"] = meta.runId;
+        framesIn += 1;
+        if (!coalescer) {
+          pipelineBody(reshaped);
+          return;
+        }
+        const mt = reshaped.message_type;
+        if (!firstTextDeltaSent && (mt === "assistant_message" || mt === "reasoning_message")) {
+          firstTextDeltaSent = true;
+          // Flush anything pending first (e.g. an early tool_call snapshot)
+          // so inter-frame order is preserved, then emit the first delta
+          // immediately — no window wait on the turn's first token.
+          coalescer.flushAll();
+          pipelineBody(reshaped);
+          return;
+        }
+        coalescer.handle(reshaped);
+      },
+    });
+    // End-of-turn: flush pending coalesced content BEFORE the A2UI splitter
+    // tail below and before the buffered stop_reason / usage_statistics
+    // forwarding — final partial buffers must precede the terminal frames.
+    coalescer?.flushAll();
+  } catch (err) {
+    // lcp hr5rw (§3a.7): typed pool-capacity rejections (pool_saturated /
+    // pool_queue_timeout / cancelled-while-queued) propagate out of
+    // runTurnWithHeal BEFORE any worker ran finalizeTurnLifecycle — but the
+    // run was pre-created above (lcp-99a) with status "running" and the
+    // client already saw turn_started. Without finalization here the run
+    // leaks forever in _activeRuns / run.json and reconnect subscribers
+    // never get a terminal sentinel. Route it through the same finalizeRun
+    // terminal path a worker-side failure takes (terminal stop_reason
+    // frame first — appendRunFrame no-ops after finalize), then rethrow so
+    // the WS handler's existing error + turn_done(failed) reply still runs.
+    // A cancel-while-queued has usually ALREADY been finalized by
+    // cancelRun (status "cancelled"), so the running-status guard makes
+    // this a no-op there; it still catches pool-shutdown "cancelled"
+    // rejections that bypass cancelRun.
+    const capacityCode = poolCapacityErrorCode(err);
+    if (capacityCode && runHandle.record.status === "running") {
+      const wasCancelled = capacityCode === "cancelled";
+      emit({
+        message_type: "stop_reason",
+        stop_reason: wasCancelled ? "user_cancelled" : "error",
+        ...(wasCancelled ? {} : { error: err instanceof Error ? err.message : String(err), code: capacityCode }),
+        run_id: runHandle.id,
+      } as BridgeFrame);
+      finalizeRun(runHandle, {
+        status: wasCancelled ? "cancelled" : "failed",
+        stopReason: capacityCode,
+      });
+    }
+    throw err;
+  } finally {
+    // dispose() flushes any remainder (covers the throw path) and refuses
+    // further input; late frames pass through as a safety net.
+    coalescer?.dispose();
+    // lcp xwi3z (§2a.6): per-turn coalescing instrumentation — the
+    // acceptance metric (≥3× frame-rate reduction) is measured off this line.
+    console.log(
+      `[mobile-channel] stream-coalesce run=${runHandle.id} enabled=${STREAM_COALESCE ? 1 : 0} ` +
+      `frames_in=${framesIn} frames_emitted=${framesEmitted}`,
+    );
+  }
 
   // End-of-turn tail: drain each splitter's pending state. Any text the
   // splitter was holding back as a possible tag opening flushes to a final

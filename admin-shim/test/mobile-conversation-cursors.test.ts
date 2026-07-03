@@ -457,6 +457,100 @@ test("resumeConversation reports cursorExpired when afterSeq is before the oldes
 });
 
 
+// ── lcp xwi3z (§2b): implicit ack on successful resume ─────────────────
+
+function sidecarFilePath(conversationId: string): string {
+  return join(
+    storeInternals.storageDir(),
+    "mobile-conversation-cursors",
+    `${storeInternals.b64url(conversationId)}.json`,
+  );
+}
+
+function readSidecarAck(conversationId: string): number {
+  const parsed = JSON.parse(readFileSync(sidecarFilePath(conversationId), "utf8")) as { last_ack_seq: number };
+  return parsed.last_ack_seq;
+}
+
+test("xwi3z: successful resume implicitly acks after_seq; replay > N only; compaction drops ≤ N", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-implicit-ack";
+    for (let i = 1; i <= 10; i++) stampConversationFrame(conv, { type: "ping", n: i });
+    assert.equal(readSidecarAck(conv), 0);
+
+    const resumed = resumeConversation(conv, 6);
+    assert.equal(resumed.ok, true);
+    assert.deepEqual(resumed.frames.map((f) => f["conv_seq"]), [7, 8, 9, 10]);
+    // Sidecar advanced to the resume cursor — no client `ack` frame needed.
+    assert.equal(readSidecarAck(conv), 6);
+
+    // Subsequent compaction actually shrinks the JSONL to the unacked tail.
+    _cursorInternals.maybeCompactReplayLog(conv, readSidecarAck(conv));
+    assert.equal(replayLineCount(conv), 4);
+    const again = resumeConversation(conv, 6);
+    assert.equal(again.ok, true);
+    assert.deepEqual(again.frames.map((f) => f["conv_seq"]), [7, 8, 9, 10]);
+  });
+});
+
+test("xwi3z: stale cursor still returns cursor_expired and does NOT ack", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-stale-no-ack";
+    for (let i = 1; i <= 8; i++) stampConversationFrame(conv, { type: "ping", n: i });
+    ackConversation(conv, 5);
+    _cursorInternals.maybeCompactReplayLog(conv, 5);
+
+    const stale = resumeConversation(conv, 2);
+    assert.equal(stale.cursorExpired, true);
+    assert.equal(stale.ok, false);
+    // The failed resume must not move the ack (an early top-of-resume ack
+    // would fire before the cursor_expired determination — pinned here).
+    assert.equal(readSidecarAck(conv), 5);
+  });
+});
+
+test("xwi3z: after_seq beyond last_assigned_seq clamps the ack (no replay suppression)", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-clamped-ack";
+    stampConversationFrame(conv, { type: "ping", n: 1 });
+    stampConversationFrame(conv, { type: "ping", n: 2 });
+
+    // Corrupt/foreign cursor far past anything ever assigned.
+    const resumed = resumeConversation(conv, 9_999);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.frames.length, 0);
+    // Clamped to last_assigned_seq (2) — NOT 9999. Without the clamp,
+    // compaction would permanently drop future frames ≤ 9999.
+    assert.equal(readSidecarAck(conv), 2);
+
+    // Frames stamped after the over-claiming resume still replay.
+    stampConversationFrame(conv, { type: "ping", n: 3 });
+    const next = resumeConversation(conv, 2);
+    assert.equal(next.ok, true);
+    assert.deepEqual(next.frames.map((f) => f["conv_seq"]), [3]);
+  });
+});
+
+test("xwi3z: multi-device regression pinned — device A's high resume expires device B's older cursor", async () => {
+  await withBackendDir(async () => {
+    const conv = "conv-two-devices";
+    for (let i = 1; i <= 10; i++) stampConversationFrame(conv, { type: "ping", n: i });
+
+    // Device A resumes at the tip → implicit ack at 10.
+    const a = resumeConversation(conv, 10);
+    assert.equal(a.ok, true);
+    assert.equal(readSidecarAck(conv), 10);
+
+    // Device B, still at seq 4, now gets cursor_expired (the :289 filter
+    // hides acked frames even before compaction runs). This is the
+    // documented, ACCEPTED behavior change: B recovers via mobile's
+    // cursor_expired → cold REST hydrate path — degraded, not data loss.
+    const b = resumeConversation(conv, 4);
+    assert.equal(b.cursorExpired, true);
+    assert.equal(b.ok, false);
+  });
+});
+
 test("resume after a high cursor near the tail returns exactly the new frames", async () => {
   await withBackendDir(async () => {
     const conv = "conv-resume-tail";

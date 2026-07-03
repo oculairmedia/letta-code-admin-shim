@@ -12,7 +12,8 @@
  *
  * lcp-2oxb.2 additions:
  *   - cap eviction skips a busy worker (unit test — no real shim subprocess).
- *   - all-busy at cap allows temporary pool overflow (unit test).
+ *   - all-busy at cap queues on the bounded FIFO — no overflow spawn
+ *     (lcp hr5rw superseded the old temporary-overflow behavior).
  *
  * Integration tests drive turns via the WS channel against the real shim
  * subprocess. The mock letta binary replays captured stream-traces so
@@ -248,7 +249,7 @@ function makeFakeAdapter(opts: {
     dead: false,
     lastUsedAt: opts.lastUsedAt ?? Date.now(),
     spawnedAt: Date.now() - 1000,
-    get busy() { return opts.busy ?? false; },
+    busy: opts.busy ?? false,
     async start(): Promise<LettaSessionInit> {
       return { agentId: this.agentId, conversationId: this.conversationId };
     },
@@ -361,23 +362,27 @@ test("lcp-2oxb.2: cap eviction skips busy worker, evicts idle LRU", async () => 
 });
 
 /**
- * lcp-2oxb.2: when ALL workers at cap are busy, get() must still return a
- * new working adapter (temporary overflow) and must NOT close any busy worker.
+ * lcp hr5rw (§3a) — supersedes the lcp-2oxb.2 "temporary overflow" test:
+ * when ALL workers at cap are busy, get() no longer spawns anyway
+ * (unbounded overflow, 330–445MB per extra worker). It QUEUES on the
+ * bounded FIFO and resolves once capacity frees. Busy workers are still
+ * never closed.
  *
  * Setup: fill pool to MAX_WORKERS with all-busy adapters.
  *
  * Assert:
- *   - get() resolves (no error / dead result).
- *   - pool.workers.size > MAX_WORKERS_RUNTIME (overflow).
+ *   - get() stays pending while all workers are busy (no overflow spawn).
+ *   - pool.workers.size never exceeds MAX_WORKERS_RUNTIME.
+ *   - After one worker frees (settles), get() resolves via cap eviction.
  *   - No busy adapter received close().
  */
-test("lcp-2oxb.2: all-busy at cap → overflow, no busy worker closed", async () => {
+test("hr5rw: all-busy at cap → queue (no overflow), no busy worker closed", async () => {
   const pool = new AgentPool();
   clearInterval(pool.housekeepTimer);
 
   const MAX_WORKERS_RUNTIME = Number(process.env["SHIM_POOL_MAX"] ?? 10);
 
-  const busyAdapters: Array<LettaSessionAdapter & { closedCount: number }> = [];
+  const busyAdapters: Array<LettaSessionAdapter & { closedCount: number; busy: boolean }> = [];
   for (let i = 0; i < MAX_WORKERS_RUNTIME; i++) {
     const adapter = makeFakeAdapter({
       conversationId: `conv-busy-${i}`,
@@ -386,7 +391,7 @@ test("lcp-2oxb.2: all-busy at cap → overflow, no busy worker closed", async ()
       lastUsedAt: i, // monotonically increasing so there's a clear LRU
     });
     pool.workers.set(pool._key(`conv-busy-${i}`, `agent-busy-${i}`), adapter);
-    busyAdapters.push(adapter);
+    busyAdapters.push(adapter as LettaSessionAdapter & { closedCount: number; busy: boolean });
   }
   assert.equal(pool.workers.size, MAX_WORKERS_RUNTIME, "pool at cap");
 
@@ -397,22 +402,34 @@ test("lcp-2oxb.2: all-busy at cap → overflow, no busy worker closed", async ()
     return overflowAdapter;
   };
 
-  const result = await pool.get("conv-overflow", "agent-overflow");
-  assert.ok(result, "get() must succeed even when all workers are busy (overflow)");
-  assert.equal(spawned, 1, "factory called exactly once");
+  let resolved = false;
+  const pending = pool.get("conv-overflow", "agent-overflow").then((w) => {
+    resolved = true;
+    return w;
+  });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(resolved, false, "all-busy at cap must queue, not overflow-spawn");
+  assert.equal(spawned, 0, "no overflow spawn while all workers are busy");
+  assert.equal(pool.workers.size, MAX_WORKERS_RUNTIME, "size stays at cap");
 
-  // Pool size should exceed the cap (temporary overflow).
+  // Free one worker (turn settles) → drain evicts it and admits the waiter.
+  busyAdapters[0]!.busy = false;
+  pool.drainCapacityWaiters();
+
+  const result = await pending;
+  assert.ok(result, "queued get() resolves once capacity frees");
+  assert.equal(spawned, 1, "factory called exactly once");
   assert.ok(
-    pool.workers.size > MAX_WORKERS_RUNTIME,
-    `pool size (${pool.workers.size}) must exceed max (${MAX_WORKERS_RUNTIME}) on all-busy overflow`,
+    pool.workers.size <= MAX_WORKERS_RUNTIME,
+    `pool size (${pool.workers.size}) must never exceed max (${MAX_WORKERS_RUNTIME})`,
   );
 
-  // No busy adapter may have been closed.
-  for (let i = 0; i < busyAdapters.length; i++) {
+  // No busy adapter may have been closed (the freed one was evicted while idle).
+  for (let i = 1; i < busyAdapters.length; i++) {
     assert.equal(
       busyAdapters[i]!.closedCount,
       0,
-      `busyAdapters[${i}] must not be closed during all-busy overflow (lcp-2oxb.2)`,
+      `busyAdapters[${i}] must not be closed while busy (lcp-2oxb.2 invariant)`,
     );
   }
 });

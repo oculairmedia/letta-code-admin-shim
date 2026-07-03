@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { patchLettaCodeSourceForTest } from "../scripts/letta-code-patch-loader.mjs";
+import {
+  patchLettaCodeSourceForTest,
+  patchLettaCodeSourceResultForTest,
+} from "../scripts/letta-code-patch-loader.mjs";
 import { VISION_MODEL_PATTERNS } from "../lib/model-catalog.js";
 
 // Resolve the REAL letta.js bundle so the guard test works in CI
@@ -659,4 +662,183 @@ test("patch-loader leaves unrelated source untouched", () => {
   const source = "export const untouched = true;\n";
 
   assert.equal(patchLettaCodeSourceForTest(source), source);
+});
+
+// ---------------------------------------------------------------------------
+// lcp-aioi8-p1 / lcp-aioi8-p2 — system-prompt dirty-check + clone-map
+// dehydration. Anchors are byte-exact copies of letta-code 0.27.22; keep in
+// sync with letta-code-patch-loader.mjs.
+// ---------------------------------------------------------------------------
+
+const SYS_PROMPT_ANCHOR =
+  "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
+  "    if (!this.storageDir)\n" +
+  "      return;\n" +
+  "    const key = this.conversationKey(conversationId, agentId);\n" +
+  "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
+  "    if (!prompt)\n" +
+  "      return;\n" +
+  "    const conversationDir = join39(this.storageDir, \"conversations\", encodePathSegment(key));\n" +
+  "    mkdirSync23(conversationDir, { recursive: true });\n" +
+  "    writeFileSync17(join39(conversationDir, \"system-prompt.json\"), `${JSON.stringify(prompt, null, 2)}\n" +
+  "`);\n" +
+  "  }";
+
+const CLONE_MAP_BULK_ANCHOR =
+  "    this.persistedMessageByMessageIdByConversationKey.set(key, new Map(Array.from(transcript.messageById, ([messageId, message]) => [\n" +
+  "      messageId,\n" +
+  "      cloneLocalMessage(message)\n" +
+  "    ])));";
+
+const CLONE_MAP_APPEND_ANCHOR = ".set(entry.message.id, cloneLocalMessage(entry.message));";
+
+const CLONE_MAP_COMPARE_ANCHOR = "localMessagesHaveSameSnapshot(persistedMessage, message)";
+
+// The lcp-aioi8 patches target the DEPLOYED runtime bundle (>= 0.27.x, the
+// global bun install that LETTA_CLI_PATH_REAL points at in production), not
+// the pinned dev dependency in node_modules (0.19.x, which predates
+// persistCompiledSystemPrompt entirely — the patches simply fail-open there).
+function resolveDeployedLettaBundle(): string | null {
+  const candidates = [
+    process.env["LETTA_CLI_PATH_REAL"] ?? "",
+    "/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js",
+    resolveLettaBundle() ?? "",
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    const source = readFileSync(candidate, "utf8");
+    if (source.includes("  persistCompiledSystemPrompt(conversationId, agentId) {")) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map dehydration", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) {
+    t.skip("no letta-code bundle with persistCompiledSystemPrompt (>= 0.27) available on this host");
+    return;
+  }
+  const bundle = readFileSync(bundlePath, "utf8");
+
+  // Unique-match assertion holds on the real bundle (drift alarm on update).
+  assert.equal(bundle.split(SYS_PROMPT_ANCHOR).length - 1, 1, "P1 anchor must be unique");
+  assert.equal(bundle.split(CLONE_MAP_BULK_ANCHOR).length - 1, 1, "P2 bulk anchor must be unique");
+  assert.equal(bundle.split(CLONE_MAP_APPEND_ANCHOR).length - 1, 1, "P2 append anchor must be unique");
+  assert.equal(bundle.split(CLONE_MAP_COMPARE_ANCHOR).length - 1, 1, "P2 compare anchor must be unique");
+
+  const { source: patched, skippedPatches } = patchLettaCodeSourceResultForTest(bundle);
+  assert.equal(skippedPatches, 0, "no patch may fail-open against the pinned bundle");
+
+  // P1: dirty-check in place, memo helper injected, unconditional write gone.
+  assert.ok(patched.includes("if (globalThis.__lcpSysPromptJson.get(key) === json)"));
+  assert.ok(patched.includes("globalThis.__lcpSysPromptJson = globalThis.__lcpSysPromptJson || new Map();"));
+  assert.ok(patched.includes('writeFileSync17(join39(conversationDir, "system-prompt.json"), json + "\\n");'));
+  assert.ok(!patched.includes(SYS_PROMPT_ANCHOR));
+
+  // P2: all three sites dehydrated atomically.
+  assert.ok(patched.includes(".set(entry.message.id, JSON.stringify(entry.message));"));
+  assert.ok(patched.includes("persistedMessage === JSON.stringify(message)"));
+  assert.ok(!patched.includes(CLONE_MAP_BULK_ANCHOR));
+  assert.ok(!patched.includes("cloneLocalMessage(entry.message)"));
+  // The other cloneLocalMessage call sites (non-anchored) must be untouched.
+  assert.ok(patched.includes("cloneLocalMessage("));
+});
+
+test("patch-loader: lcp-aioi8-p1 fail-open on single-byte anchor drift", () => {
+  // Mutate one byte inside the anchor: the method is renamed, so nothing may
+  // be patched and the source must come back byte-identical (fail-open).
+  const drifted = "const before = 1;\n" +
+    SYS_PROMPT_ANCHOR.replace("mkdirSync23", "mkdirSync24") +
+    "\nconst after = 2;\n";
+
+  const { source, appliedPatches } = patchLettaCodeSourceResultForTest(drifted);
+  assert.equal(source, drifted, "drifted anchor must leave source untouched");
+  assert.equal(appliedPatches, 0);
+});
+
+test("patch-loader: lcp-aioi8-p1 unique-match assertion skips duplicated anchors", () => {
+  const duplicated = "class A {\n" + SYS_PROMPT_ANCHOR + "\n}\nclass B {\n" + SYS_PROMPT_ANCHOR + "\n}\n";
+
+  const { source, appliedPatches } = patchLettaCodeSourceResultForTest(duplicated);
+  assert.equal(source, duplicated, "double-matched anchor must not be patched anywhere");
+  assert.equal(appliedPatches, 0);
+
+  // Sanity: the same anchor occurring exactly once IS patched.
+  const single = "class A {\n" + SYS_PROMPT_ANCHOR + "\n}\n";
+  const patchedSingle = patchLettaCodeSourceForTest(single);
+  assert.ok(patchedSingle.includes("globalThis.__lcpSysPromptJson.get(key) === json"));
+});
+
+test("patch-loader: lcp-aioi8-p2 applies atomically or not at all", () => {
+  // Only two of the three anchors present (bulk-rebuild missing): NONE of the
+  // clone-map replacements may land, or the map would mix value types.
+  const partial =
+    "if (persistedMessage && " + CLONE_MAP_COMPARE_ANCHOR + ") {\n  return;\n}\n" +
+    "this.persistedMessagesByMessageId(key)" + CLONE_MAP_APPEND_ANCHOR + "\n";
+
+  const { source, appliedPatches } = patchLettaCodeSourceResultForTest(partial);
+  assert.equal(source, partial, "partial anchor set must not be patched");
+  assert.equal(appliedPatches, 0);
+
+  // All three present exactly once → all three replaced.
+  const complete = partial + CLONE_MAP_BULK_ANCHOR + "\n";
+  const patchedComplete = patchLettaCodeSourceForTest(complete);
+  assert.ok(patchedComplete.includes("persistedMessage === JSON.stringify(message)"));
+  assert.ok(patchedComplete.includes(".set(entry.message.id, JSON.stringify(entry.message));"));
+  assert.ok(patchedComplete.includes("      JSON.stringify(message)\n    ])));"));
+  assert.ok(!patchedComplete.includes("cloneLocalMessage"));
+});
+
+test("patch-loader: lcp-aioi8-p1 dirty-check skips unchanged system-prompt writes", () => {
+  // Build a runnable fixture around the byte-exact anchor, patch it, eval it,
+  // and drive persistCompiledSystemPrompt twice with an unchanged prompt.
+  const fixture = [
+    "var writes = [];",
+    "function join39(...parts) { return parts.join(\"/\"); }",
+    "function encodePathSegment(value) { return value; }",
+    "function mkdirSync23() {}",
+    "function writeFileSync17(path, data) { writes.push({ path, data }); }",
+    "class FixtureStore {",
+    "  constructor() {",
+    "    this.storageDir = \"/fixture\";",
+    "    this.compiledSystemPromptByConversationKey = new Map();",
+    "  }",
+    "  conversationKey(conversationId, agentId) { return `${conversationId}:${agentId}`; }",
+    SYS_PROMPT_ANCHOR,
+    "}",
+    "({ FixtureStore, writes });",
+  ].join("\n");
+
+  const patched = patchLettaCodeSourceForTest(fixture);
+  assert.ok(patched.includes("globalThis.__lcpSysPromptJson.get(key) === json"));
+
+  const globals = globalThis as typeof globalThis & { __lcpSysPromptJson?: Map<string, string> };
+  const previousMemo = globals.__lcpSysPromptJson;
+  globals.__lcpSysPromptJson = undefined;
+  try {
+    const evaluated = eval(patched) as {
+      FixtureStore: new () => {
+        storageDir: string;
+        compiledSystemPromptByConversationKey: Map<string, unknown>;
+        persistCompiledSystemPrompt(conversationId: string, agentId: string): void;
+      };
+      writes: Array<{ path: string; data: string }>;
+    };
+    const store = new evaluated.FixtureStore();
+    store.compiledSystemPromptByConversationKey.set("conv-1:agent-1", { system: "alpha" });
+
+    store.persistCompiledSystemPrompt("conv-1", "agent-1");
+    store.persistCompiledSystemPrompt("conv-1", "agent-1");
+    assert.equal(evaluated.writes.length, 1, "unchanged prompt must write exactly once");
+    assert.equal(evaluated.writes[0]?.data, JSON.stringify({ system: "alpha" }, null, 2) + "\n");
+
+    store.compiledSystemPromptByConversationKey.set("conv-1:agent-1", { system: "beta" });
+    store.persistCompiledSystemPrompt("conv-1", "agent-1");
+    assert.equal(evaluated.writes.length, 2, "changed prompt must write again");
+    assert.equal(evaluated.writes[1]?.data, JSON.stringify({ system: "beta" }, null, 2) + "\n");
+  } finally {
+    globals.__lcpSysPromptJson = previousMemo;
+  }
 });

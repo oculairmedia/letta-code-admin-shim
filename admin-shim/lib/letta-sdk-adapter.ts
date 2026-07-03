@@ -107,6 +107,17 @@ function logLine(msg: string): void {
   console.log(`[sdk-adapter] ${msg}`);
 }
 
+/**
+ * lcp xwi3z (§2c): real DEBUG_SDK gate. The per-frame SDK_MSG probe below
+ * (sdkMessageToLettaFrame) claimed to be "cheap if DEBUG_SDK is unset",
+ * but no such gate existed — every stream event logged unconditionally
+ * (47k+ lines in the production log at audit time). Module-level const:
+ * set DEBUG_SDK=1 (or "true") in the service env to re-enable the probe.
+ * Only the per-frame probe is gated — other logLine call sites are
+ * low-rate and operationally load-bearing, and stay unconditional.
+ */
+const DEBUG_SDK = process.env["DEBUG_SDK"] === "1" || process.env["DEBUG_SDK"] === "true";
+
 function safeJson(value: unknown): string {
   try {
     return JSON.stringify(value, (_key: string, inner: unknown) => (
@@ -246,11 +257,19 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   // with any upstream-allocated ids in the same turn.
   private syntheticSeqId = 1_000_000;
   private readonly externalTools: AnyAgentTool[];
+  // lcp hr5rw (§3a.5): depth of the `this.chain` turn queue — incremented
+  // when a turn is chained in runTurn(), decremented when it fully settles
+  // (after finalizeTurnLifecycle inside _runTurnInner). The pool's
+  // eviction paths read this via pendingTurns() so a worker that is
+  // finalizing, or has a chained turn B queued, is never closed.
+  private pendingTurnCount = 0;
+  private readonly onTurnSettled: (() => void) | undefined;
 
-  constructor({ conversationId, agentId, tools }: LettaSessionAdapterOptions) {
+  constructor({ conversationId, agentId, tools, onTurnSettled }: LettaSessionAdapterOptions) {
     this.conversationId = conversationId;
     this.agentId = agentId;
     this.externalTools = tools ?? [];
+    this.onTurnSettled = onTurnSettled;
     this.session = null;
     this.ready = false;
     this.dead = false;
@@ -258,6 +277,11 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     this.spawnedAt = Date.now();
     this.sessionId = "";
     this.chain = Promise.resolve();
+  }
+
+  /** lcp hr5rw (§3a.5): see pendingTurnCount. */
+  pendingTurns(): number {
+    return this.pendingTurnCount;
   }
 
   async start(): Promise<LettaSessionInit> {
@@ -318,11 +342,28 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   async runTurn(input: string | unknown[], opts: RunTurnOptions = {}): Promise<AdapterRunTurnResult> {
     // Serialize: if a previous turn is in flight on this adapter, wait for
     // it before starting the next. Matches direct adapter semantics.
+    this.pendingTurnCount += 1;
     const turn = this.chain.then(() => this._runTurnInner(input, opts));
     this.chain = turn.catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[sdk-adapter] turn chain recovered after failure for ${this.conversationId}: ${msg}`);
     });
+    // lcp hr5rw (§3a.5): settle bookkeeping + pool wake-up. Fires AFTER
+    // finalizeTurnLifecycle (which _runTurnInner awaits before resolving),
+    // on both success and failure paths — the point where this worker is
+    // genuinely reusable/evictable (unless another turn is chained, which
+    // pendingTurnCount still reflects).
+    void turn
+      .catch(() => { /* chain recovery above already logged */ })
+      .finally(() => {
+        this.pendingTurnCount = Math.max(0, this.pendingTurnCount - 1);
+        try {
+          this.onTurnSettled?.();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[sdk-adapter] onTurnSettled hook failed for ${this.conversationId}: ${msg}`);
+        }
+      });
     return turn;
   }
 
@@ -346,6 +387,78 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     const cancellation = new Promise<string>((resolve) => {
       resolveCancellation = resolve;
     });
+    // lcp hr5rw (§3c): cancel soft-grace state. `session.abort()` is a soft
+    // stdin interrupt the CLI survives — after a user cancel we OBSERVE the
+    // CLI's post-interrupt ack (the SDK's "interrupted" result frame)
+    // instead of unconditionally force-evicting the warm worker (which was
+    // 18/18 `cancel_grace_expired` in the audit, a 3.1s respawn per cancel).
+    //
+    // The post-abort drain is SERIALIZED onto `this.chain` — NEVER run as a
+    // detached background loop. `session.stream()` generators consume a
+    // single shared buffer (each buffered message goes to exactly ONE
+    // consumer, and the generation filter only discards *older*
+    // generations), so a detached drain overlapping the next turn's
+    // stream() iterator would steal and discard the new turn's frames —
+    // a poisoned worker. Chaining means a re-send on this worker waits for
+    // the interrupt ack before its stream() starts, and the raced
+    // outstanding iterator.next() from the cancelled loop (which already
+    // owns one future buffered message) is consumed inside the drain.
+    let streamIterator: AsyncIterator<SDKMessage> | null = null;
+    let pendingNext: Promise<IteratorResult<SDKMessage>> | null = null;
+    let synthesizedSettlements = 0;
+    let graceDeadline = 0;
+    const drainInterruptAck = async (): Promise<void> => {
+      const it = streamIterator;
+      if (!it) return; // cancelled before the stream started — nothing buffered
+      try {
+        while (!settled) {
+          const remaining = graceDeadline - Date.now();
+          if (remaining <= 0) return; // grace backstop (forceEvict) owns cleanup
+          const nextP = pendingNext ?? it.next();
+          pendingNext = null;
+          const raced = await Promise.race([
+            nextP.then((value) => ({ kind: "msg" as const, value })),
+            new Promise<{ kind: "deadline" }>((resolve) => {
+              const t = setTimeout(() => resolve({ kind: "deadline" as const }), remaining);
+              t.unref?.();
+            }),
+          ]);
+          if (raced.kind === "deadline") {
+            // Bounded by the grace window; the outstanding read stays
+            // parked (the backstop will close the session anyway).
+            pendingNext = nextP;
+            return;
+          }
+          const { value, done } = raced.value;
+          if (done) return; // stream closed without an ack — backstop evicts
+          const msg = value as SDKMessage;
+          if (msg.type !== "result") continue; // discard the cancelled turn's stale frames
+          // Post-interrupt ack observed (SDK emits an "interrupted" result).
+          if (synthesizedSettlements > 0) {
+            // Consistency guard (§3c.5): finalizeTurnLifecycle synthesized
+            // tool_result settlements for dangling tool_calls, so the CLI's
+            // in-memory snapshot disagrees with disk. Keeping the worker
+            // would let its end-of-turn flush clobber the heal (the
+            // lcp-0vi evict-before-heal hazard) — let the grace backstop
+            // evict despite the ack.
+            logLine(
+              `cancel ack for ${this.conversationId} but synthesized_settlements=${synthesizedSettlements} — evicting anyway (lcp-0vi)`,
+            );
+            return;
+          }
+          settled = true;
+          if (cancelGraceTimer) {
+            clearTimeout(cancelGraceTimer);
+            cancelGraceTimer = null;
+          }
+          logLine(`cancel interrupt acked — worker stays warm conv=${this.conversationId}`);
+          return;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logLine(`cancel drain aborted for ${this.conversationId}: ${msg}`);
+      }
+    };
     const cancelSession = (reason = "user_cancelled"): void => {
       if (!cancelled) {
         cancelled = true;
@@ -356,7 +469,11 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
         console.warn(`[sdk-adapter] session abort failed for ${this.conversationId}: ${msg}`);
       });
       if (!cancelGraceTimer) {
-        const graceMs = Math.max(0, Number(process.env["SHIM_CANCEL_GRACE_MS"] ?? 1000));
+        // lcp hr5rw (§3c.4): default raised 1000 → 3000ms — 1s is too tight
+        // for an in-flight LLM call to unwind to the interrupt ack, which
+        // made the backstop the common path instead of a backstop.
+        const graceMs = Math.max(0, Number(process.env["SHIM_CANCEL_GRACE_MS"] ?? 3000));
+        graceDeadline = Date.now() + graceMs;
         cancelGraceTimer = setTimeout(() => {
           if (settled) return;
           try {
@@ -371,6 +488,33 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
           });
         }, graceMs);
         cancelGraceTimer.unref?.();
+        // §3c.1: chain the drain — runs after this turn resolves (finalize
+        // included, so synthesizedSettlements is known) and BEFORE any
+        // queued re-send turn's stream() starts. The drain is bounded by
+        // the grace window, so grace expiry also unblocks anything queued
+        // behind it on the chain.
+        //
+        // The drain COUNTS in pendingTurnCount: once the cancelled turn
+        // settles, `busy` is false and (without this) pendingTurns() would
+        // read 0 — letting a settle-driven cap-eviction close this worker
+        // while its grace timer is still pending. A fresh worker spawned
+        // under the same key would then be the grace timer's forceEvict
+        // target (see the identity guard in agent-pool runTurnWithHeal);
+        // counting the drain keeps the worker off the victim list until
+        // the ack (or the grace deadline) resolves it.
+        this.pendingTurnCount += 1;
+        this.chain = this.chain
+          .then(() => drainInterruptAck())
+          .catch(() => { /* drain never rejects */ })
+          .finally(() => {
+            this.pendingTurnCount = Math.max(0, this.pendingTurnCount - 1);
+            try {
+              this.onTurnSettled?.();
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.warn(`[sdk-adapter] onTurnSettled hook failed for ${this.conversationId}: ${msg}`);
+            }
+          });
       }
     };
     let runHandle: RunHandle;
@@ -511,12 +655,20 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       await session.send(sendInput);
 
       const iterator = session.stream()[Symbol.asyncIterator]();
+      streamIterator = iterator;
       while (true) {
+        // lcp hr5rw (§3c): keep the in-flight read referenced. When the
+        // cancellation race wins, this read is still outstanding and owns
+        // one future buffered message — the chained drain consumes it so a
+        // re-send's fresh stream() never races it for frames.
+        if (!pendingNext) pendingNext = iterator.next();
+        const currentNext = pendingNext;
         const next = await Promise.race([
-          iterator.next().then((value) => ({ kind: "message" as const, value })),
+          currentNext.then((value) => ({ kind: "message" as const, value })),
           cancellation.then((reason) => ({ kind: "cancelled" as const, reason })),
         ]);
-        if (next.kind === "cancelled") break;
+        if (next.kind === "cancelled") break; // pendingNext stays outstanding for the drain
+        pendingNext = null;
         const { value, done } = next.value;
         if (done) break;
         const msg = value as SDKMessage;
@@ -595,7 +747,7 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
     // /steps surfaces look identical regardless of transport.
     const finishedExit = false; // no subprocess to crash
     const finishedTimeout = timedOut;
-    const { newUserMessageId } = await finalizeTurnLifecycle({
+    const { newUserMessageId, synthesizedSettlements: synthCount } = await finalizeTurnLifecycle({
       runHandle,
       frames,
       conversationId: this.conversationId,
@@ -606,6 +758,11 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
       finishedExit,
       finishedTimeout,
     });
+    // lcp hr5rw (§3c.5): feed the consistency guard — the chained cancel
+    // drain (which runs after this turn resolves) keeps the worker warm
+    // only when the interrupt ack is clean AND no settlements were
+    // synthesized onto disk.
+    synthesizedSettlements = synthCount;
 
     // lcp-0vi: surface the SDK error payload through every return path so
     // pool.runTurnWithHeal() can match the dangling-tool-use signature.
@@ -1293,13 +1450,16 @@ function sdkMessageToLettaFrame(
   //   3. If present: something downstream of here is dropping them. Hunt
   //      in chat.ts:reshapeFrame and emit() in mobile-channel-host.
   //
-  // Cheap if DEBUG_SDK is unset (logLine no-ops). Leave it.
-  try {
-    const inner = (msg as { event?: { message_type?: string } }).event?.message_type;
-    logLine(`SDK_MSG type=${msg.type}${inner ? ` inner=${inner}` : ""}`);
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    logLine(`SDK_MSG logging_failed=${detail}`);
+  // Free when DEBUG_SDK is unset (the module-level gate skips the block
+  // entirely — lcp xwi3z §2c). Leave it.
+  if (DEBUG_SDK) {
+    try {
+      const inner = (msg as { event?: { message_type?: string } }).event?.message_type;
+      logLine(`SDK_MSG type=${msg.type}${inner ? ` inner=${inner}` : ""}`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      logLine(`SDK_MSG logging_failed=${detail}`);
+    }
   }
   switch (msg.type) {
     case "stream_event": {

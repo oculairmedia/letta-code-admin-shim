@@ -48,6 +48,7 @@ import {
   type ChannelManifest,
 } from "./channel-config.js";
 import { buildChannelHost, makeAdapterLog, type AdapterLog } from "./channel-host-capabilities.js";
+import { poolCapacityErrorCode } from "./agent-pool.js";
 import { bridgeSendMessage, peekMobileChannelAdapter } from "./mobile-channel-host.js";
 import type { ChannelAdapter } from "./types/channel-plugin.js";
 
@@ -89,6 +90,24 @@ export interface AdapterHandle {
 }
 
 /** Control-flow error the REST layer maps to an HTTP status (§2.5). */
+/**
+ * lcp hr5rw (§3a.7): map a typed pool-capacity rejection to the short
+ * room notice handleInbound posts via `sendDirectReply`. Returns null for
+ * every other error so non-capacity failures keep today's silent-drop
+ * behavior (typing released via the `finished` lifecycle only).
+ * Exported for unit tests.
+ */
+export function poolCapacityNotice(err: unknown): { code: string; text: string } | null {
+  const code = poolCapacityErrorCode(err);
+  if (!code) return null;
+  return {
+    code,
+    text: code === "cancelled"
+      ? "Request cancelled while waiting for an agent worker."
+      : "The agent pool is busy right now — please retry in a moment.",
+  };
+}
+
 export class ChannelControlError extends Error {
   constructor(
     message: string,
@@ -557,6 +576,18 @@ class Supervisor {
       this.handle.lastError = `inbound dispatch failed: ${msg}`;
       this.handle.lastErrorAt = nowIso();
       this.adapterLog.log(`inbound dispatch failed: ${msg}`);
+      // lcp hr5rw (§3a.7): typed pool-capacity rejections get a short
+      // notice posted back to the room instead of today's silence (typing
+      // stops via the `finished` lifecycle, message silently dropped).
+      // Every other error code keeps the silent behavior unchanged.
+      const notice = poolCapacityNotice(err);
+      if (notice && chatId && typeof this.handle.adapter?.sendDirectReply === "function") {
+        try {
+          await this.handle.adapter.sendDirectReply(chatId, notice.text, { code: notice.code });
+        } catch (replyErr) {
+          this.recordPluginCallError("sendDirectReply", replyErr);
+        }
+      }
     } finally {
       // Mandatory on EVERY exit (including drops): matrix starts a typing
       // heartbeat before onMessage and only a `finished` lifecycle event

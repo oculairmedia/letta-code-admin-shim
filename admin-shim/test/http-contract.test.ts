@@ -323,7 +323,7 @@ test("GET /v1/agents?slim=true defaults: name->Untitled, description->null", asy
   assert.equal(bare!["description"], null);
 });
 
-test("GET /v1/agents (default, no slim) is unchanged — full AgentState shape", async (t) => {
+test("GET /v1/agents (default, no slim) is unchanged — full AgentState shape, message_ids empty by default (zt3vm)", async (t) => {
   const shim = await startShim();
   t.after(() => shim.stop());
 
@@ -333,6 +333,9 @@ test("GET /v1/agents (default, no slim) is unchanged — full AgentState shape",
     systemPrompt: "Full system prompt.",
   });
   seedConversation(shim.stateDir, id);
+  // Seed a real transcript so the default branch has something it could
+  // (wrongly) hydrate — zt3vm makes transcripts opt-in on the LIST.
+  seedMessage(shim.stateDir, id, "default", { id: "msg-zt3vm-1", role: "user", content: "hi" });
 
   // No slim param, and explicit slim=false, both yield the full shape.
   for (const qs of ["", "?slim=false"]) {
@@ -346,8 +349,57 @@ test("GET /v1/agents (default, no slim) is unchanged — full AgentState shape",
     // Heavy fields present on the default path.
     assert.ok("llm_config" in a, `default path keeps llm_config (qs="${qs}")`);
     assert.ok("memory" in a, `default path keeps memory (qs="${qs}")`);
+    // zt3vm: message_ids stays in the shape (old clients deserialize it)
+    // but is [] unless ?include=transcripts — no transcript hydration on
+    // the list path by default.
     assert.ok("message_ids" in a, `default path keeps message_ids (qs="${qs}")`);
+    assert.deepEqual(a["message_ids"], [], `default path leaves message_ids empty (qs="${qs}")`);
   }
+});
+
+// lcp zt3vm: transcript hydration on the list endpoint is opt-in.
+test("GET /v1/agents?include=transcripts populates message_ids; default and detail unaffected", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const id = seedAgent(shim.stateDir, {
+    id: "agent-include-001",
+    name: "IncludeMe",
+    systemPrompt: "Prompt.",
+  });
+  seedConversation(shim.stateDir, id);
+  seedMessage(shim.stateDir, id, "default", { id: "msg-inc-1", role: "user", content: "hello" });
+  seedMessage(shim.stateDir, id, "default", { id: "msg-inc-2", role: "assistant", content: "hi there" });
+
+  // Opt-in: transcripts hydrate and message_ids fills.
+  const withT = await getJson(`${shim.url}/v1/agents?include=transcripts`);
+  assert.equal(withT.res.status, 200);
+  const rowT = (withT.body as Array<Record<string, unknown>>)[0]!;
+  const ids = rowT["message_ids"] as string[];
+  assert.ok(Array.isArray(ids) && ids.length >= 2, `expected hydrated message_ids, got ${JSON.stringify(ids)}`);
+  assert.ok(ids.includes("msg-inc-1") && ids.includes("msg-inc-2"));
+
+  // Default list: same shape, but message_ids empty.
+  const noT = await getJson(`${shim.url}/v1/agents`);
+  const rowD = (noT.body as Array<Record<string, unknown>>)[0]!;
+  assert.deepEqual(rowD["message_ids"], []);
+  // Everything except message_ids is identical between the two responses.
+  const stripped = (row: Record<string, unknown>): Record<string, unknown> => {
+    const { message_ids: _drop, ...rest } = row;
+    return rest;
+  };
+  assert.deepEqual(stripped(rowD), stripped(rowT));
+
+  // slim projection is untouched by include.
+  const slim = await getJson(`${shim.url}/v1/agents?slim=true&include=transcripts`);
+  const slimRow = (slim.body as Array<Record<string, unknown>>)[0]!;
+  assert.deepEqual(Object.keys(slimRow).sort(), ["description", "id", "name"]);
+
+  // Per-agent detail endpoint still hydrates transcripts unconditionally.
+  const detail = await getJson(`${shim.url}/v1/agents/${id}`);
+  assert.equal(detail.res.status, 200);
+  const detailIds = (detail.body as Record<string, unknown>)["message_ids"] as string[];
+  assert.ok(detailIds.includes("msg-inc-1") && detailIds.includes("msg-inc-2"), "detail keeps message_ids");
 });
 
 test("GET /v1/agents orders by mtime descending", async (t) => {

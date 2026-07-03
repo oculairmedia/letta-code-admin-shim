@@ -19,7 +19,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { extname } from "node:path";
 
-import { getAgentPool } from "./agent-pool.js";
+import { getAgentPool, poolCapacityErrorCode } from "./agent-pool.js";
 import { findUnmappedTailUserMessageId, writeAttachmentsForLocalId, writeOtidForLocalId, syncSkillsBlockForAgent } from "./store.js";
 import { toStringArrayOrNull } from "./translate.js";
 import { extractAttachmentRefsFromMessageBody } from "./attachments.js";
@@ -953,6 +953,13 @@ export async function handleSendMessage(
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      // lcp hr5rw (§3a.7): typed pool-capacity rejections map to
+      // deterministic HTTP statuses so clients can back off / retry:
+      //   pool_saturated     → 429 (queue full)
+      //   pool_queue_timeout → 503 (queued, no capacity in the window)
+      // SSE callers get the error event on the already-open stream with
+      // the typed code attached.
+      const capacityCode = poolCapacityErrorCode(err);
       if (!res.writableEnded) {
         if (wantStream) {
           res.write(
@@ -960,13 +967,22 @@ export async function handleSendMessage(
               message_type: "stop_reason",
               stop_reason: "error",
               error: msg,
+              ...(capacityCode ? { code: capacityCode } : {}),
             }),
           );
           res.write(sseDoneFrame());
           res.end();
         } else {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ detail: `pool dispatch failed: ${msg}` }));
+          const status = capacityCode === "pool_saturated"
+            ? 429
+            : capacityCode === "pool_queue_timeout"
+              ? 503
+              : 500;
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            detail: capacityCode ? msg : `pool dispatch failed: ${msg}`,
+            ...(capacityCode ? { code: capacityCode } : {}),
+          }));
         }
       }
     }

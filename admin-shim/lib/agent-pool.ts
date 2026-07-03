@@ -21,6 +21,8 @@
  *   SHIM_POOL_IDLE_SEC      default 300  evict sessions idle this long
  *   SHIM_POOL_SPAWN_TIMEOUT default 15000 ms to wait for the init message
  *   SHIM_POOL_TURN_TIMEOUT  default 180_000 ms watchdog per turn
+ *   SHIM_POOL_QUEUE_MAX     default 16   cold spawns queued when all busy (lcp hr5rw)
+ *   SHIM_POOL_QUEUE_TIMEOUT_MS default 30_000 queue wait budget before 503
  *
  * Note (lcp-sdk.10, 2026-05-22): the hand-rolled subprocess transport
  * was retired in favor of the SDK transport. The Session adapter is the
@@ -57,6 +59,7 @@ import {
   recordRunOtid,
   recordRunStep,
   recordRunTool,
+  setRunCancelHandler,
   type RunHandle,
   type UsageInput,
   type ApprovalScope,
@@ -78,6 +81,55 @@ const IDLE_EVICT_MS = Number(process.env["SHIM_POOL_IDLE_SEC"] ?? 300) * 1000;
 // can exercise the idle-evict path within the suite's wall-clock budget
 // rather than waiting half a minute per case.
 const HOUSEKEEP_INTERVAL_MS = Number(process.env["SHIM_POOL_HOUSEKEEP_MS"] ?? 30_000);
+// lcp hr5rw (§3a): bounded FIFO overflow queue for cold spawns when every
+// worker at/over cap is busy. Previously the cap loop `break`ed and spawned
+// anyway — unbounded overflow at 330–445MB per extra worker.
+const QUEUE_MAX = Number(process.env["SHIM_POOL_QUEUE_MAX"] ?? 16);
+const QUEUE_TIMEOUT_MS = Number(process.env["SHIM_POOL_QUEUE_TIMEOUT_MS"] ?? 30_000);
+
+/**
+ * lcp hr5rw (§3a): typed capacity errors so callers can map deterministically:
+ *   pool_saturated    → HTTP 429 (queue full at enqueue time)
+ *   pool_queue_timeout → HTTP 503 (queued but no capacity within the window)
+ *   cancelled          → the run was cancelled while queued
+ */
+export type PoolCapacityErrorCode = "pool_saturated" | "pool_queue_timeout" | "cancelled";
+
+export class PoolCapacityError extends Error {
+  readonly code: PoolCapacityErrorCode;
+  constructor(code: PoolCapacityErrorCode, message: string) {
+    super(message);
+    this.name = "PoolCapacityError";
+    this.code = code;
+  }
+}
+
+/** Narrow an unknown error to a pool-capacity code, if it carries one. */
+export function poolCapacityErrorCode(err: unknown): PoolCapacityErrorCode | null {
+  if (err instanceof PoolCapacityError) return err.code;
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  return code === "pool_saturated" || code === "pool_queue_timeout" || code === "cancelled"
+    ? code
+    : null;
+}
+
+/** One FIFO entry waiting for pool capacity (cold-spawn path only). */
+interface CapacityWaiter {
+  key: string;
+  /** Run ids of the callers coalesced onto this waiter (for cancelQueued). */
+  runIds: string[];
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+  /** True once resolved/rejected (admit, timeout, or cancel). */
+  settled: boolean;
+  /**
+   * Admission grants ONE spawn reservation per waiter; the first coalesced
+   * caller to resume claims it, the rest re-check warm/spawning maps.
+   */
+  reservationClaimed: boolean;
+}
 
 /**
  * Approval gate state for a single approval_request_message.
@@ -266,6 +318,14 @@ export interface LettaSessionAdapterOptions {
   conversationId: string;
   agentId: string;
   tools?: AnyAgentTool[];
+  /**
+   * lcp hr5rw (§3a.5): fired once per turn AFTER finalizeTurnLifecycle
+   * completes (NOT where currentRunHandle is nulled — firing earlier would
+   * let the pool cap-evict a worker that is still finalizing, clobbering
+   * the CLI's end-of-turn messages.jsonl flush, or one with a chained turn
+   * queued). The pool uses it to drain capacity waiters.
+   */
+  onTurnSettled?: () => void;
 }
 
 /** Adapter-owned turn result. Public callers still see RunTurnResult via AgentPool#get(). */
@@ -297,6 +357,15 @@ export interface LettaSessionAdapter {
   readonly busy?: boolean;
   /** Currently executing run ID, if any. Useful for cleaning up dangling state on eviction. */
   readonly activeRunId?: string | null;
+  /**
+   * lcp hr5rw (§3a.5): depth of the adapter's turn chain — turns chained
+   * and not yet fully settled (including the finalize window after `busy`
+   * flips false). Eviction paths must skip adapters with pendingTurns() > 0:
+   * closing one mid-finalize can clobber the CLI's end-of-turn disk flush
+   * (the lcp-0vi hazard), and closing one with a chained turn fails that
+   * turn with "runTurn on dead adapter".
+   */
+  pendingTurns?(): number;
   start(): Promise<LettaSessionInit>;
   runTurn(input: string | unknown[], opts?: RunTurnOptions): Promise<AdapterRunTurnResult>;
   abort(reason?: string): Promise<void> | void;
@@ -334,6 +403,9 @@ export interface PoolStats {
   max: number;
   idle_evict_sec: number;
   workers: WorkerStat[];
+  /** lcp hr5rw: additive — cold spawns queued for capacity + in-flight spawns. */
+  queued: number;
+  in_flight_spawns: number;
   /** lcp-2oxb.1: additive performance snapshot; never undefined. */
   perf: PoolPerfStats;
 }
@@ -471,8 +543,13 @@ export async function finalizeTurnLifecycle(args: {
   cancelled: boolean;
   finishedExit: boolean;
   finishedTimeout: boolean;
-}): Promise<{ newUserMessageId: string | null }> {
+}): Promise<{ newUserMessageId: string | null; synthesizedSettlements: number }> {
   const { runHandle, frames, conversationId, agentId, messageIdsBefore, turnStartedAt, cancelled, finishedExit, finishedTimeout } = args;
+  // lcp hr5rw (§3c.5): count of tool_result settlements SYNTHESIZED onto
+  // disk for dangling tool_calls. When > 0 the CLI's in-memory snapshot
+  // disagrees with disk, so the cancel soft-grace keep-alive must NOT keep
+  // the worker warm (the lcp-0vi evict-before-heal hazard).
+  let synthesizedSettlements = 0;
   try {
     await stampNewMessages(conversationId, agentId, turnStartedAt);
   } catch (err) {
@@ -530,6 +607,7 @@ export async function finalizeTurnLifecycle(args: {
         messageIdsBefore,
       });
       if (settled.messagesAppended > 0) {
+        synthesizedSettlements = settled.messagesAppended;
         logLine(`settled ${settled.messagesAppended} dangling tool_call(s) for run=${runHandle.id} reason=${settleReason}`);
         for (const s of settled.settled) {
           recordRunMessage(runHandle, `synth-settle:${runHandle.id}:${s.tool_call_id}`);
@@ -563,7 +641,7 @@ export async function finalizeTurnLifecycle(args: {
       usage: usage as UsageStatisticsEvent | null,
     });
   }
-  return { newUserMessageId };
+  return { newUserMessageId, synthesizedSettlements };
 }
 
 /**
@@ -589,6 +667,20 @@ export class AgentPool {
   spawning: Map<string, Promise<LettaSessionAdapter>>;
   housekeepTimer: NodeJS.Timeout;
   /**
+   * lcp hr5rw (§3a): FIFO of cold-spawn callers waiting for capacity.
+   * Bounded by SHIM_POOL_QUEUE_MAX; entries time out after
+   * SHIM_POOL_QUEUE_TIMEOUT_MS. Warm hits (even busy ones) never queue —
+   * they serialize on the adapter's own promise chain.
+   */
+  capacityWaiters: CapacityWaiter[] = [];
+  /**
+   * lcp hr5rw (§3a.3): spawns admitted but not yet landed in `workers`
+   * (start() takes ~3s). Admission control computes
+   * `admit = MAX_WORKERS − workers.size − inFlightSpawns` so several
+   * capacity-frees during a spawn window can never burst past MAX.
+   */
+  inFlightSpawns = 0;
+  /**
    * lcp-2oxb.2: seam for unit tests. When set, get() calls this instead
    * of the module-level createAdapter() so tests can inject fake adapters
    * without spawning real SDK sessions. Production code never sets this.
@@ -607,6 +699,158 @@ export class AgentPool {
     return this.workers.size;
   }
 
+  /** lcp hr5rw: true when the adapter may be closed by capacity eviction. */
+  private _evictableForCapacity(w: LettaSessionAdapter): boolean {
+    return !w.busy && (w.pendingTurns?.() ?? 0) === 0;
+  }
+
+  /**
+   * Evict ONE LRU idle worker to make room for a spawn. Returns false when
+   * every worker is busy / finalizing / has chained turns (nothing safe to
+   * close). Invariant preserved: a busy or pending-turn worker is NEVER
+   * closed here (closing mid-turn or mid-finalize clobbers the CLI's
+   * end-of-turn disk flush — lcp-0vi).
+   */
+  private _evictIdleForCapacity(): boolean {
+    const entries = [...this.workers.entries()].sort(
+      (a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
+    );
+    const victimEntry = entries.find(([, w]) => this._evictableForCapacity(w));
+    if (!victimEntry) return false;
+    const [oldestKey, victim] = victimEntry;
+    logLine(`evicting (cap) conv=${oldestKey}`);
+    this.workers.delete(oldestKey);
+    if (victim.activeRunId) {
+      rejectApprovalGate(victim.activeRunId, new Error("worker_evicted"));
+    }
+    victim.close();
+    return true;
+  }
+
+  /**
+   * lcp hr5rw (§3a): reserve one spawn slot, cap-evicting idle workers as
+   * needed. Returns false when the pool is saturated with busy workers —
+   * the caller must queue (no more spawn-anyway overflow).
+   */
+  private _tryReserveCapacity(): boolean {
+    while (this.workers.size + this.inFlightSpawns >= MAX_WORKERS) {
+      if (!this._evictIdleForCapacity()) return false;
+    }
+    this.inFlightSpawns += 1;
+    return true;
+  }
+
+  /**
+   * lcp hr5rw (§3a): park a cold-spawn caller until capacity frees.
+   * Same-key callers coalesce onto one waiter (one spawn on wake, like
+   * `spawning` does). Resolves `true` for exactly one caller per waiter —
+   * the reservation owner; the rest re-check warm/spawning maps.
+   * Rejects with pool_saturated (queue full), pool_queue_timeout, or
+   * cancelled (via cancelQueued).
+   */
+  private async _waitForCapacity(key: string, runId?: string): Promise<boolean> {
+    let waiter = this.capacityWaiters.find((w) => w.key === key && !w.settled);
+    if (!waiter) {
+      const liveDepth = this.capacityWaiters.filter((w) => !w.settled).length;
+      if (liveDepth >= QUEUE_MAX) {
+        throw new PoolCapacityError(
+          "pool_saturated",
+          `pool queue full (${liveDepth}/${QUEUE_MAX}) — all ${MAX_WORKERS} workers busy`,
+        );
+      }
+      let resolve!: () => void;
+      let reject!: (err: Error) => void;
+      const promise = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      const entry: CapacityWaiter = {
+        key,
+        runIds: runId ? [runId] : [],
+        promise,
+        resolve,
+        reject,
+        settled: false,
+        reservationClaimed: false,
+        timer: setTimeout(() => {
+          if (entry.settled) return;
+          entry.settled = true;
+          const idx = this.capacityWaiters.indexOf(entry);
+          if (idx >= 0) this.capacityWaiters.splice(idx, 1);
+          entry.reject(new PoolCapacityError(
+            "pool_queue_timeout",
+            `no pool capacity within ${QUEUE_TIMEOUT_MS}ms (key=${key})`,
+          ));
+        }, QUEUE_TIMEOUT_MS),
+      };
+      // Deliberately NOT unref'd: a queued caller is a live request; the
+      // process must not exit from under it before the timeout resolves.
+      this.capacityWaiters.push(entry);
+      logLine(`pool saturated — queued cold spawn key=${key} depth=${this.capacityWaiters.filter((w) => !w.settled).length} max=${QUEUE_MAX}`);
+      waiter = entry;
+    } else if (runId && !waiter.runIds.includes(runId)) {
+      waiter.runIds.push(runId);
+    }
+    await waiter.promise;
+    if (!waiter.reservationClaimed) {
+      waiter.reservationClaimed = true;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * lcp hr5rw (§3a.4): admit queued cold spawns, FIFO, with admission
+   * control — at most `MAX_WORKERS − workers.size − inFlightSpawns` at a
+   * time (evicting idle workers to make room). Called at every
+   * capacity-freeing point: cap/manual/force eviction, housekeep
+   * idle-evict, dead-worker delete, failed spawn, and turn settlement.
+   */
+  drainCapacityWaiters(): void {
+    while (this.capacityWaiters.length > 0) {
+      const head = this.capacityWaiters[0]!;
+      if (head.settled) {
+        this.capacityWaiters.shift();
+        continue;
+      }
+      // Make room (evict idle) or stop — head-of-line blocks, FIFO.
+      let hasRoom = this.workers.size + this.inFlightSpawns < MAX_WORKERS;
+      while (!hasRoom) {
+        if (!this._evictIdleForCapacity()) return;
+        hasRoom = this.workers.size + this.inFlightSpawns < MAX_WORKERS;
+      }
+      this.capacityWaiters.shift();
+      head.settled = true;
+      clearTimeout(head.timer);
+      // Reservation is granted to the waiter; the first coalesced caller
+      // to resume claims it (see _waitForCapacity) and increments nothing
+      // further — the slot is held here, before any caller yields.
+      this.inFlightSpawns += 1;
+      logLine(`pool queue admit key=${head.key} remaining=${this.capacityWaiters.filter((w) => !w.settled).length}`);
+      head.resolve();
+    }
+  }
+
+  /**
+   * lcp hr5rw (§3a.6): remove a queued cold spawn for `runId` and reject
+   * its waiter with a typed `cancelled` error so a mobile cancel during
+   * queueing doesn't strand the caller for the full queue timeout. NOTE:
+   * same-key callers coalesce onto one waiter, so cancelling one run
+   * rejects the whole (agent, conv) group — acceptable: they target the
+   * same worker and the group is re-queueable.
+   */
+  cancelQueued(runId: string): boolean {
+    const idx = this.capacityWaiters.findIndex((w) => !w.settled && w.runIds.includes(runId));
+    if (idx < 0) return false;
+    const [waiter] = this.capacityWaiters.splice(idx, 1);
+    if (!waiter) return false;
+    waiter.settled = true;
+    clearTimeout(waiter.timer);
+    logLine(`pool queue cancel run=${runId} key=${waiter.key}`);
+    waiter.reject(new PoolCapacityError("cancelled", `run ${runId} cancelled while queued for pool capacity`));
+    return true;
+  }
+
   /**
    * Compose the cache key. Conv id "default" collides across agents (every
    * agent has its own "default" thread), so we MUST include the agent id
@@ -622,15 +866,70 @@ export class AgentPool {
    * Get a ready worker for (conversationId, agentId). Reuses warm one;
    * spawns + waits for init if cold. Concurrent callers for the same
    * (agent, conv) coalesce on a single spawn.
+   *
+   * lcp hr5rw (§3a): when every worker at/over cap is busy, the cold-spawn
+   * path QUEUES on a bounded FIFO instead of spawning anyway (the old
+   * `pool overflow (all busy)` path — unbounded, 330–445MB per extra
+   * worker). Rejections are typed: PoolCapacityError with code
+   * pool_saturated / pool_queue_timeout / cancelled. Warm hits (even busy
+   * ones) never queue — they serialize via the adapter's promise chain.
+   *
+   * Cap eviction (lcp-2oxb.2 invariant preserved and extended): a victim
+   * must be !busy AND have no pending turns (finalize window / chained
+   * turn B — closing those clobbers the CLI's end-of-turn disk flush or
+   * fails turn B with "runTurn on dead adapter").
    */
-  async get(conversationId: string, agentId: string): Promise<LettaSessionAdapter> {
+  async get(
+    conversationId: string,
+    agentId: string,
+    getOpts: { runId?: string } = {},
+  ): Promise<LettaSessionAdapter> {
     const key = this._key(conversationId, agentId);
-    let worker = this.workers.get(key);
-    if (worker && !worker.dead) return worker;
-    if (worker && worker.dead) this.workers.delete(key);
+    let reserved = false;
+    const releaseReservation = (): void => {
+      if (reserved) {
+        reserved = false;
+        this.inFlightSpawns = Math.max(0, this.inFlightSpawns - 1);
+      }
+    };
 
-    const inFlight = this.spawning.get(key);
-    if (inFlight) return inFlight;
+    for (;;) {
+      const worker = this.workers.get(key);
+      if (worker && !worker.dead) {
+        if (reserved) {
+          releaseReservation();
+          this.drainCapacityWaiters();
+        }
+        return worker;
+      }
+      if (worker && worker.dead) {
+        this.workers.delete(key);
+        this.drainCapacityWaiters();
+        continue;
+      }
+      const inFlight = this.spawning.get(key);
+      if (inFlight) {
+        if (reserved) {
+          releaseReservation();
+          this.drainCapacityWaiters();
+        }
+        return inFlight;
+      }
+      if (reserved) break; // admitted from the queue (or reserved below) → spawn
+      if (this._tryReserveCapacity()) {
+        reserved = true;
+        break;
+      }
+      // All busy at/over cap → park on the bounded FIFO. Throws typed
+      // pool_saturated / pool_queue_timeout / cancelled. On wake, loop
+      // back: a warm worker or an in-flight spawn may now exist for key.
+      try {
+        reserved = await this._waitForCapacity(key, getOpts.runId);
+      } catch (err) {
+        releaseReservation(); // defensive; we hold none on this path
+        throw err;
+      }
+    }
 
     let resolveSpawn!: (w: LettaSessionAdapter) => void;
     let rejectSpawn!: (err: any) => void;
@@ -643,47 +942,15 @@ export class AgentPool {
 
     (async (): Promise<void> => {
       try {
-        // lcp-2oxb.2: Evict LRU idle worker(s) when at/over cap.
-        //
-        // The original loop always evicted the absolute stalest worker by
-        // lastUsedAt, even when that worker had a turn in flight (busy===true).
-        // Closing a busy worker terminates the SDK session mid-turn, causing
-        // the in-flight turn to resolve with dead:true — worst-case when the
-        // parked turn is exactly the stalest (a "ask" keepalive refreshes the
-        // silence watchdog but NOT lastUsedAt, so a parked approval is always
-        // the LRU victim under churn).
-        //
-        // Fix: sort workers LRU-first but skip any where busy===true. If ALL
-        // workers at/over cap are busy, break out of the loop and spawn anyway
-        // (temporary overflow bounded by the number of concurrent turns).
-        // housekeep() naturally drains overflow as each busy turn finishes —
-        // it already skips busy workers and evicts idle ones on the next tick.
-        //
-        // Invariant preserved: a busy worker is NEVER closed here.
-        while (this.workers.size >= MAX_WORKERS) {
-          // Sort all pool entries LRU-first (oldest lastUsedAt first).
-          const entries = [...this.workers.entries()].sort(
-            (a, b) => a[1].lastUsedAt - b[1].lastUsedAt,
-          );
-          // Find the least-recently-used entry that is not busy.
-          const victimEntry = entries.find(([, w]) => !w.busy);
-          if (!victimEntry) {
-            // All workers at/over cap are busy with in-flight turns. Allow a
-            // temporary overflow rather than killing any busy worker.
-            logLine(`pool overflow (all busy) size=${this.workers.size} max=${MAX_WORKERS}`);
-            break;
-          }
-          const [oldestKey, victim] = victimEntry;
-          logLine(`evicting (cap) conv=${oldestKey}`);
-          this.workers.delete(oldestKey);
-          if (victim.activeRunId) {
-            rejectApprovalGate(victim.activeRunId, new Error("worker_evicted"));
-          }
-          victim.close();
-        }
-
         const factory = this._adapterFactory ?? createAdapter;
-        const w = await factory({ conversationId, agentId });
+        const w = await factory({
+          conversationId,
+          agentId,
+          // lcp hr5rw (§3a.5): wake queued cold spawns when a turn fully
+          // settles (after finalizeTurnLifecycle) — the point where the
+          // worker becomes genuinely reusable/evictable.
+          onTurnSettled: () => this.drainCapacityWaiters(),
+        });
         try {
           await w.start();
         } catch (err) {
@@ -708,6 +975,11 @@ export class AgentPool {
       return w;
     } finally {
       this.spawning.delete(key);
+      // Success: the worker now counts in workers.size, so release the
+      // reservation (net capacity unchanged). Failure: the slot frees for
+      // the next queued waiter. Either way, drain (no-op when full).
+      releaseReservation();
+      this.drainCapacityWaiters();
     }
   }
 
@@ -735,6 +1007,7 @@ export class AgentPool {
       logLine(`evict close failed key=${key}: ${msg}`);
     }
     logLine(`evicted (manual) key=${key} size=${this.workers.size}`);
+    this.drainCapacityWaiters();
     return true;
   }
 
@@ -756,6 +1029,7 @@ export class AgentPool {
       logLine(`force-evict close threw key=${key}: ${msg}`);
     }
     logLine(`force-evicted key=${key} reason=${reason} size=${this.workers.size}`);
+    this.drainCapacityWaiters();
     return true;
   }
 
@@ -821,12 +1095,38 @@ export class AgentPool {
       adapter = await factory({ conversationId, agentId, tools: opts.tools });
       await adapter.start();
     } else {
-      adapter = await this.get(conversationId, agentId);
+      // lcp hr5rw (§3a.6): while queued for capacity, route cancelRun to
+      // cancelQueued so a mobile cancel doesn't strand the waiter for the
+      // full queue timeout. Only pre-created handles (mobile WS) have a
+      // cancellable id at this point; adapter.runTurn re-binds the real
+      // cancel handler once the worker exists.
+      if (opts.runHandle) {
+        const runId = opts.runHandle.id;
+        setRunCancelHandler(runId, () => {
+          this.cancelQueued(runId);
+        });
+      }
+      adapter = await this.get(conversationId, agentId, {
+        ...(opts.runHandle ? { runId: opts.runHandle.id } : {}),
+      });
     }
     const turnOpts: RunTurnOptions = {
       ...opts,
       onCancelGraceExpired: (runId) => {
-        this.forceEvict(conversationId, agentId, `cancel_grace_expired run=${runId}`);
+        // Worker-identity guard: forceEvict is a by-KEY lookup, but the
+        // grace timer can fire after THIS turn's worker already left the
+        // pool (evicted, died) and a FRESH worker spawned under the same
+        // key for a re-send. Evicting by key alone would close that new
+        // worker mid-turn — so only evict when the keyed worker is still
+        // the adapter this turn ran on. (Ephemeral opts.tools adapters are
+        // never in `workers`, so they correctly skip here too — the
+        // adapter's own grace-timer close() handles them.)
+        const key = this._key(conversationId, agentId);
+        if (this.workers.get(key) === adapter) {
+          this.forceEvict(conversationId, agentId, `cancel_grace_expired run=${runId}`);
+        } else {
+          logLine(`cancel grace expired run=${runId} but key=${key} holds a different worker — skipping forceEvict`);
+        }
         opts.onCancelGraceExpired?.(runId);
       },
     };
@@ -950,28 +1250,40 @@ export class AgentPool {
 
   housekeep(): void {
     const now = Date.now();
+    let freed = false;
     for (const [key, w] of this.workers) {
       if (w.dead) {
         this.workers.delete(key);
+        freed = true;
         continue;
       }
       if (now - w.lastUsedAt > IDLE_EVICT_MS) {
-        if (w.busy) {
+        if (w.busy || (w.pendingTurns?.() ?? 0) > 0) {
           logLine(`skipping eviction (busy) conv=${key} idle=${(now - w.lastUsedAt) / 1000}s`);
           continue;
         }
         logLine(`evicting (idle) conv=${key} idle=${(now - w.lastUsedAt) / 1000}s`);
         this.workers.delete(key);
+        freed = true;
         if (w.activeRunId) {
           rejectApprovalGate(w.activeRunId, new Error("worker_evicted"));
         }
         w.close();
       }
     }
+    if (freed) this.drainCapacityWaiters();
   }
 
   async stopAll(): Promise<void> {
     if (this.housekeepTimer) clearInterval(this.housekeepTimer);
+    // lcp hr5rw: unblock queued cold spawns so shutdown never hangs on the
+    // queue timeout.
+    for (const waiter of this.capacityWaiters.splice(0)) {
+      if (waiter.settled) continue;
+      waiter.settled = true;
+      clearTimeout(waiter.timer);
+      waiter.reject(new PoolCapacityError("cancelled", "pool shutting down"));
+    }
     const all = [...this.workers.values()];
     this.workers.clear();
     await Promise.allSettled(all.map((w) => {
@@ -994,6 +1306,8 @@ export class AgentPool {
       size: this.workers.size,
       max: MAX_WORKERS,
       idle_evict_sec: IDLE_EVICT_MS / 1000,
+      queued: this.capacityWaiters.filter((w) => !w.settled).length,
+      in_flight_spawns: this.inFlightSpawns,
       workers: [...this.workers.entries()].map(([k, w]) => ({
         key: k,
         conversation_id: w.conversationId,
