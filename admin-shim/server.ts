@@ -151,6 +151,7 @@ import {
   listAdapterHandles,
   reloadChannelAccounts,
   restartAdapter,
+  sendAdapterMessage,
   startAdapter,
   startChannelRegistry,
   stopAdapter,
@@ -2857,6 +2858,52 @@ async function handleChannelAdapterControl(
   }
 }
 
+/**
+ * Agent-initiated outbound send: POST
+ * /v1/channels/{channelId}/accounts/{accountId}/messages. Delivery goes
+ * through the registry (adapter must be "running"); the message text is
+ * never logged or echoed in errors — failures surface only as scrubbed
+ * {detail} strings from ChannelControlError / the generic fallback.
+ */
+async function handleChannelOutboundSend(
+  req: IncomingMessage,
+  res: ServerResponse,
+  channelId: string,
+  accountId: string,
+): Promise<void> {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  const body = await readJsonBody(req);
+  const chatId = typeof body["chatId"] === "string" && body["chatId"].length > 0
+    ? (body["chatId"] as string)
+    : null;
+  if (!chatId) return badRequest(res, "chatId is required");
+  const text = typeof body["text"] === "string" && body["text"].length > 0
+    ? (body["text"] as string)
+    : null;
+  if (!text) return badRequest(res, "text is required (non-empty string)");
+  const threadId = typeof body["threadId"] === "string" ? (body["threadId"] as string) : null;
+  const markdown = typeof body["markdown"] === "boolean" ? (body["markdown"] as boolean) : undefined;
+  try {
+    const { sentAt } = await sendAdapterMessage(channelId, accountId, {
+      chatId,
+      text,
+      threadId,
+      ...(markdown === undefined ? {} : { markdown }),
+    });
+    json(res, 200, { ok: true, sentAt });
+  } catch (err) {
+    // ChannelControlError carries the HTTP status (404 unknown adapter, 409
+    // not running / no outbound support, 502 plugin send failure); its
+    // messages are already secret-scrubbed. The generic fallback is NOT —
+    // scrub, and never include the message text.
+    if (err instanceof ChannelControlError) {
+      return json(res, err.status, { detail: err.message });
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    json(res, 502, { detail: scrubSecrets(`outbound send failed: ${msg}`) });
+  }
+}
+
 function channelsMethodNotAllowed(
   req: IncomingMessage,
   res: ServerResponse,
@@ -3243,6 +3290,16 @@ const server = createServer((req, res) => {
     if (req.method === "POST") return void handleChannelAccountCreate(req, res, channelId);
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     return channelsMethodNotAllowed(req, res, "GET, POST, OPTIONS");
+  }
+  const channelOutboundMatch = pathname.match(
+    /^\/v1\/channels\/([^/]+)\/accounts\/([^/]+)\/messages\/?$/,
+  );
+  if (channelOutboundMatch) {
+    const channelId = decodeURIComponent(channelOutboundMatch[1]!);
+    const accountId = decodeURIComponent(channelOutboundMatch[2]!);
+    if (req.method === "POST") return void handleChannelOutboundSend(req, res, channelId, accountId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "POST, OPTIONS");
   }
   const channelAccountMatch = pathname.match(/^\/v1\/channels\/([^/]+)\/accounts\/([^/]+)\/?$/);
   if (channelAccountMatch) {

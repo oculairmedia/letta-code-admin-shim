@@ -431,6 +431,93 @@ test("adapter control stops/starts/restarts; status carries turn timestamps; mob
   assert.equal(unknown.status, 404);
 });
 
+// ── agent-initiated outbound send ────────────────────────────────────
+
+test("POST /v1/channels/{id}/accounts/{id}/messages sends outbound through the adapter", async (t) => {
+  const shim = await startShim({
+    channels: [{ id: "fake", pluginDir: FAKE_PLUGIN_DIR, accounts: [fakeAccount()] }],
+  });
+  t.after(() => shim.stop());
+  await shim.waitForLogLine(/fake:main starting -> running/);
+
+  // 400s: missing chatId, missing text, empty text.
+  const noChat = await sendJson(shim, "POST", "/v1/channels/fake/accounts/main/messages", {
+    text: "hi",
+  });
+  assert.equal(noChat.status, 400);
+  assert.equal(noChat.body.detail, "chatId is required");
+  const noText = await sendJson(shim, "POST", "/v1/channels/fake/accounts/main/messages", {
+    chatId: "outroom",
+  });
+  assert.equal(noText.status, 400);
+  assert.equal(noText.body.detail, "text is required (non-empty string)");
+  const emptyText = await sendJson(shim, "POST", "/v1/channels/fake/accounts/main/messages", {
+    chatId: "outroom",
+    text: "",
+  });
+  assert.equal(emptyText.status, 400);
+  assert.equal(readOutbox(shim).length, 0, "rejected sends must not reach the adapter");
+
+  // Happy path: adapter captures chatId/text/threadId (+ markdown passthrough).
+  const before = await adapterStatus(shim, "main");
+  assert.equal(before!["lastOutboundAt"], null);
+  const sent = await sendJson(shim, "POST", "/v1/channels/fake/accounts/main/messages", {
+    chatId: "outroom",
+    text: "agent says hello",
+    threadId: "thread-7",
+    markdown: true,
+  });
+  assert.equal(sent.status, 200);
+  assert.equal(sent.body.ok, true);
+  assert.ok(typeof sent.body.sentAt === "string" && sent.body.sentAt.length > 0);
+  const outbox = readOutbox(shim);
+  assert.equal(outbox.length, 1);
+  assert.equal(outbox[0]!["chatId"], "outroom");
+  assert.equal(outbox[0]!["text"], "agent says hello");
+  assert.equal(outbox[0]!["threadId"], "thread-7", "threadId must pass through to sendMessage");
+  assert.equal(outbox[0]!["markdown"], true, "markdown flag must pass through to sendMessage");
+  const after = await adapterStatus(shim, "main");
+  assert.equal(after!["lastOutboundAt"], sent.body.sentAt, "send must update lastOutboundAt");
+
+  // threadId omitted ⇒ adapter sees null (same shape as the inbound reply path).
+  const rootSend = await sendJson(shim, "POST", "/v1/channels/fake/accounts/main/messages", {
+    chatId: "outroom",
+    text: "root-level message",
+  });
+  assert.equal(rootSend.status, 200);
+  assert.equal(readOutbox(shim)[1]!["threadId"], null);
+
+  // 404s: unknown account, unknown channel.
+  const unknownAccount = await sendJson(shim, "POST", "/v1/channels/fake/accounts/nope/messages", {
+    chatId: "outroom",
+    text: "hi",
+  });
+  assert.equal(unknownAccount.status, 404);
+  assert.ok(typeof unknownAccount.body.detail === "string");
+  const unknownChannel = await sendJson(shim, "POST", "/v1/channels/nope/accounts/main/messages", {
+    chatId: "outroom",
+    text: "hi",
+  });
+  assert.equal(unknownChannel.status, 404);
+
+  // 405 with Allow on wrong method.
+  const wrongMethod = await sendJson(shim, "GET", "/v1/channels/fake/accounts/main/messages");
+  assert.equal(wrongMethod.status, 405);
+  assert.match(wrongMethod.headers.get("allow") ?? "", /POST/, "405 must set Allow");
+
+  // 409 once the adapter is stopped; no outbox entry is produced.
+  const stopped = await sendJson(shim, "POST", "/v1/channels/fake/adapters/main/stop");
+  assert.equal(stopped.status, 200);
+  const outboxBefore = readOutbox(shim).length;
+  const whileStopped = await sendJson(shim, "POST", "/v1/channels/fake/accounts/main/messages", {
+    chatId: "outroom",
+    text: "into the void",
+  });
+  assert.equal(whileStopped.status, 409);
+  assert.match(whileStopped.body.detail, /stopped/);
+  assert.equal(readOutbox(shim).length, outboxBefore, "stopped adapter must not send");
+});
+
 // ── 7. account mutation reload + scrubbed crash error ────────────────
 
 test("account mutations hot-reload adapters and crash errors are scrubbed", async (t) => {

@@ -876,6 +876,64 @@ export async function stopAdapter(channelId: string, accountId: string): Promise
   return sup.handle;
 }
 
+/** Agent-initiated outbound send (POST …/accounts/{id}/messages). */
+export interface OutboundSendArgs {
+  chatId: string;
+  text: string;
+  threadId?: string | null;
+  markdown?: boolean;
+}
+
+/**
+ * Deliver an agent-initiated outbound message through a running adapter's
+ * `sendMessage` (same ChannelAdapter contract call the inbound reply path
+ * uses). Errors surface as ChannelControlError so the REST layer can map
+ * them to a status: 404 unknown adapter, 409 not running / no outbound
+ * support, 502 plugin send failure (message scrubbed via errMsg; the text
+ * itself is never logged or echoed).
+ */
+export async function sendAdapterMessage(
+  channelId: string,
+  accountId: string,
+  args: OutboundSendArgs,
+): Promise<{ sentAt: string }> {
+  const sup = requireSupervisor(channelId, accountId);
+  sup.refreshMobileProxy(); // no-op for managed adapters; keeps mobile state fresh
+  const handle = sup.handle;
+  if (handle.state !== "running" || !handle.adapter) {
+    throw new ChannelControlError(
+      `adapter ${channelId}:${accountId} is ${handle.state}, not running`,
+      409,
+    );
+  }
+  const adapter = handle.adapter;
+  if (typeof adapter.sendMessage !== "function") {
+    throw new ChannelControlError(
+      `adapter ${channelId}:${accountId} does not support outbound send`,
+      409,
+    );
+  }
+  try {
+    // Promise.resolve wrapper: a synchronous throw inside the plugin must
+    // land in this catch, never escape into server.ts (crash isolation).
+    await Promise.resolve(
+      adapter.sendMessage({
+        chatId: args.chatId,
+        text: args.text,
+        threadId: args.threadId ?? null,
+        ...(typeof args.markdown === "boolean" ? { markdown: args.markdown } : {}),
+      }),
+    );
+  } catch (err) {
+    // Same failure accounting as the inbound reply path: two send failures
+    // inside the window ⇒ the supervisor crashes/backs off the instance.
+    sup.recordPluginCallError("sendMessage", err);
+    throw new ChannelControlError(`sendMessage failed: ${errMsg(err)}`, 502);
+  }
+  handle.lastOutboundAt = nowIso();
+  return { sentAt: handle.lastOutboundAt };
+}
+
 export async function restartAdapter(channelId: string, accountId: string): Promise<AdapterHandle> {
   const sup = requireSupervisor(channelId, accountId);
   assertManaged(sup);
