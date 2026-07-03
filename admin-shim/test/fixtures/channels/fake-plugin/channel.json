@@ -1,0 +1,5 @@
+{
+  "id": "fake",
+  "displayName": "Fake",
+  "entry": "./plugin.mjs"
+}

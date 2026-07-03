@@ -22,7 +22,7 @@
 
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import type { Readable } from "node:stream";
-import { cpSync, mkdtempSync, rmSync, existsSync, mkdirSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,6 +52,36 @@ export interface ShimOpts {
   mobileToken?: string | undefined;
   /** If false, return as soon as we have a port (default true). */
   waitForReady?: boolean | undefined;
+  /** Extra channels to seed into <homeDir>/.letta/channels/ before boot. */
+  channels?: SeedChannelSpec[] | undefined;
+}
+
+export interface SeedChannelSpec {
+  /** Channel id (directory name under ~/.letta/channels/). */
+  id: string;
+  /** Directory copied verbatim into the channel dir (channel.json + plugin.mjs …). */
+  pluginDir: string;
+  /** Written as accounts.json ({ accounts }) when provided. */
+  accounts?: Array<Record<string, unknown>> | undefined;
+  /** Written as routing.yaml — JSON body ({ routes }), CLI-compatible — when provided. */
+  routes?: Array<Record<string, unknown>> | undefined;
+}
+
+/**
+ * Seed one channel directory under `<homeDir>/.letta/channels/<id>/`.
+ * Call BEFORE the shim boots (the registry discovers channels at listen
+ * time) — startShim({ channels: [...] }) does this for you.
+ */
+export function seedChannel(homeDir: string, spec: SeedChannelSpec): void {
+  const dst = join(homeDir, ".letta", "channels", spec.id);
+  mkdirSync(dst, { recursive: true });
+  cpSync(spec.pluginDir, dst, { recursive: true });
+  if (spec.accounts) {
+    writeFileSync(join(dst, "accounts.json"), JSON.stringify({ accounts: spec.accounts }, null, 2) + "\n");
+  }
+  if (spec.routes) {
+    writeFileSync(join(dst, "routing.yaml"), JSON.stringify({ routes: spec.routes }, null, 2) + "\n");
+  }
 }
 
 export interface WaitForLogLineOpts {
@@ -133,8 +163,22 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
       updatedAt: "1970-01-01T00:00:00.000Z",
     }],
   };
-  const { writeFileSync } = await import("node:fs");
   writeFileSync(mobileAccountsPath, JSON.stringify(mobileAccounts, null, 2));
+
+  // The repo channels dir also carries the REAL matrix channel (live
+  // homeserver URL + token). The channel registry would try to start it on
+  // boot, so neutralize its accounts for tests — matrix behavior is
+  // exercised via the fake plugin fixture instead.
+  const matrixAccountsPath = join(channelsDst, "matrix", "accounts.json");
+  if (existsSync(matrixAccountsPath)) {
+    writeFileSync(matrixAccountsPath, JSON.stringify({ accounts: [] }, null, 2) + "\n");
+  }
+
+  // Seed any test-requested channels (fake plugin fixtures etc.) before the
+  // shim boots — the registry discovers channels once, at listen time.
+  for (const spec of opts.channels ?? []) {
+    seedChannel(homeDir, spec);
+  }
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,

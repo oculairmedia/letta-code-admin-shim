@@ -14,10 +14,12 @@
  */
 
 import { appendFileSync, existsSync, readFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { IncomingMessage } from "node:http";
+
+import { channelDir as resolveChannelDir } from "./channel-paths.js";
+import { buildChannelHost } from "./channel-host-capabilities.js";
 
 import { reshapeFrame, attachReadImageToToolReturn } from "./chat.js";
 import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
@@ -136,8 +138,7 @@ export async function rekickActiveGoalContinuationsOnBoot(
 }
 
 function channelDir(): string {
-  const root = process.env["LETTA_HOME"] || join(homedir(), ".letta");
-  return join(root, "channels", "mobile");
+  return resolveChannelDir("mobile");
 }
 
 /**
@@ -871,7 +872,7 @@ interface GetMobileChannelAdapterOptions {
  * pending dispatcher gates; non-approval actions with a resolvable run become
  * synthetic agent input; every action is recorded to the run sidecar.
  */
-function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
+export function handleUserAction(action: A2uiUserAction): A2uiUserActionAck {
   const actionId =
     typeof action.action_id === "string" && action.action_id.length > 0
       ? action.action_id
@@ -1532,7 +1533,7 @@ export function handleReflectionSettingsSet(
  *  - `subscribeAgentEvents(listener)` — register for agent_updated push
  *  - `subscribeGoalEvents(listener)` — register for goals_updated push
  */
-interface MobileChannelHost {
+export interface MobileChannelHost {
   log: (msg: string) => void;
   getServerId: () => string;
   getA2uiServerCapabilities: typeof getA2uiServerCapabilities;
@@ -1611,6 +1612,27 @@ interface MobileChannelPluginModule {
 // exactly once, only one adapter instance lives. On rejection we clear
 // the slot so a retry is possible.
 let cachedAdapterPromise: Promise<MobileChannelAdapter | null> | null = null;
+// Resolved value shadow for peekMobileChannelAdapter — the channel
+// registry's mobile proxy must never CALL getMobileChannelAdapter (that
+// would construct the adapter outside the WS upgrade path); it only peeks.
+let cachedAdapterResolved: MobileChannelAdapter | null | undefined;
+
+/**
+ * Read-only peek at the mobile adapter cache for the channel registry's
+ * mobile carve-out proxy (§1.5 of the channel-host design):
+ *  - "unstarted": no WS upgrade has constructed the adapter yet
+ *  - "starting":  construction in flight
+ *  - "disabled":  construction resolved null (no enabled mobile account)
+ *  - "running":   an adapter instance exists
+ */
+export function peekMobileChannelAdapter():
+  | { phase: "unstarted" | "starting" | "disabled" }
+  | { phase: "running"; adapter: MobileChannelAdapter } {
+  if (!cachedAdapterPromise) return { phase: "unstarted" };
+  if (cachedAdapterResolved === undefined) return { phase: "starting" };
+  if (cachedAdapterResolved === null) return { phase: "disabled" };
+  return { phase: "running", adapter: cachedAdapterResolved };
+}
 
 /**
  * Load the mobile channel plugin and create the adapter. Memoized.
@@ -1623,9 +1645,12 @@ export function getMobileChannelAdapter(
   if (cachedAdapterPromise) return cachedAdapterPromise;
   const promise = createMobileChannelAdapter(options);
   cachedAdapterPromise = promise;
-  // Clear the cache on rejection so a fresh upgrade attempt can retry
-  // (e.g. accounts.json was just written, plugin file appears).
-  promise.catch(() => { cachedAdapterPromise = null; });
+  promise.then(
+    (adapter) => { cachedAdapterResolved = adapter; },
+    // Clear the cache on rejection so a fresh upgrade attempt can retry
+    // (e.g. accounts.json was just written, plugin file appears).
+    () => { cachedAdapterPromise = null; cachedAdapterResolved = undefined; },
+  );
   return promise;
 }
 
@@ -1655,36 +1680,13 @@ async function createMobileChannelAdapter(
     log.log?.("[mobile-channel] plugin malformed (no createAdapter)");
     return null;
   }
-  const host: MobileChannelHost = {
-    log: (msg: string) => log.log?.(msg),
+  // Extracted host composition (channel-host-capabilities.ts) — the same
+  // object literal this file used to build inline, now shared with the
+  // generic channel registry so every channel gets the identical bridge.
+  const host: MobileChannelHost = buildChannelHost({
+    log: { log: (msg: string) => log.log?.(msg) },
     getServerId,
-    getA2uiServerCapabilities,
-    bridgeSendMessage,
-    cancelRun: (runId: string) => cancelRun(runId),
-    touchAdapter: (convId: string, agId: string) => getAgentPool().touch(convId, agId),
-    handleUserAction,
-    mobileConversationCursorCapabilities,
-    stampConversationFrame,
-    resumeConversation,
-    ackConversation,
-    subscribeConversationEvents,
-    subscribeToRun,
-    handleCronList,
-    handleCronAdd,
-    handleCronGet,
-    handleCronDelete,
-    handleCronDeleteAll,
-    subscribeCronEvents,
-    subscribeAgentEvents,
-    subscribeGoalEvents,
-    subscribeApprovalEvents,
-    handleReflectionSettingsGet,
-    handleReflectionSettingsSet,
-    subscribeReflectionEvents,
-      handleSubagentList,
-    handleSubagentTodos,
-    subscribeSubagentEvents,
-  };
+  });
   const adapter = await plugin.createAdapter(account, host);
   await adapter.start?.();
   log.log?.(`[mobile-channel] adapter ready (account=${account.accountId})`);

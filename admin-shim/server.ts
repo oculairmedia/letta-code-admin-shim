@@ -146,6 +146,36 @@ import {
   sweepPendingApprovalsOnBoot,
 } from "./lib/pending-approval.js";
 import { finalizeRestartingRunsOnShutdown } from "./lib/restart-finalizer.js";
+import {
+  ChannelControlError,
+  listAdapterHandles,
+  reloadChannelAccounts,
+  restartAdapter,
+  startAdapter,
+  startChannelRegistry,
+  stopAdapter,
+  stopChannelRegistry,
+  type AdapterHandle,
+} from "./lib/channel-registry.js";
+import {
+  ChannelStoreConflictError,
+  deleteAccount as deleteChannelAccount,
+  deleteRoute as deleteChannelRoute,
+  deriveRouteId,
+  discoverChannels,
+  listAccounts as listChannelAccounts,
+  listRoutes as listChannelRoutes,
+  patchAccount as patchChannelAccount,
+  redactConfig,
+  registerSecretValues,
+  scrubSecrets,
+  upsertAccount as upsertChannelAccount,
+  upsertRoute as upsertChannelRoute,
+  type ChannelAccount,
+  type ChannelManifest,
+  type Route as ChannelRoute,
+} from "./lib/channel-config.js";
+import { channelDir } from "./lib/channel-paths.js";
 import { applyNativeGoalCommandForAgent, getNativeGoalForAgent, getNativeGoalForConversation } from "./lib/native-goal-mode.js";
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -2483,6 +2513,359 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   } catch { return {}; }
 }
 
+// ── /v1/channels — generic channel host REST surface (letta-mobile-6ahjp) ──
+//
+// Config reads/writes go through the lock-serialized store in
+// lib/channel-config.ts (same files the letta CLI writes); adapter control
+// goes through the supervision registry in lib/channel-registry.ts.
+// Secrets are WRITE-ONLY: every response passes account config through
+// redactConfig(), so a SECRET_KEY_RE-matching key surfaces only as the
+// { "__secret_set": true } sentinel — the raw value is never serialized.
+
+const MOBILE_ACCOUNT_MUTATION_NOTE =
+  "mobile adapter requires shim restart to pick up account changes";
+
+function findChannelManifest(channelId: string): ChannelManifest | null {
+  return discoverChannels().find((m) => m.id === channelId) ?? null;
+}
+
+function serializeAdapterStatus(handle: AdapterHandle): Record<string, unknown> {
+  return {
+    accountId: handle.accountId,
+    state: handle.state,
+    enabled: handle.enabled,
+    managed: handle.managed,
+    restarts: handle.restarts,
+    lastStartedAt: handle.lastStartedAt,
+    lastStoppedAt: handle.lastStoppedAt,
+    lastError: handle.lastError,
+    lastErrorAt: handle.lastErrorAt,
+    lastSyncAt: handle.lastSyncAt,
+    lastInboundAt: handle.lastInboundAt,
+    lastOutboundAt: handle.lastOutboundAt,
+    nextRetryAt: handle.nextRetryAt,
+    note: handle.note,
+    recentLog: handle.recentLog().slice(-50),
+  };
+}
+
+function channelAdapterStatuses(channelId: string): Array<Record<string, unknown>> {
+  return listAdapterHandles()
+    .filter((h) => h.channelId === channelId)
+    .map(serializeAdapterStatus);
+}
+
+function serializeChannel(manifest: ChannelManifest): Record<string, unknown> {
+  const entry =
+    typeof manifest.entry === "string" && manifest.entry.length > 0
+      ? manifest.entry
+      : "plugin.mjs";
+  return {
+    id: manifest.id,
+    displayName: manifest.displayName ?? null,
+    entry: manifest.entry ?? null,
+    pluginPresent: existsSync(join(channelDir(manifest.id), entry)),
+    accounts: listChannelAccounts(manifest.id).length,
+    routes: listChannelRoutes(manifest.id).length,
+    adapters: channelAdapterStatuses(manifest.id),
+    managed: manifest.id !== "mobile",
+  };
+}
+
+/**
+ * Map a channel store failure to a response. These handlers are dispatched
+ * `return void handleX(...)`, so an escaped rejection would leave the client
+ * hanging forever and (with SHIM_CHANNELS_ENABLED=0, where the registry's
+ * process traps are not installed) hit Node's unhandled-rejection default
+ * and kill the shim. Duplicate-key conflicts (checked INSIDE the channel
+ * lock) map to 409; anything else — lock acquire timeout, corrupt JSON — is
+ * a scrubbed 500.
+ */
+function channelStoreFailure(res: ServerResponse, err: unknown): void {
+  if (err instanceof ChannelStoreConflictError) {
+    return json(res, 409, { detail: err.message });
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  json(res, 500, { detail: scrubSecrets(msg) });
+}
+
+/** Redact secret config values (write-only contract, §2.3 of the design). */
+function redactChannelAccount(account: ChannelAccount): Record<string, unknown> {
+  const config = account.config;
+  const redacted =
+    config && typeof config === "object" && !Array.isArray(config)
+      ? redactConfig(config as Record<string, unknown>)
+      : config;
+  return { ...account, config: redacted } as Record<string, unknown>;
+}
+
+/**
+ * After a persisted account mutation: hot-reload the registry's handles for
+ * this channel (new enabled account ⇒ create+start; disabled/deleted ⇒
+ * stop+remove; changed config ⇒ restart). Mobile is persisted-only — the WS
+ * host reloads accounts on shim restart — so it gets a note instead.
+ */
+async function afterChannelAccountMutation(channelId: string): Promise<Record<string, unknown>> {
+  if (channelId === "mobile") return { note: MOBILE_ACCOUNT_MUTATION_NOTE };
+  try {
+    await reloadChannelAccounts(channelId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[channel-registry] account reload failed for ${channelId}: ${scrubSecrets(msg)}`);
+  }
+  return {};
+}
+
+function handleChannelsList(res: ServerResponse): void {
+  json(res, 200, { channels: discoverChannels().map(serializeChannel) });
+}
+
+function handleChannelDetail(res: ServerResponse, channelId: string): void {
+  const manifest = findChannelManifest(channelId);
+  if (!manifest) return notFound(res, `unknown channel ${channelId}`);
+  json(res, 200, serializeChannel(manifest));
+}
+
+function handleChannelStatus(res: ServerResponse, channelId: string): void {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  json(res, 200, { channelId, adapters: channelAdapterStatuses(channelId) });
+}
+
+function handleChannelAccountsList(res: ServerResponse, channelId: string): void {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  json(res, 200, { accounts: listChannelAccounts(channelId).map(redactChannelAccount) });
+}
+
+async function handleChannelAccountCreate(
+  req: IncomingMessage,
+  res: ServerResponse,
+  channelId: string,
+): Promise<void> {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  const body = await readJsonBody(req);
+  const accountId = typeof body["accountId"] === "string" ? body["accountId"] : "";
+  if (!accountId) return badRequest(res, "accountId is required");
+  let persisted: ChannelAccount;
+  try {
+    // The store stamps `channel: <channelId>` on create (consumers filter
+    // on it — e.g. mobile's loadAccount()); the body never needs to send it.
+    // expectAbsent runs the duplicate 409 check INSIDE the channel lock — a
+    // lock-free pre-check here would let two concurrent POSTs both pass and
+    // the second silently merge over the first.
+    persisted = await upsertChannelAccount(channelId, body as ChannelAccount, {
+      expectAbsent: true,
+    });
+  } catch (err) {
+    return channelStoreFailure(res, err);
+  }
+  registerSecretValues(
+    channelId,
+    accountId,
+    (persisted.config ?? null) as Record<string, unknown> | null,
+  );
+  const extra = await afterChannelAccountMutation(channelId);
+  // Create response == subsequent GET (crons rule), redacted.
+  json(res, 201, { ...redactChannelAccount(persisted), ...extra });
+}
+
+function handleChannelAccountDetail(
+  res: ServerResponse,
+  channelId: string,
+  accountId: string,
+): void {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  const account = listChannelAccounts(channelId).find((a) => a.accountId === accountId);
+  if (!account) return notFound(res, `unknown account ${accountId}`);
+  json(res, 200, redactChannelAccount(account));
+}
+
+async function handleChannelAccountPatch(
+  req: IncomingMessage,
+  res: ServerResponse,
+  channelId: string,
+  accountId: string,
+): Promise<void> {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  const body = await readJsonBody(req);
+  // Identity fields are immutable via PATCH — a renamed accountId would
+  // orphan the registry handle and dangle routes keyed on the old id.
+  delete body["accountId"];
+  delete body["channel"];
+  // patchAccount merges `config` via mergeConfigPreservingSecrets: an
+  // omitted or sentinel secret keeps the stored value; null deletes it.
+  let persisted: ChannelAccount | null;
+  try {
+    persisted = await patchChannelAccount(channelId, accountId, body as Partial<ChannelAccount>);
+  } catch (err) {
+    return channelStoreFailure(res, err);
+  }
+  if (!persisted) return notFound(res, `unknown account ${accountId}`);
+  registerSecretValues(
+    channelId,
+    accountId,
+    (persisted.config ?? null) as Record<string, unknown> | null,
+  );
+  const extra = await afterChannelAccountMutation(channelId);
+  json(res, 200, { ...redactChannelAccount(persisted), ...extra });
+}
+
+async function handleChannelAccountDelete(
+  res: ServerResponse,
+  channelId: string,
+  accountId: string,
+): Promise<void> {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  let deleted: boolean;
+  try {
+    deleted = await deleteChannelAccount(channelId, accountId);
+  } catch (err) {
+    return channelStoreFailure(res, err);
+  }
+  if (!deleted) return notFound(res, `unknown account ${accountId}`);
+  const extra = await afterChannelAccountMutation(channelId);
+  json(res, 200, { deleted: true, accountId, ...extra });
+}
+
+/** Route + its derived (never persisted) stable id — base64url of the CLI routeKey. */
+function routeWithId(route: ChannelRoute): Record<string, unknown> {
+  return { id: deriveRouteId(route), ...route };
+}
+
+function handleChannelRoutesList(res: ServerResponse, channelId: string): void {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  json(res, 200, { routes: listChannelRoutes(channelId).map(routeWithId) });
+}
+
+async function handleChannelRouteCreate(
+  req: IncomingMessage,
+  res: ServerResponse,
+  channelId: string,
+): Promise<void> {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  const body = await readJsonBody(req);
+  for (const field of ["accountId", "chatId", "agentId", "conversationId"] as const) {
+    if (typeof body[field] !== "string" || (body[field] as string).length === 0) {
+      return badRequest(res, `${field} is required`);
+    }
+  }
+  const threadId = typeof body["threadId"] === "string" ? (body["threadId"] as string) : null;
+  // Full CLI field set (§2.4/§4): chatType, threadId:null, outboundEnabled,
+  // timestamps — byte-compatible with `letta channels route add` output.
+  const route: ChannelRoute = {
+    accountId: body["accountId"] as string,
+    chatId: body["chatId"] as string,
+    chatType: typeof body["chatType"] === "string" ? (body["chatType"] as string) : "group",
+    threadId,
+    agentId: body["agentId"] as string,
+    conversationId: body["conversationId"] as string,
+    enabled: body["enabled"] !== false,
+    outboundEnabled: body["outboundEnabled"] !== false,
+  };
+  let persisted: ChannelRoute;
+  try {
+    // expectAbsent: duplicate 409 is checked INSIDE the channel lock, so a
+    // concurrent identical POST (or a CLI `route add` landing in between)
+    // cannot be silently merged over.
+    persisted = await upsertChannelRoute(channelId, route, { expectAbsent: true });
+  } catch (err) {
+    return channelStoreFailure(res, err);
+  }
+  // Route changes need no adapter action — resolveRoute reads fresh per
+  // inbound message (stat-cached), so this route is live immediately.
+  json(res, 201, routeWithId(persisted));
+}
+
+async function handleChannelRoutePatch(
+  req: IncomingMessage,
+  res: ServerResponse,
+  channelId: string,
+  routeId: string,
+): Promise<void> {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  const body = await readJsonBody(req);
+  for (const keyField of ["accountId", "chatId", "threadId"] as const) {
+    if (keyField in body) {
+      return badRequest(res, "cannot change route key fields; delete and recreate");
+    }
+  }
+  const existing = listChannelRoutes(channelId).find((r) => deriveRouteId(r) === routeId);
+  if (!existing) return notFound(res, `unknown route ${routeId}`);
+  const patched: ChannelRoute = { ...existing };
+  if (typeof body["agentId"] === "string") patched.agentId = body["agentId"] as string;
+  if (typeof body["conversationId"] === "string") {
+    patched.conversationId = body["conversationId"] as string;
+  }
+  if (typeof body["enabled"] === "boolean") patched.enabled = body["enabled"] as boolean;
+  if (typeof body["outboundEnabled"] === "boolean") {
+    patched.outboundEnabled = body["outboundEnabled"] as boolean;
+  }
+  let persisted: ChannelRoute;
+  try {
+    persisted = await upsertChannelRoute(channelId, patched);
+  } catch (err) {
+    return channelStoreFailure(res, err);
+  }
+  json(res, 200, routeWithId(persisted));
+}
+
+async function handleChannelRouteDelete(
+  res: ServerResponse,
+  channelId: string,
+  routeId: string,
+): Promise<void> {
+  if (!findChannelManifest(channelId)) return notFound(res, `unknown channel ${channelId}`);
+  // Resolve the id against the live route list instead of decoding it: the
+  // CLI routeKey is colon-separated but chatIds (matrix room ids) contain
+  // colons, so splitting the decoded key would be ambiguous.
+  const existing = listChannelRoutes(channelId).find((r) => deriveRouteId(r) === routeId);
+  if (!existing) return notFound(res, `unknown route ${routeId}`);
+  try {
+    await deleteChannelRoute(channelId, {
+      accountId: existing.accountId ?? null,
+      chatId: existing.chatId,
+      threadId: existing.threadId ?? null,
+    });
+  } catch (err) {
+    return channelStoreFailure(res, err);
+  }
+  json(res, 200, { deleted: true, id: routeId });
+}
+
+async function handleChannelAdapterControl(
+  res: ServerResponse,
+  channelId: string,
+  accountId: string,
+  action: "start" | "stop" | "restart",
+): Promise<void> {
+  try {
+    const handle =
+      action === "start"
+        ? await startAdapter(channelId, accountId)
+        : action === "stop"
+          ? await stopAdapter(channelId, accountId)
+          : await restartAdapter(channelId, accountId);
+    json(res, 200, serializeAdapterStatus(handle));
+  } catch (err) {
+    // ChannelControlError carries the HTTP status (404 unknown, 409 mobile
+    // carve-out / zombie stop, 502 start failure); its messages are already
+    // secret-scrubbed by the registry. The generic fallback is NOT — scrub.
+    if (err instanceof ChannelControlError) {
+      return json(res, err.status, { detail: err.message });
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    json(res, 502, { detail: scrubSecrets(`adapter ${action} failed: ${msg}`) });
+  }
+}
+
+function channelsMethodNotAllowed(
+  req: IncomingMessage,
+  res: ServerResponse,
+  allow: string,
+): void {
+  res.setHeader("Allow", allow);
+  json(res, 405, { detail: `${req.method} not allowed on this channels endpoint` });
+}
+
 // ── router ────────────────────────────────────────────────────────
 
 function pad(s: unknown, n: number): string { return String(s).padEnd(n); }
@@ -2837,6 +3220,76 @@ const server = createServer((req, res) => {
     return handleCronMethodNotAllowed(req, res);
   }
 
+  // ── /v1/channels — generic channel host (letta-mobile-6ahjp) ──
+  // Config CRUD hits the lock-serialized store in lib/channel-config.ts
+  // (same files the letta CLI writes; secrets write-only via redactConfig);
+  // adapter control goes through the registry in lib/channel-registry.ts.
+  if (pathname === "/v1/channels" || pathname === "/v1/channels/") {
+    if (req.method === "GET") return handleChannelsList(res);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "GET, OPTIONS");
+  }
+  const channelStatusMatch = pathname.match(/^\/v1\/channels\/([^/]+)\/status\/?$/);
+  if (channelStatusMatch) {
+    const channelId = decodeURIComponent(channelStatusMatch[1]!);
+    if (req.method === "GET") return handleChannelStatus(res, channelId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "GET, OPTIONS");
+  }
+  const channelAccountsMatch = pathname.match(/^\/v1\/channels\/([^/]+)\/accounts\/?$/);
+  if (channelAccountsMatch) {
+    const channelId = decodeURIComponent(channelAccountsMatch[1]!);
+    if (req.method === "GET") return handleChannelAccountsList(res, channelId);
+    if (req.method === "POST") return void handleChannelAccountCreate(req, res, channelId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "GET, POST, OPTIONS");
+  }
+  const channelAccountMatch = pathname.match(/^\/v1\/channels\/([^/]+)\/accounts\/([^/]+)\/?$/);
+  if (channelAccountMatch) {
+    const channelId = decodeURIComponent(channelAccountMatch[1]!);
+    const accountId = decodeURIComponent(channelAccountMatch[2]!);
+    if (req.method === "GET") return handleChannelAccountDetail(res, channelId, accountId);
+    if (req.method === "PATCH") return void handleChannelAccountPatch(req, res, channelId, accountId);
+    if (req.method === "DELETE") return void handleChannelAccountDelete(res, channelId, accountId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "GET, PATCH, DELETE, OPTIONS");
+  }
+  const channelRoutesMatch = pathname.match(/^\/v1\/channels\/([^/]+)\/routes\/?$/);
+  if (channelRoutesMatch) {
+    const channelId = decodeURIComponent(channelRoutesMatch[1]!);
+    if (req.method === "GET") return handleChannelRoutesList(res, channelId);
+    if (req.method === "POST") return void handleChannelRouteCreate(req, res, channelId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "GET, POST, OPTIONS");
+  }
+  const channelRouteMatch = pathname.match(/^\/v1\/channels\/([^/]+)\/routes\/([^/]+)\/?$/);
+  if (channelRouteMatch) {
+    const channelId = decodeURIComponent(channelRouteMatch[1]!);
+    const routeId = decodeURIComponent(channelRouteMatch[2]!);
+    if (req.method === "PATCH") return void handleChannelRoutePatch(req, res, channelId, routeId);
+    if (req.method === "DELETE") return void handleChannelRouteDelete(res, channelId, routeId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "PATCH, DELETE, OPTIONS");
+  }
+  const channelAdapterMatch = pathname.match(
+    /^\/v1\/channels\/([^/]+)\/adapters\/([^/]+)\/(start|stop|restart)\/?$/,
+  );
+  if (channelAdapterMatch) {
+    const channelId = decodeURIComponent(channelAdapterMatch[1]!);
+    const accountId = decodeURIComponent(channelAdapterMatch[2]!);
+    const action = channelAdapterMatch[3] as "start" | "stop" | "restart";
+    if (req.method === "POST") return void handleChannelAdapterControl(res, channelId, accountId, action);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "POST, OPTIONS");
+  }
+  const channelDetailMatch = pathname.match(/^\/v1\/channels\/([^/]+)\/?$/);
+  if (channelDetailMatch) {
+    const channelId = decodeURIComponent(channelDetailMatch[1]!);
+    if (req.method === "GET") return handleChannelDetail(res, channelId);
+    if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+    return channelsMethodNotAllowed(req, res, "GET, OPTIONS");
+  }
+
   // /v1/work-activity — external work ingest (lcp-zncq)
   if (pathname === "/v1/work-activity" || pathname === "/v1/work-activity/") {
     if (req.method === "POST") return handleWorkActivityIngest(req, res);
@@ -3094,6 +3547,23 @@ server.listen(PORT, HOST, () => {
       },
     });
   }
+
+  // ── Generic channel host (letta-mobile-9o50g) ──
+  // Boot wiring only in this phase; the /v1/channels REST surface (bead
+  // letta-mobile-6ahjp) lands next. SHIM_CHANNELS_ENABLED=0 disables the
+  // registry entirely — mobile is unaffected either way (WS-host managed,
+  // never registry-managed).
+  if (process.env["SHIM_CHANNELS_ENABLED"] !== "0") {
+    try {
+      startChannelRegistry({
+        log: { log: (msg: string) => console.log(msg) },
+        getServerId: () => SERVER_ID,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[channel-registry] start failed: ${msg}`);
+    }
+  }
 });
 
 // ── Mobile channel WS upgrade route ───────────────────────────────
@@ -3168,6 +3638,10 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
     console.warn(`[shim] restart finalizer failed: ${msg}`);
   }
   try { stopCronScheduler(); } catch {}
+  // Channel registry stops BEFORE the pool — an in-flight channel turn's
+  // onFrame/outbound must not fire against a dead pool. Overall cap 2s
+  // (per-adapter stop race 1.5s) inside this function's 4s force-exit.
+  try { await stopChannelRegistry(); } catch {}
   try { await getAgentPool().stopAll(); } catch {}
   try { await mobileAdapter?.stop?.(); } catch {}
   // Terminate live WS clients so server.close() can resolve.
