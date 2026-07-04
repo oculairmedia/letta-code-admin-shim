@@ -1,0 +1,7 @@
+{
+  "id": "telegram",
+  "displayName": "Telegram",
+  "entry": "./plugin.mjs",
+  "runtimePackages": [],
+  "runtimeModules": []
+}

@@ -1,0 +1,20 @@
+{
+  "accounts": [
+    {
+      "channel": "telegram",
+      "accountId": "default",
+      "displayName": "your-bot",
+      "enabled": false,
+      "dmPolicy": "open",
+      "config": {
+        "botToken": "REPLACE_WITH_BOT_TOKEN",
+        "apiBaseUrl": "https://api.telegram.org",
+        "allowedChats": [],
+        "pollTimeoutSec": 30,
+        "typingIndicators": true
+      },
+      "createdAt": "1970-01-01T00:00:00.000Z",
+      "updatedAt": "1970-01-01T00:00:00.000Z"
+    }
+  ]
+}
