@@ -48,7 +48,7 @@
  * on demand via `listActiveSubagents()` / `snapshotSubagents()`.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, watch as fsWatch, statSync, type FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 import { invalidateMessagesCache, messagesJsonlPath } from "./store.js";
 import { readSubagentTodos, type TodoItem, type TodoSnapshot } from "./subagent-todos.js";
@@ -170,6 +170,19 @@ const SUBAGENT_LIVENESS_SWEEP_MS = (() => {
 const SUBAGENT_NO_LOGFILE_TIMEOUT_MS = (() => {
   const n = Number(process.env["SHIM_SUBAGENT_NO_LOGFILE_TIMEOUT_MS"] ?? 90_000);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 90_000;
+})();
+
+/**
+ * Stale logfile mtime window for unknown-PID entries (lcp-a08r fix #2).
+ * When a background subagent has no PID but has a logfile, use the logfile's
+ * mtime as a liveness hint. Only finalize if mtime is older than this window
+ * AND no terminal marker is present. This prevents truly abandoned entries
+ * from sitting forever while still protecting actively-working long-running
+ * subagents. Default: 30 minutes.
+ */
+const SUBAGENT_STALE_LOGFILE_MTIME_MS = (() => {
+  const n = Number(process.env["SHIM_SUBAGENT_STALE_LOGFILE_MTIME_MS"] ?? 1_800_000);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 1_800_000;
 })();
 
 function nowIso(): string {
@@ -508,6 +521,8 @@ const TASK_COMPLETED_MARKER = "[Task completed]";
 // recognizing them, a failed worker's log gets rehydrated as `running`
 // on every shim boot and lingers forever (the orphan that survived ~22h).
 const TASK_FAILED_MARKERS = ["[Task failed]", "subagent_status=error"];
+// Success marker without the [Task completed] footer (lcp-a08r fix #3).
+const TASK_SUCCESS_MARKERS = ["subagent_status=success"];
 const TODO_WATCH_DEBOUNCE_MS = 200;
 
 export function computeTodoProgress(snapshotOrTodos: TodoSnapshot | TodoItem[]): TodoProgress {
@@ -653,6 +668,8 @@ function readLogTerminalStatus(logFile: string): "completed" | "failed" | null {
     const text = readFileSync(logFile, "utf8");
     const lines = text.split("\n");
     if (lines.some((line) => line.trim() === TASK_COMPLETED_MARKER)) return "completed";
+    // lcp-a08r fix #3: recognize subagent_status=success as completed even without [Task completed].
+    if (TASK_SUCCESS_MARKERS.some((m) => lines.some((line) => line.trim() === m))) return "completed";
     if (TASK_FAILED_MARKERS.some((m) => lines.some((line) => line.trim() === m))) return "failed";
     return null;
   } catch {
@@ -779,6 +796,7 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
   let swept = 0;
   for (const entry of _subagents.values()) {
     if (entry.status !== "running") continue;
+    // No-logfile entries: finalize as orphaned once older than SUBAGENT_NO_LOGFILE_TIMEOUT_MS.
     if (!entry.logFile) {
       const startedMs = Date.parse(entry.startedAt);
       if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
@@ -787,6 +805,7 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
       }
       continue;
     }
+    // Check terminal status from the log file.
     const terminal = readLogTerminalStatus(entry.logFile);
     if (terminal === "completed") {
       finalize(entry.toolCallId, "completed", null);
@@ -798,6 +817,7 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
       swept += 1;
       continue;
     }
+    // Check worker process liveness.
     const alive = isWorkerProcessAlive(entry);
     if (alive === false) {
       finalize(entry.toolCallId, "failed", "worker_process_dead");
@@ -805,20 +825,40 @@ export function sweepOrphanedSubagents(nowMs = Date.now()): number {
       continue;
     }
     if (alive === true) continue;
-    // letta-mobile-73o2h.4: the PID is unknown (the log was started before
-    // the worker stamped its pid, or the worker exited without writing
-    // one). Without a positive liveness signal we cannot prove the entry
-    // is alive — silence is not life. Finalize as orphaned once the log
-    // is stale past SUBAGENT_NO_LOGFILE_TIMEOUT_MS so the mobile chat bar
-    // never surfaces a stranded "running" chip.
-    if (!existsSync(entry.logFile)) {
-      const startedMs = Date.parse(entry.startedAt);
-      if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
-        finalize(entry.toolCallId, "failed", "orphaned");
-        swept += 1;
+    // lcp-a08r fix #1: Unknown PID with existing log file.
+    // Background Task dispatches NEVER have a PID (letta.js prints no PID line;
+    // parseAgentReturnBody /PID:\\s*(\\d+)/i never matches), so EVERY long-running
+    // background subagent would get falsely killed at ~90s. The rehydrate path
+    // already spares unknown-PID entries (commit 2e457b6 "silence is not death");
+    // the sweep must match that logic. Do NOT finalize on age alone; let the
+    // log-terminal-marker check and the watch/timeout machinery handle it (600s
+    // stream timeout still applies; log markers are the terminal authority).
+    //
+    // lcp-a08r fix #2 (optional hardening): Use logfile mtime as a liveness hint.
+    // If the logfile hasn't been touched in SUBAGENT_STALE_LOGFILE_MTIME_MS (30min)
+    // AND still has no terminal marker, finalize as orphaned. This prevents truly
+    // abandoned entries from sitting forever while protecting actively-working
+    // long-running subagents.
+    if (existsSync(entry.logFile)) {
+      try {
+        const stats = statSync(entry.logFile);
+        const mtimeMs = stats.mtimeMs;
+        const mtimeAgeMs = nowMs - mtimeMs;
+        if (mtimeAgeMs > SUBAGENT_STALE_LOGFILE_MTIME_MS) {
+          // Logfile is very stale. Finalize as orphaned.
+          finalize(entry.toolCallId, "failed", "orphaned");
+          swept += 1;
+          continue;
+        }
+      } catch {
+        // statSync failed (file vanished?); fall through to no-logfile path below.
       }
+      // lcp-a08r fix #4: Log when we spare an unknown-PID entry for diagnostics.
+      // This makes future stalls debuggable without littering normal operation.
+      console.log(`[subagent-registry] sweep.spared_unknown_pid toolCallId=${entry.toolCallId} taskId=${entry.taskId} age=${Math.floor((nowMs - Date.parse(entry.startedAt)) / 1000)}s`);
       continue;
     }
+    // Unknown PID with missing log file: finalize as orphaned once stale.
     const startedMs = Date.parse(entry.startedAt);
     if (Number.isFinite(startedMs) && nowMs - startedMs > SUBAGENT_NO_LOGFILE_TIMEOUT_MS) {
       finalize(entry.toolCallId, "failed", "orphaned");
