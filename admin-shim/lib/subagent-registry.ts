@@ -87,6 +87,22 @@ export interface SubagentEntry {
   failureReason: string | null;
   /** The parent run id this dispatch was streamed from. */
   parentRunId: string | null;
+  /**
+   * The parent AGENT's id (agent-local-<uuid>) that dispatched this
+   * subagent (letta-mobile-m6oa1.2). Interim provenance emitted by the
+   * shim so mobile can group ephemeral subagents by authoritative parent
+   * identity WITHOUT inferring from the display name. Null when the parent
+   * agent id is not in scope at the ingesting call site (older shims omit
+   * the field entirely). Origination moves to the Kotlin App Server later
+   * in epic m6oa1.
+   */
+  parentAgentId: string | null;
+  /**
+   * The parent CONVERSATION's id that this subagent was dispatched from
+   * (letta-mobile-m6oa1.2). Interim provenance — see [parentAgentId].
+   * Null when not in scope at the ingesting call site (older shims omit it).
+   */
+  parentConversationId: string | null;
   /** Provenance — "letta" for Agent-tool dispatches, or the external producer's id. */
   source: string;
   /** The subagent's OWN agent id (agent-local-<uuid>); null until resolved. */
@@ -331,13 +347,19 @@ export function recordSubagentDispatch(input: {
   parentRunId: string | null;
   args: unknown;
   source?: string;
+  /** Interim provenance (letta-mobile-m6oa1.2); null/omit when not in scope. */
+  parentAgentId?: string | null;
+  /** Interim provenance (letta-mobile-m6oa1.2); null/omit when not in scope. */
+  parentConversationId?: string | null;
 }): SubagentEntry {
-  const { toolCallId, parentRunId, args, source } = input;
+  const { toolCallId, parentRunId, args, source, parentAgentId, parentConversationId } = input;
   const parsed = parseAgentDispatchArgs(args);
   const existing = _subagents.get(toolCallId);
   if (existing) {
     // Backfill any newly-available metadata; do not resurrect terminal entries.
     existing.parentRunId ??= parentRunId;
+    existing.parentAgentId ??= parentAgentId ?? null;
+    existing.parentConversationId ??= parentConversationId ?? null;
     existing.description ??= parsed.description;
     existing.subagentType ??= parsed.subagentType;
     return clone(existing);
@@ -352,6 +374,8 @@ export function recordSubagentDispatch(input: {
     status: "running",
     failureReason: null,
     parentRunId,
+    parentAgentId: parentAgentId ?? null,
+    parentConversationId: parentConversationId ?? null,
     subagentAgentId: null,
     todo_progress: null,
     subagentConversationId: null,
@@ -423,7 +447,12 @@ export function recordSubagentReturn(input: {
  * each reshaped frame plus the owning parent run id; non-Agent frames are
  * ignored. Returns the affected entry (or null).
  */
-export function ingestParentFrame(frame: unknown, parentRunId: string | null): SubagentEntry | null {
+export function ingestParentFrame(
+  frame: unknown,
+  parentRunId: string | null,
+  parentAgentId?: string | null,
+  parentConversationId?: string | null,
+): SubagentEntry | null {
   if (!frame || typeof frame !== "object") return null;
   const f = frame as Record<string, unknown>;
   const mt = f["message_type"];
@@ -432,7 +461,13 @@ export function ingestParentFrame(frame: unknown, parentRunId: string | null): S
     if (!tc || tc["name"] !== "Agent") return null;
     const toolCallId = typeof tc["tool_call_id"] === "string" ? (tc["tool_call_id"] as string) : null;
     if (!toolCallId) return null;
-    return recordSubagentDispatch({ toolCallId, parentRunId, args: tc["arguments"] });
+    return recordSubagentDispatch({
+      toolCallId,
+      parentRunId,
+      args: tc["arguments"],
+      parentAgentId: parentAgentId ?? null,
+      parentConversationId: parentConversationId ?? null,
+    });
   }
   if (mt === "tool_return_message") {
     if (f["name"] !== "Agent") return null;
