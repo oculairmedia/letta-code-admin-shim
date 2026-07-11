@@ -2212,6 +2212,8 @@ active run. Tests in `admin-shim/test/ws-protocol.test.ts`
 
 ## 13. Headless clients
 
+### 13.1 Contract surfaces
+
 **Status:** Stable. Documented as part of `lcp-auo`.
 
 The `/shim/v1/mobile` WS is the canonical live transport for *all* clients, including headless test clients. The protocol was originally designed alongside the Android app, but the server contains no implicit Android-only assumptions. Any client-type-specific behavior is opt-in via headers or capability negotiation.
@@ -2224,3 +2226,19 @@ To build a headless test client (e.g. `letta-mobile:cli`), you must implement th
 - **Minimal Loop**: Implement the sequence `hello` → `welcome` → `send_message` → receive response frames until `turn_done`.
 
 For a reference implementation of a minimal headless diagnostic client, see `admin-shim/scripts/ws-probe.mjs`.
+
+### 13.2 Active-subagent registry entry
+
+**Status:** Stable. Source of truth: `admin-shim/lib/subagent-registry.ts` (`SubagentEntry`).
+
+Each entry in the shim's active-subagent registry (surfaced via `GET /v1/work-activity` and the `subagents_updated` / `subagent_list_response` WS frames) describes one subagent dispatched from a parent `Agent` tool call. The correlation key is `toolCallId` (the parent `Agent` tool_call's `tool_call_id`). Selected fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `toolCallId` | `string` | Correlation key — the parent `Agent` tool_call's `tool_call_id`. |
+| `subagentAgentId` | `string \| null` | The subagent's OWN agent id (`agent-local-<uuid>`); null until the background dispatch return resolves it. |
+| `parentRunId` | `string \| null` | The parent run id this dispatch was streamed from. |
+| `parentAgentId` | `string \| null` | **New (letta-mobile-m6oa1.2).** The parent AGENT's id that dispatched this subagent. Interim provenance the shim emits so consumers can group ephemeral subagents by authoritative parent identity — never inferred from the display name. **Optional and nullable**: older shims omit the field entirely, and the shim emits `null` when the parent agent id is not in scope at the ingesting call site. Origination moves to the Kotlin App Server later in epic `m6oa1`. |
+| `parentConversationId` | `string \| null` | **New (letta-mobile-m6oa1.2).** The parent CONVERSATION's id this subagent was dispatched from. Same interim-provenance semantics as `parentAgentId`: **optional, nullable, omitted by older shims**, `null` when not in scope. |
+
+Consumers MUST treat `parentAgentId` / `parentConversationId` as optional and nullable (older shims, or dispatches whose parent identity was not in scope, carry neither) and MUST NOT infer parent provenance from the subagent's display name.

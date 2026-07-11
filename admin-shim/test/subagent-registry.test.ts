@@ -182,6 +182,83 @@ test("subagent-registry: recordSubagentDispatch defaults source to 'letta' when 
   __resetSubagentRegistry();
 });
 
+// ── letta-mobile-m6oa1.2: interim subagent provenance ───────────────────
+
+test("subagent-registry: recordSubagentDispatch stores parentAgentId + parentConversationId when provided", () => {
+  __resetSubagentRegistry();
+  const entry = recordSubagentDispatch({
+    toolCallId: "toolu_provenance_explicit",
+    parentRunId: "run-prov",
+    args: { description: "provenance", run_in_background: true },
+    parentAgentId: "agent-local-parent-1111-2222-3333-444444444444",
+    parentConversationId: "conv-parent-abc",
+  });
+  assert.equal(entry.parentAgentId, "agent-local-parent-1111-2222-3333-444444444444");
+  assert.equal(entry.parentConversationId, "conv-parent-abc");
+  __resetSubagentRegistry();
+});
+
+test("subagent-registry: recordSubagentDispatch defaults parentAgentId + parentConversationId to null when absent", () => {
+  __resetSubagentRegistry();
+  const entry = recordSubagentDispatch({
+    toolCallId: "toolu_provenance_absent",
+    parentRunId: "run-prov-absent",
+    args: { description: "no provenance", run_in_background: true },
+  });
+  assert.equal(entry.parentAgentId, null, "parentAgentId must default null when omitted");
+  assert.equal(entry.parentConversationId, null, "parentConversationId must default null when omitted");
+  // Nullable fields must survive JSON serialization for the wire.
+  const wire = JSON.parse(JSON.stringify(entry));
+  assert.equal(wire.parentAgentId, null);
+  assert.equal(wire.parentConversationId, null);
+  __resetSubagentRegistry();
+});
+
+test("subagent-registry: ingestParentFrame threads parentAgentId + parentConversationId onto the entry", () => {
+  __resetSubagentRegistry();
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  const entry = ingestParentFrame(
+    dispatchFrame(tcid, "Provenance via frame"),
+    "run-prov-frame",
+    "agent-local-frame-9999-8888-7777-666666666666",
+    "conv-frame-xyz",
+  );
+  assert.ok(entry);
+  assert.equal(entry!.parentAgentId, "agent-local-frame-9999-8888-7777-666666666666");
+  assert.equal(entry!.parentConversationId, "conv-frame-xyz");
+  __resetSubagentRegistry();
+});
+
+test("subagent-registry: ingestParentFrame defaults provenance to null when parent identity not passed", () => {
+  __resetSubagentRegistry();
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  const entry = ingestParentFrame(dispatchFrame(tcid, "No provenance via frame"), "run-prov-frame-null");
+  assert.ok(entry);
+  assert.equal(entry!.parentAgentId, null);
+  assert.equal(entry!.parentConversationId, null);
+  __resetSubagentRegistry();
+});
+
+test("subagent-registry: re-observed dispatch backfills provenance without resurrecting", () => {
+  __resetSubagentRegistry();
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  // First observation with no provenance in scope.
+  const first = ingestParentFrame(dispatchFrame(tcid, "Backfill me"), "run-backfill");
+  assert.equal(first!.parentAgentId, null);
+  assert.equal(first!.parentConversationId, null);
+  // Replay observes the same dispatch, now with provenance available.
+  const second = recordSubagentDispatch({
+    toolCallId: tcid,
+    parentRunId: "run-backfill",
+    args: { description: "Backfill me", run_in_background: true },
+    parentAgentId: "agent-local-backfill-1234",
+    parentConversationId: "conv-backfill-1234",
+  });
+  assert.equal(second.parentAgentId, "agent-local-backfill-1234", "provenance backfills on re-observe");
+  assert.equal(second.parentConversationId, "conv-backfill-1234");
+  __resetSubagentRegistry();
+});
+
 // ── lcp-4m36: TodoWrite progress ────────────────────────────────────────
 
 test("subagent-registry: computes TodoWrite progress fraction", () => {
