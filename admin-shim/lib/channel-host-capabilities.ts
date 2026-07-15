@@ -14,7 +14,8 @@
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { cancelRun, getAgentPool } from "./agent-pool.js";
+import { getAgentPool } from "./agent-pool.js";
+import { cancelRunAndHeal } from "./cancel-heal.js";
 import { getA2uiServerCapabilities } from "./a2ui-adapter.js";
 import {
   ackConversation,
@@ -62,7 +63,11 @@ export function buildChannelHost(options: ChannelHostOptions): MobileChannelHost
     getServerId: () => options.getServerId(),
     getA2uiServerCapabilities,
     bridgeSendMessage,
-    cancelRun: (runId: string) => cancelRun(runId),
+    // lcp-im5q: cancels arriving over a channel WS (mobile stop button,
+    // matrix, …) must repair the transcript exactly like the REST cancel
+    // route, or a cancel-mid-tool-call wedges the conversation for strict
+    // providers on the next turn.
+    cancelRun: (runId: string) => cancelRunAndHeal(runId),
     touchAdapter: (convId: string, agId: string) => getAgentPool().touch(convId, agId),
     handleUserAction,
     mobileConversationCursorCapabilities,

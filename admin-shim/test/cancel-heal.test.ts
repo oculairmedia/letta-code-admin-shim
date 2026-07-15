@@ -321,3 +321,61 @@ test("cancel-heal: partial completion preserves valid tool_return while healing 
     assert.equal(originalTr.toolCallId, "toolu_DONE");
   });
 });
+
+// ── lcp-im5q: WS channel cancel seam ──────────────────────────────
+//
+// The mobile stop button (and every channel plugin) cancels via
+// `host.cancelRun`, which channel-host-capabilities binds to
+// `cancelRunAndHeal` — NOT the REST handler above. Pin that this seam
+// performs the same detached transcript repair, or a WS cancel
+// mid-tool-call wedges the conversation for strict providers.
+
+test("cancel-heal: cancelRunAndHeal (WS channel seam) heals orphan detached", async () => {
+  const { cancelRunAndHeal } = await import("../lib/cancel-heal.js");
+  await withBackendDir(async (stateDir) => {
+    const agentId = "agent-ws-orphan";
+    const { convDir } = seedAgentAndConv(stateDir, agentId);
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: [{ type: "text", text: "do thing" }] },
+      {
+        id: "a1",
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "toolu_WS_ORPHAN", name: "Bash", arguments: { command: "sleep 999" } },
+        ],
+      },
+      // NO matching toolResult — cancel-mid-tool shape.
+    ]);
+
+    const run = createRun({ agentId, conversationId: "default" });
+    appendRunFrame(run.id, {
+      message_type: "tool_call_message",
+      tool_call: { tool_call_id: "toolu_WS_ORPHAN", name: "Bash", arguments: "{}" },
+      tool_calls: [{ tool_call_id: "toolu_WS_ORPHAN", name: "Bash", arguments: "{}" }],
+    });
+
+    assert.equal(cancelRunAndHeal(run.id), true, "active run cancels via the WS seam");
+
+    // The heal runs detached (fire-and-forget past the sync cancel
+    // return). Poll the transcript for the synthetic toolResult.
+    const deadline = Date.now() + 5_000;
+    let after: Record<string, unknown>[] = [];
+    while (Date.now() < deadline) {
+      after = readMessages(convDir);
+      if (after.length >= 3) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(after.length, 3, "detached heal must append the synthetic toolResult");
+    const synthetic = after[2] as { role: string; toolCallId?: string; isError?: boolean };
+    assert.equal(synthetic.role, "toolResult");
+    assert.equal(synthetic.toolCallId, "toolu_WS_ORPHAN");
+    assert.equal(synthetic.isError, true);
+  });
+});
+
+test("cancel-heal: cancelRunAndHeal on unknown run id → false, no crash", async () => {
+  const { cancelRunAndHeal } = await import("../lib/cancel-heal.js");
+  await withBackendDir(async () => {
+    assert.equal(cancelRunAndHeal("run-does-not-exist"), false);
+  });
+});

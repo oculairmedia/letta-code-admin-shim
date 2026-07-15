@@ -65,13 +65,12 @@ import {
 } from "./lib/translate.js";
 import { handleSendMessage } from "./lib/chat.js";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.js";
-import { healConversation } from "./lib/conversation-healer.js";
+import { healAfterCancel } from "./lib/cancel-heal.js";
 import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
 import { broadcastAgentEvent, type AgentEventReason } from "./lib/agent-events.js";
 import {
   aggregateUsage,
   buildMessageRunMap,
-  collectDanglingToolCallIds,
   deleteRun,
   getRun,
   inFlightMessageIds,
@@ -2412,38 +2411,9 @@ async function handleAgentMessagesCancel(req: IncomingMessage, res: ServerRespon
   json(res, 200, out);
 }
 
-/**
- * letta-mobile-ja4xe: best-effort post-cancel transcript repair.
- * Wraps `healConversation` so a thrown or rejected heal never reaches
- * the cancel response. Runs detached — the cancel HTTP response is
- * already on the wire by the time this fires.
- */
-async function healAfterCancel(runId: string, agentId: string | null, conversationId: string | null): Promise<void> {
-  if (!agentId || !conversationId) return;
-  let dangling: string[];
-  try {
-    dangling = collectDanglingToolCallIds(runId);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[cancel-heal] collectDanglingToolCallIds failed for run ${runId}: ${msg}`);
-    return;
-  }
-  if (dangling.length === 0) return;
-  try {
-    const report = await healConversation(conversationId, agentId, dangling, { runId });
-    if (report.messagesEdited + report.messagesRemoved + report.messagesAppended > 0) {
-      console.log(
-        `[cancel-heal] run=${runId} conversation=${conversationId} ` +
-        `settled=${report.settled.length} removed=${report.removed.length} ` +
-        `unresolved=${report.unresolved.length} ` +
-        `appended=${report.messagesAppended} removed_msgs=${report.messagesRemoved} edited_msgs=${report.messagesEdited}`,
-      );
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[cancel-heal] healConversation failed for run ${runId} conv ${conversationId}: ${msg}`);
-  }
-}
+// letta-mobile-ja4xe / lcp-im5q: post-cancel transcript repair moved to
+// lib/cancel-heal.ts (healAfterCancel) so the WS channel cancel path can
+// share it — see channel-host-capabilities.ts cancelRunAndHeal.
 
 // ── search (lcp-c61s) ──────────────────────────────────────────────
 //
