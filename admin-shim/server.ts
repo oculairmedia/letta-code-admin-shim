@@ -1518,7 +1518,9 @@ function rehydrateSubagentsFromRunFrames(): number {
       try {
         const parsed = JSON.parse(line) as unknown;
         const frame = isRecord(parsed) && "frame" in parsed ? parsed["frame"] : parsed;
-        if (ingestParentFrame(frame, run.id)) count += 1;
+        // letta-mobile-m6oa1.2: originate interim subagent provenance from the
+        // rehydrated run record's parent identity (agent + conversation).
+        if (ingestParentFrame(frame, run.id, run.agent_id ?? null, run.conversation_id ?? null)) count += 1;
       } catch {
         continue;
       }

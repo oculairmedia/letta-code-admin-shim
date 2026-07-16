@@ -340,7 +340,12 @@ export async function bridgeSendMessage(
   // their cursor in lockstep with what subscribe(run_id, cursor) would replay.
   const emit = (frame: BridgeFrame): void => {
     try {
-      ingestParentFrame(frame, runHandle.id);
+      // letta-mobile-m6oa1.2: originate interim subagent provenance from the
+      // parent identity already resolved in this host context. effectiveAgentId
+      // / effectiveConvId are the authoritative (agent, conversation) pair the
+      // turn runs under, so mobile can group ephemeral subagents by parent
+      // without inferring from the display name.
+      ingestParentFrame(frame, runHandle.id, effectiveAgentId, effectiveConvId);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[mobile-channel] subagent-registry ingest failed: ${msg}`);

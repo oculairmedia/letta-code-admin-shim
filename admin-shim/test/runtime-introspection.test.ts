@@ -87,6 +87,8 @@ function runningSubagent(input: Partial<SubagentEntry> & { toolCallId: string; s
     status: "running",
     failureReason: null,
     parentRunId: input.parentRunId ?? null,
+    parentAgentId: input.parentAgentId ?? null,
+    parentConversationId: input.parentConversationId ?? null,
     source: input.source ?? "letta",
     subagentAgentId: input.subagentAgentId ?? null,
     todo_progress: input.todo_progress ?? null,
