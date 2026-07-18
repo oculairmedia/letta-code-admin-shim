@@ -1235,11 +1235,31 @@ function handleConversationStream(req: IncomingMessage, res: ServerResponse, ext
 }
 
 async function handleConversationCancel(_req: IncomingMessage, res: ServerResponse, conversationId: string): Promise<void> {
-  // Phase 1: there's no shared subprocess registry yet. Acknowledge so the
-  // client UI clears any pending state.
   const conv = await getConversation(conversationId);
   if (!conv) return notFound(res, `conversation ${conversationId}`);
-  json(res, 200, { id: conv.id, status: "accepted" });
+
+  const activeRuns = listRuns({
+    agentId: conv.agent_id,
+    conversationId: conv.id,
+    active: true,
+    limit: 100,
+  });
+  const cancelled: Record<string, string> = {};
+  for (const run of activeRuns) {
+    cancelled[run.id] = cancelRun(run.id) ? "cancelled" : "not_active";
+  }
+
+  // Also evict the warm worker for this (agent, conversation). A completed run
+  // has already dropped out of /v1/runs?active=true, but the SDK-backed worker
+  // can remain alive in the pool; dogfood/daemon cleanup needs this endpoint to
+  // release that process without cancelling every active run for the agent.
+  const evicted = await getAgentPool().evict(conv.id, conv.agent_id);
+  json(res, 200, {
+    id: conv.id,
+    status: "accepted",
+    cancelled,
+    evicted,
+  });
 }
 
 async function handleConversationStub(_req: IncomingMessage, res: ServerResponse, conversationId: string, op: string): Promise<void> {
