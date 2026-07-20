@@ -406,39 +406,85 @@ function handleShimCapabilities(_req: IncomingMessage, res: ServerResponse): voi
   });
 }
 
-function requiredConversationScope(url: URL, res: ServerResponse): string | null {
-  const conversationId = url.searchParams.get("conversation_id")?.trim() ?? "";
-  if (!conversationId) {
+interface SubagentConversationScope {
+  conversationId: string;
+  agentId: string;
+}
+
+async function resolveSubagentConversationScope(
+  url: URL,
+  res: ServerResponse,
+): Promise<SubagentConversationScope | null> {
+  const externalConversationId = url.searchParams.get("conversation_id")?.trim() ?? "";
+  if (!externalConversationId) {
     badRequest(res, "conversation_id is required");
     return null;
   }
-  return conversationId;
+
+  const rawAgentId = url.searchParams.get("agent_id")?.trim() || null;
+  const agentIdHint = rawAgentId
+    ? resolveAgentIdAlias(rawAgentId, (id) => getAgentRecord(id) != null)
+    : null;
+  const resolved = await resolveConversationId(externalConversationId);
+  if (resolved) {
+    const agentId = resolveAgentIdAlias(resolved.agentId, (id) => getAgentRecord(id) != null);
+    return agentIdHint && agentIdHint !== agentId
+      ? null
+      : { conversationId: resolved.conversationId, agentId };
+  }
+
+  // The store deliberately refuses bare `default` because it is shared by
+  // every agent. Keep supporting it only when the caller supplies ownership.
+  if (externalConversationId === "default") {
+    if (!agentIdHint) {
+      badRequest(res, "agent_id is required for conversation_id=default");
+      return null;
+    }
+    return { conversationId: "default", agentId: agentIdHint };
+  }
+
+  // Unknown conversation ids cannot be safely assigned to an agent.
+  return null;
 }
 
-function handleScopedSubagentList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const conversationId = requiredConversationScope(url, res);
-  if (!conversationId) return;
+function subagentBelongsToScope(
+  entry: { parentConversationId: string | null; parentAgentId: string | null },
+  scope: SubagentConversationScope,
+): boolean {
+  return entry.parentConversationId === scope.conversationId && entry.parentAgentId === scope.agentId;
+}
+
+async function handleScopedSubagentList(_req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const scope = await resolveSubagentConversationScope(url, res);
+  if (!scope) {
+    if (!res.headersSent) json(res, 200, { subagents: [] });
+    return;
+  }
   const allRaw = url.searchParams.get("all");
   if (allRaw !== null && allRaw !== "true" && allRaw !== "false") {
     return badRequest(res, "all must be true or false");
   }
   const includeTerminal = allRaw === "true";
+  sweepOrphanedSubagents();
   const subagents = snapshotSubagents().filter((entry) =>
-    entry.parentConversationId === conversationId && (includeTerminal || entry.status === "running")
+    subagentBelongsToScope(entry, scope) && (includeTerminal || entry.status === "running")
   );
   json(res, 200, { subagents });
 }
 
-function handleScopedSubagentTodos(
+async function handleScopedSubagentTodos(
   _req: IncomingMessage,
   res: ServerResponse,
   url: URL,
   toolCallId: string,
-): void {
-  const conversationId = requiredConversationScope(url, res);
-  if (!conversationId) return;
+): Promise<void> {
+  const scope = await resolveSubagentConversationScope(url, res);
+  if (!scope) {
+    if (!res.headersSent) json(res, 200, { found: false, subagent: null, todos: [], todos_found: false });
+    return;
+  }
   const result = handleSubagentTodos(toolCallId);
-  if (!result.subagent || result.subagent.parentConversationId !== conversationId) {
+  if (!result.subagent || !subagentBelongsToScope(result.subagent, scope)) {
     return json(res, 200, { found: false, subagent: null, todos: [], todos_found: false });
   }
   json(res, 200, result);
