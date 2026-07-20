@@ -120,12 +120,28 @@ test("conversation-scoped subagent REST contract resolves ownership and sweeps s
     terminal: true,
   });
   seedSubagentRun(fixtureDir, {
+    runId: "run-fresh-a",
+    toolCallId: "tool/fresh-a",
+    parentAgentId: parentA,
+    parentConversationId: "conv-fresh-a",
+    subagentAgentId: "agent-local-fresh",
+    description: "Fresh A",
+  });
+  seedSubagentRun(fixtureDir, {
     runId: "run-active-b",
     toolCallId: "tool-active-b",
     parentAgentId: parentB,
     parentConversationId: "conv-b",
     subagentAgentId: otherAgentId,
     description: "Active B",
+  });
+  const staleDetailLog = seedSubagentRun(fixtureDir, {
+    runId: "run-stale-detail-a",
+    toolCallId: "tool/stale-detail-a",
+    parentAgentId: parentA,
+    parentConversationId: "conv-a",
+    subagentAgentId: "agent-local-stale-detail",
+    description: "Stale detail A",
   });
   const staleLog = seedSubagentRun(fixtureDir, {
     runId: "run-stale-a",
@@ -199,14 +215,14 @@ test("conversation-scoped subagent REST contract resolves ownership and sweeps s
   appendFileSync(staleLog, "[Task completed]\n");
   const activeOnly = await getJson(`${shim.url}/shim/v1/subagents?conversation_id=conv-a&all=false`);
   assert.equal(activeOnly.status, 200);
-  assert.deepEqual(toolCallIds(activeOnly.body), ["tool/active-a"]);
+  assert.deepEqual(toolCallIds(activeOnly.body), ["tool/stale-detail-a", "tool/active-a"]);
   assert.equal(subagents(activeOnly.body)[0]?.["parentConversationId"], "conv-a");
 
   const all = await getJson(`${shim.url}/shim/v1/subagents?conversation_id=conv-a&all=true`);
   assert.equal(all.status, 200);
   assert.deepEqual(
     new Set(toolCallIds(all.body)),
-    new Set(["tool/active-a", "tool-completed-a", "tool/stale-a"]),
+    new Set(["tool/active-a", "tool-completed-a", "tool/stale-a", "tool/stale-detail-a"]),
   );
   assert.ok(subagents(all.body).every((entry) =>
     entry["parentConversationId"] === "conv-a" && entry["parentAgentId"] === parentA
@@ -236,6 +252,15 @@ test("conversation-scoped subagent REST contract resolves ownership and sweeps s
   const wrongConversationList = await getJson(`${shim.url}/shim/v1/subagents?conversation_id=conv-missing&all=true`);
   assert.deepEqual(wrongConversationList.body, { subagents: [] });
 
+  const freshWithOwner = await getJson(
+    `${shim.url}/shim/v1/subagents?conversation_id=conv-fresh-a&agent_id=${parentA}&all=false`,
+  );
+  assert.deepEqual(toolCallIds(freshWithOwner.body), ["tool/fresh-a"]);
+  const freshWithoutOwner = await getJson(
+    `${shim.url}/shim/v1/subagents?conversation_id=conv-fresh-a&all=false`,
+  );
+  assert.deepEqual(freshWithoutOwner.body, { subagents: [] });
+
   const todos = await getJson(`${shim.url}/shim/v1/subagents/tool%2Factive-a/todos?conversation_id=conv-a`);
   assert.equal(todos.status, 200);
   assert.equal(field(todos.body, "found"), true);
@@ -245,6 +270,12 @@ test("conversation-scoped subagent REST contract resolves ownership and sweeps s
   assert.deepEqual(field(todos.body, "todos"), [
     { content: "Ship fix", status: "in_progress", activeForm: "Shipping fix" },
   ]);
+
+  appendFileSync(staleDetailLog, "[Task completed]\n");
+  const staleTodos = await getJson(
+    `${shim.url}/shim/v1/subagents/tool%2Fstale-detail-a/todos?conversation_id=conv-a`,
+  );
+  assert.equal(field(field(staleTodos.body, "subagent"), "status"), "completed");
 
   const aliasTodos = await getJson(
     `${shim.url}/shim/v1/subagents/tool%2Fdefault-a/todos?conversation_id=conv-default-${parentA}`,

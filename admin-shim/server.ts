@@ -443,8 +443,12 @@ async function resolveSubagentConversationScope(
     return { conversationId: "default", agentId: agentIdHint };
   }
 
-  // Unknown conversation ids cannot be safely assigned to an agent.
-  return null;
+  // Fresh/custom ids may not exist in the store yet. The caller-provided
+  // agent hint supplies the missing ownership dimension, matching the raw-id
+  // fallback used when a turn is first dispatched.
+  return agentIdHint
+    ? { conversationId: externalConversationId, agentId: agentIdHint }
+    : null;
 }
 
 function subagentBelongsToScope(
@@ -483,6 +487,7 @@ async function handleScopedSubagentTodos(
     if (!res.headersSent) json(res, 200, { found: false, subagent: null, todos: [], todos_found: false });
     return;
   }
+  sweepOrphanedSubagents();
   const result = handleSubagentTodos(toolCallId);
   if (!result.subagent || !subagentBelongsToScope(result.subagent, scope)) {
     return json(res, 200, { found: false, subagent: null, todos: [], todos_found: false });
