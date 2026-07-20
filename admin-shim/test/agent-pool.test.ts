@@ -89,6 +89,17 @@ describe("agent-pool approval gates", () => {
     await assert.rejects(p, /approval_timeout: no decision for myTool within 10ms/);
   });
 
+  test("evict reports whether a worker existed and closes it deterministically", async () => {
+    const pool = new AgentPool();
+    pool._adapterFactory = async (opts) => new FakeAdapter(opts);
+
+    const adapter = await pool.get("conv-clean", "agent-clean") as unknown as FakeAdapter;
+    assert.equal(await pool.evict("conv-clean", "agent-clean"), true);
+    assert.equal(adapter.closed, true);
+    assert.equal(await pool.evict("conv-clean", "agent-clean"), false);
+    await pool.stopAll();
+  });
+
   test("evicting a worker rejects its pending approval gate", async () => {
     const pool = new AgentPool();
     pool._adapterFactory = async (opts) => new FakeAdapter(opts);

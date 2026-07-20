@@ -603,6 +603,32 @@ test("runs: num_steps mirrors model-step count from stop_reason frames", async (
   assert.equal((b3.body as RunRecord).num_steps, 4);
 });
 
+test("conversation cancel evicts the warm worker after a completed turn", async (t) => {
+  const shim = await startShim();
+  t.after(() => shim.stop());
+
+  const agentId = seedAgent(shim.stateDir, { id: "agent-conversation-cancel" });
+  seedConversation(shim.stateDir, agentId);
+  const convId = externalConvId(agentId);
+
+  const turn = await sendTurn(shim, agentId, "reply with pong", { convId });
+  assert.ok(turn.runId, "turn should expose a run id");
+
+  const cancelRes = await fetch(`${shim.url}/v1/conversations/${convId}/cancel`, { method: "POST" });
+  assert.equal(cancelRes.status, 200);
+  const cancelBody = await cancelRes.json() as { cancelled: Record<string, string>; evicted: boolean };
+  assert.deepEqual(cancelBody.cancelled, {});
+  assert.equal(typeof cancelBody.evicted, "boolean");
+
+  const after = await getJson(`${shim.url}/shim/pool`);
+  const afterWorkers = (after.body as { workers: Array<{ conversation_id: string; agent_id: string }> }).workers;
+  assert.equal(
+    afterWorkers.some((worker) => worker.conversation_id === convId && worker.agent_id === agentId),
+    false,
+    "conversation cancel should evict the warm worker",
+  );
+});
+
 test("runs: cancel via POST /v1/agents/{id}/messages/cancel with run_ids", async (t) => {
   const shim = await startShim({ env: { LETTA_MOCK_DELAY_MS: "1500" } });
   t.after(() => shim.stop());
