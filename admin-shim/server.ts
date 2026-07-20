@@ -89,6 +89,7 @@ import {
   bridgeSendMessage,
   getMobileChannelAdapter,
   handleReflectionSettingsGet,
+  handleSubagentTodos,
   kickGoalContinuation,
   rekickActiveGoalContinuationsOnBoot,
 } from "./lib/mobile-channel-host.js";
@@ -398,7 +399,49 @@ function handleShimCapabilities(_req: IncomingMessage, res: ServerResponse): voi
       ws_push: "reflection_settings_updated",
       rest_read_mirror: "/v1/agents/{agent_id}/reflection",
     },
+    subagent_registry_v1: {
+      available: true,
+      transport: "rest",
+    },
   });
+}
+
+function requiredConversationScope(url: URL, res: ServerResponse): string | null {
+  const conversationId = url.searchParams.get("conversation_id")?.trim() ?? "";
+  if (!conversationId) {
+    badRequest(res, "conversation_id is required");
+    return null;
+  }
+  return conversationId;
+}
+
+function handleScopedSubagentList(_req: IncomingMessage, res: ServerResponse, url: URL): void {
+  const conversationId = requiredConversationScope(url, res);
+  if (!conversationId) return;
+  const allRaw = url.searchParams.get("all");
+  if (allRaw !== null && allRaw !== "true" && allRaw !== "false") {
+    return badRequest(res, "all must be true or false");
+  }
+  const includeTerminal = allRaw === "true";
+  const subagents = snapshotSubagents().filter((entry) =>
+    entry.parentConversationId === conversationId && (includeTerminal || entry.status === "running")
+  );
+  json(res, 200, { subagents });
+}
+
+function handleScopedSubagentTodos(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  toolCallId: string,
+): void {
+  const conversationId = requiredConversationScope(url, res);
+  if (!conversationId) return;
+  const result = handleSubagentTodos(toolCallId);
+  if (!result.subagent || result.subagent.parentConversationId !== conversationId) {
+    return json(res, 200, { found: false, subagent: null, todos: [], todos_found: false });
+  }
+  json(res, 200, result);
 }
 
 // lcp-4d5f: REST read mirror. Alias resolution + defaults live in the shared
@@ -2642,6 +2685,19 @@ const server = createServer((req, res) => {
   }
   if (req.method === "GET" && (pathname === "/shim/v1/capabilities" || pathname === "/shim/v1/capabilities/")) {
     return handleShimCapabilities(req, res);
+  }
+  if (req.method === "GET" && (pathname === "/shim/v1/subagents" || pathname === "/shim/v1/subagents/")) {
+    return handleScopedSubagentList(req, res, url);
+  }
+  const shimSubagentTodos = pathname.match(/^\/shim\/v1\/subagents\/([^/]+)\/todos\/?$/);
+  if (req.method === "GET" && shimSubagentTodos) {
+    let toolCallId: string;
+    try {
+      toolCallId = decodeURIComponent(shimSubagentTodos[1]!);
+    } catch {
+      return badRequest(res, "invalid tool_call_id encoding");
+    }
+    return handleScopedSubagentTodos(req, res, url, toolCallId);
   }
   if (req.method === "GET" && pathname === "/shim/pool") {
     return handlePoolStats(req, res);
