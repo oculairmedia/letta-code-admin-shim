@@ -1236,7 +1236,12 @@ async function handleConversationMessagesList(
   const { limit } = parsePagination(url.searchParams);
   const before = url.searchParams.get("before") ?? undefined;
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
-  let items = await listMessages(resolved.conversationId, resolved.agentId, { limit, before });
+  // Load the pre-cursor window without limiting it yet. The active-run filter
+  // below can remove an arbitrarily large tail during tool-heavy turns; limiting
+  // first would return a short or empty page even though stable older history
+  // exists. listMessages still serves its stat-gated cached parse, so this does
+  // not add another disk read.
+  let items = await listMessages(resolved.conversationId, resolved.agentId, { before });
   // lcp-r0m: drop in-flight assistant/tool messages owned by an active run.
   // The WS path is streaming pure deltas under cm-stream-<otid> for these
   // messages; returning the cumulative snapshot here races the stream and
@@ -1253,6 +1258,9 @@ async function handleConversationMessagesList(
       return typeof mid !== "string" || !inFlight.has(mid);
     });
   }
+  // Apply the page size to the stable projection, not the raw transcript tail.
+  // This backfills from older messages when the newest records are in-flight.
+  if (limit && limit > 0) items = items.slice(-limit);
   if (order === "desc") items = [...items].reverse();
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);
