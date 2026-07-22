@@ -64,13 +64,12 @@ import {
 } from "./lib/translate.js";
 import { handleSendMessage } from "./lib/chat.js";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.js";
-import { healConversation } from "./lib/conversation-healer.js";
+import { cancelRunAndHeal } from "./lib/cancel-heal.js";
 import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
 import { broadcastAgentEvent, type AgentEventReason } from "./lib/agent-events.js";
 import {
   aggregateUsage,
   buildMessageRunMap,
-  collectDanglingToolCallIds,
   deleteRun,
   getRun,
   inFlightMessageIds,
@@ -2468,58 +2467,12 @@ async function handleAgentMessagesCancel(req: IncomingMessage, res: ServerRespon
       out[id] = "agent_mismatch";
       continue;
     }
-    const cancelled = cancelRun(id);
+    const cancelled = cancelRunAndHeal(id);
     out[id] = cancelled ? "cancelled" : "not_active";
-    // letta-mobile-ja4xe: after a successful cancel, scan the run's
-    // frames.jsonl for tool_call ids that were emitted but never
-    // returned. A cancel-mid-tool-call otherwise leaves an orphan
-    // tool_use/tool_calls on disk that strict providers (OpenAI /
-    // Anthropic) reject on the FOLLOWING turn with an
-    // invalid_request_error. healConversation repairs the on-disk
-    // transcript so the next user turn is accepted. The heal is
-    // best-effort: any failure is logged but does NOT change the
-    // cancel response — the user's UX is "cancelled", not "cancelled
-    // but the next turn will fail again because of a transient heal
-    // I/O error".
-    if (cancelled) {
-      void healAfterCancel(id, run.agent_id, run.conversation_id);
-    }
   }
   json(res, 200, out);
 }
 
-/**
- * letta-mobile-ja4xe: best-effort post-cancel transcript repair.
- * Wraps `healConversation` so a thrown or rejected heal never reaches
- * the cancel response. Runs detached — the cancel HTTP response is
- * already on the wire by the time this fires.
- */
-async function healAfterCancel(runId: string, agentId: string | null, conversationId: string | null): Promise<void> {
-  if (!agentId || !conversationId) return;
-  let dangling: string[];
-  try {
-    dangling = collectDanglingToolCallIds(runId);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[cancel-heal] collectDanglingToolCallIds failed for run ${runId}: ${msg}`);
-    return;
-  }
-  if (dangling.length === 0) return;
-  try {
-    const report = await healConversation(conversationId, agentId, dangling, { runId });
-    if (report.messagesEdited + report.messagesRemoved + report.messagesAppended > 0) {
-      console.log(
-        `[cancel-heal] run=${runId} conversation=${conversationId} ` +
-        `settled=${report.settled.length} removed=${report.removed.length} ` +
-        `unresolved=${report.unresolved.length} ` +
-        `appended=${report.messagesAppended} removed_msgs=${report.messagesRemoved} edited_msgs=${report.messagesEdited}`,
-      );
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[cancel-heal] healConversation failed for run ${runId} conv ${conversationId}: ${msg}`);
-  }
-}
 
 // ── search (lcp-c61s) ──────────────────────────────────────────────
 //

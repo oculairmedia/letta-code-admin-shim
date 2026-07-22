@@ -71,6 +71,7 @@ import type {
   UsageStatisticsEvent,
 } from "./types/letta-stream.js";
 import { runTurnWithLlmRetry } from "./llm-retry.js";
+import { awaitCancelHeal } from "./cancel-heal.js";
 
 const MAX_WORKERS = Number(process.env["SHIM_POOL_MAX"] ?? 10);
 const IDLE_EVICT_MS = Number(process.env["SHIM_POOL_IDLE_SEC"] ?? 300) * 1000;
@@ -797,6 +798,9 @@ export class AgentPool {
     input: string | unknown[],
     opts: RunTurnOptions = {},
   ): Promise<AdapterRunTurnResult> {
+    // A new send must not initialize or reuse a session from the transcript
+    // until a preceding cancellation repair for this conversation completes.
+    await awaitCancelHeal(agentId, conversationId);
     try {
       const preflightCandidates = detectConsecutiveUserMessageIndices(
         await listMessages(conversationId, agentId),
