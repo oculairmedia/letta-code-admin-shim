@@ -1252,6 +1252,13 @@ test("ws: REST /messages backfills stable history while dropping an in-flight ta
       sourceMessageIndex: i,
     });
   }
+  // Prime the subprocess store after out-of-process fixture writes. This also
+  // proves the stable window is visible before the active turn captures it.
+  const seeded = await fetch(new URL(`/v1/conversations/${convId}/messages?limit=5`, shim.url!), {
+    headers: { authorization: `Bearer ${shim.mobileToken}` },
+  });
+  const seededItems = await seeded.json() as Array<{ id?: string }>;
+  assert.deepEqual(seededItems.map((message) => message.id), Array.from({ length: 5 }, (_, i) => `stable-${i}`));
   conn.send({
     type: "send_message",
     agent_id: agentId,
