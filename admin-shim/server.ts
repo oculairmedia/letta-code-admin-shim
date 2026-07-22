@@ -64,13 +64,12 @@ import {
 } from "./lib/translate.js";
 import { handleSendMessage } from "./lib/chat.js";
 import { cancelRun, getAgentPool } from "./lib/agent-pool.js";
-import { healConversation } from "./lib/conversation-healer.js";
+import { cancelRunAndHeal } from "./lib/cancel-heal.js";
 import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
 import { broadcastAgentEvent, type AgentEventReason } from "./lib/agent-events.js";
 import {
   aggregateUsage,
   buildMessageRunMap,
-  collectDanglingToolCallIds,
   deleteRun,
   getRun,
   inFlightMessageIds,
@@ -89,6 +88,7 @@ import {
   bridgeSendMessage,
   getMobileChannelAdapter,
   handleReflectionSettingsGet,
+  handleSubagentTodos,
   kickGoalContinuation,
   rekickActiveGoalContinuationsOnBoot,
 } from "./lib/mobile-channel-host.js";
@@ -398,7 +398,100 @@ function handleShimCapabilities(_req: IncomingMessage, res: ServerResponse): voi
       ws_push: "reflection_settings_updated",
       rest_read_mirror: "/v1/agents/{agent_id}/reflection",
     },
+    subagent_registry_v1: {
+      available: true,
+      transport: "rest",
+    },
   });
+}
+
+interface SubagentConversationScope {
+  conversationId: string;
+  agentId: string;
+}
+
+async function resolveSubagentConversationScope(
+  url: URL,
+  res: ServerResponse,
+): Promise<SubagentConversationScope | null> {
+  const externalConversationId = url.searchParams.get("conversation_id")?.trim() ?? "";
+  if (!externalConversationId) {
+    badRequest(res, "conversation_id is required");
+    return null;
+  }
+
+  const rawAgentId = url.searchParams.get("agent_id")?.trim() || null;
+  const agentIdHint = rawAgentId
+    ? resolveAgentIdAlias(rawAgentId, (id) => getAgentRecord(id) != null)
+    : null;
+  const resolved = await resolveConversationId(externalConversationId);
+  if (resolved) {
+    const agentId = resolveAgentIdAlias(resolved.agentId, (id) => getAgentRecord(id) != null);
+    return agentIdHint && agentIdHint !== agentId
+      ? null
+      : { conversationId: resolved.conversationId, agentId };
+  }
+
+  // The store deliberately refuses bare `default` because it is shared by
+  // every agent. Keep supporting it only when the caller supplies ownership.
+  if (externalConversationId === "default") {
+    if (!agentIdHint) {
+      badRequest(res, "agent_id is required for conversation_id=default");
+      return null;
+    }
+    return { conversationId: "default", agentId: agentIdHint };
+  }
+
+  // Fresh/custom ids may not exist in the store yet. The caller-provided
+  // agent hint supplies the missing ownership dimension, matching the raw-id
+  // fallback used when a turn is first dispatched.
+  return agentIdHint
+    ? { conversationId: externalConversationId, agentId: agentIdHint }
+    : null;
+}
+
+function subagentBelongsToScope(
+  entry: { parentConversationId: string | null; parentAgentId: string | null },
+  scope: SubagentConversationScope,
+): boolean {
+  return entry.parentConversationId === scope.conversationId && entry.parentAgentId === scope.agentId;
+}
+
+async function handleScopedSubagentList(_req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  const scope = await resolveSubagentConversationScope(url, res);
+  if (!scope) {
+    if (!res.headersSent) json(res, 200, { subagents: [] });
+    return;
+  }
+  const allRaw = url.searchParams.get("all");
+  if (allRaw !== null && allRaw !== "true" && allRaw !== "false") {
+    return badRequest(res, "all must be true or false");
+  }
+  const includeTerminal = allRaw === "true";
+  sweepOrphanedSubagents();
+  const subagents = snapshotSubagents().filter((entry) =>
+    subagentBelongsToScope(entry, scope) && (includeTerminal || entry.status === "running")
+  );
+  json(res, 200, { subagents });
+}
+
+async function handleScopedSubagentTodos(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  toolCallId: string,
+): Promise<void> {
+  const scope = await resolveSubagentConversationScope(url, res);
+  if (!scope) {
+    if (!res.headersSent) json(res, 200, { found: false, subagent: null, todos: [], todos_found: false });
+    return;
+  }
+  sweepOrphanedSubagents();
+  const result = handleSubagentTodos(toolCallId);
+  if (!result.subagent || !subagentBelongsToScope(result.subagent, scope)) {
+    return json(res, 200, { found: false, subagent: null, todos: [], todos_found: false });
+  }
+  json(res, 200, result);
 }
 
 // lcp-4d5f: REST read mirror. Alias resolution + defaults live in the shared
@@ -2374,58 +2467,12 @@ async function handleAgentMessagesCancel(req: IncomingMessage, res: ServerRespon
       out[id] = "agent_mismatch";
       continue;
     }
-    const cancelled = cancelRun(id);
+    const cancelled = cancelRunAndHeal(id);
     out[id] = cancelled ? "cancelled" : "not_active";
-    // letta-mobile-ja4xe: after a successful cancel, scan the run's
-    // frames.jsonl for tool_call ids that were emitted but never
-    // returned. A cancel-mid-tool-call otherwise leaves an orphan
-    // tool_use/tool_calls on disk that strict providers (OpenAI /
-    // Anthropic) reject on the FOLLOWING turn with an
-    // invalid_request_error. healConversation repairs the on-disk
-    // transcript so the next user turn is accepted. The heal is
-    // best-effort: any failure is logged but does NOT change the
-    // cancel response — the user's UX is "cancelled", not "cancelled
-    // but the next turn will fail again because of a transient heal
-    // I/O error".
-    if (cancelled) {
-      void healAfterCancel(id, run.agent_id, run.conversation_id);
-    }
   }
   json(res, 200, out);
 }
 
-/**
- * letta-mobile-ja4xe: best-effort post-cancel transcript repair.
- * Wraps `healConversation` so a thrown or rejected heal never reaches
- * the cancel response. Runs detached — the cancel HTTP response is
- * already on the wire by the time this fires.
- */
-async function healAfterCancel(runId: string, agentId: string | null, conversationId: string | null): Promise<void> {
-  if (!agentId || !conversationId) return;
-  let dangling: string[];
-  try {
-    dangling = collectDanglingToolCallIds(runId);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[cancel-heal] collectDanglingToolCallIds failed for run ${runId}: ${msg}`);
-    return;
-  }
-  if (dangling.length === 0) return;
-  try {
-    const report = await healConversation(conversationId, agentId, dangling, { runId });
-    if (report.messagesEdited + report.messagesRemoved + report.messagesAppended > 0) {
-      console.log(
-        `[cancel-heal] run=${runId} conversation=${conversationId} ` +
-        `settled=${report.settled.length} removed=${report.removed.length} ` +
-        `unresolved=${report.unresolved.length} ` +
-        `appended=${report.messagesAppended} removed_msgs=${report.messagesRemoved} edited_msgs=${report.messagesEdited}`,
-      );
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[cancel-heal] healConversation failed for run ${runId} conv ${conversationId}: ${msg}`);
-  }
-}
 
 // ── search (lcp-c61s) ──────────────────────────────────────────────
 //
@@ -2642,6 +2689,19 @@ const server = createServer((req, res) => {
   }
   if (req.method === "GET" && (pathname === "/shim/v1/capabilities" || pathname === "/shim/v1/capabilities/")) {
     return handleShimCapabilities(req, res);
+  }
+  if (req.method === "GET" && (pathname === "/shim/v1/subagents" || pathname === "/shim/v1/subagents/")) {
+    return handleScopedSubagentList(req, res, url);
+  }
+  const shimSubagentTodos = pathname.match(/^\/shim\/v1\/subagents\/([^/]+)\/todos\/?$/);
+  if (req.method === "GET" && shimSubagentTodos) {
+    let toolCallId: string;
+    try {
+      toolCallId = decodeURIComponent(shimSubagentTodos[1]!);
+    } catch {
+      return badRequest(res, "invalid tool_call_id encoding");
+    }
+    return handleScopedSubagentTodos(req, res, url, toolCallId);
   }
   if (req.method === "GET" && pathname === "/shim/pool") {
     return handlePoolStats(req, res);

@@ -21,6 +21,7 @@ import type { IncomingMessage } from "node:http";
 
 import { reshapeFrame, attachReadImageToToolReturn } from "./chat.js";
 import { cancelRun, getAgentPool, resolveApprovalGate } from "./agent-pool.js";
+import { cancelRunAndHeal } from "./cancel-heal.js";
 import { readPendingApproval, resolveApproval } from "./pending-approval.js";
 import { resolveAgentIdAlias } from "./agent-aliases.js";
 import { getA2uiServerCapabilities, type A2uiCapability } from "./a2ui-adapter.js";
@@ -1665,7 +1666,7 @@ async function createMobileChannelAdapter(
     getServerId,
     getA2uiServerCapabilities,
     bridgeSendMessage,
-    cancelRun: (runId: string) => cancelRun(runId),
+    cancelRun: (runId: string) => cancelRunAndHeal(runId),
     touchAdapter: (convId: string, agId: string) => getAgentPool().touch(convId, agId),
     handleUserAction,
     mobileConversationCursorCapabilities,
