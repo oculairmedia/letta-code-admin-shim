@@ -116,6 +116,7 @@ export interface RunHandle {
   // doesn't race the WS delta stream for the same logical message.
   // Populated at runTurn entry, never re-read on disk.
   messageIdsAtTurnStart: Set<string>;
+  messageCountAtTurnStart: number;
   // lcp-2oxb.3: frames.jsonl fd, opened lazily (O_APPEND) on the first
   // appendRunFrame and reused for the whole run. One writeSync per frame
   // (~µs to page cache) replaces the old open+write+close+mkdir cycle while
@@ -582,6 +583,7 @@ export function createRun({ agentId, conversationId, onCancel, background }: Cre
     frameCount: 0,
     inFlightOtids: new Set<string>(),
     messageIdsAtTurnStart: new Set<string>(),
+    messageCountAtTurnStart: 0,
     _frameFd: null,
     _ring: [],
     _listeners: new Set<LiveFrameListener>(),
@@ -655,6 +657,7 @@ export function setMessageIdsAtTurnStart(
 ): void {
   if (!handle) return;
   handle.messageIdsAtTurnStart = new Set(ids);
+  handle.messageCountAtTurnStart = handle.messageIdsAtTurnStart.size;
 }
 
 export function recordRunTool(
@@ -1599,6 +1602,15 @@ export function listActiveRunsForConversation(
  * On no active runs OR no snapshot recorded yet, returns an empty set
  * (i.e. nothing is in-flight, the caller's filter is a no-op).
  */
+export function activeRunMessageCountAtTurnStart(
+  agentId: string,
+  conversationId: string,
+): number | null {
+  const handles = listActiveRunsForConversation(agentId, conversationId);
+  if (handles.length === 0) return null;
+  return Math.min(...handles.map((handle) => handle.messageCountAtTurnStart));
+}
+
 export function inFlightMessageIds(
   agentId: string,
   conversationId: string,

@@ -1238,12 +1238,20 @@ test("ws: seq_id alias survives a2ui-enabled turn (splitter flush gets seq_id, n
 
 // ─── 18c. REST /messages drops in-flight content during a WS turn ─────
 
-test("ws: REST /messages drops in-flight content during a WS turn (lcp-r0m)", async (t) => {
-  // Slow the mock so the turn stays in-flight long enough to issue a REST
-  // GET and observe filtering. Same trick as the cancel/single-flight tests.
+test("ws: REST /messages backfills stable history while dropping an in-flight tail (lcp-r0m)", async (t) => {
+  // Slow the mock so the turn stays in-flight long enough to issue REST
+  // pagination reads while the transcript tail belongs to that active turn.
   const { shim, conn, agentId, convId } = await setupAuthed(t, {
     env: { LETTA_MOCK_DELAY_MS: "200" },
   });
+  for (let i = 0; i < 5; i++) {
+    seedMessage(shim.stateDir, agentId, "default", {
+      id: `stable-${i}`,
+      role: "user",
+      content: `stable ${i}`,
+      sourceMessageIndex: i,
+    });
+  }
   conn.send({
     type: "send_message",
     agent_id: agentId,
@@ -1266,7 +1274,7 @@ test("ws: REST /messages drops in-flight content during a WS turn (lcp-r0m)", as
   // Issue REST GET /v1/conversations/{convId}/messages while the turn is
   // still in flight. The handler must filter out in-flight messages so the
   // client never sees a cumulative snapshot that races the WS deltas.
-  const restUrl = new URL(`/v1/conversations/${convId}/messages?limit=250&order=desc`, shim.url!);
+  const restUrl = new URL(`/v1/conversations/${convId}/messages?limit=3&order=desc`, shim.url!);
   const resp = await fetch(restUrl, {
     headers: { authorization: `Bearer ${shim.mobileToken}` },
   });
@@ -1283,6 +1291,17 @@ test("ws: REST /messages drops in-flight content during a WS turn (lcp-r0m)", as
     0,
     `REST /messages must drop in-flight assistant_messages (got ${restAssistants.length})`,
   );
+  assert.deepEqual(
+    items.map((message) => message.id),
+    ["stable-4", "stable-3", "stable-2"],
+    "the page must backfill from the stable pre-turn window",
+  );
+  const before = await fetch(
+    new URL(`/v1/conversations/${convId}/messages?limit=2&order=asc&before=stable-4`, shim.url!),
+    { headers: { authorization: `Bearer ${shim.mobileToken}` } },
+  );
+  const beforeItems = await before.json() as Array<{ id?: string }>;
+  assert.deepEqual(beforeItems.map((message) => message.id), ["stable-2", "stable-3"]);
   // Let the turn complete cleanly so the test's afterEach doesn't dangle.
   // (We don't assert post-turn_done REST shape here — the mock doesn't
   // append to messages.jsonl on its own, so a positive disk assertion

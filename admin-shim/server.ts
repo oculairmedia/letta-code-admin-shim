@@ -68,6 +68,7 @@ import { healConversation } from "./lib/conversation-healer.js";
 import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
 import { broadcastAgentEvent, type AgentEventReason } from "./lib/agent-events.js";
 import {
+  activeRunMessageCountAtTurnStart,
   aggregateUsage,
   buildMessageRunMap,
   collectDanglingToolCallIds,
@@ -1236,31 +1237,16 @@ async function handleConversationMessagesList(
   const { limit } = parsePagination(url.searchParams);
   const before = url.searchParams.get("before") ?? undefined;
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
-  // Load the pre-cursor window without limiting it yet. The active-run filter
-  // below can remove an arbitrarily large tail during tool-heavy turns; limiting
-  // first would return a short or empty page even though stable older history
-  // exists. listMessages still serves its stat-gated cached parse, so this does
-  // not add another disk read.
-  let items = await listMessages(resolved.conversationId, resolved.agentId, { before });
-  // lcp-r0m: drop in-flight assistant/tool messages owned by an active run.
-  // The WS path is streaming pure deltas under cm-stream-<otid> for these
-  // messages; returning the cumulative snapshot here races the stream and
-  // produces incoherent text on the client (the 2026-05-19 "StandStanding
-  // by..." repro). On the next hydrate after turn_done they appear cleanly.
-  const inFlight = inFlightMessageIds(
-    resolved.agentId,
-    resolved.conversationId,
-    items.map((m) => (m as { id?: unknown }).id).filter((id): id is string => typeof id === "string"),
-  );
-  if (inFlight.size > 0) {
-    items = items.filter((m) => {
-      const mid = (m as { id?: unknown }).id;
-      return typeof mid !== "string" || !inFlight.has(mid);
-    });
-  }
-  // Apply the page size to the stable projection, not the raw transcript tail.
-  // This backfills from older messages when the newest records are in-flight.
-  if (limit && limit > 0) items = items.slice(-limit);
+  // An active run owns every transcript row after its pre-turn snapshot.
+  // Bound the stable page at that snapshot before applying limit so an
+  // arbitrarily long tool-heavy tail cannot empty the page. This remains
+  // O(limit): listMessages slices directly from the cached transcript array.
+  const stableEnd = activeRunMessageCountAtTurnStart(resolved.agentId, resolved.conversationId);
+  let items = await listMessages(resolved.conversationId, resolved.agentId, {
+    limit,
+    before,
+    endExclusive: stableEnd ?? undefined,
+  });
   if (order === "desc") items = [...items].reverse();
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);

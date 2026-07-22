@@ -165,6 +165,7 @@ export interface ResolvedConversation {
 export interface ListMessagesOptions {
   limit?: number | undefined;
   before?: string | undefined;
+  endExclusive?: number | undefined;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -892,20 +893,17 @@ export function invalidateConversationsListCache(): void {
 export async function listMessages(
   conversationId: string,
   agentId: string,
-  { limit, before }: ListMessagesOptions = {},
+  { limit, before, endExclusive }: ListMessagesOptions = {},
 ): Promise<LocalMessage[]> {
   const key = conversationKey(conversationId, agentId);
   const dir = join(storageDir(), "conversations", b64url(key));
   const all = await loadFilteredMessages(join(dir, "messages.jsonl"));
-  let scoped: LocalMessage[] = all;
-  if (before) {
-    const idx = all.findIndex((m) => m.id === before);
-    if (idx >= 0) scoped = all.slice(0, idx);
-  }
+  const beforeIndex = before ? all.findIndex((m) => m.id === before) : -1;
+  const cursorEnd = beforeIndex >= 0 ? beforeIndex : all.length;
+  const boundedEnd = endExclusive == null ? cursorEnd : Math.min(cursorEnd, endExclusive);
+  let scoped = all.slice(0, boundedEnd);
   if (limit && limit > 0) scoped = scoped.slice(-limit);
-  // Never hand back the cached array itself — callers must not be able to
-  // mutate cache state. (slice() above already copies; cover the pass-through.)
-  return scoped === all ? all.slice() : scoped;
+  return scoped;
 }
 
 /**

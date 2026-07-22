@@ -24,7 +24,6 @@ import {
   externalConvId,
 } from "./helpers/index.js";
 import type { LocalMessagePart } from "../lib/types/letta-stream.js";
-import { createRun, finalizeRun, setMessageIdsAtTurnStart } from "../lib/runs.js";
 
 // ── helpers ─────────────────────────────────────────────────────────
 
@@ -1158,43 +1157,6 @@ test("GET /v1/conversations/{ext}/messages honors limit and before", async (t) =
   const before = await getJson(`${shim.url}/v1/conversations/${ext}/messages?before=pp-3`);
   const beforeArr = before.body as Array<{ id: string }>;
   assert.deepEqual(beforeArr.map((m) => m.id), ["pp-0", "pp-1", "pp-2"]);
-});
-
-test("GET /v1/conversations/{ext}/messages backfills stable history after filtering an in-flight tail", async (t) => {
-  const shim = await startShim();
-  t.after(() => shim.stop());
-
-  const aid = seedAgent(shim.stateDir, { id: "agent-proj-inflight-page" });
-  seedConversation(shim.stateDir, aid);
-  for (let i = 0; i < 5; i++) {
-    seedMessage(shim.stateDir, aid, "default", {
-      id: `stable-${i}`,
-      role: "user",
-      content: `stable ${i}`,
-      sourceMessageIndex: i,
-    });
-  }
-
-  const run = createRun({ agentId: aid, conversationId: "default" });
-  t.after(() => finalizeRun(run, { status: "completed", stopReason: "end_turn", usage: null }));
-  setMessageIdsAtTurnStart(run, Array.from({ length: 5 }, (_, i) => `stable-${i}`));
-  for (let i = 0; i < 5; i++) {
-    seedMessage(shim.stateDir, aid, "default", {
-      id: `in-flight-${i}`,
-      role: "assistant",
-      content: `partial ${i}`,
-      sourceMessageIndex: i + 5,
-    });
-  }
-
-  const ext = externalConvId(aid);
-  const asc = await getJson(`${shim.url}/v1/conversations/${ext}/messages?limit=3&order=asc`);
-  const ascArr = asc.body as Array<{ id: string }>;
-  assert.deepEqual(ascArr.map((m) => m.id), ["stable-2", "stable-3", "stable-4"]);
-
-  const desc = await getJson(`${shim.url}/v1/conversations/${ext}/messages?limit=3&order=desc`);
-  const descArr = desc.body as Array<{ id: string }>;
-  assert.deepEqual(descArr.map((m) => m.id), ["stable-4", "stable-3", "stable-2"]);
 });
 
 test("GET /v1/conversations/{ext}/messages projects assistant text into assistant_message", async (t) => {
