@@ -69,12 +69,12 @@ function childPidsOf(pid: number | undefined): number[] {
   }
 }
 
-async function waitForFreshFrame<T extends MobileWsFrame>(
+async function waitForFrameFrom<T extends MobileWsFrame>(
   conn: MobileWsHandle,
+  cursor: number,
   predicate: (frame: MobileWsFrame) => boolean,
   timeoutMs = 15_000,
 ): Promise<T> {
-  const cursor = conn.frames.length;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     for (let i = cursor; i < conn.frames.length; i++) {
@@ -93,7 +93,6 @@ async function readJson<T>(url: string): Promise<T> {
 }
 
 async function createDueCronTask(url: string, agentId: string, conversationId: string): Promise<CronCreateResponse> {
-  const scheduledFor = new Date(Date.now() - 1_000).toISOString();
   const res = await fetch(`${url}/v1/crons`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -103,12 +102,13 @@ async function createDueCronTask(url: string, agentId: string, conversationId: s
       name: "dogfood-rig-smoke",
       description: "dogfood SchedulerDaemon cleanup smoke",
       prompt: "dogfood-rig smoke: reply with writeback-ok",
-      at: scheduledFor,
+      at: "in 0m",
       timezone: "UTC",
     }),
   });
-  assert.equal(res.status, 201, await res.text());
-  return await res.json() as CronCreateResponse;
+  const body = await res.text();
+  assert.equal(res.status, 201, body);
+  return JSON.parse(body) as CronCreateResponse;
 }
 
 async function waitForProcessExit(pid: number | undefined, label: string, timeoutMs = 5_000): Promise<void> {
@@ -120,12 +120,13 @@ async function waitForProcessExit(pid: number | undefined, label: string, timeou
   assert.fail(`${label} process ${pid ?? "<unknown>"} remained alive after natural harness exit`);
 }
 
-test("dogfood-rig-smoke: scheduler fire writes back and natural shim exit leaves no workers", async () => {
+test("dogfood-rig-smoke: scheduler fire writes back and natural shim exit leaves no workers", {
+  skip: process.platform === "linux" ? false : "process cleanup assertions require Linux /proc",
+}, async () => {
   const shim = await startShim({
     env: {
-      SHIM_POOL_IDLE_SEC: "1",
-      SHIM_POOL_HOUSEKEEP_MS: "250",
-      SHIM_CRON_CATCHUP_WINDOW_MS: "60000",
+      SHIM_POOL_IDLE_SEC: "300",
+      SHIM_CRON_TICK_INTERVAL_MS: "100",
     },
   });
   let stopped = false;
@@ -139,12 +140,22 @@ test("dogfood-rig-smoke: scheduler fire writes back and natural shim exit leaves
 
     const conn = await openMobileWs(shim.url!, { token: shim.mobileToken });
     try {
+      const subscriptionCursor = conn.frames.length;
+      conn.send({ type: "subscribe_conversation", conversation_id: conversationId, after_seq: 0 });
+      await waitForFrameFrom(
+        conn,
+        subscriptionCursor,
+        (frame) => frame.type === "conversation_subscribed" && frame["conversation_id"] === conversationId,
+      );
+
+      const writebackCursor = conn.frames.length;
       const created = await createDueCronTask(shim.url!, agentId, "default");
       assert.equal(created.name, "dogfood-rig-smoke");
       assert.equal(created.agent_id, agentId);
 
-      const done = await waitForFreshFrame<TurnDoneFrame>(
+      const done = await waitForFrameFrom<TurnDoneFrame>(
         conn,
+        writebackCursor,
         (frame) => frame.type === "turn_done" && frame["agent_id"] === agentId && frame["conversation_id"] === conversationId,
         20_000,
       );
@@ -153,7 +164,7 @@ test("dogfood-rig-smoke: scheduler fire writes back and natural shim exit leaves
 
       const poolDuringTurn = await readJson<PoolStats>(`${shim.url}/shim/pool`);
       assert.ok(
-        poolDuringTurn.workers.some((worker) => worker.agent_id === agentId && worker.conversation_id === conversationId),
+        poolDuringTurn.workers.some((worker) => worker.agent_id === agentId && worker.conversation_id === created.conversation_id),
         "cron fire should have spawned a conversation-scoped worker before shutdown",
       );
 
