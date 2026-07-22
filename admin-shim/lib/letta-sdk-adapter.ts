@@ -70,6 +70,7 @@ import {
 } from "./runs.js";
 
 import { ensureA2uiBlockAttached, type A2uiCapability } from "./a2ui-adapter.js";
+import { awaitCancelHeal } from "./cancel-heal.js";
 
 import { listMessages } from "./store.js";
 import { sleeptimeOptionsForAgent } from "./reflection-settings.js";
@@ -327,6 +328,9 @@ export class SdkBackedLettaSessionAdapter implements LettaSessionAdapter {
   }
 
   private async _runTurnInner(input: string | unknown[], opts: RunTurnOptions): Promise<AdapterRunTurnResult> {
+    // Cancellation releases the adapter queue before transcript repair may
+    // finish. Gate every successor here, including turns already queued.
+    await awaitCancelHeal(this.agentId, this.conversationId);
     if (!this.session) throw new Error("SDK adapter: runTurn before start()");
     if (this.dead) throw new Error("SDK adapter: runTurn on dead adapter");
     const session = this.session;
