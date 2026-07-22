@@ -71,6 +71,25 @@ export interface ShimHandle {
   stop(): Promise<void>;
 }
 
+async function waitForChildExit(
+  child: ChildProcessByStdio<null, Readable, Readable>,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return await new Promise<boolean>((resolve) => {
+    const finish = (exited: boolean) => {
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref();
+    child.once("exit", onExit);
+    if (child.exitCode !== null || child.signalCode !== null) finish(true);
+  });
+}
+
 /**
  * Start the shim. Returns a handle with:
  *   url             — base URL (e.g. http://127.0.0.1:18293)
@@ -218,18 +237,19 @@ export async function startShim(opts: ShimOpts = {}): Promise<ShimHandle> {
       });
     },
     async stop() {
-      if (!child.killed) {
-        child.kill("SIGTERM");
-        await new Promise<void>((r) => {
-          const onExit = () => r();
-          child.once("exit", onExit);
-          setTimeout(() => {
-            if (!child.killed) child.kill("SIGKILL");
-            r();
-          }, 2000).unref();
-        });
+      try {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGTERM");
+          if (!await waitForChildExit(child, 2000)) {
+            child.kill("SIGKILL");
+            if (!await waitForChildExit(child, 2000)) {
+              throw new Error(`shim process ${child.pid ?? "<unknown>"} did not exit after SIGKILL`);
+            }
+          }
+        }
+      } finally {
+        try { rmSync(tmp, { recursive: true, force: true }); } catch {}
       }
-      try { rmSync(tmp, { recursive: true, force: true }); } catch {}
     },
   };
 

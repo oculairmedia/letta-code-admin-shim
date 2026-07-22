@@ -3098,6 +3098,7 @@ server.listen(PORT, HOST, () => {
   // their idle window.
   if (process.env["SHIM_CRON_ENABLED"] !== "0") {
     startCronScheduler({
+      tickIntervalMs: Math.max(1, Number(process.env["SHIM_CRON_TICK_INTERVAL_MS"]) || 60_000),
       fireTask: async (task, wrappedPrompt) => {
         await ensureMobileAdapter();
         const conversationId = task.conversation_id === "default"
