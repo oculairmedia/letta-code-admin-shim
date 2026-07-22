@@ -39,6 +39,7 @@ import {
   getFramesFilePath,
 } from "../lib/runs.js";
 import { healConversation } from "../lib/conversation-healer.js";
+import { awaitCancelHeal, cancelRunAndHeal } from "../lib/cancel-heal.js";
 import { startShim, seedAgent, seedConversation, externalConvId } from "./helpers/index.js";
 import type { ShimHandle } from "./helpers/shim.js";
 
@@ -253,6 +254,58 @@ test("cancel-heal: run with no tool calls at all → no orphan, no heal", async 
     assert.equal(report, null, "no heal should fire when there are no orphans");
     const after = readMessages(convDir);
     assert.equal(after.length, 2, "messages.jsonl must be untouched when there are no orphans");
+  });
+});
+
+test("cancel-heal: cancel completion barrier heals before an immediate next send", async () => {
+  await withBackendDir(async (stateDir) => {
+    const agentId = "agent-immediate";
+    const { convDir } = seedAgentAndConv(stateDir, agentId);
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: [{ type: "text", text: "do thing" }] },
+      { id: "a1", role: "assistant", content: [{ type: "toolCall", id: "toolu_IMMEDIATE", name: "Bash", arguments: {} }] },
+    ]);
+    const run = createRun({ agentId, conversationId: "default" });
+    appendRunFrame(run.id, {
+      message_type: "tool_call_message",
+      tool_call: { tool_call_id: "toolu_IMMEDIATE", name: "Bash", arguments: "{}" },
+    });
+
+    assert.equal(cancelRunAndHeal(run.id), true);
+    await awaitCancelHeal(agentId, "default");
+
+    const messages = readMessages(convDir);
+    assert.equal(messages.length, 3);
+    assert.equal(messages[2]?.["toolCallId"], "toolu_IMMEDIATE");
+  });
+});
+
+test("cancel-heal: a queued B turn cannot pass A's cancellation repair", async () => {
+  await withBackendDir(async (stateDir) => {
+    const agentId = "agent-queued";
+    const { convDir } = seedAgentAndConv(stateDir, agentId);
+    writeMessages(convDir, [
+      { id: "u0", role: "user", content: [{ type: "text", text: "A" }] },
+      { id: "a1", role: "assistant", content: [{ type: "toolCall", id: "toolu_QUEUED", name: "Bash", arguments: {} }] },
+    ]);
+    const run = createRun({ agentId, conversationId: "default" });
+    appendRunFrame(run.id, {
+      message_type: "tool_call_message",
+      tool_call: { tool_call_id: "toolu_QUEUED", name: "Bash", arguments: "{}" },
+    });
+
+    let releaseA!: () => void;
+    const aSettled = new Promise<void>((resolve) => { releaseA = resolve; });
+    const adapterQueue = aSettled.then(async () => {
+      await awaitCancelHeal(agentId, "default");
+      return readMessages(convDir);
+    });
+
+    assert.equal(cancelRunAndHeal(run.id), true);
+    releaseA();
+    const messagesSeenByB = await adapterQueue;
+    assert.equal(messagesSeenByB.length, 3);
+    assert.equal(messagesSeenByB[2]?.["toolCallId"], "toolu_QUEUED");
   });
 });
 
