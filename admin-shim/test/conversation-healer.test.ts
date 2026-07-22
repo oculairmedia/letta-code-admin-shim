@@ -132,7 +132,7 @@ test("detectUnexpectedToolResults: pulls OpenAI call ids from role tool errors",
   assert.deepEqual(detectUnexpectedToolResults({ error: { message: detail } }), ["call_abc123", "call_def456"]);
 });
 
-test("detectConsecutiveUserMessageIndices: removes all trailing user runs", () => {
+test("detectConsecutiveUserMessageIndices: removes trailing user runs, keeps last as current input", () => {
   const records = [
     { id: "u0", role: "user" },
     { id: "a0", role: "assistant" },
@@ -140,7 +140,7 @@ test("detectConsecutiveUserMessageIndices: removes all trailing user runs", () =
     { id: "u2", role: "user" },
     { id: "u3", role: "user" },
   ];
-  assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2, 3, 4]);
+  assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2, 3]);
 });
 
 test("detectConsecutiveUserMessageIndices: keeps latest user in an interior run", () => {
@@ -154,13 +154,13 @@ test("detectConsecutiveUserMessageIndices: keeps latest user in an interior run"
   assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2]);
 });
 
-test("detectConsecutiveUserMessageIndices: removes a single stale trailing user before next turn", () => {
+test("detectConsecutiveUserMessageIndices: keeps sole trailing user as current input", () => {
   const records = [
     { id: "u0", role: "user" },
     { id: "a0", role: "assistant" },
     { id: "u1", role: "user" },
   ];
-  assert.deepEqual(detectConsecutiveUserMessageIndices(records), [2]);
+  assert.deepEqual(detectConsecutiveUserMessageIndices(records), []);
 });
 
 test("healConsecutiveUserMessages: removes trailing failed user messages and audits", async () => {
@@ -183,17 +183,17 @@ test("healConsecutiveUserMessages: removes trailing failed user messages and aud
       now: 1779500000000,
     });
 
-    assert.deepEqual(report.removed, ["u1", "u2"]);
-    assert.equal(report.messagesRemoved, 2);
+    assert.deepEqual(report.removed, ["u1"]);
+    assert.equal(report.messagesRemoved, 1);
     assert.deepEqual(
       readMessages(convDir).map((m) => m["id"]),
-      ["u0", "a0"],
+      ["u0", "a0", "u2"],
     );
 
     const auditPath = join(stateDir, "..", "state", "runs", "run-consecutive-1", "heal.jsonl");
     assert.ok(existsSync(auditPath), `expected audit sidecar at ${auditPath}`);
     const entry = JSON.parse(readFileSync(auditPath, "utf8").trim());
-    assert.deepEqual(entry["removed"], ["u1", "u2"]);
+    assert.deepEqual(entry["removed"], ["u1"]);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(join(stateDir, "..", "state"), { recursive: true, force: true });

@@ -68,6 +68,7 @@ import { cancelRunAndHeal } from "./lib/cancel-heal.js";
 import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
 import { broadcastAgentEvent, type AgentEventReason } from "./lib/agent-events.js";
 import {
+  activeRunMessageIdsAtTurnStart,
   aggregateUsage,
   buildMessageRunMap,
   deleteRun,
@@ -1235,23 +1236,16 @@ async function handleConversationMessagesList(
   const { limit } = parsePagination(url.searchParams);
   const before = url.searchParams.get("before") ?? undefined;
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
-  let items = await listMessages(resolved.conversationId, resolved.agentId, { limit, before });
-  // lcp-r0m: drop in-flight assistant/tool messages owned by an active run.
-  // The WS path is streaming pure deltas under cm-stream-<otid> for these
-  // messages; returning the cumulative snapshot here races the stream and
-  // produces incoherent text on the client (the 2026-05-19 "StandStanding
-  // by..." repro). On the next hydrate after turn_done they appear cleanly.
-  const inFlight = inFlightMessageIds(
-    resolved.agentId,
-    resolved.conversationId,
-    items.map((m) => (m as { id?: unknown }).id).filter((id): id is string => typeof id === "string"),
-  );
-  if (inFlight.size > 0) {
-    items = items.filter((m) => {
-      const mid = (m as { id?: unknown }).id;
-      return typeof mid !== "string" || !inFlight.has(mid);
-    });
-  }
+  // During an active turn, return only IDs captured in its pre-turn snapshot.
+  // Snapshot membership remains correct when the CLI rewrites/reorders the
+  // transcript, unlike a positional count boundary, and the reverse scan stops
+  // as soon as it has collected the requested stable page.
+  const stableIds = activeRunMessageIdsAtTurnStart(resolved.agentId, resolved.conversationId);
+  let items = await listMessages(resolved.conversationId, resolved.agentId, {
+    limit,
+    before,
+    includeIds: stableIds ?? undefined,
+  });
   if (order === "desc") items = [...items].reverse();
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
   const otidMap = await readOtidMap(resolved.conversationId, resolved.agentId);

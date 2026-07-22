@@ -392,6 +392,7 @@ export async function healConversation(
 export function detectConsecutiveUserMessageIndices(records: unknown[]): number[] {
   const toRemove = new Set<number>();
   let userRun: number[] = [];
+  let hasNonUser = false;
 
   const flushInteriorRun = (): void => {
     if (userRun.length > 1) {
@@ -407,10 +408,19 @@ export function detectConsecutiveUserMessageIndices(records: unknown[]): number[
       userRun.push(i);
       continue;
     }
+    hasNonUser = true;
     flushInteriorRun();
   }
 
-  for (const idx of userRun) toRemove.add(idx);
+  // lcp-r0m: remove trailing consecutive user duplicates, but only when
+  // there is at least one non-user anchor in the transcript.  The last
+  // user message is always preserved — it is the current turn's input.
+  // Interior runs already handle this via flushInteriorRun; the trailing
+  // run mirrors that logic.  An all-user transcript (no anchor) represents
+  // the user's current session — nothing to heal.
+  if (hasNonUser && userRun.length > 0) {
+    for (const idx of userRun.slice(0, -1)) toRemove.add(idx);
+  }
 
   return [...toRemove].sort((a, b) => a - b);
 }
