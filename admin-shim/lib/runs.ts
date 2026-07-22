@@ -1608,7 +1608,11 @@ export function activeRunMessageCountAtTurnStart(
 ): number | null {
   const handles = listActiveRunsForConversation(agentId, conversationId);
   if (handles.length === 0) return null;
-  return Math.min(...handles.map((handle) => handle.messageCountAtTurnStart));
+  // The mobile host and SDK adapter can briefly expose two handles for one
+  // logical turn; the host-side placeholder has an empty snapshot while the
+  // adapter handle owns the real pre-turn boundary. Single-flight guarantees
+  // there is no independently executing second turn for this conversation.
+  return Math.max(...handles.map((handle) => handle.messageCountAtTurnStart));
 }
 
 export function inFlightMessageIds(
