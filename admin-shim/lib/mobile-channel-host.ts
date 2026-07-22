@@ -32,7 +32,7 @@ import {
   type A2uiBlock,
   type A2uiMetrics,
 } from "./a2ui-stream-splitter.js";
-import { appendRunFrame, createRun, getFramesFilePath, getRun, isRunUserStopped, recordA2uiUserAction, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
+import { appendRunFrame, createRun, getFramesFilePath, getRun, isRunUserStopped, recordA2uiUserAction, setMessageIdsAtTurnStart, subscribeLiveFrames, type ApprovalScope } from "./runs.js";
 import {
   getSubagent,
   ingestParentFrame,
@@ -295,6 +295,7 @@ export async function bridgeSendMessage(
       // state is observed at run start.
     },
   });
+  setMessageIdsAtTurnStart(runHandle, preTurnMessageIds);
   if (otid?.startsWith("goalcont-")) {
     runHandle.record.metadata = { ...(runHandle.record.metadata ?? {}), goal_continuation: true, otid };
   }
