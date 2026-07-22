@@ -1602,17 +1602,17 @@ export function listActiveRunsForConversation(
  * On no active runs OR no snapshot recorded yet, returns an empty set
  * (i.e. nothing is in-flight, the caller's filter is a no-op).
  */
-export function activeRunMessageCountAtTurnStart(
+export function activeRunMessageIdsAtTurnStart(
   agentId: string,
   conversationId: string,
-): number | null {
+): ReadonlySet<string> | null {
   const handles = listActiveRunsForConversation(agentId, conversationId);
   if (handles.length === 0) return null;
-  // The mobile host and SDK adapter can briefly expose two handles for one
-  // logical turn; the host-side placeholder has an empty snapshot while the
-  // adapter handle owns the real pre-turn boundary. Single-flight guarantees
-  // there is no independently executing second turn for this conversation.
-  return Math.max(...handles.map((handle) => handle.messageCountAtTurnStart));
+  // A logical mobile turn can briefly expose both host and adapter handles.
+  // The initialized handle owns the largest complete pre-turn snapshot.
+  return handles.reduce((largest, handle) =>
+    handle.messageIdsAtTurnStart.size > largest.size ? handle.messageIdsAtTurnStart : largest,
+  handles[0]!.messageIdsAtTurnStart);
 }
 
 export function inFlightMessageIds(

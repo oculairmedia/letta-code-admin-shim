@@ -68,7 +68,7 @@ import { healConversation } from "./lib/conversation-healer.js";
 import { resolveAgentIdAlias } from "./lib/agent-aliases.js";
 import { broadcastAgentEvent, type AgentEventReason } from "./lib/agent-events.js";
 import {
-  activeRunMessageCountAtTurnStart,
+  activeRunMessageIdsAtTurnStart,
   aggregateUsage,
   buildMessageRunMap,
   collectDanglingToolCallIds,
@@ -1237,15 +1237,15 @@ async function handleConversationMessagesList(
   const { limit } = parsePagination(url.searchParams);
   const before = url.searchParams.get("before") ?? undefined;
   const order = (url.searchParams.get("order") ?? "asc").toLowerCase();
-  // An active run owns every transcript row after its pre-turn snapshot.
-  // Bound the stable page at that snapshot before applying limit so an
-  // arbitrarily long tool-heavy tail cannot empty the page. This remains
-  // O(limit): listMessages slices directly from the cached transcript array.
-  const stableEnd = activeRunMessageCountAtTurnStart(resolved.agentId, resolved.conversationId);
+  // During an active turn, return only IDs captured in its pre-turn snapshot.
+  // Snapshot membership remains correct when the CLI rewrites/reorders the
+  // transcript, unlike a positional count boundary, and the reverse scan stops
+  // as soon as it has collected the requested stable page.
+  const stableIds = activeRunMessageIdsAtTurnStart(resolved.agentId, resolved.conversationId);
   let items = await listMessages(resolved.conversationId, resolved.agentId, {
     limit,
     before,
-    endExclusive: stableEnd ?? undefined,
+    includeIds: stableIds ?? undefined,
   });
   if (order === "desc") items = [...items].reverse();
   const realTimes = await readMessageTimestamps(resolved.conversationId, resolved.agentId);
