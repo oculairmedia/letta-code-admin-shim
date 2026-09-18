@@ -129,16 +129,22 @@ const EFFECTIVE_AGENT_MODEL_SETTINGS_FIX_LITERAL =
   `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
   `    })`;
 
-const THINKING_REQUEST_GUARD_ANCHOR =
-  `  if (options3?.metadata) {\n` +
-  `    const userId = options3.metadata.user_id;`;
+const THINKING_REQUEST_GUARD_PATTERN =
+  /  if \((options\d*)\?\.metadata\) \{\n    const userId = \1\.metadata\.user_id;/g;
 
-const THINKING_REQUEST_GUARD_INSERT =
-  `  if (params.thinking && params.thinking.type !== "enabled" && "budget_tokens" in params.thinking) {\n` +
-  `    delete params.thinking.budget_tokens;\n` +
-  `  }\n` +
-  `  if (options3?.metadata) {\n` +
-  `    const userId = options3.metadata.user_id;`;
+/**
+ * @param {string} options the captured binding name
+ * @returns {string}
+ */
+function thinkingRequestGuardInsert(options) {
+  return (
+    `  if (params.thinking && params.thinking.type !== "enabled" && "budget_tokens" in params.thinking) {\n` +
+    `    delete params.thinking.budget_tokens;\n` +
+    `  }\n` +
+    `  if (${options}?.metadata) {\n` +
+    `    const userId = ${options}.metadata.user_id;`
+  );
+}
 
 // lcp-7kk: universal chokepoint guard.
 //
@@ -497,36 +503,36 @@ const OPENAI_TOOLS_INDENTED_REPLACEMENT =
 const SYS_PROMPT_MEMO_HELPER_DEFINITION =
   "globalThis.__lcpSysPromptJson = globalThis.__lcpSysPromptJson || new Map();\n";
 
-const SYS_PROMPT_PERSIST_TOKEN =
-  "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
-  "    if (!this.storageDir)\n" +
-  "      return;\n" +
-  "    const key = this.conversationKey(conversationId, agentId);\n" +
-  "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
-  "    if (!prompt)\n" +
-  "      return;\n" +
-  "    const conversationDir = join39(this.storageDir, \"conversations\", encodePathSegment(key));\n" +
-  "    mkdirSync23(conversationDir, { recursive: true });\n" +
-  "    writeFileSync17(join39(conversationDir, \"system-prompt.json\"), `${JSON.stringify(prompt, null, 2)}\n" +
-  "`);\n" +
-  "  }";
+// The three fs bindings are numbered by the minifier and renumber on most releases, so they
+// are captured rather than spelled. Everything else here is the behaviour being replaced.
+const SYS_PROMPT_PERSIST_PATTERN =
+  /  persistCompiledSystemPrompt\(conversationId, agentId\) \{\n    if \(!this\.storageDir\)\n      return;\n    const key = this\.conversationKey\(conversationId, agentId\);\n    const prompt = this\.compiledSystemPromptByConversationKey\.get\(key\);\n    if \(!prompt\)\n      return;\n    const conversationDir = (join\d+)\(this\.storageDir, "conversations", encodePathSegment\(key\)\);\n    (mkdirSync\d+)\(conversationDir, \{ recursive: true \}\);\n    (writeFileSync\d+)\(\1\(conversationDir, "system-prompt\.json"\), `\$\{JSON\.stringify\(prompt, null, 2\)\}\n`\);\n  \}/g;
 
-const SYS_PROMPT_PERSIST_REPLACEMENT =
-  "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
-  "    if (!this.storageDir)\n" +
-  "      return;\n" +
-  "    const key = this.conversationKey(conversationId, agentId);\n" +
-  "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
-  "    if (!prompt)\n" +
-  "      return;\n" +
-  "    const json = JSON.stringify(prompt, null, 2);\n" +
-  "    if (globalThis.__lcpSysPromptJson.get(key) === json)\n" +
-  "      return;\n" +
-  "    const conversationDir = join39(this.storageDir, \"conversations\", encodePathSegment(key));\n" +
-  "    mkdirSync23(conversationDir, { recursive: true });\n" +
-  "    writeFileSync17(join39(conversationDir, \"system-prompt.json\"), json + \"\\n\");\n" +
-  "    globalThis.__lcpSysPromptJson.set(key, json);\n" +
-  "  }";
+/**
+ * @param {string} join
+ * @param {string} mkdirSync
+ * @param {string} writeFileSync
+ * @returns {string}
+ */
+function sysPromptPersistReplacement(join, mkdirSync, writeFileSync) {
+  return (
+    "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
+    "    if (!this.storageDir)\n" +
+    "      return;\n" +
+    "    const key = this.conversationKey(conversationId, agentId);\n" +
+    "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
+    "    if (!prompt)\n" +
+    "      return;\n" +
+    "    const json = JSON.stringify(prompt, null, 2);\n" +
+    "    if (globalThis.__lcpSysPromptJson.get(key) === json)\n" +
+    "      return;\n" +
+    `    const conversationDir = ${join}(this.storageDir, "conversations", encodePathSegment(key));\n` +
+    `    ${mkdirSync}(conversationDir, { recursive: true });\n` +
+    `    ${writeFileSync}(${join}(conversationDir, "system-prompt.json"), json + "\\n");\n` +
+    "    globalThis.__lcpSysPromptJson.set(key, json);\n" +
+    "  }"
+  );
+}
 
 // lcp-aioi8-p2 (patch #19): dehydrate the persisted-message dedupe map.
 //
@@ -570,7 +576,373 @@ const CLONE_MAP_COMPARE_TOKEN =
 const CLONE_MAP_COMPARE_REPLACEMENT =
   "persistedMessage === JSON.stringify(message)";
 
+// lcp-oaiap: the OpenAI-compatible API (/v1/chat/completions and /v1/responses)
+// aborts a turn the moment the runtime reports WAITING_ON_APPROVAL, replacing
+// the agent's real answer with a canned "this API does not support" note.
+//
+// That is a RACE, not a capability gate. With auto-approval configured the
+// runtime passes briefly through WAITING_ON_APPROVAL, then approves and runs the
+// tool: the on-disk conversation holds the toolCall, a toolResult with
+// isError:false, and a correct final assistant message -- all written AFTER the
+// HTTP response was already finished with the canned text. Verified 2026-09-04
+// with `echo HELLO_FROM_TOOL`: local-conv-270 ends with "Exact output:
+// HELLO_FROM_TOOL" while the API returned the approval note. /v1/responses is
+// the same code path (it emits status:"incomplete" plus the same note), so this
+// is not fixable by switching surfaces.
+//
+// Ignore the transient status instead of finishing. A genuinely stuck approval
+// stays bounded by the existing OPENAI_TURN_TIMEOUT_MS (15 min) backstop, which
+// reports an honest timeout rather than a false capability claim.
+// Set LETTA_OPENAI_API_APPROVAL_BAIL=1 to restore stock bail-out behavior.
+const OPENAI_APPROVAL_BAIL_TOKEN = `if (status === "WAITING_ON_APPROVAL") {`;
+const OPENAI_APPROVAL_BAIL_REPLACEMENT =
+  `if (status === "WAITING_ON_APPROVAL" && globalThis.__lcpOpenAiApprovalBail()) {`;
+const OPENAI_APPROVAL_BAIL_HELPER =
+  `globalThis.__lcpOpenAiApprovalBail = globalThis.__lcpOpenAiApprovalBail || function () {\n` +
+  `  return process.env.LETTA_OPENAI_API_APPROVAL_BAIL === "1";\n` +
+  `};\n`;
+
+// lcp-otid — persist the streamed assistant otid on the durable record.
+//
+// letta-code already mints a stable per-segment id for streamed assistant text
+// (`provider-assistant-<segmentIndex>-<uuid>`, via otidForContentSegment) and
+// emits it as `otid` on every assistant_message delta; mobile sees it prefixed
+// as `cm-stream-provider-assistant-...`. The durable write does NOT keep it:
+// toLocalAssistantMessage stores responseId, model, provider and usage, so the
+// stored row shares no identifier with the stream that produced it.
+//
+// Clients are therefore forced to pair the streamed row with the settled row by
+// matching their text, and that fails the instant a stream drops its tail: both
+// rows stay on screen and the reply renders twice. Measured on device
+// 2026-09-11 — streamed 368 characters against a stored 369, a single missing
+// "?" was enough to duplicate a reply.
+//
+// The user path already persists its otid, which is exactly why user messages
+// have a key and assistant messages do not. This closes that asymmetry. The
+// local-message event carries the record that is about to be persisted, and it
+// arrives on the same generator that owns `assistantOtids`, after the deltas
+// that minted them — so the ids are stamped in place, with no global state and
+// no cross-talk between concurrent conversations.
+// The bundle's minifier names this binding `event` in 0.30.x and `event2` in
+// 0.29.x, so the stamp is tried against both spellings and the first that
+// matches exactly once wins. Everything else about the site is identical.
+const OTID_STAMP_VARIANTS = ["event", "event2"].map((binding) => ({
+  token: `            yield createLocalMessageChunk(${binding}.message);`,
+  replacement:
+    `            yield createLocalMessageChunk(globalThis.__lcpStampAssistantOtids(${binding}.message, assistantOtids));`,
+}));
+
+// toLocalAssistantMessage names every field it keeps, so a stamped otid has to
+// be named here too or the durable write drops it again.
+const OTID_PERSIST_TOKEN =
+  `    usage: message.usage ?? emptyLocalUsage(),`;
+const OTID_PERSIST_REPLACEMENT =
+  `    ...message.otid ? { otid: message.otid } : {},\n` +
+  `    usage: message.usage ?? emptyLocalUsage(),`;
+
+const OTID_HELPER =
+  `globalThis.__lcpStampAssistantOtids = globalThis.__lcpStampAssistantOtids || function (message, otids) {\n` +
+  `  try {\n` +
+  `    if (!message || typeof message !== "object") return message;\n` +
+  `    if (!otids || typeof otids.values !== "function") return message;\n` +
+  `    const byIndex = {};\n` +
+  `    for (const [index, value] of otids.entries()) {\n` +
+  `      if (typeof value === "string" && value.length > 0) byIndex[String(index)] = value;\n` +
+  `    }\n` +
+  `    const indexes = Object.keys(byIndex).map(Number).sort((a, b) => a - b);\n` +
+  `    if (indexes.length === 0) return message;\n` +
+  `    if (typeof message.otid !== "string" || message.otid.length === 0) {\n` +
+  `      message.otid = byIndex[String(indexes[0])];\n` +
+  `    }\n` +
+  `    const metadata =\n` +
+  `      message.metadata && typeof message.metadata === "object"\n` +
+  `        ? message.metadata\n` +
+  `        : (message.metadata = {});\n` +
+  `    if (!metadata.segment_otids || typeof metadata.segment_otids !== "object") {\n` +
+  `      metadata.segment_otids = byIndex;\n` +
+  `    }\n` +
+  `    return message;\n` +
+  `  } catch {\n` +
+  `    return message;\n` +
+  `  }\n` +
+  `};\n`;
+
+// Persisting the otid is only half of it: the history projection rebuilds
+// assistant frames from the stored record and names every field it emits, so
+// without this the client reading history still sees no identity and falls back
+// to matching text. The segment index the projection is flushing is the same
+// index the otid was minted under, so the lookup is exact even when one stored
+// reply projects into several assistant frames.
+const OTID_PROJECT_TOKEN =
+  `    messages.push({\n` +
+  `      id: isFirst ? message.id : \`\${message.id}:assistant:\${pendingTextStartIndex}\`,\n` +
+  `      date,\n` +
+  `      agent_id: agentId,\n` +
+  `      conversation_id: conversationId,\n` +
+  `      message_type: "assistant_message",\n` +
+  `      role: "assistant",\n` +
+  `      content: pendingTextContent\n` +
+  `    });`;
+
+const OTID_PROJECT_REPLACEMENT =
+  `    messages.push({\n` +
+  `      id: isFirst ? message.id : \`\${message.id}:assistant:\${pendingTextStartIndex}\`,\n` +
+  `      date,\n` +
+  `      agent_id: agentId,\n` +
+  `      conversation_id: conversationId,\n` +
+  `      message_type: "assistant_message",\n` +
+  `      role: "assistant",\n` +
+  `      ...globalThis.__lcpSegmentOtid(message, pendingTextStartIndex, isFirst),\n` +
+  `      content: pendingTextContent\n` +
+  `    });`;
+
+const OTID_PROJECT_HELPER =
+  `globalThis.__lcpSegmentOtid = globalThis.__lcpSegmentOtid || function (message, segmentIndex, isFirst) {\n` +
+  `  try {\n` +
+  `    const segments = message && message.metadata && message.metadata.segment_otids;\n` +
+  `    const fromIndex =\n` +
+  `      segments && typeof segments === "object" ? segments[String(segmentIndex)] : undefined;\n` +
+  `    const otid = typeof fromIndex === "string" && fromIndex.length > 0\n` +
+  `      ? fromIndex\n` +
+  `      : isFirst && typeof message?.otid === "string" && message.otid.length > 0\n` +
+  `        ? message.otid\n` +
+  `        : undefined;\n` +
+  `    return otid ? { otid } : {};\n` +
+  `  } catch {\n` +
+  `    return {};\n` +
+  `  }\n` +
+  `};\n`;
+
+// lcp-clr: conversation-scoped last-run timestamp; lcp-clr-x adds a
+// cross-conversation fallback when the in-flight conversation is empty.
+//
+// Upstream bug (letta-code >= 0.27.x, the listener warmup path): the
+// agent-info system reminder renders
+//   `- **Last message**: <ts> (<relative>)`
+// from `agent.last_run_completion`, which the local backend derives inside
+// `projectAgent()` from the agent's hardcoded `default` conversation:
+//
+//   const defaultConversation = this.findConversation("default", record.id);
+//   const lastRunCompletion =
+//     defaultConversation?.last_message_at ?? defaultConversation?.updated_at ?? null;
+//
+// So in any non-default conversation the reminder reports the `default`
+// conversation's timestamp — and the relative-time formatter then says
+// "55 days ago" for a conversation the user opened 30 seconds ago. Cloud
+// `last_run_completion` is genuinely agent-scoped (the cloud backend's only
+// notion of a run is per-agent), so `projectAgent` is defensible as written;
+// the bug is that the reminder's read site in the listen path always asks
+// for the agent-scoped value even when the in-flight conversation is in
+// scope. Half conversation-scoped, half agent-scoped.
+//
+// The single listen-path site that builds `listenAgentMetadata` already has
+// `getBackend()`, `agentId`, and the in-flight `conversationId` in scope —
+// `conversationId` is then passed straight into `buildListenReminderContext`
+// a few lines below — so we route the timestamp through a helper that
+// prefers the conversation's own `last_message_at` / `updated_at`,
+// then falls back to the most-recent OTHER conversation on this agent when
+// this conversation is still empty (lcp-clr-x), and otherwise returns
+// `kind: "none"` so the renderer can say "No previous messages" honestly.
+//
+// Why the cross-conv fallback (lcp-clr-x): a brand-new conversation opened
+// mid-session has no `last_message_at`, but the user may have meaningful
+// continuity in a sibling conversation that started 42 minutes ago. We
+// don't want to surface that as "Last message in this conversation" (a
+// lie) or as "No previous messages" (technically true, useless). The
+// helper returns a structured object `{ kind, last_message_at,
+// conversation_id, summary }` so the renderer can emit a SECOND line:
+//   - **Most recent activity**: <ts> (<relative>) in <conversation_id>.
+// The banner's primary `Last message:` line still reads "No previous
+// messages in this conversation" in the cross-conv case — we never let
+// the sibling-conv timestamp masquerade as THIS conversation's.
+//
+// Interactive path coverage: the same bug exists in the React
+// state-setting sites at ~515437 and ~515495 (the `setAgentLastRunAt`
+// callers), but both feed `hasSentAgentInfo`-gated values that never
+// reach the reminder in the same turn the listen path runs. Subsequent
+// turns get the React-state value (still a bare ISO string from
+// `agent.last_run_completion`); the renderer normalizes that to
+// `kind: "this"` so interactive-path behaviour is preserved.
+//
+// Fail-safe: the helper swallows every error and returns
+// `kind: "none"` on failure. Renderer normalization treats any string
+// `lastRunAt` (legacy interactive-path output) as `kind: "this"`, so
+// even if the helper is missing the renderer still produces the
+// upstream banner. No bead exists for either fix — the repo's beads DB
+// is currently schema-skewed (v65 DB vs v53 binary), so the fix is
+// tracked only in git.
+const CONVERSATION_LAST_RUN_TOKEN =
+  `      if (!runtime.reminderState.hasSentAgentInfo && cachedAgent) {\n` +
+  `        listenAgentMetadata = {\n` +
+  `          name: cachedAgent.name ?? null,\n` +
+  `          description: cachedAgent.description ?? null,\n` +
+  `          lastRunAt: cachedAgent.last_run_completion ?? null\n` +
+  `        };\n` +
+  `      }`;
+
+const CONVERSATION_LAST_RUN_REPLACEMENT =
+  `      if (!runtime.reminderState.hasSentAgentInfo && cachedAgent) {\n` +
+  `        listenAgentMetadata = {\n` +
+  `          name: cachedAgent.name ?? null,\n` +
+  `          description: cachedAgent.description ?? null,\n` +
+  `          lastRunAt: await globalThis.__lcpConversationLastRunAt(getBackend(), agentId, conversationId, cachedAgent.last_run_completion ?? null)\n` +
+  `        };\n` +
+  `      }`;
+
+// Returns a structured object so the renderer can dispatch by kind.
+//   { kind: "this",   last_message_at, conversation_id, summary }
+//   { kind: "recent", last_message_at, conversation_id, summary }
+//   { kind: "none",   last_message_at: null, conversation_id: null, summary: null }
+//
+// `agentFallback` (the buggy `agent.last_run_completion`) is no longer
+// surfaced — returning it was the original bug. Cross-conv fallback uses
+// `listConversations({ agent_id, limit: 5 })` which is already
+// pre-sorted descending by `last_message_at` in the local backend
+// (`src/backend/local/local-conversations.ts:listLocalConversations`).
+// `limit: 5` is one disk scan; cheap for the cold-start path.
+const CONVERSATION_LAST_RUN_HELPER_DEFINITION =
+  `globalThis.__lcpConversationLastRunAt = globalThis.__lcpConversationLastRunAt || async function (backend, agentId, conversationId) {\n` +
+  `  const noneResult = () => ({ kind: "none", last_message_at: null, conversation_id: null, summary: null });\n` +
+  `  try {\n` +
+  `    if (!backend || typeof backend.retrieveConversation !== "function" ||\n` +
+  `        typeof conversationId !== "string" || conversationId === "" || conversationId === "default") {\n` +
+  `      return noneResult();\n` +
+  `    }\n` +
+  `    const conversation = await backend.retrieveConversation(conversationId, agentId);\n` +
+  `    if (conversation && typeof conversation === "object") {\n` +
+  `      const stamp = conversation.last_message_at ?? conversation.updated_at ?? null;\n` +
+  `      if (typeof stamp === "string" && !Number.isNaN(Date.parse(stamp))) {\n` +
+  `        return { kind: "this", last_message_at: stamp, conversation_id: conversationId, summary: conversation.summary ?? null };\n` +
+  `      }\n` +
+  `    }\n` +
+  `    // lcp-clr-x: in-flight conversation is empty or un-stamped. Surface\n` +
+  `    // the most-recent sibling conversation on the same agent instead of\n` +
+  `    // claiming nothing happened. limit=5 caps the file scan; the local\n` +
+  `    // backend pre-sorts desc by last_message_at.\n` +
+  `    if (backend && typeof backend.listConversations === "function" && typeof agentId === "string" && agentId !== "") {\n` +
+  `      const recent = await backend.listConversations({ agent_id: agentId, limit: 5 });\n` +
+  `      if (Array.isArray(recent)) {\n` +
+  `        const sibling = recent.find((c) => c && typeof c === "object" && c.id !== conversationId && typeof c.last_message_at === "string" && !Number.isNaN(Date.parse(c.last_message_at)));\n` +
+  `        if (sibling) {\n` +
+  `          return { kind: "recent", last_message_at: sibling.last_message_at, conversation_id: sibling.id, summary: sibling.summary ?? null };\n` +
+  `        }\n` +
+  `      }\n` +
+  `    }\n` +
+  `  } catch {}\n` +
+  `  return noneResult();\n` +
+  `};\n`;
+
+// lcp-clr-x: rewrite buildAgentInfo so it dispatches on the structured
+// object shape returned by the helper. The interactive path still sets
+// `lastRunAt` to a bare ISO string; we normalize that to `{ kind: "this",
+// last_message_at: <str> }` so one branch path covers both shapes.
+//
+// The renderer change is the only place that reads `agentInfo.lastRunAt`,
+// so patching this single function is sufficient — the reminder-build
+// chain is `buildSharedReminderParts({ agent: { lastRunAt, ... } })` →
+// `buildAgentInfo(options)` and no other consumer inspects this field.
+// `getRelativeTime` is a sibling function in the same source file, in
+// scope wherever buildAgentInfo is.
+const BUILD_AGENT_INFO_TOKEN =
+  `function buildAgentInfo(options) {\n` +
+  `  try {\n` +
+  `    const { agentInfo, conversationId } = options;\n` +
+  `    let lastRunInfo = "No previous messages";\n` +
+  `    if (agentInfo.lastRunAt) {\n` +
+  `      try {\n` +
+  `        const lastRunDate = new Date(agentInfo.lastRunAt);\n` +
+  `        const localLastRun = lastRunDate.toLocaleString();\n` +
+  `        const relativeTime = getRelativeTime(agentInfo.lastRunAt);\n` +
+  `        lastRunInfo = \`\${localLastRun} (\${relativeTime})\`;\n` +
+  `      } catch {\n` +
+  `        lastRunInfo = "(failed to parse last run time)";\n` +
+  `      }\n` +
+  `    }\n` +
+  `    const showMemoryDir = (() => {\n` +
+  `      try {\n` +
+  `        return isLocalBackendEnvEnabled() || settingsManager.isMemfsEnabled(agentInfo.id);\n` +
+  `      } catch {\n` +
+  `        return false;\n` +
+  `      }\n` +
+  `    })();`;
+
+const BUILD_AGENT_INFO_REPLACEMENT =
+  `function buildAgentInfo(options) {\n` +
+  `  try {\n` +
+  `    const { agentInfo, conversationId } = options;\n` +
+  `    // Normalize: legacy interactive-path callers pass a bare ISO string;\n` +
+  `    // the new lcp-clr helper passes a structured object. Treat strings\n` +
+  `    // as kind:"this" so one branch path covers both shapes.\n` +
+  `    const lastRunRaw = typeof agentInfo.lastRunAt === "string" && agentInfo.lastRunAt\n` +
+  `      ? { kind: "this", last_message_at: agentInfo.lastRunAt, conversation_id: conversationId ?? null, summary: null }\n` +
+  `      : (agentInfo.lastRunAt && typeof agentInfo.lastRunAt === "object" ? agentInfo.lastRunAt : { kind: "none", last_message_at: null, conversation_id: null, summary: null });\n` +
+  `    const lastRunInfo = globalThis.__lcpFormatLastRun(lastRunRaw);\n` +
+  `    const showMemoryDir = (() => {\n` +
+  `      try {\n` +
+  `        return isLocalBackendEnvEnabled() || settingsManager.isMemfsEnabled(agentInfo.id);\n` +
+  `      } catch {\n` +
+  `        return false;\n` +
+  `      }\n` +
+  `    })();`;
+
+// Renderer formatter. Dispatches on `kind` and emits the full
+// "Last message:" line text. For `kind: "recent"` it returns two
+// concatenated lines (the renderer places them after the bullet row
+// in the existing template). For all other kinds it returns a single
+// line. The wrapped `try/catch` keeps the reminder building even when
+// a sibling conversation object is malformed.
+//
+// The string-concatenation at the bottom matches the original builder's
+// `return \`...${lastRunInfo}...\`;` shape — same `lastRunInfo` variable
+// gets the same interpolated position, so no other line needs to move.
+const BUILD_AGENT_INFO_HELPER_DEFINITION =
+  `globalThis.__lcpFormatLastRun = globalThis.__lcpFormatLastRun || function (lastRun) {\n` +
+  `  try {\n` +
+  `    if (!lastRun || typeof lastRun !== "object") return "No previous messages";\n` +
+  `    if (lastRun.kind !== "this" && lastRun.kind !== "recent" && lastRun.kind !== "none") return "No previous messages";\n` +
+  `    const fmtLine = (stamp) => {\n` +
+  `      const d = new Date(stamp);\n` +
+  `      if (Number.isNaN(d.getTime())) return "No previous messages";\n` +
+  `      const local = d.toLocaleString();\n` +
+  `      const relative = getRelativeTime(stamp);\n` +
+  `      return \`\${local} (\${relative})\`;\n` +
+  `    };\n` +
+  `    if (lastRun.kind === "this") {\n` +
+  `      return lastRun.last_message_at ? fmtLine(lastRun.last_message_at) : "No previous messages";\n` +
+  `    }\n` +
+  `    if (lastRun.kind === "none") {\n` +
+  `      return "No previous messages";\n` +
+  `    }\n` +
+  `    // kind === "recent": primary line says THIS conversation is empty;\n` +
+  `    // second line attributes the recency to the sibling conv by id.\n` +
+  `    const primary = "No previous messages in this conversation";\n` +
+  `    const sibling = fmtLine(lastRun.last_message_at);\n` +
+  `    const targetId = lastRun.conversation_id ? \` in \${lastRun.conversation_id}\` : "";\n` +
+  `    return \`\${primary}\\n- **Most recent activity**: \${sibling}\${targetId}\`;\n` +
+  `  } catch {\n` +
+  `    return "(failed to parse last run time)";\n` +
+  `  }\n` +
+  `};\n`;
+
 let appliedOnce = false;
+
+/**
+ * Exact-occurrence regex match, the pattern counterpart of [countOccurrences].
+ *
+ * Some anchors differ between releases only in minifier-generated binding names —
+ * `join39` against `join34`, `options3` against `options` — which drifts the literal without
+ * changing a line of behaviour. Capturing those names instead of hard-coding them keeps one
+ * anchor working across releases, while the uniqueness check that follows is the same
+ * fail-open guard an exact literal gets.
+ *
+ * @param {string} source
+ * @param {RegExp} pattern global-flagged
+ * @returns {RegExpMatchArray | null} the only match, or null when it did not match exactly once
+ */
+function matchOnce(source, pattern) {
+  const matches = [...source.matchAll(pattern)];
+  return matches.length === 1 ? matches[0] : null;
+}
 
 /**
  * Exact-occurrence counter used for anchor uniqueness assertions. A drifted
@@ -619,15 +991,18 @@ function patchLettaCodeSource(raw, path, warn) {
     );
   }
 
-  if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
-    patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
-    appliedPatches += 1;
-  } else {
-    skippedPatches += 1;
-    if (warn) process.stderr.write(
-      `[letta-code-patch] WARN: thinking-request guard anchor not found in ${path} — ` +
-      `running without lcp-9pn request guard\n`,
-    );
+  {
+    const guard = matchOnce(patched, THINKING_REQUEST_GUARD_PATTERN);
+    if (guard) {
+      patched = patched.replace(guard[0], thinkingRequestGuardInsert(guard[1] ?? "options"));
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: thinking-request guard anchor did not match exactly once in ${path} — ` +
+        `running without lcp-9pn request guard\n`,
+      );
+    }
   }
 
   // lcp-7kk: universal chokepoint normalizer for every Anthropic request.
@@ -776,15 +1151,19 @@ function patchLettaCodeSource(raw, path, warn) {
   // FAIL-OPEN with a unique-match assertion: anchor absent OR matched more
   // than once → warn + skip, never throw at boot.
   {
-    const occurrences = countOccurrences(patched, SYS_PROMPT_PERSIST_TOKEN);
-    if (occurrences === 1) {
-      patched = patched.replace(SYS_PROMPT_PERSIST_TOKEN, SYS_PROMPT_PERSIST_REPLACEMENT);
+    const persist = matchOnce(patched, SYS_PROMPT_PERSIST_PATTERN);
+    if (persist) {
+      const [token, join, mkdirSync, writeFileSync] = persist;
+      patched = patched.replace(
+        token,
+        sysPromptPersistReplacement(join ?? "", mkdirSync ?? "", writeFileSync ?? ""),
+      );
       patched = injectHelperAfterShebang(patched, SYS_PROMPT_MEMO_HELPER_DEFINITION);
       appliedPatches += 1;
     } else {
       skippedPatches += 1;
       if (warn) process.stderr.write(
-        `[letta-code-patch] WARN: persistCompiledSystemPrompt anchor matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `[letta-code-patch] WARN: persistCompiledSystemPrompt anchor did not match exactly once in ${path} — ` +
         `running without lcp-aioi8-p1 dirty-check (every append rewrites system-prompt.json)\n`,
       );
     }
@@ -813,6 +1192,96 @@ function patchLettaCodeSource(raw, path, warn) {
     }
   }
 
+  // lcp-oaiap: stop the OpenAI API from aborting auto-approved tool turns.
+  {
+    const occurrences = countOccurrences(patched, OPENAI_APPROVAL_BAIL_TOKEN);
+    if (occurrences === 1) {
+      patched = patched.replace(OPENAI_APPROVAL_BAIL_TOKEN, OPENAI_APPROVAL_BAIL_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, OPENAI_APPROVAL_BAIL_HELPER);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: WAITING_ON_APPROVAL anchor matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-oaiap (the OpenAI API will keep replacing auto-approved tool answers ` +
+        `with the canned "requires interactive approval" note)\n`,
+      );
+    }
+  }
+
+  // lcp-otid: carry the streamed segment otid onto the durable assistant record,
+  // so clients can pair the streamed row with the settled one by identity rather
+  // than by matching their text. Both anchors must be unique and both must land,
+  // or neither does: stamping without persisting is dead weight, and persisting
+  // without stamping stores an otid that no stream ever emitted.
+  {
+    const stamp = OTID_STAMP_VARIANTS.find(
+      (variant) => countOccurrences(patched, variant.token) === 1,
+    );
+    const stampOccurrences = stamp ? 1 : 0;
+    const persistOccurrences = countOccurrences(patched, OTID_PERSIST_TOKEN);
+    const projectOccurrences = countOccurrences(patched, OTID_PROJECT_TOKEN);
+    if (stamp && persistOccurrences === 1 && projectOccurrences === 1) {
+      patched = patched.replace(stamp.token, stamp.replacement);
+      patched = patched.replace(OTID_PERSIST_TOKEN, OTID_PERSIST_REPLACEMENT);
+      patched = patched.replace(OTID_PROJECT_TOKEN, OTID_PROJECT_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, OTID_HELPER);
+      patched = injectHelperAfterShebang(patched, OTID_PROJECT_HELPER);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: assistant-otid anchors matched stamp=${stampOccurrences} persist=${persistOccurrences} project=${projectOccurrences} ` +
+        `(expected exactly 1 each) in ${path} — skipping lcp-otid atomically ` +
+        `(stored assistant messages keep no stream identity, so clients fall back to content matching)\n`,
+      );
+    }
+  }
+
+  // lcp-clr: conversation-scoped lastRunAt for the agent-info reminder.
+  // Unique-match assertion (skip on miss or duplicate rather than patching
+  // the wrong site): the listen path is the only place that builds
+  // `listenAgentMetadata` from `cachedAgent.last_run_completion`, but a
+  // future version could clone that block for the warmup path — in which
+  // case the patch must skip and leave that copy alone.
+  {
+    const occurrences = countOccurrences(patched, CONVERSATION_LAST_RUN_TOKEN);
+    if (occurrences === 1) {
+      patched = patched.replace(CONVERSATION_LAST_RUN_TOKEN, CONVERSATION_LAST_RUN_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, CONVERSATION_LAST_RUN_HELPER_DEFINITION);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: conversation-last-run token matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-clr (the agent-info reminder will continue to report the agent's ` +
+        `default-conversation timestamp in non-default conversations)\n`,
+      );
+    }
+  }
+
+  // lcp-clr-x: rewrite buildAgentInfo to dispatch on the structured object
+  // returned by the lcp-clr helper. Fail-open on count != 1 — never patch
+  // the wrong site or break the reminder builder. The two patches are
+  // independent: if lcp-clr-x lands but lcp-clr didn't (anchor drifted),
+  // the renderer still works against the legacy string-shaped lastRunAt
+  // because the normalization branch treats strings as kind:"this".
+  {
+    const occurrences = countOccurrences(patched, BUILD_AGENT_INFO_TOKEN);
+    if (occurrences === 1) {
+      patched = patched.replace(BUILD_AGENT_INFO_TOKEN, BUILD_AGENT_INFO_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, BUILD_AGENT_INFO_HELPER_DEFINITION);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: buildAgentInfo token matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-clr-x (cross-conversation fallback won't render; "No previous messages" ` +
+        `and the agent-level timestamp keep showing as before)\n`,
+      );
+    }
+  }
+
   return { source: patched, appliedPatches, skippedPatches };
 }
 
@@ -834,6 +1303,11 @@ export function patchLettaCodeSourceForTest(raw) {
 export function patchLettaCodeSourceResultForTest(raw) {
   return patchLettaCodeSource(raw, "<test>", false);
 }
+
+// Exported for tests that eval the helper definition against a stub backend
+// to exercise the kind-dispatch semantics of `__lcpConversationLastRunAt`.
+// The body is unchanged — only the export is new.
+export { CONVERSATION_LAST_RUN_HELPER_DEFINITION };
 
 // Insert injected source after a leading `#!` shebang (which must remain line 1
 // for Node to strip it). ESM hoists `import` declarations, so a statement placed

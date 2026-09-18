@@ -1,14 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import {
   patchLettaCodeSourceForTest,
   patchLettaCodeSourceResultForTest,
+  CONVERSATION_LAST_RUN_HELPER_DEFINITION,
 } from "../scripts/letta-code-patch-loader.mjs";
 import { VISION_MODEL_PATTERNS } from "../lib/model-catalog.js";
 
+// Use this for LEGACY / dev-dep assertions — the pinned admin-shim
+// node_modules copy (0.19.x as of writing). For modern anchors (>=0.27.x)
+// use `resolveDeployedLettaBundle()` instead, which probes the live runtime
+// bundle that `LETTA_CLI_PATH_REAL` points at in production.
+//
 // Resolve the REAL letta.js bundle so the guard test works in CI
 // (admin-shim/node_modules/...) AND locally — never a machine-specific
 // absolute path. `letta.js` is NOT an exported subpath, so resolve the
@@ -27,9 +33,10 @@ function resolveLettaBundle(): string | null {
     if (parent === dir) break;
     dir = parent;
   }
-  // Fallback: the global bun install (local dev convenience).
-  const globalCandidate = "/root/.bun/install/global/" + rel;
-  if (existsSync(globalCandidate)) return globalCandidate;
+  // No deployed / global-bun fallback here — that role belongs to
+  // `resolveDeployedLettaBundle()`. Keeping this resolver scoped to the
+  // pinned dev dep prevents a stale global install from silently
+  // satisfying a test that the deployed bundle would have failed.
   return null;
 }
 
@@ -699,8 +706,17 @@ const CLONE_MAP_COMPARE_ANCHOR = "localMessagesHaveSameSnapshot(persistedMessage
 // the pinned dev dependency in node_modules (0.19.x, which predates
 // persistCompiledSystemPrompt entirely — the patches simply fail-open there).
 function resolveDeployedLettaBundle(): string | null {
+  // Deployment order, newest first. The stale copy under .bun is several releases behind what
+  // the service runs, and asserting "nothing fails open" against it asserts nothing useful.
+  const versioned = existsSync("/root")
+    ? readdirSync("/root")
+        .filter((entry) => entry.startsWith("letta-code-") && !entry.endsWith(".tgz"))
+        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+        .map((entry) => join("/root", entry, "node_modules/@letta-ai/letta-code/letta.js"))
+    : [];
   const candidates = [
     process.env["LETTA_CLI_PATH_REAL"] ?? "",
+    ...versioned,
     "/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js",
     resolveLettaBundle() ?? "",
   ].filter(Boolean);
@@ -723,7 +739,8 @@ test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map de
   const bundle = readFileSync(bundlePath, "utf8");
 
   // Unique-match assertion holds on the real bundle (drift alarm on update).
-  assert.equal(bundle.split(SYS_PROMPT_ANCHOR).length - 1, 1, "P1 anchor must be unique");
+  const sysPromptSites = [...bundle.matchAll(/  persistCompiledSystemPrompt\(conversationId, agentId\) \{/g)];
+  assert.equal(sysPromptSites.length, 1, "P1 anchor must be unique");
   assert.equal(bundle.split(CLONE_MAP_BULK_ANCHOR).length - 1, 1, "P2 bulk anchor must be unique");
   assert.equal(bundle.split(CLONE_MAP_APPEND_ANCHOR).length - 1, 1, "P2 append anchor must be unique");
   assert.equal(bundle.split(CLONE_MAP_COMPARE_ANCHOR).length - 1, 1, "P2 compare anchor must be unique");
@@ -734,8 +751,16 @@ test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map de
   // P1: dirty-check in place, memo helper injected, unconditional write gone.
   assert.ok(patched.includes("if (globalThis.__lcpSysPromptJson.get(key) === json)"));
   assert.ok(patched.includes("globalThis.__lcpSysPromptJson = globalThis.__lcpSysPromptJson || new Map();"));
-  assert.ok(patched.includes('writeFileSync17(join39(conversationDir, "system-prompt.json"), json + "\\n");'));
-  assert.ok(!patched.includes(SYS_PROMPT_ANCHOR));
+  // Shape, not binding numbers: the minifier renumbers those on most releases and the anchor
+  // is built to tolerate it, so freezing them here would fail the next upgrade for no reason.
+  assert.ok(
+    /writeFileSync\d+\(join\d+\(conversationDir, "system-prompt\.json"\), json \+ "\\n"\);/.test(patched),
+    "the memoized write must be in place",
+  );
+  assert.ok(
+    !/writeFileSync\d+\(join\d+\(conversationDir, "system-prompt\.json"\), `\$\{JSON\.stringify/.test(patched),
+    "the unconditional write must be gone",
+  );
 
   // P2: all three sites dehydrated atomically.
   assert.ok(patched.includes(".set(entry.message.id, JSON.stringify(entry.message));"));
@@ -746,11 +771,12 @@ test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map de
   assert.ok(patched.includes("cloneLocalMessage("));
 });
 
-test("patch-loader: lcp-aioi8-p1 fail-open on single-byte anchor drift", () => {
-  // Mutate one byte inside the anchor: the method is renamed, so nothing may
-  // be patched and the source must come back byte-identical (fail-open).
+test("patch-loader: lcp-aioi8-p1 fail-open on structural anchor drift", () => {
+  // Renumbered bindings (mkdirSync23 -> mkdirSync24) are what the anchor now tolerates by
+  // design, so drift has to be structural to prove fail-open: the method itself is renamed.
+  // Nothing may be patched and the source must come back byte-identical.
   const drifted = "const before = 1;\n" +
-    SYS_PROMPT_ANCHOR.replace("mkdirSync23", "mkdirSync24") +
+    SYS_PROMPT_ANCHOR.replace("persistCompiledSystemPrompt", "persistCompiledSystemPromptV2") +
     "\nconst after = 2;\n";
 
   const { source, appliedPatches } = patchLettaCodeSourceResultForTest(drifted);
@@ -841,4 +867,480 @@ test("patch-loader: lcp-aioi8-p1 dirty-check skips unchanged system-prompt write
   } finally {
     globals.__lcpSysPromptJson = previousMemo;
   }
+});
+
+// lcp-otid — the streamed assistant otid has to survive the durable write, or a
+// client cannot pair the streamed row with the settled one except by matching
+// their text, which duplicates a reply whenever a stream drops its tail.
+const OTID_STAMP_ANCHOR = `            yield createLocalMessageChunk(event.message);`;
+const OTID_PERSIST_ANCHOR = `    usage: message.usage ?? emptyLocalUsage(),`;
+const OTID_PROJECT_ANCHOR =
+  "    messages.push({\n" +
+  "      id: isFirst ? message.id : `${message.id}:assistant:${pendingTextStartIndex}`,\n" +
+  "      date,\n" +
+  "      agent_id: agentId,\n" +
+  "      conversation_id: conversationId,\n" +
+  '      message_type: "assistant_message",\n' +
+  '      role: "assistant",\n' +
+  "      content: pendingTextContent\n" +
+  "    });";
+
+test("patch-loader: lcp-otid stamps the segment otid and persists it", () => {
+  const bundle =
+    "const before = 1;\n" +
+    OTID_STAMP_ANCHOR + "\n" +
+    OTID_PERSIST_ANCHOR + "\n" +
+    OTID_PROJECT_ANCHOR + "\n" +
+    "const after = 2;\n";
+
+  const patched = patchLettaCodeSourceForTest(bundle);
+
+  // Stamped where the otids were minted, persisted where the record is built.
+  assert.ok(patched.includes("globalThis.__lcpStampAssistantOtids(event.message, assistantOtids)"));
+  assert.ok(patched.includes("...message.otid ? { otid: message.otid } : {},"));
+  assert.ok(patched.includes("globalThis.__lcpStampAssistantOtids = globalThis.__lcpStampAssistantOtids ||"));
+});
+
+test("patch-loader: lcp-otid stamps the first segment and records them all", () => {
+  const globals = globalThis as Record<string, unknown>;
+  const previous = globals["__lcpStampAssistantOtids"];
+  delete globals["__lcpStampAssistantOtids"];
+  try {
+    const patched = patchLettaCodeSourceForTest(
+      OTID_STAMP_ANCHOR + "\n" + OTID_PERSIST_ANCHOR + "\n" + OTID_PROJECT_ANCHOR + "\n",
+    );
+    // The helper is injected ahead of the bundle; take exactly it, so the test
+    // evaluates the shipped source rather than a copy that could drift from it.
+    const start = patched.indexOf("globalThis.__lcpStampAssistantOtids =");
+    assert.ok(start >= 0, "helper must be injected");
+    const end = patched.indexOf("\n};\n", start);
+    assert.ok(end > start, "helper must be terminated");
+    new Function(patched.slice(start, end + "\n};".length))();
+    const stamp = globals["__lcpStampAssistantOtids"] as
+      (message: unknown, otids: unknown) => Record<string, unknown>;
+
+    const otids = new Map<number, string>([
+      [0, "provider-assistant-0-aaa"],
+      [2, "provider-assistant-2-bbb"],
+    ]);
+    const message: Record<string, unknown> = { role: "assistant", content: [] };
+    const stamped = stamp(message, otids);
+
+    // The first segment names the row, because that is the id the stream opens
+    // with; the rest are kept so a multi-segment reply can still be paired.
+    assert.equal(stamped["otid"], "provider-assistant-0-aaa");
+    // Keyed by the segment index they were minted under, so the read path can
+    // look one up exactly when a stored reply projects into several frames.
+    assert.deepEqual(
+      (stamped["metadata"] as Record<string, unknown>)["segment_otids"],
+      { "0": "provider-assistant-0-aaa", "2": "provider-assistant-2-bbb" },
+    );
+    // Stamping is in place: the object the caller persists is the one we edited.
+    assert.equal(stamped, message);
+
+    // An otid the turn already carries wins; a stamp must never rename a row.
+    const named: Record<string, unknown> = { otid: "already-named" };
+    assert.equal(stamp(named, otids)["otid"], "already-named");
+
+    // Nothing to stamp, nothing changed.
+    const empty: Record<string, unknown> = { role: "assistant" };
+    assert.equal(stamp(empty, new Map())["otid"], undefined);
+  } finally {
+    if (previous === undefined) delete globals["__lcpStampAssistantOtids"];
+    else globals["__lcpStampAssistantOtids"] = previous;
+  }
+});
+
+test("patch-loader: lcp-otid projects the stored otid back onto history frames", () => {
+  const globals = globalThis as Record<string, unknown>;
+  const previous = globals["__lcpSegmentOtid"];
+  delete globals["__lcpSegmentOtid"];
+  try {
+    const patched = patchLettaCodeSourceForTest(
+      OTID_STAMP_ANCHOR + "\n" + OTID_PERSIST_ANCHOR + "\n" + OTID_PROJECT_ANCHOR + "\n",
+    );
+    assert.ok(patched.includes("globalThis.__lcpSegmentOtid(message, pendingTextStartIndex, isFirst)"));
+
+    const start = patched.indexOf("globalThis.__lcpSegmentOtid =");
+    assert.ok(start >= 0, "projection helper must be injected");
+    const end = patched.indexOf("\n};\n", start);
+    new Function(patched.slice(start, end + "\n};".length))();
+    const segmentOtid = globals["__lcpSegmentOtid"] as
+      (message: unknown, index: number, isFirst: boolean) => Record<string, unknown>;
+
+    const stored = {
+      otid: "provider-assistant-0-aaa",
+      metadata: {
+        segment_otids: { "0": "provider-assistant-0-aaa", "2": "provider-assistant-2-bbb" },
+      },
+    };
+    // Each projected frame carries the otid of the segment it was flushed from.
+    assert.deepEqual(segmentOtid(stored, 0, true), { otid: "provider-assistant-0-aaa" });
+    assert.deepEqual(segmentOtid(stored, 2, false), { otid: "provider-assistant-2-bbb" });
+    // A segment with no recorded otid names nothing rather than borrowing one.
+    assert.deepEqual(segmentOtid(stored, 5, false), {});
+    // Records written before this patch fall back to the row otid on the first
+    // frame only, and never invent one for a later segment.
+    const legacy = { otid: "provider-assistant-0-ccc" };
+    assert.deepEqual(segmentOtid(legacy, 0, true), { otid: "provider-assistant-0-ccc" });
+    assert.deepEqual(segmentOtid(legacy, 3, false), {});
+    assert.deepEqual(segmentOtid({}, 0, true), {});
+  } finally {
+    if (previous === undefined) delete globals["__lcpSegmentOtid"];
+    else globals["__lcpSegmentOtid"] = previous;
+  }
+});
+
+// lcp-clr: conversation-scoped lastRunAt for the agent-info reminder. The
+// listen-path site that builds `listenAgentMetadata` is the only place that
+// reads `cachedAgent.last_run_completion`, so the anchor must match the
+// deployed bundle exactly once, the rewrite must install the helper via
+// `globalThis.__lcpConversationLastRunAt(...)` against the in-scope
+// `getBackend()`, `agentId`, and `conversationId`, and the original literal
+// line must be gone — otherwise the local backend keeps reporting the
+// agent's `default` conversation timestamp in non-default conversations
+// (the "55 days ago" on a brand-new conversation bug).
+//
+// Anchors and replacements are shape-only — the minifier renumbers bindings
+// on most releases and this test must keep passing across them.
+const CLR_LISTEN_SITE_TOKEN =
+  `      if (!runtime.reminderState.hasSentAgentInfo && cachedAgent) {\n` +
+  `        listenAgentMetadata = {\n` +
+  `          name: cachedAgent.name ?? null,\n` +
+  `          description: cachedAgent.description ?? null,\n` +
+  `          lastRunAt: cachedAgent.last_run_completion ?? null\n` +
+  `        };\n` +
+  `      }`;
+
+test("patch-loader: lcp-clr rewrites the deployed listen-path lastRunAt to a conversation-scoped helper", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) {
+    t.skip(
+      "no letta-code bundle with persistCompiledSystemPrompt (>= 0.27) available on this host — lcp-clr cannot be verified against the real bundle",
+    );
+    return;
+  }
+  const bundle = readFileSync(bundlePath, "utf8");
+
+  // Unique-match assertion holds on the real bundle (drift alarm on upgrade).
+  assert.equal(
+    bundle.split(CLR_LISTEN_SITE_TOKEN).length - 1,
+    1,
+    "lcp-clr anchor must be unique on the deployed bundle",
+  );
+
+  const { source: patched, skippedPatches, appliedPatches } = patchLettaCodeSourceResultForTest(bundle);
+
+  // The deployed-bundle test a few blocks above also asserts
+  // `skippedPatches === 0` after a sequence of patches runs; that contract
+  // must continue to hold with lcp-clr appended — the patch succeeds against
+  // a real bundle.
+  assert.equal(
+    skippedPatches,
+    0,
+    "no patch (including lcp-clr) may fail-open against the deployed bundle",
+  );
+  assert.ok(
+    (appliedPatches ?? 0) >= 1,
+    "lcp-clr must increment appliedPatches on the deployed bundle",
+  );
+
+  // The original literal line that read `cachedAgent.last_run_completion`
+  // must be gone — replacing the half-conversation-scoped, half-agent-scoped
+  // reminder is the entire point of the patch.
+  assert.equal(
+    patched.split(
+      "          lastRunAt: cachedAgent.last_run_completion ?? null",
+    ).length - 1,
+    0,
+    "the agent-scoped lastRunAt literal must be removed",
+  );
+
+  // The rewrite calls the helper with the three in-scope identifiers plus
+  // the agent-level fallback — they are the only correct seams.
+  assert.ok(
+    patched.includes(
+      "          lastRunAt: await globalThis.__lcpConversationLastRunAt(getBackend(), agentId, conversationId, cachedAgent.last_run_completion ?? null)",
+    ),
+    "the helper call must thread backend / agentId / conversationId and fall back to the agent-scoped value",
+  );
+
+  // The helper is injected after the shebang so Node sees it as a top-level
+  // statement; duplicate-injection is harmless because of the `|| function`
+  // guard but the function body must be present at least once.
+  assert.ok(
+    patched.includes(
+      'globalThis.__lcpConversationLastRunAt = globalThis.__lcpConversationLastRunAt || async function',
+    ),
+    "the __lcpConversationLastRunAt helper must be injected",
+  );
+  assert.ok(
+    patched.includes("backend.retrieveConversation(conversationId, agentId)"),
+    "the helper must resolve the conversation via the backend",
+  );
+  assert.ok(
+    !patched.includes(`return null;\n      }\n    }\n  } catch {}\n  return agentFallback;`),
+    "the helper must surface its no-conversation-match null-return without leaking the literal snippet",
+  );
+});
+
+test("patch-loader: lcp-clr fail-open on a duplicate-anchor source", () => {
+  // Synthesize a minimal source in which the listen-path site appears twice
+  // — e.g. a future letta.js that clones the block for the warmup path.
+  // lcp-clr must skip rather than patching the wrong site and silently
+  // corrupting the warmup path. No other anchor from the upstream patch
+  // list appears in this fragment, so applied/skipped counts are scoped
+  // solely to lcp-clr.
+  const doubleSource = "class A {\n" + CLR_LISTEN_SITE_TOKEN + "\n}\nclass B {\n" + CLR_LISTEN_SITE_TOKEN + "\n}\n";
+  const { source, appliedPatches } = patchLettaCodeSourceResultForTest(doubleSource);
+  assert.equal(source, doubleSource, "double-matched anchor must not be patched anywhere");
+  assert.equal(appliedPatches, 0, "appliedPatches must be 0 when lcp-clr cannot prove uniqueness");
+
+  // Sanity: the same anchor occurring exactly once IS patched.
+  const single = "class A {\n" + CLR_LISTEN_SITE_TOKEN + "\n}\n";
+  const patchedSingle = patchLettaCodeSourceForTest(single);
+  assert.ok(
+    patchedSingle.includes(
+      "          lastRunAt: await globalThis.__lcpConversationLastRunAt(getBackend(), agentId, conversationId, cachedAgent.last_run_completion ?? null)",
+    ),
+    "single-occurrence anchor must be rewritten and routed through the helper",
+  );
+});
+
+// lcp-clr-x: cross-conversation fallback for the agent-info reminder's
+// lastRunAt, plus the renderer rewrite that dispatches on the structured
+// `{ kind: "this" | "recent" | "none", last_message_at, conversation_id,
+// summary }` shape.
+//
+// The helper is exposed via `import { CONVERSATION_LAST_RUN_HELPER_DEFINITION
+// } from "../scripts/letta-code-patch-loader.mjs"` so we can eval it
+// directly and verify the kind-dispatch semantics with a stubbed backend.
+// The renderer is verified against the deployed bundle like the rest of
+// the modern-anchor tests.
+const CLR_RENDERER_TOKEN =
+  `function buildAgentInfo(options) {\n` +
+  `  try {\n` +
+  `    const { agentInfo, conversationId } = options;\n` +
+  `    let lastRunInfo = "No previous messages";\n` +
+  `    if (agentInfo.lastRunAt) {\n` +
+  `      try {\n` +
+  `        const lastRunDate = new Date(agentInfo.lastRunAt);\n` +
+  `        const localLastRun = lastRunDate.toLocaleString();\n` +
+  `        const relativeTime = getRelativeTime(agentInfo.lastRunAt);\n` +
+  `        lastRunInfo = \`\${localLastRun} (\${relativeTime})\`;\n` +
+  `      } catch {\n` +
+  `        lastRunInfo = "(failed to parse last run time)";\n` +
+  `      }\n` +
+  `    }\n` +
+  `    const showMemoryDir = (() => {\n` +
+  `      try {\n` +
+  `        return isLocalBackendEnvEnabled() || settingsManager.isMemfsEnabled(agentInfo.id);\n` +
+  `      } catch {\n` +
+  `        return false;\n` +
+  `      }\n` +
+  `    })();`;
+
+test("patch-loader: lcp-clr-x rewrites buildAgentInfo to dispatch on the structured lastRunAt shape", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) {
+    t.skip(
+      "no letta-code bundle with persistCompiledSystemPrompt (>= 0.27) available on this host — lcp-clr-x cannot be verified against the real bundle",
+    );
+    return;
+  }
+  const bundle = readFileSync(bundlePath, "utf8");
+
+  // Unique-match assertion: buildAgentInfo must appear exactly once on the
+  // bundle. If it clones for a warmup path in a future release the patch
+  // must skip and a human must disambiguate.
+  assert.equal(
+    bundle.split(CLR_RENDERER_TOKEN).length - 1,
+    1,
+    "lcp-clr-x renderer anchor must be unique on the deployed bundle",
+  );
+
+  const { source: patched, skippedPatches } = patchLettaCodeSourceResultForTest(bundle);
+  assert.equal(skippedPatches, 0, "no patch may fail-open against the deployed bundle");
+
+  // The renderer now normalizes the legacy bare-string shape and dispatches
+  // through the new formatter.
+  assert.ok(
+    patched.includes(
+      'const lastRunRaw = typeof agentInfo.lastRunAt === "string" && agentInfo.lastRunAt',
+    ),
+    "the renderer must normalize legacy string-shaped lastRunAt",
+  );
+  assert.ok(
+    patched.includes("const lastRunInfo = globalThis.__lcpFormatLastRun(lastRunRaw);"),
+    "the renderer must call the new formatter",
+  );
+  assert.ok(
+    !patched.includes('let lastRunInfo = "No previous messages";'),
+    "the original `let lastRunInfo = ...` initializer must be replaced",
+  );
+
+  // The formatter helper is injected alongside the lcp-clr helper.
+  assert.ok(
+    patched.includes("globalThis.__lcpFormatLastRun = globalThis.__lcpFormatLastRun || function"),
+    "the __lcpFormatLastRun helper must be injected",
+  );
+  assert.ok(
+    patched.includes('primary = "No previous messages in this conversation"'),
+    "the cross-conv branch must emit the honest primary line",
+  );
+  assert.ok(
+    patched.includes("- **Most recent activity**:"),
+    "the cross-conv branch must emit the Most recent activity attribution line",
+  );
+});
+
+// Behaviour tests for the helper. We can't easily mock `backend.listConversations`
+// from inside the patched source, so we eval the helper definition against
+// a stub backend. This is the only path that exercises the kind-dispatch
+// logic with real returns — the bundle-level tests above can only assert
+// string presence.
+//
+// `node --test` doesn't accept `describe` blocks (that's a mocha pattern),
+// so the helper tests are top-level. Each test re-evals the helper
+// definition against a fresh stub backend so they're isolated.
+// `node:test` runs them in declaration order with `--test-concurrency=1`.
+//
+// @param {Record<string, unknown>} stubBackend
+// @returns {(args: { agentId: string; conversationId: string }) => Promise<unknown>}
+// The helper assigns to globalThis on first call; we clear the cache key
+// beforehand so subsequent evals re-evaluate the function body.
+function loadLcpConversationLastRunAt(stubBackend) {
+  // @ts-ignore
+  delete (globalThis as { __lcpConversationLastRunAt?: unknown }).__lcpConversationLastRunAt;
+  const helperSource = CONVERSATION_LAST_RUN_HELPER_DEFINITION;
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval
+  new Function(helperSource)();
+  // @ts-ignore
+  const helper = globalThis.__lcpConversationLastRunAt;
+  if (typeof helper !== "function") {
+    throw new Error("helper did not register on globalThis");
+  }
+  return (args: { agentId: string; conversationId: string }) =>
+    // @ts-ignore
+    helper(stubBackend, args.agentId, args.conversationId);
+}
+
+test("__lcpConversationLastRunAt: kind: this when the in-flight conversation has a last_message_at", async () => {
+  const stamp = "2026-09-18T01:00:00.000Z";
+  const backend = {
+    retrieveConversation: async () => ({ id: "conv-X", last_message_at: stamp, summary: "active" }),
+    listConversations: async () => [],
+  };
+  const result = await loadLcpConversationLastRunAt(backend)({
+    agentId: "agent-1",
+    conversationId: "conv-X",
+  });
+  assert.deepEqual(result, {
+    kind: "this",
+    last_message_at: stamp,
+    conversation_id: "conv-X",
+    summary: "active",
+  });
+});
+
+test("__lcpConversationLastRunAt: kind: recent when this conv is empty and a sibling has a stamp", async () => {
+  const backend = {
+    retrieveConversation: async () => ({ id: "conv-new", last_message_at: null }),
+    listConversations: async () => [
+      { id: "conv-old", last_message_at: "2026-09-18T00:30:00.000Z", summary: "earlier" },
+    ],
+  };
+  const result = await loadLcpConversationLastRunAt(backend)({
+    agentId: "agent-1",
+    conversationId: "conv-new",
+  });
+  assert.deepEqual(result, {
+    kind: "recent",
+    last_message_at: "2026-09-18T00:30:00.000Z",
+    conversation_id: "conv-old",
+    summary: "earlier",
+  });
+});
+
+test("__lcpConversationLastRunAt: kind: none when listConversations throws", async () => {
+  const backend = {
+    retrieveConversation: async () => ({ id: "conv-new", last_message_at: null }),
+    listConversations: async () => {
+      throw new Error("disk gone");
+    },
+  };
+  const result = await loadLcpConversationLastRunAt(backend)({
+    agentId: "agent-1",
+    conversationId: "conv-new",
+  });
+  assert.deepEqual(result, {
+    kind: "none",
+    last_message_at: null,
+    conversation_id: null,
+    summary: null,
+  });
+});
+
+test("__lcpConversationLastRunAt: kind: none when this conv is the magic 'default' id", async () => {
+  const backend = {
+    retrieveConversation: async () => {
+      throw new Error("retrieveConversation should NOT be called for `default`");
+    },
+    listConversations: async () => {
+      throw new Error("listConversations should NOT be called for `default`");
+    },
+  };
+  const result = await loadLcpConversationLastRunAt(backend)({
+    agentId: "agent-1",
+    conversationId: "default",
+  });
+  assert.deepEqual(result, {
+    kind: "none",
+    last_message_at: null,
+    conversation_id: null,
+    summary: null,
+  });
+});
+
+test("__lcpConversationLastRunAt: recent filters out the in-flight conversation from the sibling set", async () => {
+  const backend = {
+    retrieveConversation: async () => ({ id: "conv-self", last_message_at: null }),
+    listConversations: async () => [
+      { id: "conv-self", last_message_at: "2026-09-18T01:00:00.000Z" },
+      { id: "conv-other", last_message_at: "2026-09-18T00:30:00.000Z" },
+    ],
+  };
+  const result = await loadLcpConversationLastRunAt(backend)({
+    agentId: "agent-1",
+    conversationId: "conv-self",
+  });
+  // Must surface the OTHER conv, not the one we're standing in.
+  assert.equal(result.kind, "recent");
+  assert.equal(result.conversation_id, "conv-other");
+});
+
+// Fail-open assertion for the renderer: when the buildAgentInfo anchor
+// appears twice the patch must skip and not patch either site.
+test("patch-loader: lcp-clr-x fail-open on a duplicate-renderer source", () => {
+  const doubleSource = "class A {\n" + CLR_RENDERER_TOKEN + "\n}\nclass B {\n" + CLR_RENDERER_TOKEN + "\n}\n";
+  const { source, skippedPatches } = patchLettaCodeSourceResultForTest(doubleSource);
+  // Source must be untouched (every other patch anchor is absent so the only
+  // thing the loader could have done is patch a renderer site — which it
+  // must not do with a duplicate anchor). However, OTHER patches may have
+  // applied (the THINKING/CHOKEPOINT tokens are also absent here), so the
+  // assertion is specifically that the renderer anchor was not patched.
+  assert.equal(
+    source.split(CLR_RENDERER_TOKEN).length - 1,
+    2,
+    "the renderer anchor must remain in both sites when duplicated",
+  );
+  assert.ok(skippedPatches >= 1, "duplicate renderer anchor must bump skipped count");
+
+  // Single-occurrence must be patched.
+  const single = "class A {\n" + CLR_RENDERER_TOKEN + "\n}\n";
+  const patchedSingle = patchLettaCodeSourceForTest(single);
+  assert.ok(
+    patchedSingle.includes("const lastRunInfo = globalThis.__lcpFormatLastRun(lastRunRaw);"),
+    "single-occurrence renderer anchor must be rewritten to call the formatter",
+  );
 });

@@ -565,6 +565,12 @@ class Supervisor {
             text: replyText,
             replyToMessageId: inbound["messageId"] ?? null,
             threadId,
+            // Attribute the reply to the agent that produced it, so channels
+            // with per-agent identity routing (e.g. matrix send-as-agent) post
+            // under that agent's own identity rather than the shared account.
+            // Generic across all agents — the route already resolved which agent
+            // owns this conversation.
+            senderAgentId: route.agentId,
           });
           this.handle.lastOutboundAt = nowIso();
         } catch (err) {

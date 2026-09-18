@@ -677,6 +677,180 @@ test("subagent-registry: dead-PID running entry is never surfaced as running", (
   __resetSubagentRegistry();
 });
 
+// ── lcp-a08r: Fix false-terminal sweep for background subagents without PID ──
+
+test("lcp-a08r fix #1: sweep preserves unknown-PID running entry with existing log file at age 120s", () => {
+  // PRIMARY FIX: Background Task dispatches NEVER have a PID (letta.js prints
+  // no PID line; parseAgentReturnBody /PID:\s*(\d+)/i never matches), so EVERY
+  // long-running background subagent got falsely killed at ~90s. The sweep must
+  // NOT finalize unknown-PID entries with existing log files on age alone; let
+  // the log-terminal-marker check and the watch/timeout machinery handle it.
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-a08r-preserve-unknown-pid-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_long_running.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\nworking for a long time\n");
+    ingestParentFrame(dispatchFrame(tcid, "Long-running no-PID subagent"), "run-a08r");
+    // Background dispatch with NO PID in the return (letta.js typical behavior).
+    ingestParentFrame(returnFrame(tcid, "task_long_running", "agent-local-a08r-1111-2222-3333-444444444444", logFile), "run-a08r");
+    
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.workerPid, null, "background dispatch should have null PID (no PID line in log)");
+    assert.equal(entry?.status, "running");
+
+    // Sweep at age 120s (well past SUBAGENT_NO_LOGFILE_TIMEOUT_MS=90s).
+    const swept = sweepOrphanedSubagents(Date.parse(entry!.startedAt) + 120_000);
+
+    assert.equal(swept, 0, "sweep must NOT finalize unknown-PID entry with existing log file");
+    const stillRunning = getSubagent(tcid);
+    assert.equal(stillRunning?.status, "running", "entry must remain running");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("lcp-a08r fix #1: sweep finalizes confirmed-dead PID (worker_process_dead)", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-a08r-dead-pid-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_dead_worker.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\nworking\n");
+    ingestParentFrame(dispatchFrame(tcid, "Dead worker PID"), "run-a08r-dead");
+    ingestParentFrame(returnFrame(tcid, "task_dead_worker", "agent-local-a08r-dead-5555-6666-7777-888888888888", logFile, 999999), "run-a08r-dead");
+    __setSubagentProcessAliveCheckerForTest((pid) => {
+      assert.equal(pid, 999999);
+      return false; // PID is dead.
+    });
+
+    const swept = sweepOrphanedSubagents(Date.now());
+
+    assert.equal(swept, 1, "sweep must finalize confirmed-dead PID");
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "failed");
+    assert.equal(entry?.failureReason, "worker_process_dead");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("lcp-a08r fix #1: sweep finalizes no-logfile entry older than 90s (orphaned)", () => {
+  __resetSubagentRegistry();
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    const entry = recordSubagentDispatch({
+      toolCallId: tcid,
+      parentRunId: "run-a08r-no-logfile",
+      args: { description: "Dispatch never produced a log", run_in_background: true },
+    });
+
+    const swept = sweepOrphanedSubagents(Date.parse(entry.startedAt) + 90_001);
+
+    assert.equal(swept, 1, "sweep must finalize no-logfile entry older than 90s");
+    const sweptEntry = getSubagent(tcid);
+    assert.equal(sweptEntry?.status, "failed");
+    assert.equal(sweptEntry?.failureReason, "orphaned");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("lcp-a08r fix #3: readLogTerminalStatus returns completed for subagent_status=success without [Task completed]", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-a08r-success-marker-"));
+  const logFile = join(tmpDir, "task_success_marker.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nworking\nsubagent_status=success\nfinal output\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, "completed", "subagent_status=success must return 'completed' even without [Task completed]");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("lcp-a08r fix #3: sweep completes running entry when log has subagent_status=success", () => {
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-a08r-success-sweep-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_success_sweep.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started]\nworking\n");
+    ingestParentFrame(dispatchFrame(tcid, "Success marker sweep"), "run-a08r-success");
+    ingestParentFrame(returnFrame(tcid, "task_success_sweep", "agent-local-a08r-succ-9999-aaaa-bbbb-cccccccccccc", logFile), "run-a08r-success");
+    assert.equal(getSubagent(tcid)?.status, "running");
+    // Simulate log file getting subagent_status=success but no [Task completed] footer.
+    writeFileSync(logFile, "[Task started]\nworking\nsubagent_status=success\nfinal output\n");
+
+    const swept = sweepOrphanedSubagents(Date.now());
+
+    assert.equal(swept, 1);
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.status, "completed", "sweep must complete entry with subagent_status=success");
+    assert.equal(entry?.failureReason, null);
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
+test("lcp-a08r regression: subagent_status=error still fails", () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "shim-a08r-error-regression-"));
+  const logFile = join(tmpDir, "task_error_regression.log");
+  try {
+    writeFileSync(
+      logFile,
+      "[Task started]\nworking\nsubagent_status=error\nstopped\n",
+      "utf8",
+    );
+    const status = __readLogTerminalStatus(logFile);
+    assert.equal(status, "failed", "subagent_status=error must still return 'failed'");
+  } finally {
+    unlinkSync(logFile);
+  }
+});
+
+test("lcp-a08r integration: long-running background subagent with no PID stays running past 90s", () => {
+  // End-to-end test: a background dispatch with no PID line (typical letta.js
+  // behavior) must NOT be swept as orphaned at 90s. This is the exact user-facing
+  // bug: "my long-running subagent gets killed at ~90s even though it's still working."
+  __resetSubagentRegistry();
+  const stateDir = join(tmpdir(), `shim-a08r-integration-${Math.random().toString(36).slice(2)}`);
+  const logFile = join(stateDir, "task_integration.log");
+  const tcid = `toolu_${Math.random().toString(36).slice(2)}`;
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(logFile, "[Task started: Long-running research]\nworking step 1\nworking step 2\n");
+    ingestParentFrame(dispatchFrame(tcid, "Long-running research"), "run-a08r-integration");
+    ingestParentFrame(returnFrame(tcid, "task_integration", "agent-local-a08r-integ-aaaa-bbbb-cccc-dddddddddddd", logFile), "run-a08r-integration");
+    
+    const entry = getSubagent(tcid);
+    assert.equal(entry?.workerPid, null, "background dispatch should have null PID");
+    assert.equal(entry?.status, "running");
+
+    // Sweep at age 100s, 200s, 300s (all past the old 90s threshold).
+    const startedMs = Date.parse(entry!.startedAt);
+    sweepOrphanedSubagents(startedMs + 100_000);
+    assert.equal(getSubagent(tcid)?.status, "running", "must stay running at 100s");
+    sweepOrphanedSubagents(startedMs + 200_000);
+    assert.equal(getSubagent(tcid)?.status, "running", "must stay running at 200s");
+    sweepOrphanedSubagents(startedMs + 300_000);
+    assert.equal(getSubagent(tcid)?.status, "running", "must stay running at 300s");
+
+    // Now write terminal marker and sweep should pick it up.
+    writeFileSync(logFile, "[Task started: Long-running research]\nworking step 1\nworking step 2\nsubagent_status=success\n");
+    sweepOrphanedSubagents(startedMs + 400_000);
+    assert.equal(getSubagent(tcid)?.status, "completed", "must finalize as completed when log has terminal marker");
+  } finally {
+    __resetSubagentRegistry();
+  }
+});
+
 // ── Regression: premature subagent chip termination fix (PR #139, 8403bd8f) ─
 
 test("readLogTerminalStatus: false positive - substring in tool output does NOT trigger completion", () => {
