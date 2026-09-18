@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import {
@@ -699,8 +699,17 @@ const CLONE_MAP_COMPARE_ANCHOR = "localMessagesHaveSameSnapshot(persistedMessage
 // the pinned dev dependency in node_modules (0.19.x, which predates
 // persistCompiledSystemPrompt entirely — the patches simply fail-open there).
 function resolveDeployedLettaBundle(): string | null {
+  // Deployment order, newest first. The stale copy under .bun is several releases behind what
+  // the service runs, and asserting "nothing fails open" against it asserts nothing useful.
+  const versioned = existsSync("/root")
+    ? readdirSync("/root")
+        .filter((entry) => entry.startsWith("letta-code-") && !entry.endsWith(".tgz"))
+        .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+        .map((entry) => join("/root", entry, "node_modules/@letta-ai/letta-code/letta.js"))
+    : [];
   const candidates = [
     process.env["LETTA_CLI_PATH_REAL"] ?? "",
+    ...versioned,
     "/root/.bun/install/global/node_modules/@letta-ai/letta-code/letta.js",
     resolveLettaBundle() ?? "",
   ].filter(Boolean);
@@ -723,7 +732,8 @@ test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map de
   const bundle = readFileSync(bundlePath, "utf8");
 
   // Unique-match assertion holds on the real bundle (drift alarm on update).
-  assert.equal(bundle.split(SYS_PROMPT_ANCHOR).length - 1, 1, "P1 anchor must be unique");
+  const sysPromptSites = [...bundle.matchAll(/  persistCompiledSystemPrompt\(conversationId, agentId\) \{/g)];
+  assert.equal(sysPromptSites.length, 1, "P1 anchor must be unique");
   assert.equal(bundle.split(CLONE_MAP_BULK_ANCHOR).length - 1, 1, "P2 bulk anchor must be unique");
   assert.equal(bundle.split(CLONE_MAP_APPEND_ANCHOR).length - 1, 1, "P2 append anchor must be unique");
   assert.equal(bundle.split(CLONE_MAP_COMPARE_ANCHOR).length - 1, 1, "P2 compare anchor must be unique");
@@ -734,8 +744,16 @@ test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map de
   // P1: dirty-check in place, memo helper injected, unconditional write gone.
   assert.ok(patched.includes("if (globalThis.__lcpSysPromptJson.get(key) === json)"));
   assert.ok(patched.includes("globalThis.__lcpSysPromptJson = globalThis.__lcpSysPromptJson || new Map();"));
-  assert.ok(patched.includes('writeFileSync17(join39(conversationDir, "system-prompt.json"), json + "\\n");'));
-  assert.ok(!patched.includes(SYS_PROMPT_ANCHOR));
+  // Shape, not binding numbers: the minifier renumbers those on most releases and the anchor
+  // is built to tolerate it, so freezing them here would fail the next upgrade for no reason.
+  assert.ok(
+    /writeFileSync\d+\(join\d+\(conversationDir, "system-prompt\.json"\), json \+ "\\n"\);/.test(patched),
+    "the memoized write must be in place",
+  );
+  assert.ok(
+    !/writeFileSync\d+\(join\d+\(conversationDir, "system-prompt\.json"\), `\$\{JSON\.stringify/.test(patched),
+    "the unconditional write must be gone",
+  );
 
   // P2: all three sites dehydrated atomically.
   assert.ok(patched.includes(".set(entry.message.id, JSON.stringify(entry.message));"));
@@ -746,11 +764,12 @@ test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map de
   assert.ok(patched.includes("cloneLocalMessage("));
 });
 
-test("patch-loader: lcp-aioi8-p1 fail-open on single-byte anchor drift", () => {
-  // Mutate one byte inside the anchor: the method is renamed, so nothing may
-  // be patched and the source must come back byte-identical (fail-open).
+test("patch-loader: lcp-aioi8-p1 fail-open on structural anchor drift", () => {
+  // Renumbered bindings (mkdirSync23 -> mkdirSync24) are what the anchor now tolerates by
+  // design, so drift has to be structural to prove fail-open: the method itself is renamed.
+  // Nothing may be patched and the source must come back byte-identical.
   const drifted = "const before = 1;\n" +
-    SYS_PROMPT_ANCHOR.replace("mkdirSync23", "mkdirSync24") +
+    SYS_PROMPT_ANCHOR.replace("persistCompiledSystemPrompt", "persistCompiledSystemPromptV2") +
     "\nconst after = 2;\n";
 
   const { source, appliedPatches } = patchLettaCodeSourceResultForTest(drifted);
@@ -840,5 +859,127 @@ test("patch-loader: lcp-aioi8-p1 dirty-check skips unchanged system-prompt write
     assert.equal(evaluated.writes[1]?.data, JSON.stringify({ system: "beta" }, null, 2) + "\n");
   } finally {
     globals.__lcpSysPromptJson = previousMemo;
+  }
+});
+
+// lcp-otid — the streamed assistant otid has to survive the durable write, or a
+// client cannot pair the streamed row with the settled one except by matching
+// their text, which duplicates a reply whenever a stream drops its tail.
+const OTID_STAMP_ANCHOR = `            yield createLocalMessageChunk(event.message);`;
+const OTID_PERSIST_ANCHOR = `    usage: message.usage ?? emptyLocalUsage(),`;
+const OTID_PROJECT_ANCHOR =
+  "    messages.push({\n" +
+  "      id: isFirst ? message.id : `${message.id}:assistant:${pendingTextStartIndex}`,\n" +
+  "      date,\n" +
+  "      agent_id: agentId,\n" +
+  "      conversation_id: conversationId,\n" +
+  '      message_type: "assistant_message",\n' +
+  '      role: "assistant",\n' +
+  "      content: pendingTextContent\n" +
+  "    });";
+
+test("patch-loader: lcp-otid stamps the segment otid and persists it", () => {
+  const bundle =
+    "const before = 1;\n" +
+    OTID_STAMP_ANCHOR + "\n" +
+    OTID_PERSIST_ANCHOR + "\n" +
+    OTID_PROJECT_ANCHOR + "\n" +
+    "const after = 2;\n";
+
+  const patched = patchLettaCodeSourceForTest(bundle);
+
+  // Stamped where the otids were minted, persisted where the record is built.
+  assert.ok(patched.includes("globalThis.__lcpStampAssistantOtids(event.message, assistantOtids)"));
+  assert.ok(patched.includes("...message.otid ? { otid: message.otid } : {},"));
+  assert.ok(patched.includes("globalThis.__lcpStampAssistantOtids = globalThis.__lcpStampAssistantOtids ||"));
+});
+
+test("patch-loader: lcp-otid stamps the first segment and records them all", () => {
+  const globals = globalThis as Record<string, unknown>;
+  const previous = globals["__lcpStampAssistantOtids"];
+  delete globals["__lcpStampAssistantOtids"];
+  try {
+    const patched = patchLettaCodeSourceForTest(
+      OTID_STAMP_ANCHOR + "\n" + OTID_PERSIST_ANCHOR + "\n" + OTID_PROJECT_ANCHOR + "\n",
+    );
+    // The helper is injected ahead of the bundle; take exactly it, so the test
+    // evaluates the shipped source rather than a copy that could drift from it.
+    const start = patched.indexOf("globalThis.__lcpStampAssistantOtids =");
+    assert.ok(start >= 0, "helper must be injected");
+    const end = patched.indexOf("\n};\n", start);
+    assert.ok(end > start, "helper must be terminated");
+    new Function(patched.slice(start, end + "\n};".length))();
+    const stamp = globals["__lcpStampAssistantOtids"] as
+      (message: unknown, otids: unknown) => Record<string, unknown>;
+
+    const otids = new Map<number, string>([
+      [0, "provider-assistant-0-aaa"],
+      [2, "provider-assistant-2-bbb"],
+    ]);
+    const message: Record<string, unknown> = { role: "assistant", content: [] };
+    const stamped = stamp(message, otids);
+
+    // The first segment names the row, because that is the id the stream opens
+    // with; the rest are kept so a multi-segment reply can still be paired.
+    assert.equal(stamped["otid"], "provider-assistant-0-aaa");
+    // Keyed by the segment index they were minted under, so the read path can
+    // look one up exactly when a stored reply projects into several frames.
+    assert.deepEqual(
+      (stamped["metadata"] as Record<string, unknown>)["segment_otids"],
+      { "0": "provider-assistant-0-aaa", "2": "provider-assistant-2-bbb" },
+    );
+    // Stamping is in place: the object the caller persists is the one we edited.
+    assert.equal(stamped, message);
+
+    // An otid the turn already carries wins; a stamp must never rename a row.
+    const named: Record<string, unknown> = { otid: "already-named" };
+    assert.equal(stamp(named, otids)["otid"], "already-named");
+
+    // Nothing to stamp, nothing changed.
+    const empty: Record<string, unknown> = { role: "assistant" };
+    assert.equal(stamp(empty, new Map())["otid"], undefined);
+  } finally {
+    if (previous === undefined) delete globals["__lcpStampAssistantOtids"];
+    else globals["__lcpStampAssistantOtids"] = previous;
+  }
+});
+
+test("patch-loader: lcp-otid projects the stored otid back onto history frames", () => {
+  const globals = globalThis as Record<string, unknown>;
+  const previous = globals["__lcpSegmentOtid"];
+  delete globals["__lcpSegmentOtid"];
+  try {
+    const patched = patchLettaCodeSourceForTest(
+      OTID_STAMP_ANCHOR + "\n" + OTID_PERSIST_ANCHOR + "\n" + OTID_PROJECT_ANCHOR + "\n",
+    );
+    assert.ok(patched.includes("globalThis.__lcpSegmentOtid(message, pendingTextStartIndex, isFirst)"));
+
+    const start = patched.indexOf("globalThis.__lcpSegmentOtid =");
+    assert.ok(start >= 0, "projection helper must be injected");
+    const end = patched.indexOf("\n};\n", start);
+    new Function(patched.slice(start, end + "\n};".length))();
+    const segmentOtid = globals["__lcpSegmentOtid"] as
+      (message: unknown, index: number, isFirst: boolean) => Record<string, unknown>;
+
+    const stored = {
+      otid: "provider-assistant-0-aaa",
+      metadata: {
+        segment_otids: { "0": "provider-assistant-0-aaa", "2": "provider-assistant-2-bbb" },
+      },
+    };
+    // Each projected frame carries the otid of the segment it was flushed from.
+    assert.deepEqual(segmentOtid(stored, 0, true), { otid: "provider-assistant-0-aaa" });
+    assert.deepEqual(segmentOtid(stored, 2, false), { otid: "provider-assistant-2-bbb" });
+    // A segment with no recorded otid names nothing rather than borrowing one.
+    assert.deepEqual(segmentOtid(stored, 5, false), {});
+    // Records written before this patch fall back to the row otid on the first
+    // frame only, and never invent one for a later segment.
+    const legacy = { otid: "provider-assistant-0-ccc" };
+    assert.deepEqual(segmentOtid(legacy, 0, true), { otid: "provider-assistant-0-ccc" });
+    assert.deepEqual(segmentOtid(legacy, 3, false), {});
+    assert.deepEqual(segmentOtid({}, 0, true), {});
+  } finally {
+    if (previous === undefined) delete globals["__lcpSegmentOtid"];
+    else globals["__lcpSegmentOtid"] = previous;
   }
 });

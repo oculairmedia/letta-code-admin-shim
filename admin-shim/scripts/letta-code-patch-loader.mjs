@@ -129,16 +129,22 @@ const EFFECTIVE_AGENT_MODEL_SETTINGS_FIX_LITERAL =
   `      ...typeof conversationRecord.context_window_limit === "number" ? { context_window_limit: conversationRecord.context_window_limit } : {}\n` +
   `    })`;
 
-const THINKING_REQUEST_GUARD_ANCHOR =
-  `  if (options3?.metadata) {\n` +
-  `    const userId = options3.metadata.user_id;`;
+const THINKING_REQUEST_GUARD_PATTERN =
+  /  if \((options\d*)\?\.metadata\) \{\n    const userId = \1\.metadata\.user_id;/g;
 
-const THINKING_REQUEST_GUARD_INSERT =
-  `  if (params.thinking && params.thinking.type !== "enabled" && "budget_tokens" in params.thinking) {\n` +
-  `    delete params.thinking.budget_tokens;\n` +
-  `  }\n` +
-  `  if (options3?.metadata) {\n` +
-  `    const userId = options3.metadata.user_id;`;
+/**
+ * @param {string} options the captured binding name
+ * @returns {string}
+ */
+function thinkingRequestGuardInsert(options) {
+  return (
+    `  if (params.thinking && params.thinking.type !== "enabled" && "budget_tokens" in params.thinking) {\n` +
+    `    delete params.thinking.budget_tokens;\n` +
+    `  }\n` +
+    `  if (${options}?.metadata) {\n` +
+    `    const userId = ${options}.metadata.user_id;`
+  );
+}
 
 // lcp-7kk: universal chokepoint guard.
 //
@@ -497,36 +503,36 @@ const OPENAI_TOOLS_INDENTED_REPLACEMENT =
 const SYS_PROMPT_MEMO_HELPER_DEFINITION =
   "globalThis.__lcpSysPromptJson = globalThis.__lcpSysPromptJson || new Map();\n";
 
-const SYS_PROMPT_PERSIST_TOKEN =
-  "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
-  "    if (!this.storageDir)\n" +
-  "      return;\n" +
-  "    const key = this.conversationKey(conversationId, agentId);\n" +
-  "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
-  "    if (!prompt)\n" +
-  "      return;\n" +
-  "    const conversationDir = join39(this.storageDir, \"conversations\", encodePathSegment(key));\n" +
-  "    mkdirSync23(conversationDir, { recursive: true });\n" +
-  "    writeFileSync17(join39(conversationDir, \"system-prompt.json\"), `${JSON.stringify(prompt, null, 2)}\n" +
-  "`);\n" +
-  "  }";
+// The three fs bindings are numbered by the minifier and renumber on most releases, so they
+// are captured rather than spelled. Everything else here is the behaviour being replaced.
+const SYS_PROMPT_PERSIST_PATTERN =
+  /  persistCompiledSystemPrompt\(conversationId, agentId\) \{\n    if \(!this\.storageDir\)\n      return;\n    const key = this\.conversationKey\(conversationId, agentId\);\n    const prompt = this\.compiledSystemPromptByConversationKey\.get\(key\);\n    if \(!prompt\)\n      return;\n    const conversationDir = (join\d+)\(this\.storageDir, "conversations", encodePathSegment\(key\)\);\n    (mkdirSync\d+)\(conversationDir, \{ recursive: true \}\);\n    (writeFileSync\d+)\(\1\(conversationDir, "system-prompt\.json"\), `\$\{JSON\.stringify\(prompt, null, 2\)\}\n`\);\n  \}/g;
 
-const SYS_PROMPT_PERSIST_REPLACEMENT =
-  "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
-  "    if (!this.storageDir)\n" +
-  "      return;\n" +
-  "    const key = this.conversationKey(conversationId, agentId);\n" +
-  "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
-  "    if (!prompt)\n" +
-  "      return;\n" +
-  "    const json = JSON.stringify(prompt, null, 2);\n" +
-  "    if (globalThis.__lcpSysPromptJson.get(key) === json)\n" +
-  "      return;\n" +
-  "    const conversationDir = join39(this.storageDir, \"conversations\", encodePathSegment(key));\n" +
-  "    mkdirSync23(conversationDir, { recursive: true });\n" +
-  "    writeFileSync17(join39(conversationDir, \"system-prompt.json\"), json + \"\\n\");\n" +
-  "    globalThis.__lcpSysPromptJson.set(key, json);\n" +
-  "  }";
+/**
+ * @param {string} join
+ * @param {string} mkdirSync
+ * @param {string} writeFileSync
+ * @returns {string}
+ */
+function sysPromptPersistReplacement(join, mkdirSync, writeFileSync) {
+  return (
+    "  persistCompiledSystemPrompt(conversationId, agentId) {\n" +
+    "    if (!this.storageDir)\n" +
+    "      return;\n" +
+    "    const key = this.conversationKey(conversationId, agentId);\n" +
+    "    const prompt = this.compiledSystemPromptByConversationKey.get(key);\n" +
+    "    if (!prompt)\n" +
+    "      return;\n" +
+    "    const json = JSON.stringify(prompt, null, 2);\n" +
+    "    if (globalThis.__lcpSysPromptJson.get(key) === json)\n" +
+    "      return;\n" +
+    `    const conversationDir = ${join}(this.storageDir, "conversations", encodePathSegment(key));\n` +
+    `    ${mkdirSync}(conversationDir, { recursive: true });\n` +
+    `    ${writeFileSync}(${join}(conversationDir, "system-prompt.json"), json + "\\n");\n` +
+    "    globalThis.__lcpSysPromptJson.set(key, json);\n" +
+    "  }"
+  );
+}
 
 // lcp-aioi8-p2 (patch #19): dehydrate the persisted-message dedupe map.
 //
@@ -570,7 +576,162 @@ const CLONE_MAP_COMPARE_TOKEN =
 const CLONE_MAP_COMPARE_REPLACEMENT =
   "persistedMessage === JSON.stringify(message)";
 
+// lcp-oaiap: the OpenAI-compatible API (/v1/chat/completions and /v1/responses)
+// aborts a turn the moment the runtime reports WAITING_ON_APPROVAL, replacing
+// the agent's real answer with a canned "this API does not support" note.
+//
+// That is a RACE, not a capability gate. With auto-approval configured the
+// runtime passes briefly through WAITING_ON_APPROVAL, then approves and runs the
+// tool: the on-disk conversation holds the toolCall, a toolResult with
+// isError:false, and a correct final assistant message -- all written AFTER the
+// HTTP response was already finished with the canned text. Verified 2026-09-04
+// with `echo HELLO_FROM_TOOL`: local-conv-270 ends with "Exact output:
+// HELLO_FROM_TOOL" while the API returned the approval note. /v1/responses is
+// the same code path (it emits status:"incomplete" plus the same note), so this
+// is not fixable by switching surfaces.
+//
+// Ignore the transient status instead of finishing. A genuinely stuck approval
+// stays bounded by the existing OPENAI_TURN_TIMEOUT_MS (15 min) backstop, which
+// reports an honest timeout rather than a false capability claim.
+// Set LETTA_OPENAI_API_APPROVAL_BAIL=1 to restore stock bail-out behavior.
+const OPENAI_APPROVAL_BAIL_TOKEN = `if (status === "WAITING_ON_APPROVAL") {`;
+const OPENAI_APPROVAL_BAIL_REPLACEMENT =
+  `if (status === "WAITING_ON_APPROVAL" && globalThis.__lcpOpenAiApprovalBail()) {`;
+const OPENAI_APPROVAL_BAIL_HELPER =
+  `globalThis.__lcpOpenAiApprovalBail = globalThis.__lcpOpenAiApprovalBail || function () {\n` +
+  `  return process.env.LETTA_OPENAI_API_APPROVAL_BAIL === "1";\n` +
+  `};\n`;
+
+// lcp-otid — persist the streamed assistant otid on the durable record.
+//
+// letta-code already mints a stable per-segment id for streamed assistant text
+// (`provider-assistant-<segmentIndex>-<uuid>`, via otidForContentSegment) and
+// emits it as `otid` on every assistant_message delta; mobile sees it prefixed
+// as `cm-stream-provider-assistant-...`. The durable write does NOT keep it:
+// toLocalAssistantMessage stores responseId, model, provider and usage, so the
+// stored row shares no identifier with the stream that produced it.
+//
+// Clients are therefore forced to pair the streamed row with the settled row by
+// matching their text, and that fails the instant a stream drops its tail: both
+// rows stay on screen and the reply renders twice. Measured on device
+// 2026-09-11 — streamed 368 characters against a stored 369, a single missing
+// "?" was enough to duplicate a reply.
+//
+// The user path already persists its otid, which is exactly why user messages
+// have a key and assistant messages do not. This closes that asymmetry. The
+// local-message event carries the record that is about to be persisted, and it
+// arrives on the same generator that owns `assistantOtids`, after the deltas
+// that minted them — so the ids are stamped in place, with no global state and
+// no cross-talk between concurrent conversations.
+// The bundle's minifier names this binding `event` in 0.30.x and `event2` in
+// 0.29.x, so the stamp is tried against both spellings and the first that
+// matches exactly once wins. Everything else about the site is identical.
+const OTID_STAMP_VARIANTS = ["event", "event2"].map((binding) => ({
+  token: `            yield createLocalMessageChunk(${binding}.message);`,
+  replacement:
+    `            yield createLocalMessageChunk(globalThis.__lcpStampAssistantOtids(${binding}.message, assistantOtids));`,
+}));
+
+// toLocalAssistantMessage names every field it keeps, so a stamped otid has to
+// be named here too or the durable write drops it again.
+const OTID_PERSIST_TOKEN =
+  `    usage: message.usage ?? emptyLocalUsage(),`;
+const OTID_PERSIST_REPLACEMENT =
+  `    ...message.otid ? { otid: message.otid } : {},\n` +
+  `    usage: message.usage ?? emptyLocalUsage(),`;
+
+const OTID_HELPER =
+  `globalThis.__lcpStampAssistantOtids = globalThis.__lcpStampAssistantOtids || function (message, otids) {\n` +
+  `  try {\n` +
+  `    if (!message || typeof message !== "object") return message;\n` +
+  `    if (!otids || typeof otids.values !== "function") return message;\n` +
+  `    const byIndex = {};\n` +
+  `    for (const [index, value] of otids.entries()) {\n` +
+  `      if (typeof value === "string" && value.length > 0) byIndex[String(index)] = value;\n` +
+  `    }\n` +
+  `    const indexes = Object.keys(byIndex).map(Number).sort((a, b) => a - b);\n` +
+  `    if (indexes.length === 0) return message;\n` +
+  `    if (typeof message.otid !== "string" || message.otid.length === 0) {\n` +
+  `      message.otid = byIndex[String(indexes[0])];\n` +
+  `    }\n` +
+  `    const metadata =\n` +
+  `      message.metadata && typeof message.metadata === "object"\n` +
+  `        ? message.metadata\n` +
+  `        : (message.metadata = {});\n` +
+  `    if (!metadata.segment_otids || typeof metadata.segment_otids !== "object") {\n` +
+  `      metadata.segment_otids = byIndex;\n` +
+  `    }\n` +
+  `    return message;\n` +
+  `  } catch {\n` +
+  `    return message;\n` +
+  `  }\n` +
+  `};\n`;
+
+// Persisting the otid is only half of it: the history projection rebuilds
+// assistant frames from the stored record and names every field it emits, so
+// without this the client reading history still sees no identity and falls back
+// to matching text. The segment index the projection is flushing is the same
+// index the otid was minted under, so the lookup is exact even when one stored
+// reply projects into several assistant frames.
+const OTID_PROJECT_TOKEN =
+  `    messages.push({\n` +
+  `      id: isFirst ? message.id : \`\${message.id}:assistant:\${pendingTextStartIndex}\`,\n` +
+  `      date,\n` +
+  `      agent_id: agentId,\n` +
+  `      conversation_id: conversationId,\n` +
+  `      message_type: "assistant_message",\n` +
+  `      role: "assistant",\n` +
+  `      content: pendingTextContent\n` +
+  `    });`;
+
+const OTID_PROJECT_REPLACEMENT =
+  `    messages.push({\n` +
+  `      id: isFirst ? message.id : \`\${message.id}:assistant:\${pendingTextStartIndex}\`,\n` +
+  `      date,\n` +
+  `      agent_id: agentId,\n` +
+  `      conversation_id: conversationId,\n` +
+  `      message_type: "assistant_message",\n` +
+  `      role: "assistant",\n` +
+  `      ...globalThis.__lcpSegmentOtid(message, pendingTextStartIndex, isFirst),\n` +
+  `      content: pendingTextContent\n` +
+  `    });`;
+
+const OTID_PROJECT_HELPER =
+  `globalThis.__lcpSegmentOtid = globalThis.__lcpSegmentOtid || function (message, segmentIndex, isFirst) {\n` +
+  `  try {\n` +
+  `    const segments = message && message.metadata && message.metadata.segment_otids;\n` +
+  `    const fromIndex =\n` +
+  `      segments && typeof segments === "object" ? segments[String(segmentIndex)] : undefined;\n` +
+  `    const otid = typeof fromIndex === "string" && fromIndex.length > 0\n` +
+  `      ? fromIndex\n` +
+  `      : isFirst && typeof message?.otid === "string" && message.otid.length > 0\n` +
+  `        ? message.otid\n` +
+  `        : undefined;\n` +
+  `    return otid ? { otid } : {};\n` +
+  `  } catch {\n` +
+  `    return {};\n` +
+  `  }\n` +
+  `};\n`;
+
 let appliedOnce = false;
+
+/**
+ * Exact-occurrence regex match, the pattern counterpart of [countOccurrences].
+ *
+ * Some anchors differ between releases only in minifier-generated binding names —
+ * `join39` against `join34`, `options3` against `options` — which drifts the literal without
+ * changing a line of behaviour. Capturing those names instead of hard-coding them keeps one
+ * anchor working across releases, while the uniqueness check that follows is the same
+ * fail-open guard an exact literal gets.
+ *
+ * @param {string} source
+ * @param {RegExp} pattern global-flagged
+ * @returns {RegExpMatchArray | null} the only match, or null when it did not match exactly once
+ */
+function matchOnce(source, pattern) {
+  const matches = [...source.matchAll(pattern)];
+  return matches.length === 1 ? matches[0] : null;
+}
 
 /**
  * Exact-occurrence counter used for anchor uniqueness assertions. A drifted
@@ -619,15 +780,18 @@ function patchLettaCodeSource(raw, path, warn) {
     );
   }
 
-  if (patched.includes(THINKING_REQUEST_GUARD_ANCHOR)) {
-    patched = patched.replace(THINKING_REQUEST_GUARD_ANCHOR, THINKING_REQUEST_GUARD_INSERT);
-    appliedPatches += 1;
-  } else {
-    skippedPatches += 1;
-    if (warn) process.stderr.write(
-      `[letta-code-patch] WARN: thinking-request guard anchor not found in ${path} — ` +
-      `running without lcp-9pn request guard\n`,
-    );
+  {
+    const guard = matchOnce(patched, THINKING_REQUEST_GUARD_PATTERN);
+    if (guard) {
+      patched = patched.replace(guard[0], thinkingRequestGuardInsert(guard[1] ?? "options"));
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: thinking-request guard anchor did not match exactly once in ${path} — ` +
+        `running without lcp-9pn request guard\n`,
+      );
+    }
   }
 
   // lcp-7kk: universal chokepoint normalizer for every Anthropic request.
@@ -776,15 +940,19 @@ function patchLettaCodeSource(raw, path, warn) {
   // FAIL-OPEN with a unique-match assertion: anchor absent OR matched more
   // than once → warn + skip, never throw at boot.
   {
-    const occurrences = countOccurrences(patched, SYS_PROMPT_PERSIST_TOKEN);
-    if (occurrences === 1) {
-      patched = patched.replace(SYS_PROMPT_PERSIST_TOKEN, SYS_PROMPT_PERSIST_REPLACEMENT);
+    const persist = matchOnce(patched, SYS_PROMPT_PERSIST_PATTERN);
+    if (persist) {
+      const [token, join, mkdirSync, writeFileSync] = persist;
+      patched = patched.replace(
+        token,
+        sysPromptPersistReplacement(join ?? "", mkdirSync ?? "", writeFileSync ?? ""),
+      );
       patched = injectHelperAfterShebang(patched, SYS_PROMPT_MEMO_HELPER_DEFINITION);
       appliedPatches += 1;
     } else {
       skippedPatches += 1;
       if (warn) process.stderr.write(
-        `[letta-code-patch] WARN: persistCompiledSystemPrompt anchor matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `[letta-code-patch] WARN: persistCompiledSystemPrompt anchor did not match exactly once in ${path} — ` +
         `running without lcp-aioi8-p1 dirty-check (every append rewrites system-prompt.json)\n`,
       );
     }
@@ -809,6 +977,52 @@ function patchLettaCodeSource(raw, path, warn) {
         `[letta-code-patch] WARN: clone-map anchors matched bulk=${bulkOccurrences} append=${appendOccurrences} compare=${compareOccurrences} ` +
         `(expected exactly 1 each) in ${path} — skipping all of lcp-aioi8-p2 atomically ` +
         `(persisted-message dedupe map keeps full structuredClone graphs)\n`,
+      );
+    }
+  }
+
+  // lcp-oaiap: stop the OpenAI API from aborting auto-approved tool turns.
+  {
+    const occurrences = countOccurrences(patched, OPENAI_APPROVAL_BAIL_TOKEN);
+    if (occurrences === 1) {
+      patched = patched.replace(OPENAI_APPROVAL_BAIL_TOKEN, OPENAI_APPROVAL_BAIL_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, OPENAI_APPROVAL_BAIL_HELPER);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: WAITING_ON_APPROVAL anchor matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-oaiap (the OpenAI API will keep replacing auto-approved tool answers ` +
+        `with the canned "requires interactive approval" note)\n`,
+      );
+    }
+  }
+
+  // lcp-otid: carry the streamed segment otid onto the durable assistant record,
+  // so clients can pair the streamed row with the settled one by identity rather
+  // than by matching their text. Both anchors must be unique and both must land,
+  // or neither does: stamping without persisting is dead weight, and persisting
+  // without stamping stores an otid that no stream ever emitted.
+  {
+    const stamp = OTID_STAMP_VARIANTS.find(
+      (variant) => countOccurrences(patched, variant.token) === 1,
+    );
+    const stampOccurrences = stamp ? 1 : 0;
+    const persistOccurrences = countOccurrences(patched, OTID_PERSIST_TOKEN);
+    const projectOccurrences = countOccurrences(patched, OTID_PROJECT_TOKEN);
+    if (stamp && persistOccurrences === 1 && projectOccurrences === 1) {
+      patched = patched.replace(stamp.token, stamp.replacement);
+      patched = patched.replace(OTID_PERSIST_TOKEN, OTID_PERSIST_REPLACEMENT);
+      patched = patched.replace(OTID_PROJECT_TOKEN, OTID_PROJECT_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, OTID_HELPER);
+      patched = injectHelperAfterShebang(patched, OTID_PROJECT_HELPER);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: assistant-otid anchors matched stamp=${stampOccurrences} persist=${persistOccurrences} project=${projectOccurrences} ` +
+        `(expected exactly 1 each) in ${path} — skipping lcp-otid atomically ` +
+        `(stored assistant messages keep no stream identity, so clients fall back to content matching)\n`,
       );
     }
   }
