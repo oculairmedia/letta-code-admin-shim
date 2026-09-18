@@ -713,6 +713,76 @@ const OTID_PROJECT_HELPER =
   `  }\n` +
   `};\n`;
 
+// lcp-clr: conversation-scoped last-run timestamp.
+//
+// Upstream bug (letta-code >= 0.27.x, the listener warmup path): the agent-info
+// system reminder renders
+//   `- **Last message**: <ts> (<relative>)`
+// from `agent.last_run_completion`, which the local backend derives inside
+// `projectAgent()` from the agent's hardcoded `default` conversation:
+//
+//   const defaultConversation = this.findConversation("default", record.id);
+//   const lastRunCompletion =
+//     defaultConversation?.last_message_at ?? defaultConversation?.updated_at ?? null;
+//
+// So in any non-default conversation the reminder reports the `default`
+// conversation's timestamp — and the relative-time formatter then says
+// "55 days ago" for a conversation the user opened 30 seconds ago. Cloud
+// `last_run_completion` is genuinely agent-scoped (the cloud backend's only
+// notion of a run is per-agent), so `projectAgent` is defensible as written;
+// the bug is that the reminder's read site in the listen path always asks
+// for the agent-scoped value even when the in-flight conversation is in
+// scope. Half conversation-scoped, half agent-scoped.
+//
+// The single listen-path site that builds `listenAgentMetadata` already has
+// `getBackend()`, `agentId`, and the in-flight `conversationId` in scope —
+// `conversationId` is then passed straight into `buildListenReminderContext`
+// a few lines below — so we route the timestamp through a helper that
+// prefers the conversation's own `last_message_at` / `updated_at` and only
+// falls back to the agent-level value when the conversation is the magic
+// `default` id, is missing, or the backend has no conversation API (cloud).
+//
+// Fail-safe: the helper swallows every error and returns the agent-level
+// fallback unchanged, so a future backend rename or method removal degrades
+// to upstream behaviour rather than crashing the reminder build. No bead
+// exists for this fix — the repo's beads DB is currently schema-skewed
+// (v65 DB vs v53 binary), so the fix is tracked only in git.
+const CONVERSATION_LAST_RUN_TOKEN =
+  `      if (!runtime.reminderState.hasSentAgentInfo && cachedAgent) {\n` +
+  `        listenAgentMetadata = {\n` +
+  `          name: cachedAgent.name ?? null,\n` +
+  `          description: cachedAgent.description ?? null,\n` +
+  `          lastRunAt: cachedAgent.last_run_completion ?? null\n` +
+  `        };\n` +
+  `      }`;
+
+const CONVERSATION_LAST_RUN_REPLACEMENT =
+  `      if (!runtime.reminderState.hasSentAgentInfo && cachedAgent) {\n` +
+  `        listenAgentMetadata = {\n` +
+  `          name: cachedAgent.name ?? null,\n` +
+  `          description: cachedAgent.description ?? null,\n` +
+  `          lastRunAt: await globalThis.__lcpConversationLastRunAt(getBackend(), agentId, conversationId, cachedAgent.last_run_completion ?? null)\n` +
+  `        };\n` +
+  `      }`;
+
+const CONVERSATION_LAST_RUN_HELPER_DEFINITION =
+  `globalThis.__lcpConversationLastRunAt = globalThis.__lcpConversationLastRunAt || async function (backend, agentId, conversationId, agentFallback) {\n` +
+  `  try {\n` +
+  `    if (backend && typeof backend.retrieveConversation === "function" &&\n` +
+  `        typeof conversationId === "string" && conversationId !== "" && conversationId !== "default") {\n` +
+  `      const conversation = await backend.retrieveConversation(conversationId, agentId);\n` +
+  `      if (conversation && typeof conversation === "object") {\n` +
+  `        const stamp = conversation.last_message_at ?? conversation.updated_at ?? null;\n` +
+  `        // A resolved conversation is authoritative even when it has no timestamp yet:\n` +
+  `        // a brand-new conversation must read "No previous messages", not inherit the\n` +
+  `        // agent's default-conversation timestamp from months ago.\n` +
+  `        return typeof stamp === "string" && !Number.isNaN(Date.parse(stamp)) ? stamp : null;\n` +
+  `      }\n` +
+  `    }\n` +
+  `  } catch {}\n` +
+  `  return agentFallback;\n` +
+  `};\n`;
+
 let appliedOnce = false;
 
 /**
@@ -1023,6 +1093,28 @@ function patchLettaCodeSource(raw, path, warn) {
         `[letta-code-patch] WARN: assistant-otid anchors matched stamp=${stampOccurrences} persist=${persistOccurrences} project=${projectOccurrences} ` +
         `(expected exactly 1 each) in ${path} — skipping lcp-otid atomically ` +
         `(stored assistant messages keep no stream identity, so clients fall back to content matching)\n`,
+      );
+    }
+  }
+
+  // lcp-clr: conversation-scoped lastRunAt for the agent-info reminder.
+  // Unique-match assertion (skip on miss or duplicate rather than patching
+  // the wrong site): the listen path is the only place that builds
+  // `listenAgentMetadata` from `cachedAgent.last_run_completion`, but a
+  // future version could clone that block for the warmup path — in which
+  // case the patch must skip and leave that copy alone.
+  {
+    const occurrences = countOccurrences(patched, CONVERSATION_LAST_RUN_TOKEN);
+    if (occurrences === 1) {
+      patched = patched.replace(CONVERSATION_LAST_RUN_TOKEN, CONVERSATION_LAST_RUN_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, CONVERSATION_LAST_RUN_HELPER_DEFINITION);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: conversation-last-run token matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-clr (the agent-info reminder will continue to report the agent's ` +
+        `default-conversation timestamp in non-default conversations)\n`,
       );
     }
   }
