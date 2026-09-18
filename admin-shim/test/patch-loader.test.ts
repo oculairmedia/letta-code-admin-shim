@@ -9,6 +9,11 @@ import {
 } from "../scripts/letta-code-patch-loader.mjs";
 import { VISION_MODEL_PATTERNS } from "../lib/model-catalog.js";
 
+// Use this for LEGACY / dev-dep assertions — the pinned admin-shim
+// node_modules copy (0.19.x as of writing). For modern anchors (>=0.27.x)
+// use `resolveDeployedLettaBundle()` instead, which probes the live runtime
+// bundle that `LETTA_CLI_PATH_REAL` points at in production.
+//
 // Resolve the REAL letta.js bundle so the guard test works in CI
 // (admin-shim/node_modules/...) AND locally — never a machine-specific
 // absolute path. `letta.js` is NOT an exported subpath, so resolve the
@@ -27,9 +32,10 @@ function resolveLettaBundle(): string | null {
     if (parent === dir) break;
     dir = parent;
   }
-  // Fallback: the global bun install (local dev convenience).
-  const globalCandidate = "/root/.bun/install/global/" + rel;
-  if (existsSync(globalCandidate)) return globalCandidate;
+  // No deployed / global-bun fallback here — that role belongs to
+  // `resolveDeployedLettaBundle()`. Keeping this resolver scoped to the
+  // pinned dev dep prevents a stale global install from silently
+  // satisfying a test that the deployed bundle would have failed.
   return null;
 }
 
@@ -982,4 +988,120 @@ test("patch-loader: lcp-otid projects the stored otid back onto history frames",
     if (previous === undefined) delete globals["__lcpSegmentOtid"];
     else globals["__lcpSegmentOtid"] = previous;
   }
+});
+
+// lcp-clr: conversation-scoped lastRunAt for the agent-info reminder. The
+// listen-path site that builds `listenAgentMetadata` is the only place that
+// reads `cachedAgent.last_run_completion`, so the anchor must match the
+// deployed bundle exactly once, the rewrite must install the helper via
+// `globalThis.__lcpConversationLastRunAt(...)` against the in-scope
+// `getBackend()`, `agentId`, and `conversationId`, and the original literal
+// line must be gone — otherwise the local backend keeps reporting the
+// agent's `default` conversation timestamp in non-default conversations
+// (the "55 days ago" on a brand-new conversation bug).
+//
+// Anchors and replacements are shape-only — the minifier renumbers bindings
+// on most releases and this test must keep passing across them.
+const CLR_LISTEN_SITE_TOKEN =
+  `      if (!runtime.reminderState.hasSentAgentInfo && cachedAgent) {\n` +
+  `        listenAgentMetadata = {\n` +
+  `          name: cachedAgent.name ?? null,\n` +
+  `          description: cachedAgent.description ?? null,\n` +
+  `          lastRunAt: cachedAgent.last_run_completion ?? null\n` +
+  `        };\n` +
+  `      }`;
+
+test("patch-loader: lcp-clr rewrites the deployed listen-path lastRunAt to a conversation-scoped helper", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) {
+    t.skip(
+      "no letta-code bundle with persistCompiledSystemPrompt (>= 0.27) available on this host — lcp-clr cannot be verified against the real bundle",
+    );
+    return;
+  }
+  const bundle = readFileSync(bundlePath, "utf8");
+
+  // Unique-match assertion holds on the real bundle (drift alarm on upgrade).
+  assert.equal(
+    bundle.split(CLR_LISTEN_SITE_TOKEN).length - 1,
+    1,
+    "lcp-clr anchor must be unique on the deployed bundle",
+  );
+
+  const { source: patched, skippedPatches, appliedPatches } = patchLettaCodeSourceResultForTest(bundle);
+
+  // The deployed-bundle test a few blocks above also asserts
+  // `skippedPatches === 0` after a sequence of patches runs; that contract
+  // must continue to hold with lcp-clr appended — the patch succeeds against
+  // a real bundle.
+  assert.equal(
+    skippedPatches,
+    0,
+    "no patch (including lcp-clr) may fail-open against the deployed bundle",
+  );
+  assert.ok(
+    (appliedPatches ?? 0) >= 1,
+    "lcp-clr must increment appliedPatches on the deployed bundle",
+  );
+
+  // The original literal line that read `cachedAgent.last_run_completion`
+  // must be gone — replacing the half-conversation-scoped, half-agent-scoped
+  // reminder is the entire point of the patch.
+  assert.equal(
+    patched.split(
+      "          lastRunAt: cachedAgent.last_run_completion ?? null",
+    ).length - 1,
+    0,
+    "the agent-scoped lastRunAt literal must be removed",
+  );
+
+  // The rewrite calls the helper with the three in-scope identifiers plus
+  // the agent-level fallback — they are the only correct seams.
+  assert.ok(
+    patched.includes(
+      "          lastRunAt: await globalThis.__lcpConversationLastRunAt(getBackend(), agentId, conversationId, cachedAgent.last_run_completion ?? null)",
+    ),
+    "the helper call must thread backend / agentId / conversationId and fall back to the agent-scoped value",
+  );
+
+  // The helper is injected after the shebang so Node sees it as a top-level
+  // statement; duplicate-injection is harmless because of the `|| function`
+  // guard but the function body must be present at least once.
+  assert.ok(
+    patched.includes(
+      'globalThis.__lcpConversationLastRunAt = globalThis.__lcpConversationLastRunAt || async function',
+    ),
+    "the __lcpConversationLastRunAt helper must be injected",
+  );
+  assert.ok(
+    patched.includes("backend.retrieveConversation(conversationId, agentId)"),
+    "the helper must resolve the conversation via the backend",
+  );
+  assert.ok(
+    !patched.includes(`return null;\n      }\n    }\n  } catch {}\n  return agentFallback;`),
+    "the helper must surface its no-conversation-match null-return without leaking the literal snippet",
+  );
+});
+
+test("patch-loader: lcp-clr fail-open on a duplicate-anchor source", () => {
+  // Synthesize a minimal source in which the listen-path site appears twice
+  // — e.g. a future letta.js that clones the block for the warmup path.
+  // lcp-clr must skip rather than patching the wrong site and silently
+  // corrupting the warmup path. No other anchor from the upstream patch
+  // list appears in this fragment, so applied/skipped counts are scoped
+  // solely to lcp-clr.
+  const doubleSource = "class A {\n" + CLR_LISTEN_SITE_TOKEN + "\n}\nclass B {\n" + CLR_LISTEN_SITE_TOKEN + "\n}\n";
+  const { source, appliedPatches } = patchLettaCodeSourceResultForTest(doubleSource);
+  assert.equal(source, doubleSource, "double-matched anchor must not be patched anywhere");
+  assert.equal(appliedPatches, 0, "appliedPatches must be 0 when lcp-clr cannot prove uniqueness");
+
+  // Sanity: the same anchor occurring exactly once IS patched.
+  const single = "class A {\n" + CLR_LISTEN_SITE_TOKEN + "\n}\n";
+  const patchedSingle = patchLettaCodeSourceForTest(single);
+  assert.ok(
+    patchedSingle.includes(
+      "          lastRunAt: await globalThis.__lcpConversationLastRunAt(getBackend(), agentId, conversationId, cachedAgent.last_run_completion ?? null)",
+    ),
+    "single-occurrence anchor must be rewritten and routed through the helper",
+  );
 });
