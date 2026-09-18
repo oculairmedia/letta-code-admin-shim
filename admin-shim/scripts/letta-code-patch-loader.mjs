@@ -713,10 +713,11 @@ const OTID_PROJECT_HELPER =
   `  }\n` +
   `};\n`;
 
-// lcp-clr: conversation-scoped last-run timestamp.
+// lcp-clr: conversation-scoped last-run timestamp; lcp-clr-x adds a
+// cross-conversation fallback when the in-flight conversation is empty.
 //
-// Upstream bug (letta-code >= 0.27.x, the listener warmup path): the agent-info
-// system reminder renders
+// Upstream bug (letta-code >= 0.27.x, the listener warmup path): the
+// agent-info system reminder renders
 //   `- **Last message**: <ts> (<relative>)`
 // from `agent.last_run_completion`, which the local backend derives inside
 // `projectAgent()` from the agent's hardcoded `default` conversation:
@@ -738,15 +739,38 @@ const OTID_PROJECT_HELPER =
 // `getBackend()`, `agentId`, and the in-flight `conversationId` in scope —
 // `conversationId` is then passed straight into `buildListenReminderContext`
 // a few lines below — so we route the timestamp through a helper that
-// prefers the conversation's own `last_message_at` / `updated_at` and only
-// falls back to the agent-level value when the conversation is the magic
-// `default` id, is missing, or the backend has no conversation API (cloud).
+// prefers the conversation's own `last_message_at` / `updated_at`,
+// then falls back to the most-recent OTHER conversation on this agent when
+// this conversation is still empty (lcp-clr-x), and otherwise returns
+// `kind: "none"` so the renderer can say "No previous messages" honestly.
 //
-// Fail-safe: the helper swallows every error and returns the agent-level
-// fallback unchanged, so a future backend rename or method removal degrades
-// to upstream behaviour rather than crashing the reminder build. No bead
-// exists for this fix — the repo's beads DB is currently schema-skewed
-// (v65 DB vs v53 binary), so the fix is tracked only in git.
+// Why the cross-conv fallback (lcp-clr-x): a brand-new conversation opened
+// mid-session has no `last_message_at`, but the user may have meaningful
+// continuity in a sibling conversation that started 42 minutes ago. We
+// don't want to surface that as "Last message in this conversation" (a
+// lie) or as "No previous messages" (technically true, useless). The
+// helper returns a structured object `{ kind, last_message_at,
+// conversation_id, summary }` so the renderer can emit a SECOND line:
+//   - **Most recent activity**: <ts> (<relative>) in <conversation_id>.
+// The banner's primary `Last message:` line still reads "No previous
+// messages in this conversation" in the cross-conv case — we never let
+// the sibling-conv timestamp masquerade as THIS conversation's.
+//
+// Interactive path coverage: the same bug exists in the React
+// state-setting sites at ~515437 and ~515495 (the `setAgentLastRunAt`
+// callers), but both feed `hasSentAgentInfo`-gated values that never
+// reach the reminder in the same turn the listen path runs. Subsequent
+// turns get the React-state value (still a bare ISO string from
+// `agent.last_run_completion`); the renderer normalizes that to
+// `kind: "this"` so interactive-path behaviour is preserved.
+//
+// Fail-safe: the helper swallows every error and returns
+// `kind: "none"` on failure. Renderer normalization treats any string
+// `lastRunAt` (legacy interactive-path output) as `kind: "this"`, so
+// even if the helper is missing the renderer still produces the
+// upstream banner. No bead exists for either fix — the repo's beads DB
+// is currently schema-skewed (v65 DB vs v53 binary), so the fix is
+// tracked only in git.
 const CONVERSATION_LAST_RUN_TOKEN =
   `      if (!runtime.reminderState.hasSentAgentInfo && cachedAgent) {\n` +
   `        listenAgentMetadata = {\n` +
@@ -765,22 +789,139 @@ const CONVERSATION_LAST_RUN_REPLACEMENT =
   `        };\n` +
   `      }`;
 
+// Returns a structured object so the renderer can dispatch by kind.
+//   { kind: "this",   last_message_at, conversation_id, summary }
+//   { kind: "recent", last_message_at, conversation_id, summary }
+//   { kind: "none",   last_message_at: null, conversation_id: null, summary: null }
+//
+// `agentFallback` (the buggy `agent.last_run_completion`) is no longer
+// surfaced — returning it was the original bug. Cross-conv fallback uses
+// `listConversations({ agent_id, limit: 5 })` which is already
+// pre-sorted descending by `last_message_at` in the local backend
+// (`src/backend/local/local-conversations.ts:listLocalConversations`).
+// `limit: 5` is one disk scan; cheap for the cold-start path.
 const CONVERSATION_LAST_RUN_HELPER_DEFINITION =
-  `globalThis.__lcpConversationLastRunAt = globalThis.__lcpConversationLastRunAt || async function (backend, agentId, conversationId, agentFallback) {\n` +
+  `globalThis.__lcpConversationLastRunAt = globalThis.__lcpConversationLastRunAt || async function (backend, agentId, conversationId) {\n` +
+  `  const noneResult = () => ({ kind: "none", last_message_at: null, conversation_id: null, summary: null });\n` +
   `  try {\n` +
-  `    if (backend && typeof backend.retrieveConversation === "function" &&\n` +
-  `        typeof conversationId === "string" && conversationId !== "" && conversationId !== "default") {\n` +
-  `      const conversation = await backend.retrieveConversation(conversationId, agentId);\n` +
-  `      if (conversation && typeof conversation === "object") {\n` +
-  `        const stamp = conversation.last_message_at ?? conversation.updated_at ?? null;\n` +
-  `        // A resolved conversation is authoritative even when it has no timestamp yet:\n` +
-  `        // a brand-new conversation must read "No previous messages", not inherit the\n` +
-  `        // agent's default-conversation timestamp from months ago.\n` +
-  `        return typeof stamp === "string" && !Number.isNaN(Date.parse(stamp)) ? stamp : null;\n` +
+  `    if (!backend || typeof backend.retrieveConversation !== "function" ||\n` +
+  `        typeof conversationId !== "string" || conversationId === "" || conversationId === "default") {\n` +
+  `      return noneResult();\n` +
+  `    }\n` +
+  `    const conversation = await backend.retrieveConversation(conversationId, agentId);\n` +
+  `    if (conversation && typeof conversation === "object") {\n` +
+  `      const stamp = conversation.last_message_at ?? conversation.updated_at ?? null;\n` +
+  `      if (typeof stamp === "string" && !Number.isNaN(Date.parse(stamp))) {\n` +
+  `        return { kind: "this", last_message_at: stamp, conversation_id: conversationId, summary: conversation.summary ?? null };\n` +
+  `      }\n` +
+  `    }\n` +
+  `    // lcp-clr-x: in-flight conversation is empty or un-stamped. Surface\n` +
+  `    // the most-recent sibling conversation on the same agent instead of\n` +
+  `    // claiming nothing happened. limit=5 caps the file scan; the local\n` +
+  `    // backend pre-sorts desc by last_message_at.\n` +
+  `    if (backend && typeof backend.listConversations === "function" && typeof agentId === "string" && agentId !== "") {\n` +
+  `      const recent = await backend.listConversations({ agent_id: agentId, limit: 5 });\n` +
+  `      if (Array.isArray(recent)) {\n` +
+  `        const sibling = recent.find((c) => c && typeof c === "object" && c.id !== conversationId && typeof c.last_message_at === "string" && !Number.isNaN(Date.parse(c.last_message_at)));\n` +
+  `        if (sibling) {\n` +
+  `          return { kind: "recent", last_message_at: sibling.last_message_at, conversation_id: sibling.id, summary: sibling.summary ?? null };\n` +
+  `        }\n` +
   `      }\n` +
   `    }\n` +
   `  } catch {}\n` +
-  `  return agentFallback;\n` +
+  `  return noneResult();\n` +
+  `};\n`;
+
+// lcp-clr-x: rewrite buildAgentInfo so it dispatches on the structured
+// object shape returned by the helper. The interactive path still sets
+// `lastRunAt` to a bare ISO string; we normalize that to `{ kind: "this",
+// last_message_at: <str> }` so one branch path covers both shapes.
+//
+// The renderer change is the only place that reads `agentInfo.lastRunAt`,
+// so patching this single function is sufficient — the reminder-build
+// chain is `buildSharedReminderParts({ agent: { lastRunAt, ... } })` →
+// `buildAgentInfo(options)` and no other consumer inspects this field.
+// `getRelativeTime` is a sibling function in the same source file, in
+// scope wherever buildAgentInfo is.
+const BUILD_AGENT_INFO_TOKEN =
+  `function buildAgentInfo(options) {\n` +
+  `  try {\n` +
+  `    const { agentInfo, conversationId } = options;\n` +
+  `    let lastRunInfo = "No previous messages";\n` +
+  `    if (agentInfo.lastRunAt) {\n` +
+  `      try {\n` +
+  `        const lastRunDate = new Date(agentInfo.lastRunAt);\n` +
+  `        const localLastRun = lastRunDate.toLocaleString();\n` +
+  `        const relativeTime = getRelativeTime(agentInfo.lastRunAt);\n` +
+  `        lastRunInfo = \`\${localLastRun} (\${relativeTime})\`;\n` +
+  `      } catch {\n` +
+  `        lastRunInfo = "(failed to parse last run time)";\n` +
+  `      }\n` +
+  `    }\n` +
+  `    const showMemoryDir = (() => {\n` +
+  `      try {\n` +
+  `        return isLocalBackendEnvEnabled() || settingsManager.isMemfsEnabled(agentInfo.id);\n` +
+  `      } catch {\n` +
+  `        return false;\n` +
+  `      }\n` +
+  `    })();`;
+
+const BUILD_AGENT_INFO_REPLACEMENT =
+  `function buildAgentInfo(options) {\n` +
+  `  try {\n` +
+  `    const { agentInfo, conversationId } = options;\n` +
+  `    // Normalize: legacy interactive-path callers pass a bare ISO string;\n` +
+  `    // the new lcp-clr helper passes a structured object. Treat strings\n` +
+  `    // as kind:"this" so one branch path covers both shapes.\n` +
+  `    const lastRunRaw = typeof agentInfo.lastRunAt === "string" && agentInfo.lastRunAt\n` +
+  `      ? { kind: "this", last_message_at: agentInfo.lastRunAt, conversation_id: conversationId ?? null, summary: null }\n` +
+  `      : (agentInfo.lastRunAt && typeof agentInfo.lastRunAt === "object" ? agentInfo.lastRunAt : { kind: "none", last_message_at: null, conversation_id: null, summary: null });\n` +
+  `    const lastRunInfo = globalThis.__lcpFormatLastRun(lastRunRaw);\n` +
+  `    const showMemoryDir = (() => {\n` +
+  `      try {\n` +
+  `        return isLocalBackendEnvEnabled() || settingsManager.isMemfsEnabled(agentInfo.id);\n` +
+  `      } catch {\n` +
+  `        return false;\n` +
+  `      }\n` +
+  `    })();`;
+
+// Renderer formatter. Dispatches on `kind` and emits the full
+// "Last message:" line text. For `kind: "recent"` it returns two
+// concatenated lines (the renderer places them after the bullet row
+// in the existing template). For all other kinds it returns a single
+// line. The wrapped `try/catch` keeps the reminder building even when
+// a sibling conversation object is malformed.
+//
+// The string-concatenation at the bottom matches the original builder's
+// `return \`...${lastRunInfo}...\`;` shape — same `lastRunInfo` variable
+// gets the same interpolated position, so no other line needs to move.
+const BUILD_AGENT_INFO_HELPER_DEFINITION =
+  `globalThis.__lcpFormatLastRun = globalThis.__lcpFormatLastRun || function (lastRun) {\n` +
+  `  try {\n` +
+  `    if (!lastRun || typeof lastRun !== "object") return "No previous messages";\n` +
+  `    if (lastRun.kind !== "this" && lastRun.kind !== "recent" && lastRun.kind !== "none") return "No previous messages";\n` +
+  `    const fmtLine = (stamp) => {\n` +
+  `      const d = new Date(stamp);\n` +
+  `      if (Number.isNaN(d.getTime())) return "No previous messages";\n` +
+  `      const local = d.toLocaleString();\n` +
+  `      const relative = getRelativeTime(stamp);\n` +
+  `      return \`\${local} (\${relative})\`;\n` +
+  `    };\n` +
+  `    if (lastRun.kind === "this") {\n` +
+  `      return lastRun.last_message_at ? fmtLine(lastRun.last_message_at) : "No previous messages";\n` +
+  `    }\n` +
+  `    if (lastRun.kind === "none") {\n` +
+  `      return "No previous messages";\n` +
+  `    }\n` +
+  `    // kind === "recent": primary line says THIS conversation is empty;\n` +
+  `    // second line attributes the recency to the sibling conv by id.\n` +
+  `    const primary = "No previous messages in this conversation";\n` +
+  `    const sibling = fmtLine(lastRun.last_message_at);\n` +
+  `    const targetId = lastRun.conversation_id ? \` in \${lastRun.conversation_id}\` : "";\n` +
+  `    return \`\${primary}\\n- **Most recent activity**: \${sibling}\${targetId}\`;\n` +
+  `  } catch {\n` +
+  `    return "(failed to parse last run time)";\n` +
+  `  }\n` +
   `};\n`;
 
 let appliedOnce = false;
@@ -1119,6 +1260,28 @@ function patchLettaCodeSource(raw, path, warn) {
     }
   }
 
+  // lcp-clr-x: rewrite buildAgentInfo to dispatch on the structured object
+  // returned by the lcp-clr helper. Fail-open on count != 1 — never patch
+  // the wrong site or break the reminder builder. The two patches are
+  // independent: if lcp-clr-x lands but lcp-clr didn't (anchor drifted),
+  // the renderer still works against the legacy string-shaped lastRunAt
+  // because the normalization branch treats strings as kind:"this".
+  {
+    const occurrences = countOccurrences(patched, BUILD_AGENT_INFO_TOKEN);
+    if (occurrences === 1) {
+      patched = patched.replace(BUILD_AGENT_INFO_TOKEN, BUILD_AGENT_INFO_REPLACEMENT);
+      patched = injectHelperAfterShebang(patched, BUILD_AGENT_INFO_HELPER_DEFINITION);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: buildAgentInfo token matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-clr-x (cross-conversation fallback won't render; "No previous messages" ` +
+        `and the agent-level timestamp keep showing as before)\n`,
+      );
+    }
+  }
+
   return { source: patched, appliedPatches, skippedPatches };
 }
 
@@ -1140,6 +1303,11 @@ export function patchLettaCodeSourceForTest(raw) {
 export function patchLettaCodeSourceResultForTest(raw) {
   return patchLettaCodeSource(raw, "<test>", false);
 }
+
+// Exported for tests that eval the helper definition against a stub backend
+// to exercise the kind-dispatch semantics of `__lcpConversationLastRunAt`.
+// The body is unchanged — only the export is new.
+export { CONVERSATION_LAST_RUN_HELPER_DEFINITION };
 
 // Insert injected source after a leading `#!` shebang (which must remain line 1
 // for Node to strip it). ESM hoists `import` declarations, so a statement placed
