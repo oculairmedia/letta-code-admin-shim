@@ -325,9 +325,12 @@ const DOWNGRADE_IMAGES_REPLACEMENT =
 // batch result as a duplicate. Preserve the raw multimodal tool return on the
 // stream chunk; projection layers can still stringify it for UI, while the next
 // model turn keeps the image block.
-const MULTIMODAL_TOOL_RETURN_TOKEN =
-  `tool_return: getDisplayableToolReturn(toolResult.toolReturn),`;
-const MULTIMODAL_TOOL_RETURN_REPLACEMENT = `tool_return: toolResult.toolReturn,`;
+// The bundler suffixes colliding local names (toolResult -> toolResult2 in
+// 0.34.x), so accept either spelling and keep the replacement matching it.
+const MULTIMODAL_TOOL_RETURN_VARIANTS = ["toolResult", "toolResult2"].map((name) => ({
+  token: `tool_return: getDisplayableToolReturn(${name}.toolReturn),`,
+  replacement: `tool_return: ${name}.toolReturn,`,
+}));
 
 // lcp-taqw: normalizeOutgoingApprovalMessages() validates tool returns before
 // sending approval turns back into the local backend. Its built-in
@@ -484,6 +487,39 @@ const OPENAI_TOOLS_INDENTED_REPLACEMENT =
   `    "generate_image"\n` +
   `  ];`;
 
+// letta-code >= 0.32.17 (lcp-htu3 drift, 2026-09-24): the flat DEFAULT_TOOLS /
+// OPENAI_DEFAULT_TOOLS arrays were replaced by TOOLSET_CATALOG.<id>.tools in
+// src/tools/toolset-catalog.ts (8-space entries, `      ]` close, no `;`). One
+// anchor per toolset whose last entry is stable: default ends "Write", codex
+// ends "ApplyPatch","UpdatePlan", letta ends "ViewImage","UpdatePlan". Each is
+// verified unique in 0.32.17 and absent in 0.32.3, so both bundles keep
+// registering generate_image in every default toolset.
+const TOOLSET_CATALOG_DEFAULT_TOKEN =
+  `        "Write"\n` +
+  `      ]`;
+const TOOLSET_CATALOG_DEFAULT_REPLACEMENT =
+  `        "Write",\n` +
+  `        "generate_image"\n` +
+  `      ]`;
+const TOOLSET_CATALOG_CODEX_TOKEN =
+  `        "ApplyPatch",\n` +
+  `        "UpdatePlan"\n` +
+  `      ]`;
+const TOOLSET_CATALOG_CODEX_REPLACEMENT =
+  `        "ApplyPatch",\n` +
+  `        "UpdatePlan",\n` +
+  `        "generate_image"\n` +
+  `      ]`;
+const TOOLSET_CATALOG_LETTA_TOKEN =
+  `        "ViewImage",\n` +
+  `        "UpdatePlan"\n` +
+  `      ]`;
+const TOOLSET_CATALOG_LETTA_REPLACEMENT =
+  `        "ViewImage",\n` +
+  `        "UpdatePlan",\n` +
+  `        "generate_image"\n` +
+  `      ]`;
+
 // lcp-aioi8-p1 (patch #18): system-prompt dirty-check write.
 //
 // `persistCompiledSystemPrompt` rewrites the full ~670KB system-prompt.json on
@@ -563,6 +599,10 @@ const CLONE_MAP_BULK_REPLACEMENT =
   "      messageId,\n" +
   "      JSON.stringify(message)\n" +
   "    ])));";
+// letta-code >= 0.32.17 renamed the local to `transcript2` (2026-09-24). Same
+// site, same shape; the apply block accepts whichever variant matches once.
+const CLONE_MAP_BULK_TOKEN_V2 = CLONE_MAP_BULK_TOKEN.replaceAll("transcript.messageById", "transcript2.messageById");
+const CLONE_MAP_BULK_REPLACEMENT_V2 = CLONE_MAP_BULK_REPLACEMENT.replaceAll("transcript.messageById", "transcript2.messageById");
 
 const CLONE_MAP_APPEND_TOKEN =
   ".set(entry.message.id, cloneLocalMessage(entry.message));";
@@ -626,10 +666,17 @@ const OPENAI_APPROVAL_BAIL_HELPER =
 // The bundle's minifier names this binding `event` in 0.30.x and `event2` in
 // 0.29.x, so the stamp is tried against both spellings and the first that
 // matches exactly once wins. Everything else about the site is identical.
+// letta-code >= 0.32.17 (2026-09-24): the generator no longer owns an
+// `assistantOtids` map (upstream streams and stores the same ui-msg-*:assistant:N
+// id, so the stream/durable identity gap this patch closes is gone there). The
+// stamp site still matches, so reference the map defensively: `typeof` makes a
+// missing binding a no-op (the helper returns the message unchanged for a
+// falsy map) instead of a ReferenceError that failed EVERY turn with
+// `local_backend_error: assistantOtids is not defined`.
 const OTID_STAMP_VARIANTS = ["event", "event2"].map((binding) => ({
   token: `            yield createLocalMessageChunk(${binding}.message);`,
   replacement:
-    `            yield createLocalMessageChunk(globalThis.__lcpStampAssistantOtids(${binding}.message, assistantOtids));`,
+    `            yield createLocalMessageChunk(globalThis.__lcpStampAssistantOtids(${binding}.message, typeof assistantOtids === "undefined" ? undefined : assistantOtids));`,
 }));
 
 // toLocalAssistantMessage names every field it keeps, so a stamped otid has to
@@ -1088,8 +1135,9 @@ function patchLettaCodeSource(raw, path, warn) {
     );
   }
 
-  if (patched.includes(MULTIMODAL_TOOL_RETURN_TOKEN)) {
-    patched = patched.replace(MULTIMODAL_TOOL_RETURN_TOKEN, MULTIMODAL_TOOL_RETURN_REPLACEMENT);
+  const multimodalVariant = MULTIMODAL_TOOL_RETURN_VARIANTS.find((variant) => patched.includes(variant.token));
+  if (multimodalVariant) {
+    patched = patched.replace(multimodalVariant.token, multimodalVariant.replacement);
     appliedPatches += 1;
   } else {
     skippedPatches += 1;
@@ -1137,6 +1185,20 @@ function patchLettaCodeSource(raw, path, warn) {
     appliedPatches += 1;
     appliedGenerateImageTool = true;
   }
+  // letta-code >= 0.32.17 toolset catalog (see TOOLSET_CATALOG_*_TOKEN).
+  /** @type {Array<[string, string]>} */
+  const toolsetCatalogVariants = [
+    [TOOLSET_CATALOG_DEFAULT_TOKEN, TOOLSET_CATALOG_DEFAULT_REPLACEMENT],
+    [TOOLSET_CATALOG_CODEX_TOKEN, TOOLSET_CATALOG_CODEX_REPLACEMENT],
+    [TOOLSET_CATALOG_LETTA_TOKEN, TOOLSET_CATALOG_LETTA_REPLACEMENT],
+  ];
+  for (const [token, replacement] of toolsetCatalogVariants) {
+    if (countOccurrences(patched, token) === 1) {
+      patched = patched.replace(token, replacement);
+      appliedPatches += 1;
+      appliedGenerateImageTool = true;
+    }
+  }
   if (appliedGenerateImageTool) {
     patched = injectHelperAfterShebang(patched, GENERATE_IMAGE_TOOL_HELPER_DEFINITION);
   } else {
@@ -1174,11 +1236,18 @@ function patchLettaCodeSource(raw, path, warn) {
   // applied — a partial apply would mix clone-objects and JSON strings in the
   // same map and break the duplicate-append guard. FAIL-OPEN on any mismatch.
   {
-    const bulkOccurrences = countOccurrences(patched, CLONE_MAP_BULK_TOKEN);
+    /** @type {Array<[string, string]>} */
+    const bulkVariants = [
+      [CLONE_MAP_BULK_TOKEN, CLONE_MAP_BULK_REPLACEMENT],
+      [CLONE_MAP_BULK_TOKEN_V2, CLONE_MAP_BULK_REPLACEMENT_V2],
+    ];
+    const bulkOccurrences = bulkVariants.reduce((n, [token]) => n + countOccurrences(patched, token), 0);
+    const bulkVariant = bulkVariants.find(([token]) => countOccurrences(patched, token) === 1);
     const appendOccurrences = countOccurrences(patched, CLONE_MAP_APPEND_TOKEN);
     const compareOccurrences = countOccurrences(patched, CLONE_MAP_COMPARE_TOKEN);
-    if (bulkOccurrences === 1 && appendOccurrences === 1 && compareOccurrences === 1) {
-      patched = patched.replace(CLONE_MAP_BULK_TOKEN, CLONE_MAP_BULK_REPLACEMENT);
+    if (bulkOccurrences === 1 && bulkVariant && appendOccurrences === 1 && compareOccurrences === 1) {
+      const [bulkToken, bulkReplacement] = bulkVariant;
+      patched = patched.replace(bulkToken, bulkReplacement);
       patched = patched.replace(CLONE_MAP_APPEND_TOKEN, CLONE_MAP_APPEND_REPLACEMENT);
       patched = patched.replace(CLONE_MAP_COMPARE_TOKEN, CLONE_MAP_COMPARE_REPLACEMENT);
       appliedPatches += 1;
@@ -1278,6 +1347,26 @@ function patchLettaCodeSource(raw, path, warn) {
         `[letta-code-patch] WARN: buildAgentInfo token matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
         `running without lcp-clr-x (cross-conversation fallback won't render; "No previous messages" ` +
         `and the agent-level timestamp keep showing as before)\n`,
+      );
+    }
+  }
+
+  // lcp-ctxcap: lmStudioDiscover clamps every discovered model's context window
+  // to LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW (128k) even when the endpoint
+  // (our LiteLLM adapter) advertises more, so 1M-context models show as 128k in
+  // clients. Keep the default as the fallback for unknown models but trust an
+  // advertised value. Unique-match assertion; fail-open to the stock clamp.
+  {
+    const token = "Math.min(metadata.contextLength ?? LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW, LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW)";
+    const occurrences = countOccurrences(patched, token);
+    if (occurrences === 1) {
+      patched = patched.replace(token, "(metadata.contextLength ?? LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW)");
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: local-endpoint context clamp matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
+        `running without lcp-ctxcap (local-endpoint models stay capped at 128k)\n`,
       );
     }
   }

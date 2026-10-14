@@ -741,7 +741,14 @@ test("patch-loader: deployed letta.js bundle receives dirty-check + clone-map de
   // Unique-match assertion holds on the real bundle (drift alarm on update).
   const sysPromptSites = [...bundle.matchAll(/  persistCompiledSystemPrompt\(conversationId, agentId\) \{/g)];
   assert.equal(sysPromptSites.length, 1, "P1 anchor must be unique");
-  assert.equal(bundle.split(CLONE_MAP_BULK_ANCHOR).length - 1, 1, "P2 bulk anchor must be unique");
+  // letta-code >= 0.32.17 renamed the local `transcript` -> `transcript2`; the
+  // loader accepts either variant, so the drift alarm counts both.
+  const bulkAnchorV2 = CLONE_MAP_BULK_ANCHOR.replaceAll("transcript.messageById", "transcript2.messageById");
+  assert.equal(
+    bundle.split(CLONE_MAP_BULK_ANCHOR).length - 1 + bundle.split(bulkAnchorV2).length - 1,
+    1,
+    "P2 bulk anchor must be unique",
+  );
   assert.equal(bundle.split(CLONE_MAP_APPEND_ANCHOR).length - 1, 1, "P2 append anchor must be unique");
   assert.equal(bundle.split(CLONE_MAP_COMPARE_ANCHOR).length - 1, 1, "P2 compare anchor must be unique");
 
