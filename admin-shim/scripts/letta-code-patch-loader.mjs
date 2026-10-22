@@ -1371,6 +1371,54 @@ function patchLettaCodeSource(raw, path, warn) {
     }
   }
 
+  // lcp-reflhide: reflection integration runs as the PARENT agent (existingAgentId) in a fresh
+  // conversation that it only titles, so every integration landed in the parent's conversation
+  // list (126 on PM-letta-mobile by 2026-10-22; letta-code archives one only when the integration
+  // succeeds). Mark it hidden wherever it is titled: listLocalConversations drops hidden rows and
+  // the conversation stays retrievable by id. Expect both title sites (on start, and the archive
+  // on success); fail-open to stock when the count differs.
+  {
+    const token = "summary: buildReflectionIntegrationConversationTitle(";
+    const occurrences = countOccurrences(patched, token);
+    if (occurrences === 2) {
+      patched = patched.split(token).join("hidden: true, " + token);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: reflection integration title matched ${occurrences} time(s), expected exactly 2, in ${path} — ` +
+        `running without lcp-reflhide (reflection integration conversations stay listed)\n`,
+      );
+    }
+  }
+
+  // lcp-subagent-errlog: a subagent runs as a child `letta -p` process and letta-code reports its
+  // failures only through debugWarn, which writes nothing unless debug logging is on, so a failed
+  // reflection integration left no trace anywhere (letta-mobile-vmwl1). Also write subagent
+  // warnings, and each failed exit with the child's stderr tail, to stderr, which the App Server
+  // log captures. Two unique-match sites, applied together; fail-open to stock otherwise.
+  {
+    const warnToken = "function debugWarn(prefix, message, ...args) {\n";
+    const warnReplacement = warnToken +
+      "  if (prefix === \"subagent\") process.stderr.write(`[lcp-subagent] WARN: ${message}\\n`);\n";
+    const exitToken = "function describeSubagentExit(exitCode, exitSignal, stderr) {\n";
+    const exitReplacement = exitToken +
+      "  process.stderr.write(`[lcp-subagent] exit code=${exitCode} signal=${exitSignal} stderr tail: ` +\n" +
+      "    `${String(stderr ?? \"\").trim().slice(-2000).replace(/\\s*\\n\\s*/g, \" ⏎ \")}\\n`);\n";
+    const warnCount = countOccurrences(patched, warnToken);
+    const exitCount = countOccurrences(patched, exitToken);
+    if (warnCount === 1 && exitCount === 1) {
+      patched = patched.replace(warnToken, warnReplacement).replace(exitToken, exitReplacement);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: subagent error sites matched debugWarn=${warnCount} describeSubagentExit=${exitCount}, ` +
+        `expected 1 each, in ${path} — running without lcp-subagent-errlog\n`,
+      );
+    }
+  }
+
   return { source: patched, appliedPatches, skippedPatches };
 }
 

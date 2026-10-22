@@ -1351,3 +1351,53 @@ test("patch-loader: lcp-clr-x fail-open on a duplicate-renderer source", () => {
     "single-occurrence renderer anchor must be rewritten to call the formatter",
   );
 });
+
+// lcp-reflhide / lcp-subagent-errlog (letta-mobile-vmwl1)
+const REFLHIDE_TITLE = "summary: buildReflectionIntegrationConversationTitle(";
+const ERRLOG_WARN = "function debugWarn(prefix, message, ...args) {\n";
+const ERRLOG_EXIT = "function describeSubagentExit(exitCode, exitSignal, stderr) {\n";
+
+test("patch-loader: lcp-reflhide hides both reflection integration title sites on the deployed bundle", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) {
+    t.skip("no letta-code bundle available on this host");
+    return;
+  }
+  const bundle = readFileSync(bundlePath, "utf8");
+  if (bundle.split(REFLHIDE_TITLE).length - 1 !== 2) {
+    t.skip("this bundle predates reflection integration titling");
+    return;
+  }
+  const { source: patched, skippedPatches } = patchLettaCodeSourceResultForTest(bundle);
+  assert.equal(skippedPatches, 0, "no patch may fail-open against the deployed bundle");
+  assert.equal(patched.split(`hidden: true, ${REFLHIDE_TITLE}`).length - 1, 2, "both title sites must mark the conversation hidden");
+});
+
+test("patch-loader: lcp-reflhide skips, untouched, when the title site count drifts", () => {
+  const drifted = `const a = { ${REFLHIDE_TITLE}x) };`;
+  const { source } = patchLettaCodeSourceResultForTest(drifted);
+  assert.ok(!source.includes("hidden: true"), "one title site is not the shape the patch knows; leave it stock");
+});
+
+test("patch-loader: lcp-subagent-errlog writes subagent warnings and failed exits to stderr", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) {
+    t.skip("no letta-code bundle available on this host");
+    return;
+  }
+  const bundle = readFileSync(bundlePath, "utf8");
+  if (!bundle.includes(ERRLOG_EXIT)) {
+    t.skip("this bundle has no describeSubagentExit");
+    return;
+  }
+  const { source: patched, skippedPatches } = patchLettaCodeSourceResultForTest(bundle);
+  assert.equal(skippedPatches, 0, "no patch may fail-open against the deployed bundle");
+  assert.ok(patched.includes(`${ERRLOG_WARN}  if (prefix === "subagent") process.stderr.write(`), "subagent warnings reach stderr");
+  assert.ok(patched.includes(`${ERRLOG_EXIT}  process.stderr.write(\`[lcp-subagent] exit code=`), "failed exits reach stderr");
+});
+
+test("patch-loader: lcp-subagent-errlog applies both sites or neither", () => {
+  const onlyWarn = `${ERRLOG_WARN}  writeDebugLine(prefix, message);\n}\n`;
+  const { source } = patchLettaCodeSourceResultForTest(onlyWarn);
+  assert.ok(!source.includes("[lcp-subagent]"), "a bundle missing the exit site gets neither half");
+});
