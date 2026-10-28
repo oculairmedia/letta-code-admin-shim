@@ -41,6 +41,48 @@ import { fileURLToPath } from "node:url";
 
 const TARGET_PATH = process.env["LETTA_CLI_PATH_REAL"] ?? "";
 
+// lcp-retry-otid (letta-mobile-93cml): App Server retries refresh every input
+// OTID, then HeadlessBackend.executeConversationTurn appends the user again.
+// LocalStore only dedupes transcript entries by the newly allocated message ID.
+// Keep local user identities across retries AND dedupe before allocating that
+// ID. Use the terminal client's existing local-backend capability predicate;
+// remote Letta requests still receive fresh OTIDs. Keep the positional image
+// failure-policy remap, since approval/non-user identities still change.
+// Search only the resident tail that pushLocalMessage already loads: retries
+// happen seconds apart, while the original input is still resident. Do not
+// read the full transcript or alter unread-head validation/repair state.
+// Limitation: an input evicted from the resident tail (e.g. by compaction)
+// is no longer deduped; there is deliberately no disk fallback.
+const RETRY_OTID_REFRESH_TOKEN =
+  `function refreshTurnInputOtidsForNewRequest(state2) {\n` +
+  `  const refreshedMessages = refreshInputOtidsForNewRequest(state2.messages);\n` +
+  `  return createTurnInputState(refreshedMessages, remapImageFailureModesByPosition(state2.messages, refreshedMessages, state2.imageFailureModesByMessageOtid));\n` +
+  `}`;
+const RETRY_OTID_REFRESH_REPLACEMENT =
+  `function refreshTurnInputOtidsForNewRequest(state2) {\n` +
+  `  const backendCapabilities = getBackend().capabilities;\n` +
+  `  const retryFromPersistedLocalState = backendCapabilities.localModelCatalog && !backendCapabilities.remoteMemfs;\n` +
+  `  const refreshedMessages = state2.messages.map((message2) =>\n` +
+  `    retryFromPersistedLocalState && message2.role === "user" && message2.otid\n` +
+  `      ? message2\n` +
+  `      : refreshInputOtidsForNewRequest([message2])[0]);\n` +
+  `  return createTurnInputState(refreshedMessages, remapImageFailureModesByPosition(state2.messages, refreshedMessages, state2.imageFailureModesByMessageOtid));\n` +
+  `}`;
+const RETRY_OTID_PERSIST_TOKEN =
+  `  appendUserLocalMessage(conversationId, agentId, message) {\n` +
+  `    const conversation = this.ensureConversation(conversationId, agentId);\n` +
+  `    const date = this.currentLocalMessageDate();`;
+const RETRY_OTID_PERSIST_REPLACEMENT =
+  `  appendUserLocalMessage(conversationId, agentId, message) {\n` +
+  `    const conversation = this.ensureConversation(conversationId, agentId);\n` +
+  `    const otid = optionalString3(message.otid ?? message.client_message_id);\n` +
+  `    if (otid) {\n` +
+  `      const existing = this.residentLocalMessagesForConversation(conversation.id, agentId)\n` +
+  `        .find((stored) => stored.role === "user" && stored.otid === otid);\n` +
+  `      if (existing) return existing;\n` +
+  `    }\n` +
+  `    const date = this.currentLocalMessageDate();`;
+
 const SETTLE_BUG_LITERAL =
   `this.store.settleInterruptedToolCalls(conversationId, {\n` +
   `        reason: TURN_DID_NOT_COMPLETE\n` +
@@ -1016,6 +1058,24 @@ function patchLettaCodeSource(raw, path, warn) {
   let appliedPatches = 0;
   let skippedPatches = 0;
 
+  // Both changes must land together: stable OTIDs alone do not stop appends,
+  // and dedupe alone cannot recognize the refreshed identities of a retry.
+  {
+    const refreshCount = countOccurrences(patched, RETRY_OTID_REFRESH_TOKEN);
+    const persistCount = countOccurrences(patched, RETRY_OTID_PERSIST_TOKEN);
+    if (refreshCount === 1 && persistCount === 1) {
+      patched = patched.replace(RETRY_OTID_REFRESH_TOKEN, RETRY_OTID_REFRESH_REPLACEMENT);
+      patched = patched.replace(RETRY_OTID_PERSIST_TOKEN, RETRY_OTID_PERSIST_REPLACEMENT);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: lcp-retry-otid anchors matched refresh=${refreshCount} persist=${persistCount}, ` +
+        `expected exactly 1 each, in ${path} — skipping atomically; local retries may duplicate user prompts\n`,
+      );
+    }
+  }
+
   if (patched.includes(SETTLE_BUG_LITERAL)) {
     patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
     appliedPatches += 1;
@@ -1367,6 +1427,54 @@ function patchLettaCodeSource(raw, path, warn) {
       if (warn) process.stderr.write(
         `[letta-code-patch] WARN: local-endpoint context clamp matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
         `running without lcp-ctxcap (local-endpoint models stay capped at 128k)\n`,
+      );
+    }
+  }
+
+  // lcp-reflhide: reflection integration runs as the PARENT agent (existingAgentId) in a fresh
+  // conversation that it only titles, so every integration landed in the parent's conversation
+  // list (126 on PM-letta-mobile by 2026-10-22; letta-code archives one only when the integration
+  // succeeds). Mark it hidden wherever it is titled: listLocalConversations drops hidden rows and
+  // the conversation stays retrievable by id. Expect both title sites (on start, and the archive
+  // on success); fail-open to stock when the count differs.
+  {
+    const token = "summary: buildReflectionIntegrationConversationTitle(";
+    const occurrences = countOccurrences(patched, token);
+    if (occurrences === 2) {
+      patched = patched.split(token).join("hidden: true, " + token);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: reflection integration title matched ${occurrences} time(s), expected exactly 2, in ${path} — ` +
+        `running without lcp-reflhide (reflection integration conversations stay listed)\n`,
+      );
+    }
+  }
+
+  // lcp-subagent-errlog: a subagent runs as a child `letta -p` process and letta-code reports its
+  // failures only through debugWarn, which writes nothing unless debug logging is on, so a failed
+  // reflection integration left no trace anywhere (letta-mobile-vmwl1). Also write subagent
+  // warnings, and each failed exit with the child's stderr tail, to stderr, which the App Server
+  // log captures. Two unique-match sites, applied together; fail-open to stock otherwise.
+  {
+    const warnToken = "function debugWarn(prefix, message, ...args) {\n";
+    const warnReplacement = warnToken +
+      "  if (prefix === \"subagent\") process.stderr.write(`[lcp-subagent] WARN: ${message}\\n`);\n";
+    const exitToken = "function describeSubagentExit(exitCode, exitSignal, stderr) {\n";
+    const exitReplacement = exitToken +
+      "  process.stderr.write(`[lcp-subagent] exit code=${exitCode} signal=${exitSignal} stderr tail: ` +\n" +
+      "    `${String(stderr ?? \"\").trim().slice(-2000).replace(/\\s*\\n\\s*/g, \" ⏎ \")}\\n`);\n";
+    const warnCount = countOccurrences(patched, warnToken);
+    const exitCount = countOccurrences(patched, exitToken);
+    if (warnCount === 1 && exitCount === 1) {
+      patched = patched.replace(warnToken, warnReplacement).replace(exitToken, exitReplacement);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: subagent error sites matched debugWarn=${warnCount} describeSubagentExit=${exitCount}, ` +
+        `expected 1 each, in ${path} — running without lcp-subagent-errlog\n`,
       );
     }
   }
