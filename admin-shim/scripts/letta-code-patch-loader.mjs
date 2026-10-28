@@ -48,8 +48,11 @@ const TARGET_PATH = process.env["LETTA_CLI_PATH_REAL"] ?? "";
 // ID. Use the terminal client's existing local-backend capability predicate;
 // remote Letta requests still receive fresh OTIDs. Keep the positional image
 // failure-policy remap, since approval/non-user identities still change.
-// The disk fallback checks transcript.messageById, including inputs that
-// compaction has removed from the active message list.
+// Search only the resident tail that pushLocalMessage already loads: retries
+// happen seconds apart, while the original input is still resident. Do not
+// read the full transcript or alter unread-head validation/repair state.
+// Limitation: an input evicted from the resident tail (e.g. by compaction)
+// is no longer deduped; there is deliberately no disk fallback.
 const RETRY_OTID_REFRESH_TOKEN =
   `function refreshTurnInputOtidsForNewRequest(state2) {\n` +
   `  const refreshedMessages = refreshInputOtidsForNewRequest(state2.messages);\n` +
@@ -74,13 +77,8 @@ const RETRY_OTID_PERSIST_REPLACEMENT =
   `    const conversation = this.ensureConversation(conversationId, agentId);\n` +
   `    const otid = optionalString3(message.otid ?? message.client_message_id);\n` +
   `    if (otid) {\n` +
-  `      let existing = this.localMessagesForConversation(conversation.id, agentId)\n` +
+  `      const existing = this.residentLocalMessagesForConversation(conversation.id, agentId)\n` +
   `        .find((stored) => stored.role === "user" && stored.otid === otid);\n` +
-  `      if (!existing && this.storageDir) {\n` +
-  `        const read = this.readConversationMessagesFromDisk(this.conversationKey(conversation.id, agentId), agentId);\n` +
-  `        existing = read && Array.from(read.transcript.messageById.values())\n` +
-  `          .find((stored) => stored.role === "user" && stored.otid === otid);\n` +
-  `      }\n` +
   `      if (existing) return existing;\n` +
   `    }\n` +
   `    const date = this.currentLocalMessageDate();`;

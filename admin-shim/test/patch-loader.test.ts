@@ -1493,6 +1493,10 @@ type RetryFixtureRow = {
 type RetryFixtureStore = {
   appendTurnInput: (conversationId: string, body: { agent_id: string; messages: RetryFixtureMessage[] }) => unknown;
   appendUserLocalMessage: (conversationId: string, agentId: string, message: RetryFixtureMessage) => RetryFixtureRow;
+  localMessagesForConversation: (conversationId: string, agentId: string) => RetryFixtureRow[];
+  residentLocalMessagesForConversation: (conversationId: string, agentId: string) => RetryFixtureRow[];
+  pushLocalMessage: (conversationId: string, agentId: string, message: RetryFixtureRow) => void;
+  validateUnreadTranscriptHeadOnce: (key: string) => void;
 };
 type RetryFixtureRuntime = {
   ensure: (messages: RetryFixtureMessage[]) => RetryFixtureMessage[];
@@ -1502,14 +1506,20 @@ type RetryFixtureRuntime = {
   storeMethods: RetryFixtureStore;
 };
 
-function retryFixtureRuntime(source: string, local: boolean): RetryFixtureRuntime {
-  const factory = new Function("getBackend", "randomUUID9", "crypto", `
+function retryFixtureRuntime(
+  source: string,
+  local: boolean,
+  validateHead: (path: string, headBytes: number) => void = () => {},
+): RetryFixtureRuntime {
+  const factory = new Function("getBackend", "randomUUID9", "crypto", "validateUnreadTranscriptHead", `
     ${retrySourceBetween(source, "function optionalString3(", "function currentIsoTimestamp2(")}
     ${retrySourceBetween(source, "function textContent(", "function localImageContentFromLegacyImage(")}
     ${retrySourceBetween(source, "function timestampFromIso(", "\nfunction ")}
     ${retrySourceBetween(source, "function refreshInputOtidsForNewRequest(", "function rebuildInputWithFreshDenials(")}
     ${retrySourceBetween(source, "function ensureTurnInputMessageOtids(", "var init_turn_input_state =")}
     ${retrySourceBetween(source, "async function prepareProviderRetryInput(", "async function shouldRetryPostStopTurn(")}
+    ${retrySourceBetween(source, "function residentCoversIds(", "\nfunction ")}
+    ${retrySourceBetween(source, "function overlayResidentLocalMessageTail(", "\nfunction ")}
     const getRetryDelayMs2 = () => 0;
     const emitRecoverableRetryNotice = () => {};
     const getRetryStatusMessage = () => "retry";
@@ -1521,44 +1531,72 @@ function retryFixtureRuntime(source: string, local: boolean): RetryFixtureRuntim
       providerRetry: prepareProviderRetryInput,
       storeMethods: {
         ${retrySourceBetween(source, "  appendTurnInput(", "  appendStreamChunk(")},
-        ${retryAnchors(source).persist}
+        ${retryAnchors(source).persist},
+        ${retrySourceBetween(source, "  localMessagesForConversation(", "  residentLocalMessagesForConversation(")},
+        ${retrySourceBetween(source, "  residentLocalMessagesForConversation(", "  readConversationMessagesFromDisk(")},
+        ${retrySourceBetween(source, "  pushLocalMessage(", "  validateUnreadTranscriptHeadOnce(")},
+        ${retrySourceBetween(source, "  validateUnreadTranscriptHeadOnce(", "  persistPendingAssistantMessage(")}
       }
     };
   `);
   let seq = 0;
   const uuid = () => `retry-uuid-${++seq}`;
   const result: unknown = factory(
-    () => ({ capabilities: { localModelCatalog: local, remoteMemfs: !local } }), uuid, { randomUUID: uuid },
+    () => ({ capabilities: { localModelCatalog: local, remoteMemfs: !local } }), uuid, { randomUUID: uuid }, validateHead,
   );
   assert.ok(result && typeof result === "object" && "refresh" in result && typeof result.refresh === "function");
   return result as RetryFixtureRuntime;
 }
 
-function retryFixtureStore(runtime: RetryFixtureRuntime, path: string, compacted = false): RetryFixtureStore {
+function retryFixtureStore(runtime: RetryFixtureRuntime, path: string) {
   let seq = 0;
   const store = {
     ...runtime.storeMethods,
-    // Read the transcript on every lookup to exercise dedupe after store
-    // recreation as well as a retry with a resident original message.
-    localMessagesForConversation(conversationId: string, agentId: string) {
-      if (compacted) return [];
-      return readRetryRows(path).filter((row) =>
-        row.metadata.conversation_id === conversationId && row.metadata.agent_id === agentId);
-    },
+    // Keep the same resident tail across attempts. The shipped resident,
+    // push and unread-head methods above run against these maps.
+    localMessagesByConversationKey: new Map<string, RetryFixtureRow[]>(),
+    loadedConversationKeys: new Set<string>(),
+    tailResidentConversationKeys: new Set<string>(),
+    conversations: new Map<string, { id: string; in_context_message_ids: string[] }>(),
+    unreadTranscriptHeadBytesByKey: new Map<string, number>(),
+    loadRepairedConversationKeys: new Set<string>(),
+    transcriptMetadataByConversationKey: new Map<string, { messagesPath: string; conversationDir: string }>(),
+    stats: { fullTranscriptReads: 0 },
     storageDir: dirname(path),
     conversationKey: (conversationId: string, agentId: string) => `${agentId}:${conversationId}`,
     readConversationMessagesFromDisk(key: string) {
+      this.stats.fullTranscriptReads += 1;
+      // Reproduce the full-read side effects that used to bypass validation
+      // and disturb repair state on every new OTID.
+      this.unreadTranscriptHeadBytesByKey.delete(key);
+      this.loadRepairedConversationKeys.delete(key);
       const rows = readRetryRows(path).filter((row) =>
         `${row.metadata.agent_id}:${row.metadata.conversation_id}` === key);
-      return { transcript: { messageById: new Map(rows.map((row) => [row.id, row])) } };
+      return { messages: rows, transcript: { messageById: new Map(rows.map((row) => [row.id, row])) } };
     },
     findConversation: () => ({ agent_free: true }),
-    ensureConversation: (id: string) => ({ id }),
+    ensureConversation(id: string, agentId: string) {
+      const key = this.conversationKey(id, agentId);
+      let conversation = this.conversations.get(key);
+      if (!conversation) {
+        conversation = { id, in_context_message_ids: [] };
+        this.conversations.set(key, conversation);
+        this.localMessagesByConversationKey.set(key, []);
+        this.tailResidentConversationKeys.add(key);
+      }
+      return conversation;
+    },
     currentLocalMessageDate: () => "2026-10-28T00:00:00.000Z",
     nextLocalMessageId: () => `ui-msg-${++seq}`,
     localContentFromInputContent: (content: unknown) => content,
-    pushLocalMessage(_conversationId: string, _agentId: string, message: RetryFixtureRow) {
-      appendFileSync(path, JSON.stringify({ type: "message", message }) + "\n");
+    trimResidentConversationTail: () => {},
+    touchConversationForLocalMessage: () => {},
+    loadConversationMessageTail() {
+      throw new Error("fixture conversation should already have a resident tail");
+    },
+    persistConversationState(_conversationId: string, _agentId: string, options: { transcript: string; message: RetryFixtureRow }) {
+      assert.equal(options.transcript, "append");
+      appendFileSync(path, JSON.stringify({ type: "message", message: options.message }) + "\n");
     },
     applyApprovalResults: () => {},
   };
@@ -1575,6 +1613,44 @@ function readRetryRows(path: string): RetryFixtureRow[] {
     return message as RetryFixtureRow;
   });
 }
+
+test("patch-loader: lcp-retry-otid first send with a new otid avoids full reads and validates the unread head", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) return t.skip("no deployed letta-code bundle available");
+  const dir = mkdtempSync(fileURLToPath(new URL("./.retry-otid-", import.meta.url)));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "messages.jsonl");
+  const key = "agent-1:conv-1";
+  let validations = 0;
+  const runtime = retryFixtureRuntime(patchLettaCodeSourceForTest(readFileSync(bundlePath, "utf8")), true, (validatedPath, bytes) => {
+    validations += 1;
+    assert.equal(validatedPath, path);
+    assert.equal(bytes, 512);
+    assert.equal(store.unreadTranscriptHeadBytesByKey.get(key), 512, "validation must see the unread-head marker");
+    assert.equal(store.localMessagesByConversationKey.get(key)?.length, 0, "validate before adding the row");
+    assert.equal(existsSync(path), false, "validate before persisting the row");
+  });
+  const store = retryFixtureStore(runtime, path);
+  const conversation = store.ensureConversation("conv-1", "agent-1");
+  // The resident tail does not cover these active IDs. Calling the broader
+  // localMessagesForConversation would read the full transcript here too.
+  conversation.in_context_message_ids = ["head-only-id"];
+  store.unreadTranscriptHeadBytesByKey.set(key, 512);
+  store.transcriptMetadataByConversationKey.set(key, { messagesPath: path, conversationDir: dir });
+  store.loadRepairedConversationKeys.add(key);
+  const send = (otid: string) => store.appendTurnInput("conv-1", {
+    agent_id: "agent-1", messages: [{ type: "message", role: "user", content: "hello", otid }],
+  });
+  send("first-ever-otid");
+  assert.equal(store.stats.fullTranscriptReads, 0, "a new OTID must not trigger a full-transcript read");
+  assert.equal(validations, 1, "append must validate the unread head");
+  assert.equal(store.unreadTranscriptHeadBytesByKey.has(key), false, "validation consumes the marker");
+  assert.equal(store.loadRepairedConversationKeys.has(key), true, "dedupe must preserve repair state");
+  send("another-new-otid");
+  assert.equal(store.stats.fullTranscriptReads, 0);
+  assert.equal(validations, 1, "the head is validated only once");
+  assert.deepEqual(readRetryRows(path).map((row) => row.otid), ["first-ever-otid", "another-new-otid"]);
+});
 
 test("patch-loader: lcp-retry-otid persists one original user row across provider, empty and plan-swap retries", async (t) => {
   const bundlePath = resolveDeployedLettaBundle();
@@ -1603,13 +1679,7 @@ test("patch-loader: lcp-retry-otid persists one original user row across provide
   assert.equal(rows[0]?.otid, "cm-android-original");
   assert.deepEqual(rows[0]?.content, [{ type: "text", text: "hello" }]);
   assert.equal(state.messages[0]?.otid, "cm-android-original");
-  // A reconstructed store must recognize the persisted identity too.
-  retryFixtureStore(runtime, path).appendTurnInput("conv-1", { agent_id: "agent-1", messages: state.messages });
-  assert.equal(readRetryRows(path).length, 1);
-  // Full compaction drops even the latest user from active history. It
-  // still exists in transcript.messageById and must not be appended again.
-  retryFixtureStore(runtime, path, true).appendTurnInput("conv-1", { agent_id: "agent-1", messages: state.messages });
-  assert.equal(readRetryRows(path).length, 1);
+  assert.equal(store.stats.fullTranscriptReads, 0, "retry dedupe only searches resident rows");
 });
 
 test("patch-loader: lcp-retry-otid preserves image policy and persists new retry inputs separately", (t) => {
