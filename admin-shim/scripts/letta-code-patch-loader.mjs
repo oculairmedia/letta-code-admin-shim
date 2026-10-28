@@ -41,6 +41,50 @@ import { fileURLToPath } from "node:url";
 
 const TARGET_PATH = process.env["LETTA_CLI_PATH_REAL"] ?? "";
 
+// lcp-retry-otid (letta-mobile-93cml): App Server retries refresh every input
+// OTID, then HeadlessBackend.executeConversationTurn appends the user again.
+// LocalStore only dedupes transcript entries by the newly allocated message ID.
+// Keep local user identities across retries AND dedupe before allocating that
+// ID. Use the terminal client's existing local-backend capability predicate;
+// remote Letta requests still receive fresh OTIDs. Keep the positional image
+// failure-policy remap, since approval/non-user identities still change.
+// The disk fallback checks transcript.messageById, including inputs that
+// compaction has removed from the active message list.
+const RETRY_OTID_REFRESH_TOKEN =
+  `function refreshTurnInputOtidsForNewRequest(state2) {\n` +
+  `  const refreshedMessages = refreshInputOtidsForNewRequest(state2.messages);\n` +
+  `  return createTurnInputState(refreshedMessages, remapImageFailureModesByPosition(state2.messages, refreshedMessages, state2.imageFailureModesByMessageOtid));\n` +
+  `}`;
+const RETRY_OTID_REFRESH_REPLACEMENT =
+  `function refreshTurnInputOtidsForNewRequest(state2) {\n` +
+  `  const backendCapabilities = getBackend().capabilities;\n` +
+  `  const retryFromPersistedLocalState = backendCapabilities.localModelCatalog && !backendCapabilities.remoteMemfs;\n` +
+  `  const refreshedMessages = state2.messages.map((message2) =>\n` +
+  `    retryFromPersistedLocalState && message2.role === "user" && message2.otid\n` +
+  `      ? message2\n` +
+  `      : refreshInputOtidsForNewRequest([message2])[0]);\n` +
+  `  return createTurnInputState(refreshedMessages, remapImageFailureModesByPosition(state2.messages, refreshedMessages, state2.imageFailureModesByMessageOtid));\n` +
+  `}`;
+const RETRY_OTID_PERSIST_TOKEN =
+  `  appendUserLocalMessage(conversationId, agentId, message) {\n` +
+  `    const conversation = this.ensureConversation(conversationId, agentId);\n` +
+  `    const date = this.currentLocalMessageDate();`;
+const RETRY_OTID_PERSIST_REPLACEMENT =
+  `  appendUserLocalMessage(conversationId, agentId, message) {\n` +
+  `    const conversation = this.ensureConversation(conversationId, agentId);\n` +
+  `    const otid = optionalString3(message.otid ?? message.client_message_id);\n` +
+  `    if (otid) {\n` +
+  `      let existing = this.localMessagesForConversation(conversation.id, agentId)\n` +
+  `        .find((stored) => stored.role === "user" && stored.otid === otid);\n` +
+  `      if (!existing && this.storageDir) {\n` +
+  `        const read = this.readConversationMessagesFromDisk(this.conversationKey(conversation.id, agentId), agentId);\n` +
+  `        existing = read && Array.from(read.transcript.messageById.values())\n` +
+  `          .find((stored) => stored.role === "user" && stored.otid === otid);\n` +
+  `      }\n` +
+  `      if (existing) return existing;\n` +
+  `    }\n` +
+  `    const date = this.currentLocalMessageDate();`;
+
 const SETTLE_BUG_LITERAL =
   `this.store.settleInterruptedToolCalls(conversationId, {\n` +
   `        reason: TURN_DID_NOT_COMPLETE\n` +
@@ -1015,6 +1059,24 @@ function patchLettaCodeSource(raw, path, warn) {
   let patched = raw;
   let appliedPatches = 0;
   let skippedPatches = 0;
+
+  // Both changes must land together: stable OTIDs alone do not stop appends,
+  // and dedupe alone cannot recognize the refreshed identities of a retry.
+  {
+    const refreshCount = countOccurrences(patched, RETRY_OTID_REFRESH_TOKEN);
+    const persistCount = countOccurrences(patched, RETRY_OTID_PERSIST_TOKEN);
+    if (refreshCount === 1 && persistCount === 1) {
+      patched = patched.replace(RETRY_OTID_REFRESH_TOKEN, RETRY_OTID_REFRESH_REPLACEMENT);
+      patched = patched.replace(RETRY_OTID_PERSIST_TOKEN, RETRY_OTID_PERSIST_REPLACEMENT);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: lcp-retry-otid anchors matched refresh=${refreshCount} persist=${persistCount}, ` +
+        `expected exactly 1 each, in ${path} — skipping atomically; local retries may duplicate user prompts\n`,
+      );
+    }
+  }
 
   if (patched.includes(SETTLE_BUG_LITERAL)) {
     patched = patched.replace(SETTLE_BUG_LITERAL, SETTLE_FIX_LITERAL);
