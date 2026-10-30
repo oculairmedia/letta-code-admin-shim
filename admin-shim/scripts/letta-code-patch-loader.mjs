@@ -83,6 +83,56 @@ const RETRY_OTID_PERSIST_REPLACEMENT =
   `    }\n` +
   `    const date = this.currentLocalMessageDate();`;
 
+// lcp-agent-lazyload (letta-mobile-gxooq): LocalStore fills this.agents once, at App
+// Server start (loadFromStorage), and afterwards only with agents THIS process creates.
+// Subagents are created by their own process and written to agents/<id>.json, so an
+// App Server that started earlier answers "Agent not found" for them on
+// listConversationMessages / listAgentMessages (strictAgentAccess), and the subagent
+// view shows "message.list native command unsuccessful". refreshAgentRecordFromStorage
+// now loads an agent it has never seen from that same file (same normalization, same
+// mtime bookkeeping as loadFromStorage), and the two read paths consult it before
+// refusing. Nothing is created: an agent with no file is still "not found".
+const AGENT_LAZYLOAD_REFRESH_TOKEN =
+  `  refreshAgentRecordFromStorage(agentId) {\n` +
+  `    const existing = this.agents.get(agentId);\n` +
+  `    if (!this.storageDir || !existing)\n` +
+  `      return existing;`;
+const AGENT_LAZYLOAD_REFRESH_REPLACEMENT =
+  `  refreshAgentRecordFromStorage(agentId) {\n` +
+  `    const existing = this.agents.get(agentId);\n` +
+  `    if (this.storageDir && !existing && typeof agentId === "string" && agentId) {\n` +
+  `      const mtimeMs = this.agentRecordFileMtimeMs(agentId);\n` +
+  `      if (mtimeMs === undefined)\n` +
+  `        return existing;\n` +
+  `      try {\n` +
+  `        const raw = readJsonFile2(join20(this.storageDir, "agents", \`\${encodePathSegment(agentId)}.json\`));\n` +
+  `        const agent = normalizeAgentRecord(raw, this.defaultAgentModel);\n` +
+  `        if (!agent || agent.id !== agentId)\n` +
+  `          return existing;\n` +
+  `        this.agents.set(agentId, agent);\n` +
+  `        this.recordAgentRecordMtime(agentId, mtimeMs);\n` +
+  `        return agent;\n` +
+  `      } catch {\n` +
+  `        return existing;\n` +
+  `      }\n` +
+  `    }\n` +
+  `    if (!this.storageDir || !existing)\n` +
+  `      return existing;`;
+const AGENT_LAZYLOAD_LIST_CONVERSATION_TOKEN =
+  `    if (this.strictAgentAccess && !conversation?.agent_free && !this.agents.has(agentId)) {\n` +
+  `      throw new LocalBackendNotFoundError("Agent", agentId);\n` +
+  `    }`;
+const AGENT_LAZYLOAD_LIST_CONVERSATION_REPLACEMENT =
+  `    if (this.strictAgentAccess && !conversation?.agent_free && !this.refreshAgentRecordFromStorage(agentId)) {\n` +
+  `      throw new LocalBackendNotFoundError("Agent", agentId);\n` +
+  `    }`;
+const AGENT_LAZYLOAD_LIST_AGENT_TOKEN =
+  `  listAgentMessages(agentId, body) {\n` +
+  `    if (this.strictAgentAccess && !this.agents.has(agentId)) {`;
+const AGENT_LAZYLOAD_LIST_AGENT_REPLACEMENT =
+  `  listAgentMessages(agentId, body) {\n` +
+  `    if (this.strictAgentAccess && !this.refreshAgentRecordFromStorage(agentId)) {`;
+
 const SETTLE_BUG_LITERAL =
   `this.store.settleInterruptedToolCalls(conversationId, {\n` +
   `        reason: TURN_DID_NOT_COMPLETE\n` +
@@ -1072,6 +1122,27 @@ function patchLettaCodeSource(raw, path, warn) {
       if (warn) process.stderr.write(
         `[letta-code-patch] WARN: lcp-retry-otid anchors matched refresh=${refreshCount} persist=${persistCount}, ` +
         `expected exactly 1 each, in ${path} — skipping atomically; local retries may duplicate user prompts\n`,
+      );
+    }
+  }
+
+  // All three land together: lazy loading alone fixes nothing while the read paths
+  // still test the map directly, and the read paths alone would never find the agent.
+  {
+    const refreshCount = countOccurrences(patched, AGENT_LAZYLOAD_REFRESH_TOKEN);
+    const listConversationCount = countOccurrences(patched, AGENT_LAZYLOAD_LIST_CONVERSATION_TOKEN);
+    const listAgentCount = countOccurrences(patched, AGENT_LAZYLOAD_LIST_AGENT_TOKEN);
+    if (refreshCount === 1 && listConversationCount === 1 && listAgentCount === 1) {
+      patched = patched.replace(AGENT_LAZYLOAD_REFRESH_TOKEN, AGENT_LAZYLOAD_REFRESH_REPLACEMENT);
+      patched = patched.replace(AGENT_LAZYLOAD_LIST_CONVERSATION_TOKEN, AGENT_LAZYLOAD_LIST_CONVERSATION_REPLACEMENT);
+      patched = patched.replace(AGENT_LAZYLOAD_LIST_AGENT_TOKEN, AGENT_LAZYLOAD_LIST_AGENT_REPLACEMENT);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: lcp-agent-lazyload anchors matched refresh=${refreshCount} ` +
+        `listConversation=${listConversationCount} listAgent=${listAgentCount}, expected exactly 1 each, ` +
+        `in ${path} — skipping atomically; agents created after App Server start stay unreadable\n`,
       );
     }
   }

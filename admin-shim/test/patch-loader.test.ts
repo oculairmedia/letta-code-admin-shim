@@ -1736,3 +1736,48 @@ test("patch-loader: lcp-retry-otid leaves cloud refresh and approval identities 
   assert.notEqual(local.messages[1]?.otid, "approval-otid");
   assert.deepEqual(state.messages.map((message) => message.otid), ["user-otid", "approval-otid"], "refresh must not mutate its input");
 });
+
+// lcp-agent-lazyload (letta-mobile-gxooq): agents created after App Server start (subagents,
+// written by their own process) must be readable. The live proof runs a real `letta server`
+// against an isolated backend dir (see the PR); these assert the patch lands on the deployed
+// bundle and leaves the "no file" case refusing.
+test("patch-loader: deployed letta.js lazy-loads agents created after start (lcp-agent-lazyload)", (t) => {
+  const bundlePath = resolveDeployedLettaBundle();
+  if (!bundlePath) {
+    t.skip("no deployed letta-code bundle (>= 0.27) on this host");
+    return;
+  }
+  const bundle = readFileSync(bundlePath, "utf8");
+  const refreshAnchor =
+    "  refreshAgentRecordFromStorage(agentId) {\n" +
+    "    const existing = this.agents.get(agentId);\n" +
+    "    if (!this.storageDir || !existing)\n" +
+    "      return existing;";
+  assert.equal(bundle.split(refreshAnchor).length - 1, 1, "refresh anchor must be unique");
+  const { source: patched, skippedPatches } = patchLettaCodeSourceResultForTest(bundle);
+  assert.equal(skippedPatches, 0, "no patch may fail-open against the deployed bundle");
+  // Unknown agents are read from agents/<encoded id>.json with the same normalization as loadFromStorage.
+  assert.match(patched, /if \(this\.storageDir && !existing && typeof agentId === "string" && agentId\) \{/);
+  assert.match(patched, /normalizeAgentRecord\(raw, this\.defaultAgentModel\);\n\s+if \(!agent \|\| agent\.id !== agentId\)\n\s+return existing;\n\s+this\.agents\.set\(agentId, agent\);/);
+  // Both read paths consult the lazy loader before refusing; neither still tests the map directly.
+  assert.match(patched, /!conversation\?\.agent_free && !this\.refreshAgentRecordFromStorage\(agentId\)\)/);
+  assert.match(patched, /listAgentMessages\(agentId, body\) \{\n\s+if \(this\.strictAgentAccess && !this\.refreshAgentRecordFromStorage\(agentId\)\)/);
+  assert.doesNotMatch(patched, /!conversation\?\.agent_free && !this\.agents\.has\(agentId\)\)/);
+  // A missing file still means "not found": nothing is created on lookup.
+  assert.match(patched, /const mtimeMs = this\.agentRecordFileMtimeMs\(agentId\);\n\s+if \(mtimeMs === undefined\)\n\s+return existing;/);
+});
+
+test("patch-loader: lcp-agent-lazyload skips atomically when any anchor drifts", () => {
+  const anchors =
+    "  refreshAgentRecordFromStorage(agentId) {\n" +
+    "    const existing = this.agents.get(agentId);\n" +
+    "    if (!this.storageDir || !existing)\n" +
+    "      return existing;\n" +
+    "    if (this.strictAgentAccess && !conversation?.agent_free && !this.agents.has(agentId)) {\n" +
+    "      throw new LocalBackendNotFoundError(\"Agent\", agentId);\n" +
+    "    }\n";
+  // listAgentMessages anchor deliberately missing: nothing of the patch may land.
+  const { source } = patchLettaCodeSourceResultForTest(anchors);
+  assert.equal(source.includes("refreshAgentRecordFromStorage(agentId)) {"), false);
+  assert.equal(source.includes("typeof agentId === \"string\""), false);
+});
