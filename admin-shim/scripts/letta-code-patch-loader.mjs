@@ -41,6 +41,44 @@ import { fileURLToPath } from "node:url";
 
 const TARGET_PATH = process.env["LETTA_CLI_PATH_REAL"] ?? "";
 
+
+// lcp-model-catalog: native provider catalogs are bundled, not /v1/models
+// discovery. Match the two flattening sites atomically so the catalog used by
+// both getBuiltinModels and provider execution receives the same metadata.
+// These are the verified subscription proxy limits (f5f01c2), not public API
+// limits. gpt-6.1-luna is intentionally omitted: upstream returned model_not_found.
+const MODEL_CATALOG_PATCHES = [
+  {
+    token: '  ANTHROPIC_MODELS = flattenChatModelCatalog("anthropic", anthropic_default);',
+    addition: `
+  // lcp-model-catalog: retain an upstream entry if a future bundle adds it.
+  if (!ANTHROPIC_MODELS["claude-haiku-5-5"] && ANTHROPIC_MODELS["claude-haiku-4-5"]) {
+    ANTHROPIC_MODELS["claude-haiku-5-5"] = {
+      ...ANTHROPIC_MODELS["claude-haiku-4-5"],
+      id: "claude-haiku-5-5", name: "Claude Haiku 5.5",
+      contextWindow: 200000, maxTokens: 65536
+    };
+  }`,
+  },
+  {
+    token: '  OPENAI_MODELS = flattenChatModelCatalog("openai", openai_default);',
+    addition: `
+  // lcp-model-catalog: use the ChatGPT upstream maximum, not its default.
+  for (const id of ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"]) {
+    if (OPENAI_MODELS[id]) OPENAI_MODELS[id] = { ...OPENAI_MODELS[id], contextWindow: 872000 };
+  }
+  if (!OPENAI_MODELS["gpt-6.1-terra"] && OPENAI_MODELS["gpt-6.1-sol"]) {
+    OPENAI_MODELS["gpt-6.1-terra"] = {
+      ...OPENAI_MODELS["gpt-6.1-sol"],
+      id: "gpt-6.1-terra", name: "GPT-6.1 Terra",
+      cost: { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25,
+        tiers: [{ inputTokensAbove: 272000, input: 2, output: 7.5, cacheRead: 0.1, cacheWrite: 2.5 }] },
+      contextWindow: 872000, maxTokens: 128000
+    };
+  }`,
+  },
+];
+
 // lcp-retry-otid (letta-mobile-93cml): App Server retries refresh every input
 // OTID, then HeadlessBackend.executeConversationTurn appends the user again.
 // LocalStore only dedupes transcript entries by the newly allocated message ID.
@@ -1478,6 +1516,23 @@ function patchLettaCodeSource(raw, path, warn) {
         `[letta-code-patch] WARN: buildAgentInfo token matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
         `running without lcp-clr-x (cross-conversation fallback won't render; "No previous messages" ` +
         `and the agent-level timestamp keep showing as before)\n`,
+      );
+    }
+  }
+
+  // lcp-model-catalog: unique anchors, atomic update, fail open on drift.
+  {
+    const counts = MODEL_CATALOG_PATCHES.map(({ token }) => countOccurrences(patched, token));
+    if (counts.every((count) => count === 1)) {
+      for (const { token, addition } of MODEL_CATALOG_PATCHES) {
+        patched = patched.replace(token, token + addition);
+      }
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: lcp-model-catalog anchors matched ${counts.join(",")} (expected 1 each) in ${path} — ` +
+        `running with the bundled native model catalog\n`,
       );
     }
   }
