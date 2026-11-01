@@ -41,6 +41,65 @@ import { fileURLToPath } from "node:url";
 
 const TARGET_PATH = process.env["LETTA_CLI_PATH_REAL"] ?? "";
 
+// lcp-reflection-controls: Letta's persisted reflection settings are copied
+// field-by-field, so new per-agent keys need every read/write/command site to
+// land together. The launch wrapper leaves the stock launch body intact: this
+// matters because every automatic and manual caller is function-hoisted to the
+// wrapper, while the stock onComplete callback keeps its own lifecycle.
+const REFLECTION_CONTROLS_HELPER = `
+globalThis.__lcpReflectionOutcomes = globalThis.__lcpReflectionOutcomes || new Map();
+globalThis.__lcpRecordReflectionOutcome = function(agentId, outcome) {
+  if (typeof agentId !== "string" || !agentId) return;
+  globalThis.__lcpReflectionOutcomes.set(agentId, { ...outcome, at: new Date().toISOString() });
+};
+globalThis.__lcpReflectionLastOutcome = function(agentId) {
+  return globalThis.__lcpReflectionOutcomes.get(agentId) ?? null;
+};
+`;
+
+const REFLECTION_CONTROLS_PATCHES = [
+  {
+    token: `function applyPersistedAgentScopedSettings(base2, raw2) {\n  if (!raw2) {\n    return base2;\n  }\n  return {\n    trigger: normalizeTrigger(raw2.trigger, base2.trigger),\n    stepCount: normalizeStepCount(raw2.stepCount, base2.stepCount),\n    merge: normalizeMerge(raw2.merge, base2.merge),\n    mergeInstructions: normalizeMergeInstructions(raw2.mergeInstructions, base2.mergeInstructions)\n  };\n}\nfunction legacyModeToReflectionSettings`,
+    replacement: `function applyPersistedAgentScopedSettings(base2, raw2) {\n  if (!raw2) {\n    return base2;\n  }\n  return {\n    trigger: normalizeTrigger(raw2.trigger, base2.trigger),\n    stepCount: normalizeStepCount(raw2.stepCount, base2.stepCount),\n    merge: normalizeMerge(raw2.merge, base2.merge),\n    mergeInstructions: normalizeMergeInstructions(raw2.mergeInstructions, base2.mergeInstructions),\n    model: raw2.model === null || typeof raw2.model === "string" ? raw2.model : base2.model ?? null,\n    focusInstructions: typeof raw2.focusInstructions === "string" ? raw2.focusInstructions : base2.focusInstructions ?? ""\n  };\n}\nfunction legacyModeToReflectionSettings`,
+  },
+  {
+    token: `  const merge4 = normalizeMerge(settings3.merge, DEFAULT_REFLECTION_SETTINGS.merge);\n  const mergeInstructions = normalizeMergeInstructions(settings3.mergeInstructions, DEFAULT_REFLECTION_SETTINGS.mergeInstructions);\n  const legacyMode = reflectionSettingsToLegacyMode(settings3);`,
+    replacement: `  const merge4 = normalizeMerge(settings3.merge, DEFAULT_REFLECTION_SETTINGS.merge);\n  const mergeInstructions = normalizeMergeInstructions(settings3.mergeInstructions, DEFAULT_REFLECTION_SETTINGS.mergeInstructions);\n  const model = settings3.model === null ? null : typeof settings3.model === "string" ? settings3.model : null;\n  const focusInstructions = typeof settings3.focusInstructions === "string" ? settings3.focusInstructions : "";\n  const legacyMode = reflectionSettingsToLegacyMode(settings3);`,
+  },
+  {
+    token: `      reflectionSettingsByAgent: {\n        ...localSettings.reflectionSettingsByAgent ?? {},\n        [agentId]: {\n          trigger: settings3.trigger,\n          stepCount: settings3.stepCount,\n          merge: merge4,\n          mergeInstructions\n        }\n      }\n    }, workingDirectory);`,
+    replacement: `      reflectionSettingsByAgent: {\n        ...localSettings.reflectionSettingsByAgent ?? {},\n        [agentId]: {\n          trigger: settings3.trigger,\n          stepCount: settings3.stepCount,\n          merge: merge4,\n          mergeInstructions,\n          model,\n          focusInstructions\n        }\n      }\n    }, workingDirectory);`,
+  },
+  {
+    token: `      reflectionSettingsByAgent: {\n        ...globalSettings.reflectionSettingsByAgent ?? {},\n        [agentId]: {\n          trigger: settings3.trigger,\n          stepCount: settings3.stepCount,\n          merge: merge4,\n          mergeInstructions\n        }\n      }\n    });\n  }\n}\nvar DEFAULT_STEP_COUNT`,
+    replacement: `      reflectionSettingsByAgent: {\n        ...globalSettings.reflectionSettingsByAgent ?? {},\n        [agentId]: {\n          trigger: settings3.trigger,\n          stepCount: settings3.stepCount,\n          merge: merge4,\n          mergeInstructions,\n          model,\n          focusInstructions\n        }\n      }\n    });\n  }\n}\nvar DEFAULT_STEP_COUNT`,
+  },
+  {
+    token: `    merge_instructions: settings3.mergeInstructions\n  };\n}\nfunction resolveReflectionSettingsScope`,
+    replacement: `    merge_instructions: settings3.mergeInstructions,\n    model: settings3.model ?? null,\n    focus_instructions: settings3.focusInstructions ?? "",\n    last_outcome: globalThis.__lcpReflectionLastOutcome(agentId)\n  };\n}\nfunction resolveReflectionSettingsScope`,
+  },
+  {
+    token: `&& (settings3.merge_instructions === undefined || typeof settings3.merge_instructions === "string") && (c.scope === undefined`,
+    replacement: `&& (settings3.merge_instructions === undefined || typeof settings3.merge_instructions === "string") && (settings3.model === undefined || settings3.model === null || typeof settings3.model === "string") && (settings3.focus_instructions === undefined || typeof settings3.focus_instructions === "string") && (c.scope === undefined`,
+  },
+  {
+    token: `      mergeInstructions: parsed.settings.merge_instructions ?? currentSettings.mergeInstructions\n    }, {`,
+    replacement: `      mergeInstructions: parsed.settings.merge_instructions ?? currentSettings.mergeInstructions,\n      model: parsed.settings.model === undefined ? currentSettings.model : parsed.settings.model,\n      focusInstructions: parsed.settings.focus_instructions === undefined ? currentSettings.focusInstructions : parsed.settings.focus_instructions\n    }, {`,
+  },
+  {
+    token: `async function launchReflectionSubagent(options, dependencies4 = {}) {`,
+    replacement: `async function __lcpLaunchReflectionSubagentInner(options, dependencies4 = {}) {`,
+  },
+  {
+    token: `\n}\nvar AUTO_REFLECTION_DESCRIPTION = "Reflect on recent conversations", REFLECTION_AGENT_ID_WAIT_MS = 30000, reservedReflectionAgentIds, pendingReflectionLaunches, suppressedAutomaticReflections;`,
+    replacement: `\n}\n// lcp-reflection-controls: all callers above and below this declaration resolve\n// here by function hoisting. The inner function has no caller-supplied completion\n// hook; completion is recorded at its existing onComplete finally block below.\nasync function launchReflectionSubagent(options, dependencies4 = {}) {\n  const reflectionSettings = options.reflectionSettings ?? getReflectionSettings(options.agentId);\n  options.reflectionSettings ??= reflectionSettings;\n  if (options.model == null && typeof reflectionSettings?.model === "string" && reflectionSettings.model.trim()) {\n    options.model = reflectionSettings.model;\n  }\n  const focusInstructions = typeof reflectionSettings?.focusInstructions === "string" ? reflectionSettings.focusInstructions : "";\n  if (focusInstructions.trim()) {\n    const focusSuffix = "\\n\\nAdditional user-provided reflection focus:\\n" + focusInstructions;\n    if (typeof options.reflectionPromptOverride === "string") {\n      options.reflectionPromptOverride += focusSuffix;\n    } else {\n      options.instruction = (typeof options.instruction === "string" ? options.instruction : "") + focusSuffix;\n    }\n  }\n  const outcome = (status, reason) => globalThis.__lcpRecordReflectionOutcome(options.agentId, {\n    status,\n    ...(reason === undefined ? {} : { reason }),\n    ...(typeof options.triggerSource === "string" ? { trigger_source: options.triggerSource } : {}),\n    ...(typeof options.model === "string" ? { model: options.model } : {})\n  });\n  try {\n    const result3 = await __lcpLaunchReflectionSubagentInner(options, dependencies4);\n    if (result3?.launched === true) {\n      outcome("launched");\n    } else {\n      outcome("skipped", result3?.reason);\n    }\n    return result3;\n  } catch (error5) {\n    outcome("failed", error5 instanceof Error ? error5.message : String(error5));\n    throw error5;\n  }\n}\nvar AUTO_REFLECTION_DESCRIPTION = "Reflect on recent conversations", REFLECTION_AGENT_ID_WAIT_MS = 30000, reservedReflectionAgentIds, pendingReflectionLaunches, suppressedAutomaticReflections;`,
+  },
+  {
+    token: `        } finally {\n          releaseReflectionLaunch(agentId);\n        }\n      }\n    });\n    releaseOnComplete = true;`,
+    replacement: `        } finally {\n          globalThis.__lcpRecordReflectionOutcome(agentId, {\n            status: success ? "completed" : "failed",\n            ...(!success && error5 !== undefined ? { reason: error5 instanceof Error ? error5.message : String(error5) } : {}),\n            trigger_source: triggerSource,\n            ...(typeof reflectionModel === "string" ? { model: reflectionModel } : typeof options.model === "string" ? { model: options.model } : {})\n          });\n          releaseReflectionLaunch(agentId);\n        }\n      }\n    });\n    releaseOnComplete = true;`,
+  },
+];
+
 
 // lcp-model-catalog: native provider catalogs are bundled, not /v1/models
 // discovery. Match the two flattening sites atomically so the catalog used by
@@ -1516,6 +1575,27 @@ function patchLettaCodeSource(raw, path, warn) {
         `[letta-code-patch] WARN: buildAgentInfo token matched ${occurrences} time(s), expected exactly 1, in ${path} — ` +
         `running without lcp-clr-x (cross-conversation fallback won't render; "No previous messages" ` +
         `and the agent-level timestamp keep showing as before)\n`,
+      );
+    }
+  }
+
+  // lcp-reflection-controls: Keep command wire shape, per-agent persistence,
+  // and launch behavior coherent. A partial patch would advertise settings that
+  // are dropped by persistence or a model that never reaches the subagent, so
+  // every exact anchor must match once before any rewrite is made.
+  {
+    const counts = REFLECTION_CONTROLS_PATCHES.map(({ token }) => countOccurrences(patched, token));
+    if (counts.every((count) => count === 1)) {
+      for (const { token, replacement } of REFLECTION_CONTROLS_PATCHES) {
+        patched = patched.replace(token, replacement);
+      }
+      patched = injectHelperAfterShebang(patched, REFLECTION_CONTROLS_HELPER);
+      appliedPatches += 1;
+    } else {
+      skippedPatches += 1;
+      if (warn) process.stderr.write(
+        `[letta-code-patch] WARN: lcp-reflection-controls anchors matched ${counts.join(",")} (expected 1 each) in ${path} — ` +
+        `running without per-agent reflection model/focus/outcomes\n`,
       );
     }
   }
