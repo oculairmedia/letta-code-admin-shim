@@ -116,10 +116,11 @@ test("lcp-reflection-controls settings round-trip and wrapper behavior execute f
     getConversationWorkingDirectory: () => "/fixture",
     emitDeviceStatusUpdate: () => {},
   };
-  const api = runInNewContext(`${helper}\n${memorySettings}\n${responseAndHandler}\n${validator}\nDEFAULT_REFLECTION_SETTINGS = { trigger: "compaction-event", stepCount: DEFAULT_STEP_COUNT, merge: "auto", mergeInstructions: "" };\n({ getReflectionSettings, handleReflectionSettingsCommand, isSetReflectionSettingsCommand, toReflectionSettingsResponse });`, context) as {
+  const api = runInNewContext(`${helper}\n${memorySettings}\n${responseAndHandler}\n${validator}\nDEFAULT_REFLECTION_SETTINGS = { trigger: "compaction-event", stepCount: DEFAULT_STEP_COUNT, merge: "auto", mergeInstructions: "" };\n({ getReflectionSettings, handleReflectionSettingsCommand, isSetReflectionSettingsCommand, persistReflectionSettingsForAgent, toReflectionSettingsResponse });`, context) as {
     getReflectionSettings(agentId: string, directory: string): Record<string, unknown>;
     handleReflectionSettingsCommand(parsed: Record<string, unknown>, socket: unknown, listener: unknown, safeSocketSend: (...args: unknown[]) => void): Promise<boolean>;
     isSetReflectionSettingsCommand(value: unknown): boolean;
+    persistReflectionSettingsForAgent(agentId: string, settings: Record<string, unknown>, options: Record<string, unknown>): Promise<void>;
     toReflectionSettingsResponse(agentId: string, directory: string): Record<string, unknown>;
   };
   const base = {
@@ -188,4 +189,25 @@ test("lcp-reflection-controls settings round-trip and wrapper behavior execute f
   assert.equal(outcome?.model, "gpt-reflection");
   assert.ok(Number.isFinite(Date.parse(String(outcome?.at))));
   assert.equal(api.toReflectionSettingsResponse("agent-1", "/fixture").last_outcome, outcome);
+
+  // The TUI's /sleeptime selector only sends these four settings. Its save
+  // must retain the per-agent model and focus set by the mobile controls.
+  const sleeptimeSettings = {
+    trigger: "compaction-event",
+    stepCount: 9,
+    merge: "explicit",
+    mergeInstructions: "Merge only when the reflection is useful.",
+  };
+  await api.persistReflectionSettingsForAgent("agent-1", sleeptimeSettings, { persistLocalProject: false });
+  let persistedAfterSleeptime = (state.global.reflectionSettingsByAgent as Record<string, Record<string, unknown>>)["agent-1"];
+  assert.ok(persistedAfterSleeptime, "/sleeptime save must retain an agent entry");
+  assert.equal(persistedAfterSleeptime.model, "gpt-reflection");
+  assert.equal(persistedAfterSleeptime.focusInstructions, "Prioritize durable mobile facts.");
+
+  // Null is deliberate: it clears an inherited per-agent model while omitted
+  // fields above keep their previously persisted values.
+  await api.persistReflectionSettingsForAgent("agent-1", { ...sleeptimeSettings, model: null }, { persistLocalProject: false });
+  persistedAfterSleeptime = (state.global.reflectionSettingsByAgent as Record<string, Record<string, unknown>>)["agent-1"];
+  assert.equal(persistedAfterSleeptime.model, null);
+  assert.equal(persistedAfterSleeptime.focusInstructions, "Prioritize durable mobile facts.");
 });
